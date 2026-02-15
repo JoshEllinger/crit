@@ -27,7 +27,7 @@
 - [ ] **GitHub Actions release workflow**: Cross-compile binaries on tagged releases (spec has a workflow sketch).
 - [ ] **Homebrew tap**: `brew install planreview`.
 - [ ] **Comment resolution**: Mark comments as "resolved" (like GitHub), visually collapsed but still in review file.
-- [ ] **Diff view**: After Claude updates the plan, show what changed alongside original comments.
+- [ ] **Diff view**: After the AI agent updates the plan, show what changed alongside original comments.
 - [ ] **Multiple reviewers**: Support `--author "Tom"` for team review scenarios.
 - [ ] **Configurable comment format**: Let users customize the review comment prefix in output.
 - [ ] **Export formats**: Export comments as GitHub Issues, Linear tickets, or TODO list.

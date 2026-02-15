@@ -1,8 +1,8 @@
 # PlanReview
 
-A lightweight CLI tool for reviewing markdown plans with GitHub PR-style inline comments. Built for the workflow of iterating on plans with AI assistants like Claude.
+A lightweight CLI tool for reviewing markdown plans with GitHub PR-style inline comments. Built for the workflow of iterating on plans with AI coding agents.
 
-You write a plan in markdown. You run `planreview` against it. You leave inline comments — single-line or multi-line ranges, just like a GitHub PR review. The tool writes a `.review.md` file in real-time with your comments interleaved, ready to hand back to Claude at any moment.
+You write a plan in markdown. You run `planreview` against it. You leave inline comments — single-line or multi-line ranges, just like a GitHub PR review. The tool writes a `.review.md` file in real-time with your comments interleaved, ready to hand back to your AI agent at any moment.
 
 ## Install
 
@@ -67,19 +67,20 @@ planreview --port 3000 plan.md
 planreview --no-open plan.md
 ```
 
-## Workflow with Claude
+## Workflow
 
 ```bash
-# 1. Claude generates a plan
-claude "Write a plan for the new auth service" > auth-plan.md
+# 1. AI agent generates a plan
+agent "Write a plan for the new auth service" > auth-plan.md
 
 # 2. Review it
 planreview auth-plan.md
 # → Leave comments in the browser
+# → On finish, the prompt is copied to your clipboard
 
-# 3. Hand the review file to Claude (server can stay running)
-claude "Read auth-plan.review.md — I've added review comments inline. \
-       Update auth-plan.md to address each one."
+# 3. Hand the review file back to your agent
+agent "I've left review comments in auth-plan.review.md — please address
+       each comment and update the plan accordingly."
 
 # 4. Review the updated plan
 planreview auth-plan.md
@@ -90,7 +91,7 @@ planreview auth-plan.md
 
 | File | Purpose |
 |------|---------|
-| `plan.review.md` | Your plan with comments interleaved — hand this to Claude |
+| `plan.review.md` | Your plan with comments interleaved — hand this to your AI agent |
 | `.plan.comments.json` | Hidden file for resuming sessions (ignore this) |
 
 ## How It Works

@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A single-binary Go CLI tool that opens a browser-based UI for reviewing markdown files with GitHub PR-style inline commenting. Comments are written in real-time to a `.review.md` file designed to be handed to Claude.
+A single-binary Go CLI tool that opens a browser-based UI for reviewing markdown files with GitHub PR-style inline commenting. Comments are written in real-time to a `.review.md` file designed to be handed to an AI coding agent.
 
 ## Project Structure
 
@@ -75,5 +75,5 @@ The trickiest part is **source line mapping**. The approach:
 
 | File | Description |
 |------|-------------|
-| `plan.review.md` | Original markdown + comments as blockquotes — hand to Claude |
+| `plan.review.md` | Original markdown + comments as blockquotes — hand to your AI agent |
 | `.plan.comments.json` | Hidden dotfile for resume support (stores file hash) |
