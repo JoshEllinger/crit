@@ -1,0 +1,140 @@
+package main
+
+import (
+	"context"
+	"embed"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+)
+
+//go:embed frontend/*
+var frontendFS embed.FS
+
+func main() {
+	port := flag.Int("port", 0, "Port to listen on (default: random available port)")
+	flag.IntVar(port, "p", 0, "Port to listen on (shorthand)")
+	outputDir := flag.String("output", "", "Output directory for review files (default: same dir as input file)")
+	flag.StringVar(outputDir, "o", "", "Output directory (shorthand)")
+	noOpen := flag.Bool("no-open", false, "Don't auto-open browser")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: planreview [options] <file.md>\n\nOptions:\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	filePath := flag.Arg(0)
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		log.Fatalf("Error resolving path: %v", err)
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	if info.IsDir() {
+		log.Fatalf("Error: %s is a directory, not a file", absPath)
+	}
+
+	outDir := *outputDir
+	if outDir == "" {
+		outDir = filepath.Dir(absPath)
+	}
+
+	doc, err := NewDocument(absPath, outDir)
+	if err != nil {
+		log.Fatalf("Error loading document: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
+	if err != nil {
+		log.Fatalf("Error starting server: %v", err)
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+
+	srv := NewServer(doc, frontendFS)
+	httpServer := &http.Server{Handler: srv}
+
+	url := fmt.Sprintf("http://localhost:%d", addr.Port)
+	fmt.Printf("PlanReview serving %s\n", filepath.Base(absPath))
+	fmt.Printf("Open %s in your browser\n", url)
+
+	if !*noOpen {
+		go openBrowser(url)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		if err := httpServer.Serve(listener); err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	fmt.Println("\nShutting down...")
+
+	doc.WriteFiles()
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	httpServer.Shutdown(shutCtx)
+
+	reviewPath := doc.reviewFilePath()
+	if len(doc.GetComments()) > 0 {
+		prompt := fmt.Sprintf("I've left review comments in %s — please address each comment and update the plan accordingly.", reviewPath)
+		fmt.Println()
+		fmt.Println(prompt)
+		fmt.Println()
+		copyToClipboard(prompt)
+	} else {
+		fmt.Println("No comments. Goodbye!")
+	}
+}
+
+func copyToClipboard(text string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "linux":
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	default:
+		return
+	}
+	cmd.Stdin = strings.NewReader(text)
+	if err := cmd.Run(); err == nil {
+		fmt.Println("(Copied to clipboard)")
+	}
+}
+
+func openBrowser(url string) {
+	time.Sleep(200 * time.Millisecond)
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "linux":
+		cmd = exec.Command("xdg-open", url)
+	default:
+		return
+	}
+	cmd.Run()
+}

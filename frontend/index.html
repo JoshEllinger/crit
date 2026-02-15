@@ -1,0 +1,1844 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PlanReview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ===== CSS Reset & Variables ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+}
+
+[data-theme="dark"] {
+  --bg-primary: #1a1b26;
+  --bg-secondary: #1e2030;
+  --bg-tertiary: #24283b;
+  --bg-hover: #292e42;
+  --bg-gutter: #16171f;
+  --fg-primary: #c0caf5;
+  --fg-secondary: #a9b1d6;
+  --fg-muted: #565f89;
+  --fg-dimmed: #3b4261;
+  --accent: #7aa2f7;
+  --accent-hover: #89b4fa;
+  --accent-subtle: rgba(122, 162, 247, 0.1);
+  --accent-bg: rgba(122, 162, 247, 0.15);
+  --green: #9ece6a;
+  --red: #f7768e;
+  --orange: #ff9e64;
+  --yellow: #e0af68;
+  --border: #292e42;
+  --border-comment: #3d59a1;
+  --comment-bg: #1a1f36;
+  --selection-bg: rgba(122, 162, 247, 0.08);
+  --shadow: 0 2px 8px rgba(0,0,0,0.3);
+  --code-bg: #1e2030;
+  --table-stripe: rgba(122, 162, 247, 0.04);
+  --blockquote-border: #3d59a1;
+  --blockquote-bg: rgba(61, 89, 161, 0.08);
+  --scrollbar-bg: #1a1b26;
+  --scrollbar-thumb: #3b4261;
+}
+
+[data-theme="light"] {
+  --bg-primary: #fafafa;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #eeeeee;
+  --bg-hover: #e8e8e8;
+  --bg-gutter: #f0f0f0;
+  --fg-primary: #24292f;
+  --fg-secondary: #57606a;
+  --fg-muted: #8b949e;
+  --fg-dimmed: #c0c8d0;
+  --accent: #0969da;
+  --accent-hover: #0550ae;
+  --accent-subtle: rgba(9, 105, 218, 0.08);
+  --accent-bg: rgba(9, 105, 218, 0.12);
+  --green: #1a7f37;
+  --red: #cf222e;
+  --orange: #bc4c00;
+  --yellow: #9a6700;
+  --border: #d8dee4;
+  --border-comment: #0969da;
+  --comment-bg: #f0f6ff;
+  --selection-bg: rgba(9, 105, 218, 0.06);
+  --shadow: 0 2px 8px rgba(0,0,0,0.08);
+  --code-bg: #f5f5f5;
+  --table-stripe: rgba(0, 0, 0, 0.02);
+  --blockquote-border: #0969da;
+  --blockquote-bg: rgba(9, 105, 218, 0.04);
+  --scrollbar-bg: #fafafa;
+  --scrollbar-thumb: #d0d0d0;
+}
+
+/* ===== Base ===== */
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-body);
+  background: var(--bg-primary);
+  color: var(--fg-primary);
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ===== Scrollbar ===== */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--scrollbar-bg); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--fg-muted); }
+
+/* ===== Header ===== */
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  backdrop-filter: blur(8px);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-secondary);
+}
+
+.header-filename {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--fg-muted);
+  background: var(--bg-tertiary);
+  padding: 3px 10px;
+  border-radius: 4px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.comment-count {
+  font-size: 13px;
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+.comment-count strong {
+  color: var(--accent);
+}
+
+.btn {
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  background: var(--bg-tertiary);
+  color: var(--fg-primary);
+  transition: all 0.15s;
+}
+.btn:hover { background: var(--bg-hover); }
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.btn-primary:hover { background: var(--accent-hover); }
+
+.btn-danger {
+  color: var(--red);
+  border-color: var(--red);
+  background: transparent;
+}
+.btn-danger:hover { background: rgba(247, 118, 142, 0.1); }
+
+.btn-sm {
+  font-size: 12px;
+  padding: 3px 10px;
+}
+
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 16px;
+  line-height: 1;
+  transition: all 0.15s;
+}
+.theme-toggle:hover { color: var(--fg-primary); background: var(--bg-tertiary); }
+
+/* ===== Stale Notice ===== */
+.stale-notice {
+  max-width: 840px;
+  margin: 16px auto;
+  padding: 12px 20px;
+  background: rgba(255, 158, 100, 0.1);
+  border: 1px solid var(--orange);
+  border-radius: 8px;
+  color: var(--orange);
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.stale-notice button {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ===== Document Container ===== */
+.document-wrapper {
+  max-width: 840px;
+  margin: 0 auto;
+  padding: 32px 0 120px 0;
+}
+
+/* ===== Line Blocks ===== */
+.line-block {
+  position: relative;
+  display: flex;
+  border-left: 3px solid transparent;
+  transition: border-color 0.15s;
+}
+
+.line-block:hover {
+  background: var(--selection-bg);
+}
+
+.line-block.has-comment {
+  border-left-color: var(--accent);
+}
+
+.line-block.selected {
+  background: var(--accent-subtle);
+}
+
+/* ===== Gutter ===== */
+.line-gutter {
+  position: relative;
+  min-width: 52px;
+  padding: 0 8px 0 8px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: inherit;
+  color: var(--fg-dimmed);
+  user-select: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+}
+
+.line-gutter:hover .line-num { display: none; }
+.line-gutter:hover .line-add { display: flex; }
+
+/* During drag, show + on all gutters in range */
+body.dragging { user-select: none; cursor: grabbing; }
+body.dragging .line-block.selected .line-gutter .line-num { display: none; }
+body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
+
+.line-num {
+  padding-top: 1px;
+  line-height: inherit;
+}
+
+.line-add {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* ===== Line Content (rendered markdown) ===== */
+.line-content {
+  flex: 1;
+  min-width: 0;
+  padding: 0 24px 0 12px;
+  overflow-wrap: break-word;
+}
+
+/* ===== Markdown Styles ===== */
+.line-content h1,
+.line-content h2,
+.line-content h3,
+.line-content h4,
+.line-content h5,
+.line-content h6 {
+  color: var(--fg-primary);
+  font-weight: 600;
+  line-height: 1.3;
+  margin-top: 8px;
+}
+
+.line-content h1 { font-size: 1.8rem; padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+.line-content h2 { font-size: 1.45rem; padding-bottom: 6px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+.line-content h3 { font-size: 1.2rem; }
+.line-content h4 { font-size: 1.05rem; }
+.line-content h5 { font-size: 0.95rem; color: var(--fg-secondary); }
+.line-content h6 { font-size: 0.9rem; color: var(--fg-muted); }
+
+.line-content p {
+  margin: 4px 0;
+}
+
+.line-content a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s;
+}
+.line-content a:hover { border-bottom-color: var(--accent); }
+
+.line-content code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.line-content pre {
+  margin: 6px 0;
+  padding: 16px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+
+.line-content pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.875rem;
+}
+
+/* === Per-line code blocks === */
+.line-content.code-line {
+  background: var(--code-bg);
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  padding-left: 16px;
+  padding-right: 16px;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  overflow-x: auto;
+  white-space: pre;
+}
+.line-content.code-line code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+}
+.line-content.code-first {
+  border-top: 1px solid var(--border);
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  padding-top: 8px;
+  margin-top: 6px;
+}
+.line-content.code-last {
+  border-bottom: 1px solid var(--border);
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+  padding-bottom: 8px;
+  margin-bottom: 6px;
+}
+.fence-marker {
+  color: var(--fg-dimmed);
+  font-size: 0.8rem;
+}
+
+/* ===== Mermaid Diagrams ===== */
+.line-content.mermaid-block {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 6px 0;
+  text-align: center;
+  min-height: 60px;
+}
+.mermaid-rendered svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* === Per-row table blocks === */
+.line-content.table-row table.split-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 0.925rem;
+  margin: 0;
+}
+.line-content.table-row th {
+  text-align: left;
+  font-weight: 600;
+  padding: 10px 14px;
+  color: var(--fg-secondary);
+  border-bottom: 2px solid var(--border);
+}
+.line-content.table-row td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.line-content.table-even td {
+  background: var(--table-stripe);
+}
+.line-content.table-first {
+  border-top: 1px solid var(--border);
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  overflow: hidden;
+}
+.line-content.table-last {
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+  overflow: hidden;
+}
+.line-content.table-last td {
+  border-bottom: none;
+}
+.line-content.table-separator {
+  height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.line-block:has(.table-separator) {
+  height: 0;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.line-content blockquote {
+  margin: 6px 0;
+  padding: 8px 16px;
+  border-left: 3px solid var(--blockquote-border);
+  background: var(--blockquote-bg);
+  border-radius: 0 6px 6px 0;
+  color: var(--fg-secondary);
+}
+
+.line-content blockquote p {
+  margin: 2px 0;
+}
+
+.line-content ul,
+.line-content ol {
+  padding-left: 24px;
+  margin: 0;
+}
+
+.line-content li {
+  margin: 0;
+}
+
+.line-content li::marker {
+  color: var(--fg-muted);
+}
+
+.line-content ul li {
+  list-style-type: '  \2022  ';
+}
+
+.line-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 0.925rem;
+}
+
+.line-content th {
+  text-align: left;
+  font-weight: 600;
+  padding: 10px 14px;
+  border-bottom: 2px solid var(--border);
+  color: var(--fg-secondary);
+}
+
+.line-content td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.line-content tr:nth-child(even) td {
+  background: var(--table-stripe);
+}
+
+.line-content hr {
+  border: none;
+  height: 1px;
+  background: var(--border);
+  margin: 24px 0;
+}
+
+.line-content img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+
+/* Task lists */
+.line-content .task-list-item {
+  list-style: none;
+  margin-left: -24px;
+  padding-left: 4px;
+}
+
+.line-content .task-list-item input[type="checkbox"] {
+  margin-right: 8px;
+  accent-color: var(--accent);
+  transform: scale(1.1);
+  pointer-events: none;
+}
+
+.line-content strong { font-weight: 600; }
+.line-content em { font-style: italic; color: var(--fg-secondary); }
+
+/* Empty lines */
+.line-content.empty-line {
+  min-height: 1.7em;
+}
+
+/* ===== Comment Inline Box (displayed after submission) ===== */
+.comment-block {
+  max-width: 840px;
+  margin: 0 auto;
+  padding: 0 0 0 55px;
+}
+
+.comment-card {
+  margin: 6px 0;
+  border: 1px solid var(--border-comment);
+  border-radius: 8px;
+  background: var(--comment-bg);
+  overflow: hidden;
+}
+
+.comment-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--accent-subtle);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.comment-line-ref {
+  font-weight: 600;
+  color: var(--accent);
+  font-family: var(--font-mono);
+}
+
+.comment-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.comment-actions button {
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  transition: all 0.15s;
+}
+.comment-actions button:hover { color: var(--fg-primary); background: var(--bg-hover); }
+.comment-actions .delete-btn:hover { color: var(--red); }
+
+.comment-body {
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.comment-time {
+  font-size: 11px;
+  color: var(--fg-dimmed);
+}
+
+/* ===== Comment Input Form ===== */
+.comment-form-wrapper {
+  max-width: 840px;
+  margin: 0 auto;
+  padding: 0 0 0 55px;
+}
+
+.comment-form {
+  margin: 6px 0;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--comment-bg);
+  overflow: hidden;
+  box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+.comment-form-header {
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  background: var(--accent-subtle);
+  border-bottom: 1px solid var(--border);
+}
+
+.comment-form textarea {
+  display: block;
+  width: 100%;
+  min-height: 80px;
+  padding: 10px 14px;
+  border: none;
+  background: var(--comment-bg);
+  color: var(--fg-primary);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+}
+
+.comment-form textarea::placeholder {
+  color: var(--fg-dimmed);
+}
+
+.comment-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* ===== Finish Overlay ===== */
+.overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+}
+.overlay.active { display: flex; }
+
+.overlay-dialog {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px;
+  max-width: 420px;
+  text-align: center;
+  box-shadow: var(--shadow);
+}
+
+.overlay-dialog h3 {
+  margin-bottom: 10px;
+  font-size: 1.1rem;
+}
+
+.overlay-dialog p {
+  color: var(--fg-secondary);
+  font-size: 14px;
+  margin-bottom: 20px;
+}
+
+.overlay-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+/* ===== Finished Message ===== */
+.finished-message {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: var(--bg-primary);
+  z-index: 300;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+}
+.finished-message.active { display: flex; }
+.finished-message h2 { color: var(--green); }
+.finished-message p { color: var(--fg-secondary); font-size: 15px; }
+
+/* ===== Loading State ===== */
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 80vh;
+  color: var(--fg-muted);
+  font-size: 15px;
+}
+
+/* ===== highlight.js Dark Theme (GitHub Dark Dimmed) ===== */
+[data-theme="dark"] .hljs{color:#adbac7;background:#22272e}
+[data-theme="dark"] .hljs-doctag,[data-theme="dark"] .hljs-keyword,[data-theme="dark"] .hljs-meta .hljs-keyword,[data-theme="dark"] .hljs-template-tag,[data-theme="dark"] .hljs-template-variable,[data-theme="dark"] .hljs-type,[data-theme="dark"] .hljs-variable.language_{color:#f47067}
+[data-theme="dark"] .hljs-title,[data-theme="dark"] .hljs-title.class_,[data-theme="dark"] .hljs-title.class_.inherited__,[data-theme="dark"] .hljs-title.function_{color:#dcbdfb}
+[data-theme="dark"] .hljs-attr,[data-theme="dark"] .hljs-attribute,[data-theme="dark"] .hljs-literal,[data-theme="dark"] .hljs-meta,[data-theme="dark"] .hljs-number,[data-theme="dark"] .hljs-operator,[data-theme="dark"] .hljs-selector-attr,[data-theme="dark"] .hljs-selector-class,[data-theme="dark"] .hljs-selector-id,[data-theme="dark"] .hljs-variable{color:#6cb6ff}
+[data-theme="dark"] .hljs-meta .hljs-string,[data-theme="dark"] .hljs-regexp,[data-theme="dark"] .hljs-string{color:#96d0ff}
+[data-theme="dark"] .hljs-built_in,[data-theme="dark"] .hljs-symbol{color:#f69d50}
+[data-theme="dark"] .hljs-code,[data-theme="dark"] .hljs-comment,[data-theme="dark"] .hljs-formula{color:#768390}
+[data-theme="dark"] .hljs-name,[data-theme="dark"] .hljs-quote,[data-theme="dark"] .hljs-selector-pseudo,[data-theme="dark"] .hljs-selector-tag{color:#8ddb8c}
+[data-theme="dark"] .hljs-subst{color:#adbac7}
+[data-theme="dark"] .hljs-section{color:#316dca;font-weight:700}
+[data-theme="dark"] .hljs-bullet{color:#eac55f}
+[data-theme="dark"] .hljs-emphasis{color:#adbac7;font-style:italic}
+[data-theme="dark"] .hljs-strong{color:#adbac7;font-weight:700}
+[data-theme="dark"] .hljs-addition{color:#b4f1b4;background-color:#1b4721}
+[data-theme="dark"] .hljs-deletion{color:#ffd8d3;background-color:#78191b}
+
+/* ===== highlight.js Light Theme (GitHub) ===== */
+[data-theme="light"] .hljs{color:#24292e;background:#fff}
+[data-theme="light"] .hljs-doctag,[data-theme="light"] .hljs-keyword,[data-theme="light"] .hljs-meta .hljs-keyword,[data-theme="light"] .hljs-template-tag,[data-theme="light"] .hljs-template-variable,[data-theme="light"] .hljs-type,[data-theme="light"] .hljs-variable.language_{color:#d73a49}
+[data-theme="light"] .hljs-title,[data-theme="light"] .hljs-title.class_,[data-theme="light"] .hljs-title.class_.inherited__,[data-theme="light"] .hljs-title.function_{color:#6f42c1}
+[data-theme="light"] .hljs-attr,[data-theme="light"] .hljs-attribute,[data-theme="light"] .hljs-literal,[data-theme="light"] .hljs-meta,[data-theme="light"] .hljs-number,[data-theme="light"] .hljs-operator,[data-theme="light"] .hljs-selector-attr,[data-theme="light"] .hljs-selector-class,[data-theme="light"] .hljs-selector-id,[data-theme="light"] .hljs-variable{color:#005cc5}
+[data-theme="light"] .hljs-meta .hljs-string,[data-theme="light"] .hljs-regexp,[data-theme="light"] .hljs-string{color:#032f62}
+[data-theme="light"] .hljs-built_in,[data-theme="light"] .hljs-symbol{color:#e36209}
+[data-theme="light"] .hljs-code,[data-theme="light"] .hljs-comment,[data-theme="light"] .hljs-formula{color:#6a737d}
+[data-theme="light"] .hljs-name,[data-theme="light"] .hljs-quote,[data-theme="light"] .hljs-selector-pseudo,[data-theme="light"] .hljs-selector-tag{color:#22863a}
+[data-theme="light"] .hljs-subst{color:#24292e}
+[data-theme="light"] .hljs-section{color:#005cc5;font-weight:700}
+[data-theme="light"] .hljs-bullet{color:#735c0f}
+[data-theme="light"] .hljs-emphasis{color:#24292e;font-style:italic}
+[data-theme="light"] .hljs-strong{color:#24292e;font-weight:700}
+[data-theme="light"] .hljs-addition{color:#22863a;background-color:#f0fff4}
+[data-theme="light"] .hljs-deletion{color:#b31d28;background-color:#ffeef0}
+
+/* ===== Responsive ===== */
+@media (max-width: 900px) {
+  .document-wrapper { padding-left: 8px; padding-right: 8px; }
+  .comment-block, .comment-form-wrapper { padding-left: 8px; }
+  .line-gutter { min-width: 36px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="header-title">PlanReview</span>
+    <span class="header-filename" id="filename"></span>
+  </div>
+  <div class="header-right">
+    <span class="comment-count" id="commentCount"></span>
+    <button class="theme-toggle" id="themeToggle" title="Toggle theme">&#9789;</button>
+    <button class="btn btn-primary" id="finishBtn">Finish Review</button>
+  </div>
+</div>
+
+<div id="staleNotice"></div>
+
+<div class="document-wrapper" id="document">
+  <div class="loading">Loading document...</div>
+</div>
+
+<div class="overlay" id="finishOverlay">
+  <div class="overlay-dialog">
+    <h3>Finish Review</h3>
+    <p>This will save all comments and shut down the server. The review file is ready for Claude.</p>
+    <div class="overlay-actions">
+      <button class="btn" id="finishCancel">Cancel</button>
+      <button class="btn btn-primary" id="finishConfirm">Finish &amp; Exit</button>
+    </div>
+  </div>
+</div>
+
+<div class="finished-message" id="finishedMessage">
+  <h2>Review Complete</h2>
+  <p id="finishedPrompt" style="
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    max-width: 600px;
+    color: var(--fg-primary);
+    cursor: pointer;
+    user-select: all;
+  "></p>
+  <p style="font-size: 13px; color: var(--fg-muted);">Copied to clipboard. You can close this tab.</p>
+</div>
+
+<script src="markdown-it.min.js"></script>
+<script src="highlight.min.js"></script>
+<script src="hljs-javascript.min.js"></script>
+<script src="hljs-typescript.min.js"></script>
+<script src="hljs-go.min.js"></script>
+<script src="hljs-python.min.js"></script>
+<script src="hljs-ruby.min.js"></script>
+<script src="hljs-rust.min.js"></script>
+<script src="hljs-sql.min.js"></script>
+<script src="hljs-bash.min.js"></script>
+<script src="hljs-json.min.js"></script>
+<script src="hljs-yaml.min.js"></script>
+<script src="hljs-xml.min.js"></script>
+<script src="hljs-css.min.js"></script>
+<script src="hljs-elixir.min.js"></script>
+<script src="mermaid.min.js"></script>
+<script>
+(function() {
+  'use strict';
+
+  // ===== State =====
+  let comments = [];
+  let rawContent = '';
+  let fileName = '';
+  let lineBlocks = []; // { startLine, endLine, html }
+  let selectionStart = null;
+  let selectionEnd = null;
+  let activeForm = null; // { afterBlockIndex, startLine, endLine, editingId }
+
+  // ===== Mermaid =====
+  let mermaidCounter = 0;
+  const mermaidSources = {}; // id -> source text
+  function getMermaidTheme() {
+    return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default';
+  }
+  mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
+
+  async function renderMermaidBlocks() {
+    const els = document.querySelectorAll('.mermaid-pending');
+    if (els.length === 0) return;
+    mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
+    for (const el of els) {
+      const srcId = el.getAttribute('data-mermaid-id');
+      const source = mermaidSources[srcId];
+      if (!source) continue;
+      const renderId = 'mermaid-svg-' + (mermaidCounter++);
+      try {
+        const { svg } = await mermaid.render(renderId, source);
+        el.innerHTML = svg;
+        el.classList.remove('mermaid-pending');
+        el.classList.add('mermaid-rendered');
+      } catch (e) {
+        // Render failed — show source as code block fallback
+        el.innerHTML = '<pre><code>' + escapeHtml(source) + '</code></pre>';
+        el.classList.remove('mermaid-pending');
+      }
+    }
+  }
+
+  // ===== Theme =====
+  const savedTheme = localStorage.getItem('planreview-theme') || 'dark';
+  document.documentElement.setAttribute('data-theme', savedTheme);
+  updateThemeIcon();
+
+  document.getElementById('themeToggle').addEventListener('click', function() {
+    const current = document.documentElement.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('planreview-theme', next);
+    updateThemeIcon();
+    // Re-highlight code blocks with appropriate theme
+    reapplyHighlightTheme();
+  });
+
+  function updateThemeIcon() {
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    document.getElementById('themeToggle').innerHTML = isDark ? '&#9789;' : '&#9788;';
+  }
+
+  function reapplyHighlightTheme() {
+    // highlight.js themes are applied via CSS, which is handled by the data-theme attribute
+    // Re-render mermaid diagrams with new theme
+    document.querySelectorAll('.mermaid-rendered').forEach(function(el) {
+      el.classList.remove('mermaid-rendered');
+      el.classList.add('mermaid-pending');
+    });
+    renderMermaidBlocks();
+  }
+
+  // ===== Init =====
+  async function init() {
+    try {
+      const [docRes, commentsRes, staleRes] = await Promise.all([
+        fetch('/api/document').then(r => r.json()),
+        fetch('/api/comments').then(r => r.json()),
+        fetch('/api/stale').then(r => r.json())
+      ]);
+
+      rawContent = docRes.content;
+      fileName = docRes.filename;
+      comments = commentsRes || [];
+
+      document.getElementById('filename').textContent = fileName;
+      document.title = `PlanReview — ${fileName}`;
+
+      if (staleRes.notice) {
+        showStaleNotice(staleRes.notice);
+      }
+
+      parseAndRender();
+      updateCommentCount();
+    } catch (err) {
+      document.getElementById('document').innerHTML =
+        `<div class="loading" style="color:var(--red)">Error loading document: ${err.message}</div>`;
+    }
+  }
+
+  // ===== Stale Notice =====
+  function showStaleNotice(msg) {
+    const el = document.getElementById('staleNotice');
+    el.innerHTML = `<div class="stale-notice">
+      <span>${msg}</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-sm" onclick="dismissStale()">Keep Comments</button>
+        <button class="btn btn-sm btn-danger" onclick="discardComments()">Discard</button>
+      </div>
+    </div>`;
+  }
+
+  window.dismissStale = async function() {
+    await fetch('/api/stale', { method: 'DELETE' });
+    document.getElementById('staleNotice').innerHTML = '';
+  };
+
+  window.discardComments = async function() {
+    // Delete all comments
+    for (const c of [...comments]) {
+      await fetch(`/api/comments/${c.id}`, { method: 'DELETE' });
+    }
+    comments = [];
+    await fetch('/api/stale', { method: 'DELETE' });
+    document.getElementById('staleNotice').innerHTML = '';
+    renderDocument();
+    updateCommentCount();
+  };
+
+  // ===== Markdown Parsing with Source Line Mapping =====
+  function parseAndRender() {
+    const md = window.markdownit({
+      html: true,
+      typographer: true,
+      linkify: true,
+      highlight: function(str, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          try { return hljs.highlight(str, { language: lang }).value; } catch (_) {}
+        }
+        try { return hljs.highlightAuto(str).value; } catch (_) {}
+        return '';
+      }
+    });
+
+    // Enable task list rendering
+    const defaultRender = md.renderer.rules.list_item_open || function(tokens, idx, options, env, self) {
+      return self.renderToken(tokens, idx, options);
+    };
+    md.renderer.rules.list_item_open = function(tokens, idx, options, env, self) {
+      const content = getListItemContent(tokens, idx);
+      if (content !== null && /^\[[ x]\]\s/.test(content)) {
+        tokens[idx].attrJoin('class', 'task-list-item');
+      }
+      return defaultRender(tokens, idx, options, env, self);
+    };
+
+    function getListItemContent(tokens, idx) {
+      for (let i = idx + 1; i < tokens.length; i++) {
+        if (tokens[i].type === 'list_item_close') break;
+        if (tokens[i].type === 'inline') return tokens[i].content;
+      }
+      return null;
+    }
+
+    // Parse tokens to get source line mappings
+    const tokens = md.parse(rawContent, {});
+    lineBlocks = buildLineBlocks(tokens, md, rawContent);
+    renderDocument();
+  }
+
+  // Split highlighted code HTML into per-line chunks,
+  // properly handling <span> tags that cross line boundaries
+  function splitHighlightedCode(html) {
+    const rawLines = html.split('\n');
+    const result = [];
+    let openTags = []; // stack of open <span ...> tag strings
+
+    for (const rawLine of rawLines) {
+      const prefix = openTags.join('');
+      const newOpenTags = [...openTags];
+      const re = /<(\/?span)([^>]*)>/g;
+      let m;
+      while ((m = re.exec(rawLine)) !== null) {
+        if (m[1] === '/span') {
+          newOpenTags.pop();
+        } else {
+          newOpenTags.push('<span' + m[2] + '>');
+        }
+      }
+      const suffix = '</span>'.repeat(newOpenTags.length);
+      result.push(prefix + rawLine + suffix);
+      openTags = newOpenTags;
+    }
+    return result;
+  }
+
+  function buildLineBlocks(tokens, md, source) {
+    const sourceLines = source.split('\n');
+    const totalLines = sourceLines.length;
+    const blocks = [];
+    let coveredUpTo = 0; // 0-indexed line we've covered up to (exclusive)
+
+    function addGapLines(upTo) {
+      for (let ln = coveredUpTo; ln < upTo; ln++) {
+        blocks.push({
+          startLine: ln + 1,
+          endLine: ln + 1,
+          html: sourceLines[ln].trim() === '' ? '' : escapeHtml(sourceLines[ln]),
+          isEmpty: sourceLines[ln].trim() === ''
+        });
+      }
+      if (upTo > coveredUpTo) coveredUpTo = upTo;
+    }
+
+    function findClose(startIdx) {
+      let depth = 1;
+      for (let j = startIdx + 1; j < tokens.length; j++) {
+        depth += tokens[j].nesting;
+        if (depth === 0) return j;
+      }
+      return startIdx;
+    }
+
+    let i = 0;
+    while (i < tokens.length) {
+      const token = tokens[i];
+
+      if (token.nesting === -1 || !token.map) { i++; continue; }
+
+      const blockStart = token.map[0];
+      const blockEnd = token.map[1];
+
+      addGapLines(blockStart);
+
+      // === Lists: split into individual list items ===
+      if (token.type === 'bullet_list_open' || token.type === 'ordered_list_open') {
+        const isOrdered = token.type === 'ordered_list_open';
+        const listTag = isOrdered ? 'ol' : 'ul';
+        const listCloseIdx = findClose(i);
+        let orderNum = 1;
+
+        let j = i + 1;
+        while (j < listCloseIdx) {
+          if (tokens[j].type === 'list_item_open') {
+            const itemCloseIdx = findClose(j);
+            const itemMap = tokens[j].map;
+
+            if (itemMap) {
+              addGapLines(itemMap[0]);
+              // Find the actual content end (exclude trailing blank lines
+              // that markdown-it includes in the list_item map)
+              let contentEnd = itemMap[1];
+              for (let ln = itemMap[1] - 1; ln > itemMap[0]; ln--) {
+                if (sourceLines[ln].trim() === '') {
+                  contentEnd = ln;
+                } else {
+                  break;
+                }
+              }
+              const itemTokens = tokens.slice(j, itemCloseIdx + 1);
+              const startAttr = isOrdered ? ' start="' + orderNum + '"' : '';
+              const itemHtml = '<' + listTag + startAttr + '>' +
+                md.renderer.render(itemTokens, md.options, {}) +
+                '</' + listTag + '>';
+              blocks.push({
+                startLine: itemMap[0] + 1,
+                endLine: contentEnd,
+                html: itemHtml,
+                isEmpty: false
+              });
+              coveredUpTo = contentEnd;
+              orderNum++;
+            }
+            j = itemCloseIdx + 1;
+          } else {
+            j++;
+          }
+        }
+
+        i = listCloseIdx + 1;
+        addGapLines(blockEnd);
+        continue;
+      }
+
+      // === Code blocks (fence): split into per-line ===
+      if (token.type === 'fence') {
+        const lang = token.info ? token.info.trim().split(/\s+/)[0] : '';
+        const code = token.content;
+
+        // === Mermaid diagrams: render as single block ===
+        if (lang === 'mermaid') {
+          const srcId = 'msrc-' + blockStart;
+          mermaidSources[srcId] = code.trim();
+          blocks.push({
+            startLine: blockStart + 1, endLine: blockEnd,
+            html: '<div class="mermaid-pending" data-mermaid-id="' + srcId + '"></div>',
+            isEmpty: false, cssClass: 'mermaid-block'
+          });
+          i++;
+          coveredUpTo = blockEnd;
+          continue;
+        }
+
+        let highlighted;
+        if (lang && hljs.getLanguage(lang)) {
+          try { highlighted = hljs.highlight(code, { language: lang }).value; } catch(_) { highlighted = escapeHtml(code); }
+        } else {
+          try { highlighted = hljs.highlightAuto(code).value; } catch(_) { highlighted = escapeHtml(code); }
+        }
+
+        const codeLines = splitHighlightedCode(highlighted);
+        // Remove trailing empty line (content usually ends with \n)
+        while (codeLines.length > 0 && codeLines[codeLines.length - 1].replace(/<[^>]*>/g, '').trim() === '') {
+          codeLines.pop();
+        }
+
+        const fenceOpen = blockStart;     // 0-indexed, ``` line
+        const fenceClose = blockEnd - 1;  // 0-indexed, closing ``` line
+        const totalCodeLines = codeLines.length;
+
+        // Opening fence line
+        blocks.push({
+          startLine: fenceOpen + 1, endLine: fenceOpen + 1,
+          html: '<span class="fence-marker">' + escapeHtml(sourceLines[fenceOpen]) + '</span>',
+          isEmpty: false, cssClass: 'code-line code-first'
+        });
+
+        // Each code line
+        for (let ci = 0; ci < totalCodeLines; ci++) {
+          blocks.push({
+            startLine: fenceOpen + 2 + ci, endLine: fenceOpen + 2 + ci,
+            html: '<code class="hljs">' + (codeLines[ci] || '&nbsp;') + '</code>',
+            isEmpty: false, cssClass: 'code-line code-mid'
+          });
+        }
+
+        // Closing fence line
+        blocks.push({
+          startLine: fenceClose + 1, endLine: fenceClose + 1,
+          html: '<span class="fence-marker">' + escapeHtml(sourceLines[fenceClose]) + '</span>',
+          isEmpty: false, cssClass: 'code-line code-last'
+        });
+
+        i++;
+        coveredUpTo = blockEnd;
+        continue;
+      }
+
+      // === Tables: split into per-row ===
+      if (token.type === 'table_open') {
+        const tableCloseIdx = findClose(i);
+        // Count columns from the first row
+        let numCols = 0;
+        for (let j = i + 1; j < tableCloseIdx; j++) {
+          if (tokens[j].type === 'th_open') numCols++;
+          if (tokens[j].type === 'tr_close') break;
+        }
+        const colWidth = numCols > 0 ? (100 / numCols).toFixed(2) + '%' : 'auto';
+        const colgroup = '<colgroup>' + ('<col style="width:' + colWidth + '">').repeat(numCols) + '</colgroup>';
+
+        let rowIndex = 0;
+        let bodyRowIndex = 0;
+        let inThead = false;
+        let j = i + 1;
+        while (j < tableCloseIdx) {
+          if (tokens[j].type === 'thead_open') { inThead = true; j++; continue; }
+          if (tokens[j].type === 'thead_close') { inThead = false; j++; continue; }
+          if (tokens[j].type === 'tbody_open' || tokens[j].type === 'tbody_close') { j++; continue; }
+
+          if (tokens[j].type === 'tr_open') {
+            const trCloseIdx = findClose(j);
+            const trMap = tokens[j].map;
+            if (trMap) {
+              // Handle gap lines between rows (e.g., |---|---| separator)
+              for (let ln = coveredUpTo; ln < trMap[0]; ln++) {
+                const lineText = sourceLines[ln].trim();
+                if (/^\|[\s\-:|]+\|$/.test(lineText) || /^[-:|][\s\-:|]*$/.test(lineText)) {
+                  // Table separator line — render as thin visual divider
+                  blocks.push({
+                    startLine: ln + 1, endLine: ln + 1,
+                    html: '', isEmpty: false, cssClass: 'table-separator'
+                  });
+                } else {
+                  blocks.push({
+                    startLine: ln + 1, endLine: ln + 1,
+                    html: lineText === '' ? '' : escapeHtml(lineText),
+                    isEmpty: lineText === ''
+                  });
+                }
+              }
+              coveredUpTo = trMap[0];
+
+              const trTokens = tokens.slice(j, trCloseIdx + 1);
+              const section = inThead ? 'thead' : 'tbody';
+              const rowHtml = '<table class="split-table">' + colgroup +
+                '<' + section + '>' +
+                md.renderer.render(trTokens, md.options, {}) +
+                '</' + section + '></table>';
+
+              let cls = 'table-row';
+              if (rowIndex === 0) cls += ' table-first';
+              if (!inThead && bodyRowIndex % 2 === 1) cls += ' table-even';
+              blocks.push({
+                startLine: trMap[0] + 1, endLine: trMap[1],
+                html: rowHtml, isEmpty: false, cssClass: cls
+              });
+              coveredUpTo = trMap[1];
+              rowIndex++;
+              if (!inThead) bodyRowIndex++;
+            }
+            j = trCloseIdx + 1;
+          } else {
+            j++;
+          }
+        }
+        // Mark the last row
+        if (blocks.length > 0 && blocks[blocks.length - 1].cssClass &&
+            blocks[blocks.length - 1].cssClass.includes('table-row')) {
+          blocks[blocks.length - 1].cssClass += ' table-last';
+        }
+
+        i = tableCloseIdx + 1;
+        addGapLines(blockEnd);
+        continue;
+      }
+
+      // === Blockquotes: split into child blocks ===
+      if (token.type === 'blockquote_open') {
+        const bqCloseIdx = findClose(i);
+        // Process children inside the blockquote as individual blocks
+        // wrapped in <blockquote>
+        let j = i + 1;
+        let hasChildren = false;
+        while (j < bqCloseIdx) {
+          if (tokens[j].nesting === -1 || !tokens[j].map) { j++; continue; }
+          hasChildren = true;
+          const childMap = tokens[j].map;
+          let childCloseIdx = j;
+          if (tokens[j].nesting === 1) {
+            childCloseIdx = findClose(j);
+          }
+          addGapLines(childMap[0]);
+          const childTokens = tokens.slice(j, childCloseIdx + 1);
+          const childHtml = '<blockquote>' +
+            md.renderer.render(childTokens, md.options, {}) +
+            '</blockquote>';
+          blocks.push({
+            startLine: childMap[0] + 1,
+            endLine: childMap[1],
+            html: childHtml,
+            isEmpty: false
+          });
+          coveredUpTo = childMap[1];
+          j = childCloseIdx + 1;
+        }
+        if (!hasChildren) {
+          // Render whole blockquote as single block
+          const bqTokens = tokens.slice(i, bqCloseIdx + 1);
+          blocks.push({
+            startLine: blockStart + 1,
+            endLine: blockEnd,
+            html: md.renderer.render(bqTokens, md.options, {}),
+            isEmpty: false
+          });
+          coveredUpTo = blockEnd;
+        }
+        i = bqCloseIdx + 1;
+        addGapLines(blockEnd);
+        continue;
+      }
+
+      // === Default: render as single block ===
+      let closeIdx = i;
+      if (token.nesting === 1) {
+        closeIdx = findClose(i);
+      }
+
+      const blockTokens = tokens.slice(i, closeIdx + 1);
+      let html;
+      try {
+        html = md.renderer.render(blockTokens, md.options, {});
+      } catch (e) {
+        html = escapeHtml(blockTokens.map(t => t.content || '').join(''));
+      }
+
+      blocks.push({
+        startLine: blockStart + 1,
+        endLine: blockEnd,
+        html: html,
+        isEmpty: false
+      });
+
+      i = closeIdx + 1;
+      coveredUpTo = blockEnd;
+    }
+
+    // Remaining lines
+    addGapLines(totalLines);
+
+    return blocks;
+  }
+
+  // Process task list checkboxes in rendered HTML
+  function processTaskLists(html) {
+    return html.replace(
+      /(<li[^>]*class="task-list-item"[^>]*>)\s*<p>\[([ x])\]\s*/gi,
+      function(match, liTag, checked) {
+        const checkbox = checked === 'x'
+          ? '<input type="checkbox" checked disabled>'
+          : '<input type="checkbox" disabled>';
+        return liTag + '<p>' + checkbox;
+      }
+    ).replace(
+      /(<li[^>]*class="task-list-item"[^>]*>)\[([ x])\]\s*/gi,
+      function(match, liTag, checked) {
+        const checkbox = checked === 'x'
+          ? '<input type="checkbox" checked disabled>'
+          : '<input type="checkbox" disabled>';
+        return liTag + checkbox;
+      }
+    );
+  }
+
+  function escapeHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ===== Render Document =====
+  function renderDocument() {
+    const container = document.getElementById('document');
+    container.innerHTML = '';
+
+    const commentsMap = buildCommentsMap();
+
+    for (let bi = 0; bi < lineBlocks.length; bi++) {
+      const block = lineBlocks[bi];
+
+      // Create line block
+      const lineBlockEl = document.createElement('div');
+      lineBlockEl.className = 'line-block';
+      lineBlockEl.dataset.blockIndex = bi;
+      lineBlockEl.dataset.startLine = block.startLine;
+      lineBlockEl.dataset.endLine = block.endLine;
+
+      // Check if this block has comments
+      const blockComments = getCommentsForBlock(block, commentsMap);
+      if (blockComments.length > 0) {
+        lineBlockEl.classList.add('has-comment');
+      }
+
+      // Check selection
+      if (selectionStart !== null && selectionEnd !== null) {
+        if (block.startLine >= selectionStart && block.endLine <= selectionEnd) {
+          lineBlockEl.classList.add('selected');
+        }
+      }
+
+      // Gutter
+      const gutter = document.createElement('div');
+      gutter.className = 'line-gutter';
+      gutter.dataset.startLine = block.startLine;
+      gutter.dataset.endLine = block.endLine;
+
+      const lineNum = document.createElement('span');
+      lineNum.className = 'line-num';
+      lineNum.textContent = block.startLine === block.endLine
+        ? block.startLine
+        : `${block.startLine}`;
+
+      const lineAdd = document.createElement('span');
+      lineAdd.className = 'line-add';
+      lineAdd.textContent = '+';
+
+      gutter.appendChild(lineNum);
+      gutter.appendChild(lineAdd);
+      gutter.addEventListener('mousedown', handleGutterMouseDown);
+
+      // Content
+      const content = document.createElement('div');
+      let contentClasses = 'line-content';
+      if (block.isEmpty) contentClasses += ' empty-line';
+      if (block.cssClass) contentClasses += ' ' + block.cssClass;
+      content.className = contentClasses;
+      let html = block.html;
+      html = processTaskLists(html);
+      content.innerHTML = html;
+
+      lineBlockEl.appendChild(gutter);
+      lineBlockEl.appendChild(content);
+      container.appendChild(lineBlockEl);
+
+      // Render comments attached to this block
+      for (const comment of blockComments) {
+        container.appendChild(createCommentElement(comment));
+      }
+
+      // Render comment form if it's after this block
+      if (activeForm && !activeForm.editingId && activeForm.afterBlockIndex === bi) {
+        container.appendChild(createCommentForm());
+      }
+    }
+
+    // Render mermaid diagrams after DOM is built
+    renderMermaidBlocks();
+  }
+
+  function buildCommentsMap() {
+    // Map comments to the block they should appear after (by end_line)
+    const map = {};
+    for (const c of comments) {
+      const key = c.end_line;
+      if (!map[key]) map[key] = [];
+      map[key].push(c);
+    }
+    return map;
+  }
+
+  function getCommentsForBlock(block, commentsMap) {
+    const result = [];
+    for (let ln = block.startLine; ln <= block.endLine; ln++) {
+      if (commentsMap[ln]) {
+        result.push(...commentsMap[ln]);
+      }
+    }
+    return result;
+  }
+
+  // ===== Gutter Drag Selection (GitHub-style) =====
+  let dragState = null; // { anchorStartLine, anchorEndLine, anchorBlockIndex }
+
+  function handleGutterMouseDown(e) {
+    e.preventDefault(); // prevent text selection
+    const gutter = e.currentTarget;
+    const startLine = parseInt(gutter.dataset.startLine);
+    const endLine = parseInt(gutter.dataset.endLine);
+    const blockEl = gutter.parentElement;
+    const blockIndex = parseInt(blockEl.dataset.blockIndex);
+
+    // Start drag
+    dragState = {
+      anchorStartLine: startLine,
+      anchorEndLine: endLine,
+      anchorBlockIndex: blockIndex,
+      currentStartLine: startLine,
+      currentEndLine: endLine,
+      currentBlockIndex: blockIndex
+    };
+
+    // Show immediate selection feedback
+    selectionStart = startLine;
+    selectionEnd = endLine;
+    activeForm = null;
+    renderDocument();
+
+    document.body.classList.add('dragging');
+    document.addEventListener('mousemove', handleDragMove);
+    document.addEventListener('mouseup', handleDragEnd);
+  }
+
+  function handleDragMove(e) {
+    if (!dragState) return;
+
+    // Find which gutter element the mouse is over
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el) return;
+
+    const lineBlock = el.closest('.line-block');
+    if (!lineBlock) return;
+
+    const hoverStartLine = parseInt(lineBlock.dataset.startLine);
+    const hoverEndLine = parseInt(lineBlock.dataset.endLine);
+    const hoverBlockIndex = parseInt(lineBlock.dataset.blockIndex);
+
+    dragState.currentStartLine = hoverStartLine;
+    dragState.currentEndLine = hoverEndLine;
+    dragState.currentBlockIndex = hoverBlockIndex;
+
+    // Update visual selection range
+    selectionStart = Math.min(dragState.anchorStartLine, hoverStartLine);
+    selectionEnd = Math.max(dragState.anchorEndLine, hoverEndLine);
+    renderDocument();
+  }
+
+  function handleDragEnd(e) {
+    document.removeEventListener('mousemove', handleDragMove);
+    document.removeEventListener('mouseup', handleDragEnd);
+    document.body.classList.remove('dragging');
+
+    if (!dragState) return;
+
+    const rangeStart = Math.min(dragState.anchorStartLine, dragState.currentStartLine);
+    const rangeEnd = Math.max(dragState.anchorEndLine, dragState.currentEndLine);
+
+    // Find the last block index in the range
+    let lastBlockIndex = 0;
+    for (let i = 0; i < lineBlocks.length; i++) {
+      if (lineBlocks[i].startLine >= rangeStart && lineBlocks[i].endLine <= rangeEnd) {
+        lastBlockIndex = i;
+      }
+    }
+
+    activeForm = {
+      afterBlockIndex: lastBlockIndex,
+      startLine: rangeStart,
+      endLine: rangeEnd,
+      editingId: null
+    };
+
+    selectionStart = rangeStart;
+    selectionEnd = rangeEnd;
+    dragState = null;
+    renderDocument();
+    focusCommentTextarea();
+  }
+
+  function focusCommentTextarea() {
+    requestAnimationFrame(() => {
+      const ta = document.querySelector('.comment-form textarea');
+      if (ta) ta.focus();
+    });
+  }
+
+  // ===== Comment Form =====
+  function createCommentForm() {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'comment-form-wrapper';
+
+    const form = document.createElement('div');
+    form.className = 'comment-form';
+
+    const header = document.createElement('div');
+    header.className = 'comment-form-header';
+    const lineRef = activeForm.startLine === activeForm.endLine
+      ? `Line ${activeForm.startLine}`
+      : `Lines ${activeForm.startLine}-${activeForm.endLine}`;
+    header.textContent = activeForm.editingId ? `Editing comment on ${lineRef}` : `Comment on ${lineRef}`;
+
+    const textarea = document.createElement('textarea');
+    textarea.placeholder = 'Leave a review comment... (Ctrl+Enter to submit, Escape to cancel)';
+    if (activeForm.editingId) {
+      const existing = comments.find(c => c.id === activeForm.editingId);
+      if (existing) textarea.value = existing.body;
+    }
+
+    textarea.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        submitComment(textarea.value);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelComment();
+      }
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'comment-form-actions';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-sm';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', cancelComment);
+
+    const submitBtn = document.createElement('button');
+    submitBtn.className = 'btn btn-sm btn-primary';
+    submitBtn.textContent = activeForm.editingId ? 'Update Comment' : 'Add Comment';
+    submitBtn.addEventListener('click', () => submitComment(textarea.value));
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(submitBtn);
+
+    form.appendChild(header);
+    form.appendChild(textarea);
+    form.appendChild(actions);
+    wrapper.appendChild(form);
+    return wrapper;
+  }
+
+  async function submitComment(body) {
+    if (!body.trim()) return;
+
+    try {
+      if (activeForm.editingId) {
+        const res = await fetch(`/api/comments/${activeForm.editingId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: body.trim() })
+        });
+        const updated = await res.json();
+        const idx = comments.findIndex(c => c.id === activeForm.editingId);
+        if (idx >= 0) comments[idx] = updated;
+      } else {
+        const res = await fetch('/api/comments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            start_line: activeForm.startLine,
+            end_line: activeForm.endLine,
+            body: body.trim()
+          })
+        });
+        const newComment = await res.json();
+        comments.push(newComment);
+      }
+    } catch (err) {
+      console.error('Error saving comment:', err);
+    }
+
+    activeForm = null;
+    selectionStart = null;
+    selectionEnd = null;
+    renderDocument();
+    updateCommentCount();
+  }
+
+  function cancelComment() {
+    activeForm = null;
+    selectionStart = null;
+    selectionEnd = null;
+    renderDocument();
+  }
+
+  // ===== Comment Display =====
+  function createCommentElement(comment) {
+    // If this comment is being edited, render an inline editor instead
+    if (activeForm && activeForm.editingId === comment.id) {
+      return createInlineEditor(comment);
+    }
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'comment-block';
+
+    const card = document.createElement('div');
+    card.className = 'comment-card';
+
+    const header = document.createElement('div');
+    header.className = 'comment-header';
+
+    const lineRef = document.createElement('span');
+    lineRef.className = 'comment-line-ref';
+    lineRef.textContent = comment.start_line === comment.end_line
+      ? `Line ${comment.start_line}`
+      : `Lines ${comment.start_line}-${comment.end_line}`;
+
+    const time = document.createElement('span');
+    time.className = 'comment-time';
+    time.textContent = formatTime(comment.created_at);
+
+    const headerLeft = document.createElement('div');
+    headerLeft.style.display = 'flex';
+    headerLeft.style.alignItems = 'center';
+    headerLeft.style.gap = '10px';
+    headerLeft.appendChild(lineRef);
+    headerLeft.appendChild(time);
+
+    const actions = document.createElement('div');
+    actions.className = 'comment-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.textContent = 'Edit';
+    editBtn.addEventListener('click', () => editComment(comment));
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'delete-btn';
+    deleteBtn.textContent = 'Delete';
+    deleteBtn.addEventListener('click', () => deleteComment(comment.id));
+
+    actions.appendChild(editBtn);
+    actions.appendChild(deleteBtn);
+
+    header.appendChild(headerLeft);
+    header.appendChild(actions);
+
+    const body = document.createElement('div');
+    body.className = 'comment-body';
+    body.textContent = comment.body;
+
+    card.appendChild(header);
+    card.appendChild(body);
+    wrapper.appendChild(card);
+    return wrapper;
+  }
+
+  function createInlineEditor(comment) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'comment-form-wrapper';
+
+    const form = document.createElement('div');
+    form.className = 'comment-form';
+
+    const header = document.createElement('div');
+    header.className = 'comment-form-header';
+    const lineRef = comment.start_line === comment.end_line
+      ? `Line ${comment.start_line}`
+      : `Lines ${comment.start_line}-${comment.end_line}`;
+    header.textContent = `Editing comment on ${lineRef}`;
+
+    const textarea = document.createElement('textarea');
+    textarea.placeholder = 'Leave a review comment... (Ctrl+Enter to submit, Escape to cancel)';
+    textarea.value = comment.body;
+
+    textarea.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        submitComment(textarea.value);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelComment();
+      }
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'comment-form-actions';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-sm';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', cancelComment);
+
+    const submitBtn = document.createElement('button');
+    submitBtn.className = 'btn btn-sm btn-primary';
+    submitBtn.textContent = 'Update Comment';
+    submitBtn.addEventListener('click', () => submitComment(textarea.value));
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(submitBtn);
+
+    form.appendChild(header);
+    form.appendChild(textarea);
+    form.appendChild(actions);
+    wrapper.appendChild(form);
+
+    requestAnimationFrame(() => textarea.focus());
+    return wrapper;
+  }
+
+  function editComment(comment) {
+    activeForm = {
+      afterBlockIndex: null, // not used for inline edit
+      startLine: comment.start_line,
+      endLine: comment.end_line,
+      editingId: comment.id
+    };
+    renderDocument();
+  }
+
+  async function deleteComment(id) {
+    try {
+      await fetch(`/api/comments/${id}`, { method: 'DELETE' });
+      comments = comments.filter(c => c.id !== id);
+    } catch (err) {
+      console.error('Error deleting comment:', err);
+    }
+    renderDocument();
+    updateCommentCount();
+  }
+
+  function formatTime(isoStr) {
+    if (!isoStr) return '';
+    const d = new Date(isoStr);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  // ===== Comment Count =====
+  function updateCommentCount() {
+    const el = document.getElementById('commentCount');
+    const n = comments.length;
+    el.innerHTML = n === 0 ? '' : `<strong>${n}</strong> comment${n === 1 ? '' : 's'}`;
+  }
+
+  // ===== Finish Review =====
+  document.getElementById('finishBtn').addEventListener('click', function() {
+    document.getElementById('finishOverlay').classList.add('active');
+  });
+
+  document.getElementById('finishCancel').addEventListener('click', function() {
+    document.getElementById('finishOverlay').classList.remove('active');
+  });
+
+  document.getElementById('finishConfirm').addEventListener('click', async function() {
+    document.getElementById('finishOverlay').classList.remove('active');
+    let reviewFile = '';
+    try {
+      const resp = await fetch('/api/finish', { method: 'POST' });
+      const data = await resp.json();
+      reviewFile = data.review_file || '';
+    } catch (_) {}
+
+    const prompt = reviewFile
+      ? `I've left review comments in ${reviewFile} — please address each comment and update the plan accordingly.`
+      : 'Review complete — no comments were left.';
+    document.getElementById('finishedPrompt').textContent = prompt;
+
+    try { await navigator.clipboard.writeText(prompt); } catch (_) {}
+
+    document.getElementById('finishedMessage').classList.add('active');
+  });
+
+  // Close overlay on escape
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+      document.getElementById('finishOverlay').classList.remove('active');
+    }
+  });
+
+  // ===== Start =====
+  init();
+
+})();
+</script>
+</body>
+</html>

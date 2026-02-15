@@ -1,0 +1,7 @@
+# Compiled binary
+planreview
+planreview.exe
+
+# Review session files (generated at runtime)
+*.comments.json
+*.review.md
