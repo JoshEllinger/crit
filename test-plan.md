@@ -22,12 +22,12 @@ PostgreSQL database. It exposes a REST API consumed by the API gateway.
 
 ### Tech Stack Comparison
 
-| Component      | Option A        | Option B       | Decision  |
-|---------------|-----------------|----------------|-----------|
-| Language      | Elixir/Phoenix  | Go             | Go        |
-| Database      | PostgreSQL      | CockroachDB    | PostgreSQL|
-| Cache         | Redis           | Memcached      | Redis     |
-| Auth tokens   | JWT             | Opaque tokens  | JWT       |
+| Component   | Option A       | Option B      | Decision   |
+| ----------- | -------------- | ------------- | ---------- |
+| Language    | Elixir/Phoenix | Go            | Go         |
+| Database    | PostgreSQL     | CockroachDB   | PostgreSQL |
+| Cache       | Redis          | Memcached     | Redis      |
+| Auth tokens | JWT            | Opaque tokens | JWT        |
 
 ## Database Schema
 
@@ -112,6 +112,10 @@ sequenceDiagram
     AuthService-->>Gateway: JWT + Refresh token
     Gateway-->>Client: 200 OK + tokens
 ```
+
+## Architecture
+
+![Photo by Jakub on Unsplash at https://unsplash.com/photos/someone-is-drawing-on-a-tablet-at-their-desk-vhZ8K5Np9mk](images/architecture.png)
 
 ## Deployment
 

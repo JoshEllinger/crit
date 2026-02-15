@@ -407,6 +407,14 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   height: auto;
 }
 
+/* ===== Images ===== */
+.line-content img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+  margin: 4px 0;
+}
+
 /* === Per-row table blocks === */
 .line-content.table-row table.split-table {
   width: 100%;
@@ -1379,6 +1387,13 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     );
   }
 
+  function rewriteImageSrcs(html) {
+    return html.replace(/(<img\s[^>]*src=")([^"]+)(")/gi, function(match, pre, src, post) {
+      if (/^https?:\/\/|^data:|^\//.test(src)) return match;
+      return pre + '/files/' + src + post;
+    });
+  }
+
   function escapeHtml(str) {
     return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
@@ -1441,6 +1456,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
       content.className = contentClasses;
       let html = block.html;
       html = processTaskLists(html);
+      html = rewriteImageSrcs(html);
       content.innerHTML = html;
 
       lineBlockEl.appendChild(gutter);

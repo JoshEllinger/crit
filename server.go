@@ -29,6 +29,7 @@ func NewServer(doc *Document, frontendFS embed.FS) *Server {
 	mux.HandleFunc("/api/comments/", s.handleCommentByID)
 	mux.HandleFunc("/api/finish", s.handleFinish)
 	mux.HandleFunc("/api/stale", s.handleStale)
+	mux.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(doc.FileDir))))
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 
 	s.mux = mux

@@ -30,6 +30,7 @@ type CommentsFile struct {
 type Document struct {
 	FilePath    string
 	FileName    string
+	FileDir     string
 	Content     string
 	FileHash    string
 	OutputDir   string
@@ -52,6 +53,7 @@ func NewDocument(filePath, outputDir string) (*Document, error) {
 	doc := &Document{
 		FilePath:  filePath,
 		FileName:  filepath.Base(filePath),
+		FileDir:   filepath.Dir(filePath),
 		Content:   content,
 		FileHash:  hash,
 		OutputDir: outputDir,
