@@ -6,13 +6,24 @@ You write a plan in markdown. You run `crit` against it. You leave inline commen
 
 ## Install
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap tomasz-tomczyk/tap
+brew install crit
+```
+
+### Download Binary
+
+Grab the latest binary for your platform from [Releases](https://github.com/tomasz-tomczyk/crit/releases).
+
 ### Build from Source
 
 Requires Go 1.25+ (install via [asdf](https://asdf-vm.com/), Homebrew, or [go.dev](https://go.dev/dl/)):
 
 ```bash
 # Clone and build
-git clone https://github.com/YOUR_USERNAME/crit.git
+git clone https://github.com/tomasz-tomczyk/crit.git
 cd crit
 go build -o crit .
 

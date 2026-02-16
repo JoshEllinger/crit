@@ -21,17 +21,26 @@ import (
 //go:embed frontend/*
 var frontendFS embed.FS
 
+var version = "dev"
+
 func main() {
 	port := flag.Int("port", 0, "Port to listen on (default: random available port)")
 	flag.IntVar(port, "p", 0, "Port to listen on (shorthand)")
 	outputDir := flag.String("output", "", "Output directory for review files (default: same dir as input file)")
 	flag.StringVar(outputDir, "o", "", "Output directory (shorthand)")
 	noOpen := flag.Bool("no-open", false, "Don't auto-open browser")
+	showVersion := flag.Bool("version", false, "Print version and exit")
+	flag.BoolVar(showVersion, "v", false, "Print version and exit (shorthand)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: crit [options] <file.md>\n\nOptions:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	if flag.NArg() < 1 {
 		flag.Usage()
