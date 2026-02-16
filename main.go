@@ -109,6 +109,7 @@ func main() {
 	close(watchStop)
 	fmt.Println("\nShutting down...")
 
+	doc.Shutdown()
 	doc.WriteFiles()
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

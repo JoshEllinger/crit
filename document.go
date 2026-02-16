@@ -258,6 +258,12 @@ func (d *Document) notify(event SSEEvent) {
 	}
 }
 
+// Shutdown sends a server-shutdown event to all SSE subscribers so the
+// browser page can show an appropriate message.
+func (d *Document) Shutdown() {
+	d.notify(SSEEvent{Type: "server-shutdown"})
+}
+
 // ReloadFile re-reads the source file and clears in-memory comments.
 // The .review.md file is kept so the agent can still reference it while editing.
 func (d *Document) ReloadFile() error {
