@@ -73,6 +73,15 @@ Copies the selected lines for you to easily edit
 
 ![Agent prompt](images/prompt.png)
 
+### Other
+
+- Real-time `.review.md` output updated on every comment change
+- Live file watching with SSE — automatic reload when the source file changes
+- Multi-round review workflow (review → finish → agent edits → new round)
+- Syntax-highlighted code blocks (via highlight.js)
+- Dark/light theme with persistence
+- Single binary with embedded frontend
+
 ## Build from Source
 
 Requires Go 1.25+ (install via [asdf](https://asdf-vm.com/), Homebrew, or [go.dev](https://go.dev/dl/)):
@@ -128,18 +137,6 @@ Crit watches the source file for changes. After you click "Finish Review" and yo
 | --------------------- | --------------------------------------------------------------- |
 | `plan.review.md`      | Original plan + comments as blockquotes — hand to your AI agent |
 | `.plan.comments.json` | Hidden file for session resume (auto-managed)                   |
-
-## Features
-
-- GitHub PR-style inline commenting with click-and-drag line selection
-- Real-time `.review.md` output updated on every comment change
-- Live file watching with SSE — automatic reload when the source file changes
-- Multi-round review workflow (review → finish → agent edits → new round)
-- Syntax-highlighted code blocks (via highlight.js)
-- Mermaid diagram rendering
-- Dark/light theme with persistence
-- Single binary with embedded frontend — no external dependencies
-- Binds to `127.0.0.1` only (localhost)
 
 ## Acknowledgments
 
