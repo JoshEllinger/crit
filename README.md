@@ -2,7 +2,43 @@
 
 A lightweight CLI tool for reviewing markdown plans with GitHub PR-style inline comments. Built for the workflow of iterating on plans with AI coding agents.
 
-You write a plan in markdown. You run `crit` against it. You leave inline comments — single-line or multi-line ranges, just like a GitHub PR review. The tool writes a `.review.md` file in real-time with your comments interleaved, ready to hand back to your AI agent at any moment.
+You write a plan in markdown. You run `crit` against it. You leave inline comments — single-line or multi-line ranges, just like a GitHub PR review. The tool writes a `.review.md` file in real-time with your comments interleaved, ready to hand back to your AI agent.
+
+## Features
+
+### Comments for single lines and blocks
+
+![Simple comments](images/simple-comments.gif)
+
+Generated Markdown:
+
+```markdown
+> **Note**: This plan covers the MVP scope. SAML integration is deferred to Phase 2
+> unless the enterprise sales team escalates priority.
+
+> **[REVIEW COMMENT — Lines 8-9]**: We should definitely defer SAML!
+
+...
+
+### Components
+
+1. **Auth API** — handles login, logout, token refresh
+2. **Token Service** — JWT issuance and validation
+3. **Provider Adapters** — pluggable OAuth2/SAML providers
+4. **Session Store** — Redis-backed session management
+
+> **[REVIEW COMMENT — Lines 16-21]**: Can you be more specific here?
+```
+
+### Insert suggestion
+
+Copies the selected lines for you to easily edit
+
+![Insert suggestion](images/suggestion.gif)
+
+### Mermaid diagram support
+
+![Mermaid diagram](images/mermaid.png)
 
 ## Install
 
