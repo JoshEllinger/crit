@@ -315,7 +315,6 @@ func (d *Document) WatchFile(stop <-chan struct{}) {
 				d.mu.RUnlock()
 
 				d.notify(event)
-				fmt.Printf("File changed: %s — notified %d client(s)\n", d.FileName, len(d.subscribers))
 			}
 		}
 	}

@@ -134,6 +134,12 @@ body {
   border-radius: 4px;
 }
 
+.header-notify {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--green);
+}
+
 .header-right {
   display: flex;
   align-items: center;
@@ -743,31 +749,6 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   word-break: break-word;
 }
 
-/* ===== Updated Banner ===== */
-.updated-banner {
-  display: none;
-  position: fixed;
-  top: 50px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 250;
-  background: var(--accent);
-  color: #fff;
-  padding: 10px 24px;
-  border-radius: 8px;
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
-  transition: opacity 0.2s;
-  animation: slideDown 0.3s ease-out;
-}
-.updated-banner.active { display: block; }
-.updated-banner:hover { opacity: 0.9; }
-@keyframes slideDown {
-  from { transform: translateX(-50%) translateY(-20px); opacity: 0; }
-  to { transform: translateX(-50%) translateY(0); opacity: 1; }
-}
 
 /* ===== Loading State ===== */
 .loading {
@@ -827,6 +808,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   <div class="header-left">
     <span class="header-title">PlanReview</span>
     <span class="header-filename" id="filename"></span>
+    <span class="header-notify" id="headerNotify"></span>
   </div>
   <div class="header-right">
     <span class="comment-count" id="commentCount"></span>
@@ -845,14 +827,13 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   <div class="waiting-dialog">
     <div class="waiting-spinner"></div>
     <h3>Review Complete</h3>
-    <p>Paste the prompt below to your agent, then wait for <strong id="waitingFilename"></strong> to be updated.</p>
+    <p id="waitingMessage"></p>
     <div class="waiting-prompt" id="waitingPrompt"></div>
-    <p style="font-size: 12px; color: var(--fg-muted); margin-top: 8px;">Copied to clipboard</p>
+    <p style="font-size: 12px; color: var(--fg-muted); margin-top: 8px;" id="waitingClipboard"></p>
     <button class="btn btn-sm" id="backToEditing" style="margin-top: 16px;">Back to editing</button>
   </div>
 </div>
 
-<div class="updated-banner" id="updatedBanner"></div>
 
 <script src="markdown-it.min.js"></script>
 <script src="highlight.min.js"></script>
@@ -885,7 +866,8 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   let selectionStart = null;
   let selectionEnd = null;
   let activeForm = null; // { afterBlockIndex, startLine, endLine, editingId }
-  let uiState = 'reviewing'; // 'reviewing' | 'waiting' | 'updated'
+  let uiState = 'reviewing'; // 'reviewing' | 'waiting'
+  let reviewRound = 1;
 
   // ===== Mermaid =====
   let mermaidCounter = 0;
@@ -1853,36 +1835,27 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   }
 
   // ===== UI State Management =====
+  function updateHeaderRound() {
+    document.getElementById('headerNotify').textContent = 'Round #' + reviewRound;
+  }
+
   function setUIState(state) {
     uiState = state;
     const finishBtn = document.getElementById('finishBtn');
     const waitingOverlay = document.getElementById('waitingOverlay');
-    const updatedBanner = document.getElementById('updatedBanner');
 
     switch (state) {
       case 'reviewing':
         finishBtn.textContent = 'Finish Review';
         finishBtn.disabled = false;
-        finishBtn.classList.remove('btn-danger');
         finishBtn.classList.add('btn-primary');
         waitingOverlay.classList.remove('active');
-        updatedBanner.classList.remove('active');
         break;
       case 'waiting':
         finishBtn.textContent = 'Waiting...';
         finishBtn.disabled = true;
         finishBtn.classList.remove('btn-primary');
         waitingOverlay.classList.add('active');
-        updatedBanner.classList.remove('active');
-        break;
-      case 'updated':
-        finishBtn.textContent = 'Finish Review';
-        finishBtn.disabled = false;
-        finishBtn.classList.remove('btn-danger');
-        finishBtn.classList.add('btn-primary');
-        waitingOverlay.classList.remove('active');
-        updatedBanner.classList.add('active');
-        updatedBanner.textContent = fileName + ' was updated — click here to start a new review';
         break;
     }
   }
@@ -1894,10 +1867,20 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     try {
       const resp = await fetch('/api/finish', { method: 'POST' });
       const data = await resp.json();
-      const prompt = data.prompt || 'Review complete — no comments were left.';
+      const hasComments = !!data.prompt;
+      const prompt = data.prompt || 'I reviewed the plan, no feedback, good to go!';
 
-      document.getElementById('waitingFilename').textContent = fileName;
       document.getElementById('waitingPrompt').textContent = prompt;
+
+      if (hasComments) {
+        document.getElementById('waitingMessage').innerHTML =
+          'Paste the prompt below to your agent, then wait for <strong>' + fileName + '</strong> to be updated.';
+        document.getElementById('waitingClipboard').textContent = 'Copied to clipboard';
+      } else {
+        document.getElementById('waitingMessage').textContent =
+          'You can close this browser tab, or leave it open for another round.';
+        document.getElementById('waitingClipboard').textContent = '';
+      }
 
       try { await navigator.clipboard.writeText(prompt); } catch (_) {}
     } catch (_) {}
@@ -1910,10 +1893,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     setUIState('reviewing');
   });
 
-  // Updated banner click — start new review round
-  document.getElementById('updatedBanner').addEventListener('click', function() {
-    setUIState('reviewing');
-  });
+
 
   // ===== SSE Client =====
   function connectSSE() {
@@ -1936,10 +1916,9 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
         document.getElementById('filename').textContent = fileName;
         document.title = 'PlanReview — ' + fileName;
 
-        if (uiState === 'waiting' || uiState === 'reviewing') {
-          setUIState('updated');
-        }
-        // If already 'updated', content was re-rendered above, banner stays visible
+        reviewRound++;
+        updateHeaderRound();
+        setUIState('reviewing');
       } catch (err) {
         console.error('Error handling file-changed event:', err);
       }
