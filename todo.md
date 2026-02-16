@@ -1,4 +1,4 @@
-# PlanReview — TODO
+# Crit — TODO
 
 ## Features (From Spec, Not Yet Implemented)
 
@@ -21,7 +21,7 @@
 ## Future Enhancements (Post-v1)
 
 - [ ] **GitHub Actions release workflow**: Cross-compile binaries on tagged releases (spec has a workflow sketch).
-- [ ] **Homebrew tap**: `brew install planreview`.
+- [ ] **Homebrew tap**: `brew install crit`.
 - [ ] **Comment resolution**: Mark comments as "resolved" (like GitHub), visually collapsed but still in review file.
 - [ ] **Diff view**: After the AI agent updates the plan, show what changed alongside original comments.
 - [ ] **Multiple reviewers**: Support `--author "Tom"` for team review scenarios.

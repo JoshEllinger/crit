@@ -1,6 +1,6 @@
 # Compiled binary
-planreview
-planreview.exe
+crit
+crit.exe
 
 # Review session files (generated at runtime)
 *.comments.json

@@ -1,4 +1,4 @@
-# PlanReview — Development Guide
+# Crit — Development Guide
 
 ## What This Is
 
@@ -7,7 +7,7 @@ A single-binary Go CLI tool that opens a browser-based UI for reviewing markdown
 ## Project Structure
 
 ```
-planreview/
+crit/
 ├── main.go              # Entry point: CLI parsing, server setup, graceful shutdown, browser open
 ├── server.go            # HTTP handlers: REST API (comments CRUD, document, finish, stale, files)
 ├── document.go          # Core state: file loading, comment storage, JSON/review file persistence
@@ -45,10 +45,10 @@ planreview/
 ## Build & Run
 
 ```bash
-go build -o planreview .          # Build
+go build -o crit .          # Build
 go test ./...                     # Run all tests (37 tests)
-./planreview test-plan.md         # Run (opens browser)
-./planreview --no-open --port 3000 test-plan.md  # Headless on fixed port
+./crit test-plan.md         # Run (opens browser)
+./crit --no-open --port 3000 test-plan.md  # Headless on fixed port
 make build-all                    # Cross-compile to dist/
 ```
 

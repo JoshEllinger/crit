@@ -1,8 +1,8 @@
-# PlanReview
+# Crit
 
 A lightweight CLI tool for reviewing markdown plans with GitHub PR-style inline comments. Built for the workflow of iterating on plans with AI coding agents.
 
-You write a plan in markdown. You run `planreview` against it. You leave inline comments — single-line or multi-line ranges, just like a GitHub PR review. The tool writes a `.review.md` file in real-time with your comments interleaved, ready to hand back to your AI agent at any moment.
+You write a plan in markdown. You run `crit` against it. You leave inline comments — single-line or multi-line ranges, just like a GitHub PR review. The tool writes a `.review.md` file in real-time with your comments interleaved, ready to hand back to your AI agent at any moment.
 
 ## Install
 
@@ -12,12 +12,12 @@ Requires Go 1.25+ (install via [asdf](https://asdf-vm.com/), Homebrew, or [go.de
 
 ```bash
 # Clone and build
-git clone https://github.com/YOUR_USERNAME/planreview.git
-cd planreview
-go build -o planreview .
+git clone https://github.com/YOUR_USERNAME/crit.git
+cd crit
+go build -o crit .
 
 # Optionally move to your PATH
-mv planreview /usr/local/bin/
+mv crit /usr/local/bin/
 ```
 
 ### Cross-compile
@@ -25,26 +25,26 @@ mv planreview /usr/local/bin/
 ```bash
 make build-all
 # Outputs to dist/:
-#   planreview-darwin-arm64
-#   planreview-darwin-amd64
-#   planreview-linux-amd64
-#   planreview-linux-arm64
+#   crit-darwin-arm64
+#   crit-darwin-amd64
+#   crit-linux-amd64
+#   crit-linux-arm64
 ```
 
 ## Usage
 
 ```bash
 # Review a markdown file (opens browser automatically)
-planreview plan.md
+crit plan.md
 
 # Specify a port
-planreview -p 3000 plan.md
+crit -p 3000 plan.md
 
 # Don't auto-open browser
-planreview --no-open plan.md
+crit --no-open plan.md
 
 # Custom output directory for .review.md
-planreview -o /tmp plan.md
+crit -o /tmp plan.md
 ```
 
 ## Workflow
@@ -54,7 +54,7 @@ planreview -o /tmp plan.md
 agent "Write a plan for the new auth service" > auth-plan.md
 
 # 2. Review it
-planreview auth-plan.md
+crit auth-plan.md
 # → Leave comments in the browser
 # → Click "Finish Review" — prompt copied to clipboard
 
@@ -69,7 +69,7 @@ agent "I've left review comments in auth-plan.review.md — please address
 
 ### Live Reload
 
-PlanReview watches the source file for changes. After you click "Finish Review" and your agent edits the file, the browser automatically reloads with the updated content and clears previous comments for a fresh review round.
+Crit watches the source file for changes. After you click "Finish Review" and your agent edits the file, the browser automatically reloads with the updated content and clears previous comments for a fresh review round.
 
 ### Output Files
 

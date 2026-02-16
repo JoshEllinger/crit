@@ -28,7 +28,7 @@ func main() {
 	flag.StringVar(outputDir, "o", "", "Output directory (shorthand)")
 	noOpen := flag.Bool("no-open", false, "Don't auto-open browser")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: planreview [options] <file.md>\n\nOptions:\n")
+		fmt.Fprintf(os.Stderr, "Usage: crit [options] <file.md>\n\nOptions:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -77,7 +77,7 @@ func main() {
 	}
 
 	url := fmt.Sprintf("http://localhost:%d", addr.Port)
-	fmt.Printf("PlanReview serving %s\n", filepath.Base(absPath))
+	fmt.Printf("Crit serving %s\n", filepath.Base(absPath))
 	fmt.Printf("Open %s in your browser\n", url)
 
 	if !*noOpen {
