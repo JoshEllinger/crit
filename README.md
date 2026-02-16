@@ -89,3 +89,11 @@ Crit watches the source file for changes. After you click "Finish Review" and yo
 - Dark/light theme with persistence
 - Single binary with embedded frontend — no external dependencies
 - Binds to `127.0.0.1` only (localhost)
+
+## Acknowledgments
+
+Crit embeds the following open-source libraries:
+
+- [markdown-it](https://github.com/markdown-it/markdown-it) — Markdown parser
+- [highlight.js](https://github.com/highlightjs/highlight.js) — Syntax highlighting
+- [Mermaid](https://github.com/mermaid-js/mermaid) — Diagram rendering
