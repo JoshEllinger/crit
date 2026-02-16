@@ -3,18 +3,20 @@
 ## Features (From Spec, Not Yet Implemented)
 
 - [ ] **Comment collapse/expand**: Comments can be collapsed/expanded (spec section "Displayed comments"). Currently all comments are always expanded.
-- [ ] **WebSocket heartbeat**: Detect if browser tab is closed, log a message to terminal (spec says optional).
-- [ ] **File watching**: Auto-reload UI when source `.md` file changes on disk (spec says nice-to-have for v1).
-- [ ] **Heading anchors**: Subtle link icon on hover for headings (spec says nice-to-have).
 - [ ] **Empty/binary file handling**: Show user-friendly messages for empty files or non-markdown files (spec "Edge Cases").
 - [ ] **Very large files**: Test with files up to ~10k lines, ensure no performance issues.
 
 ## UI Refinements
 
-- [ ] **Gutter line range display**: For multi-line blocks (code blocks, tables), the gutter shows only the start line. Could show a range like `41-58` or show line numbers for each sub-line.
-- [ ] **Comment form scroll into view**: After opening a comment form, scroll it into view if it's off-screen.
-- [ ] **Drag selection visual feedback**: During gutter drag, highlight the full range of selected blocks more prominently.
 - [ ] **Mobile/responsive**: Basic responsive CSS exists but untested on small screens.
+
+## Pre-publish (Done)
+
+- [x] **Go tooling**: go.mod updated to 1.26, golangci-lint clean, gofmt clean
+- [x] **Security review**: Fixed path traversal in `/files/`, added request body limits (1MB), added HTTP server timeouts
+- [x] **JS review**: Fixed filename XSS in innerHTML; `html:false` on comment renderer already safe; `html:true` on doc renderer is intentional (local tool)
+- [x] **Publish readiness**: LICENSE file added, README rewritten. `YOUR_USERNAME` placeholders and go.mod module path TBD when GitHub repo created.
+- [x] **Unit tests**: 37 tests across server_test.go, document_test.go, output_test.go — covers API handlers, CRUD, validation, path traversal, output generation, concurrent access
 
 ## Future Enhancements (Post-v1)
 

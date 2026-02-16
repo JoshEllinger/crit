@@ -1,0 +1,228 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+)
+
+func newTestDoc(t *testing.T, content string) *Document {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.md")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := NewDocument(path, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+func TestNewDocument(t *testing.T) {
+	doc := newTestDoc(t, "# Hello\n\nWorld")
+	if doc.FileName != "test.md" {
+		t.Errorf("FileName = %q, want test.md", doc.FileName)
+	}
+	if doc.Content != "# Hello\n\nWorld" {
+		t.Errorf("Content = %q", doc.Content)
+	}
+	if doc.FileHash == "" {
+		t.Error("FileHash should not be empty")
+	}
+	if len(doc.Comments) != 0 {
+		t.Error("should start with no comments")
+	}
+}
+
+func TestNewDocument_FileNotFound(t *testing.T) {
+	_, err := NewDocument("/nonexistent/file.md", "/tmp")
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestAddComment(t *testing.T) {
+	doc := newTestDoc(t, "line1\nline2\nline3")
+	c := doc.AddComment(1, 2, "Fix this")
+
+	if c.ID != "c1" {
+		t.Errorf("ID = %q, want c1", c.ID)
+	}
+	if c.StartLine != 1 || c.EndLine != 2 {
+		t.Errorf("lines = %d-%d, want 1-2", c.StartLine, c.EndLine)
+	}
+	if c.Body != "Fix this" {
+		t.Errorf("Body = %q", c.Body)
+	}
+	if c.CreatedAt == "" || c.UpdatedAt == "" {
+		t.Error("timestamps should be set")
+	}
+	if len(doc.GetComments()) != 1 {
+		t.Errorf("expected 1 comment, got %d", len(doc.GetComments()))
+	}
+}
+
+func TestAddComment_IncrementingIDs(t *testing.T) {
+	doc := newTestDoc(t, "a\nb")
+	c1 := doc.AddComment(1, 1, "first")
+	c2 := doc.AddComment(2, 2, "second")
+	if c1.ID != "c1" || c2.ID != "c2" {
+		t.Errorf("IDs = %q, %q; want c1, c2", c1.ID, c2.ID)
+	}
+}
+
+func TestUpdateComment(t *testing.T) {
+	doc := newTestDoc(t, "a\nb")
+	c := doc.AddComment(1, 1, "original")
+
+	updated, ok := doc.UpdateComment(c.ID, "updated body")
+	if !ok {
+		t.Error("expected update to succeed")
+	}
+	if updated.Body != "updated body" {
+		t.Errorf("Body = %q", updated.Body)
+	}
+	// UpdatedAt may be the same if test runs within the same second — that's fine.
+	// Just verify the comment was actually updated in the slice.
+	stored := doc.GetComments()[0]
+	if stored.Body != "updated body" {
+		t.Errorf("stored body = %q", stored.Body)
+	}
+}
+
+func TestUpdateComment_NotFound(t *testing.T) {
+	doc := newTestDoc(t, "a")
+	_, ok := doc.UpdateComment("nonexistent", "body")
+	if ok {
+		t.Error("expected update to fail for nonexistent ID")
+	}
+}
+
+func TestDeleteComment(t *testing.T) {
+	doc := newTestDoc(t, "a\nb")
+	c := doc.AddComment(1, 1, "to delete")
+	if !doc.DeleteComment(c.ID) {
+		t.Error("expected delete to succeed")
+	}
+	if len(doc.GetComments()) != 0 {
+		t.Error("comment should be gone")
+	}
+}
+
+func TestDeleteComment_NotFound(t *testing.T) {
+	doc := newTestDoc(t, "a")
+	if doc.DeleteComment("nonexistent") {
+		t.Error("expected delete to fail for nonexistent ID")
+	}
+}
+
+func TestGetComments_ReturnsCopy(t *testing.T) {
+	doc := newTestDoc(t, "a")
+	doc.AddComment(1, 1, "test")
+	comments := doc.GetComments()
+	comments[0].Body = "mutated"
+	if doc.GetComments()[0].Body == "mutated" {
+		t.Error("GetComments should return a copy")
+	}
+}
+
+func TestStaleNotice(t *testing.T) {
+	doc := newTestDoc(t, "a")
+	if doc.GetStaleNotice() != "" {
+		t.Error("no stale notice initially")
+	}
+	doc.mu.Lock()
+	doc.staleNotice = "stale!"
+	doc.mu.Unlock()
+	if doc.GetStaleNotice() != "stale!" {
+		t.Error("expected stale notice")
+	}
+	doc.ClearStaleNotice()
+	if doc.GetStaleNotice() != "" {
+		t.Error("expected cleared")
+	}
+}
+
+func TestSubscribeNotify(t *testing.T) {
+	doc := newTestDoc(t, "a")
+	ch := doc.Subscribe()
+	defer doc.Unsubscribe(ch)
+
+	event := SSEEvent{Type: "file-changed", Filename: "test.md", Content: "new"}
+	doc.notify(event)
+
+	received := <-ch
+	if received.Type != "file-changed" || received.Content != "new" {
+		t.Errorf("unexpected event: %+v", received)
+	}
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	doc := newTestDoc(t, "a\nb\nc")
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := doc.AddComment(1, 1, "concurrent")
+			doc.UpdateComment(c.ID, "updated")
+			doc.GetComments()
+			doc.DeleteComment(c.ID)
+		}()
+	}
+	wg.Wait()
+}
+
+func TestReloadFile(t *testing.T) {
+	doc := newTestDoc(t, "original")
+	doc.AddComment(1, 1, "comment")
+
+	// Modify the file
+	if err := os.WriteFile(doc.FilePath, []byte("modified"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := doc.ReloadFile(); err != nil {
+		t.Fatal(err)
+	}
+
+	if doc.Content != "modified" {
+		t.Errorf("Content = %q, want modified", doc.Content)
+	}
+	if len(doc.GetComments()) != 0 {
+		t.Error("comments should be cleared after reload")
+	}
+}
+
+func TestWriteFiles(t *testing.T) {
+	doc := newTestDoc(t, "line1\nline2")
+	doc.AddComment(1, 1, "note")
+
+	// Stop the debounce timer and write directly
+	doc.mu.Lock()
+	if doc.writeTimer != nil {
+		doc.writeTimer.Stop()
+	}
+	doc.mu.Unlock()
+	doc.WriteFiles()
+
+	// Check comments JSON was written
+	data, err := os.ReadFile(doc.commentsFilePath())
+	if err != nil {
+		t.Fatalf("comments file not written: %v", err)
+	}
+	if len(data) == 0 {
+		t.Error("comments file is empty")
+	}
+
+	// Check review MD was written
+	data, err = os.ReadFile(doc.reviewFilePath())
+	if err != nil {
+		t.Fatalf("review file not written: %v", err)
+	}
+	if len(data) == 0 {
+		t.Error("review file is empty")
+	}
+}

@@ -1874,7 +1874,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 
       if (hasComments) {
         document.getElementById('waitingMessage').innerHTML =
-          'Paste the prompt below to your agent, then wait for <strong>' + fileName + '</strong> to be updated.';
+          'Paste the prompt below to your agent, then wait for <strong>' + escapeHtml(fileName) + '</strong> to be updated.';
         document.getElementById('waitingClipboard').textContent = 'Copied to clipboard';
       } else {
         document.getElementById('waitingMessage').textContent =

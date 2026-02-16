@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"path/filepath"
 	"strings"
 )
 
@@ -28,7 +29,7 @@ func NewServer(doc *Document, frontendFS embed.FS) *Server {
 	mux.HandleFunc("/api/finish", s.handleFinish)
 	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/stale", s.handleStale)
-	mux.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(doc.FileDir))))
+	mux.HandleFunc("/files/", s.handleFiles)
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 
 	s.mux = mux
@@ -72,6 +73,7 @@ func (s *Server) handleComments(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, comments)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
 		var req struct {
 			StartLine int    `json:"start_line"`
 			EndLine   int    `json:"end_line"`
@@ -108,6 +110,7 @@ func (s *Server) handleCommentByID(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
 		var req struct {
 			Body string `json:"body"`
 		}
@@ -196,7 +199,29 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	reqPath := strings.TrimPrefix(r.URL.Path, "/files/")
+	if reqPath == "" || strings.Contains(reqPath, "..") {
+		http.Error(w, "Invalid file path", http.StatusBadRequest)
+		return
+	}
+
+	fullPath := filepath.Join(s.doc.FileDir, reqPath)
+	cleanPath, err := filepath.Abs(fullPath)
+	if err != nil || !strings.HasPrefix(cleanPath, s.doc.FileDir+string(filepath.Separator)) {
+		http.Error(w, "Access denied", http.StatusForbidden)
+		return
+	}
+
+	http.ServeFile(w, r, cleanPath)
+}
+
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }

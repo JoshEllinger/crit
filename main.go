@@ -69,7 +69,12 @@ func main() {
 	addr := listener.Addr().(*net.TCPAddr)
 
 	srv := NewServer(doc, frontendFS)
-	httpServer := &http.Server{Handler: srv}
+	httpServer := &http.Server{
+		Handler:     srv,
+		ReadTimeout: 15 * time.Second,
+		IdleTimeout: 60 * time.Second,
+		// No WriteTimeout — SSE connections need to stay open
+	}
 
 	url := fmt.Sprintf("http://localhost:%d", addr.Port)
 	fmt.Printf("PlanReview serving %s\n", filepath.Base(absPath))
@@ -99,7 +104,7 @@ func main() {
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	httpServer.Shutdown(shutCtx)
+	_ = httpServer.Shutdown(shutCtx)
 
 	reviewPath := doc.reviewFilePath()
 	if len(doc.GetComments()) > 0 {
@@ -140,5 +145,5 @@ func openBrowser(url string) {
 	default:
 		return
 	}
-	cmd.Run()
+	_ = cmd.Run()
 }

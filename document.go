@@ -103,7 +103,7 @@ func (d *Document) loadComments() {
 	d.Comments = cf.Comments
 	for _, c := range d.Comments {
 		id := 0
-		fmt.Sscanf(c.ID, "c%d", &id)
+		_, _ = fmt.Sscanf(c.ID, "c%d", &id)
 		if id >= d.nextID {
 			d.nextID = id + 1
 		}

@@ -9,49 +9,78 @@ A single-binary Go CLI tool that opens a browser-based UI for reviewing markdown
 ```
 planreview/
 ├── main.go              # Entry point: CLI parsing, server setup, graceful shutdown, browser open
-├── server.go            # HTTP handlers: REST API (comments CRUD, document, finish, stale)
+├── server.go            # HTTP handlers: REST API (comments CRUD, document, finish, stale, files)
 ├── document.go          # Core state: file loading, comment storage, JSON/review file persistence
 ├── output.go            # Generates .review.md (original markdown + interleaved comment blockquotes)
+├── server_test.go       # API handler tests (CRUD, validation, path traversal prevention)
+├── document_test.go     # Document operations tests (CRUD, concurrent access, file reload, SSE)
+├── output_test.go       # Review MD generation tests (formatting, ordering, multi-line)
 ├── frontend/
-│   ├── index.html       # Complete SPA — all HTML, CSS, JS in one file (~1500 lines)
+│   ├── index.html       # Complete SPA — all HTML, CSS, JS in one file (~1900 lines)
 │   ├── markdown-it.min.js    # Markdown parser (provides source line mappings via token.map)
 │   ├── highlight.min.js      # Syntax highlighter core
 │   ├── hljs-*.min.js         # Language packs (js, ts, go, python, elixir, etc.)
-│   └── hljs-{dark,light}.css # Highlight themes (embedded inline in index.html via data-theme scoping)
+│   └── mermaid.min.js        # Mermaid diagram renderer
 ├── go.mod
-├── Makefile             # build / build-all (cross-compile)
+├── Makefile             # build / build-all (cross-compile) / update-deps / clean
+├── package.json         # Frontend dependency management (markdown-it, highlight.js, mermaid)
+├── copy-deps.js         # Copies npm deps to frontend/ for embedding
 ├── test-plan.md         # Sample file for development testing
+├── LICENSE              # MIT
 └── README.md
 ```
 
 ## Key Architecture Decisions
 
 1. **All frontend assets embedded** via Go's `embed.FS` — produces a true single binary
-2. **No frontend build step** — vanilla JS, no npm/webpack/framework
+2. **No frontend build step** — vanilla JS, no npm/webpack/framework. npm is only for fetching vendor libs.
 3. **markdown-it for parsing** — chosen because it provides `token.map` (source line mappings per block)
 4. **Block-level splitting** — lists, code blocks, tables, blockquotes are split into per-item/per-line/per-row blocks so each source line is independently commentable
 5. **Comments reference source line numbers** — the `.review.md` output uses `> **[REVIEW COMMENT — Lines X-Y]**:` format
 6. **Real-time output** — `.review.md` and `.comments.json` written on every comment change (200ms debounce)
 7. **GitHub-style gutter interaction** — click-and-drag on line numbers to select ranges
+8. **Live file watching** — polls source file every second, reloads via SSE on change for multi-round review workflow
+9. **Localhost only** — server binds to `127.0.0.1`, no CORS headers needed
 
 ## Build & Run
 
 ```bash
 go build -o planreview .          # Build
+go test ./...                     # Run all tests (37 tests)
 ./planreview test-plan.md         # Run (opens browser)
 ./planreview --no-open --port 3000 test-plan.md  # Headless on fixed port
+make build-all                    # Cross-compile to dist/
+```
+
+## Linting
+
+```bash
+gofmt -l .                        # Check formatting (should be clean)
+golangci-lint run ./...           # Lint (should be clean)
 ```
 
 ## API Endpoints
 
 - `GET  /api/document` — raw markdown content + filename
 - `GET  /api/comments` — all comments
-- `POST /api/comments` — add comment `{start_line, end_line, body}`
-- `PUT  /api/comments/:id` — edit comment `{body}`
+- `POST /api/comments` — add comment `{start_line, end_line, body}` (1MB body limit)
+- `PUT  /api/comments/:id` — edit comment `{body}` (1MB body limit)
 - `DELETE /api/comments/:id` — delete comment
-- `POST /api/finish` — write final files and shut down server
+- `POST /api/finish` — write final files, return prompt for agent
+- `GET  /api/events` — SSE stream for file-changed events
 - `GET  /api/stale` — check if file changed since last session
 - `DELETE /api/stale` — dismiss stale notice
+- `GET  /files/<path>` — serve files from document directory (path traversal protected)
+
+## Security
+
+- Server binds to `127.0.0.1` only
+- `/files/` endpoint validates paths, blocks `..` traversal, verifies resolved path stays within document directory
+- Request body size limited to 1MB via `http.MaxBytesReader`
+- HTTP server has `ReadTimeout: 15s`, `IdleTimeout: 60s` (no `WriteTimeout` — SSE needs open connections)
+- Comment renderer uses `html: false` to prevent XSS in user comments
+- Document renderer uses `html: true` intentionally (reviewing your own local files)
+- Filename escaped in innerHTML contexts
 
 ## Frontend Architecture (index.html)
 
