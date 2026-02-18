@@ -825,11 +825,87 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   height: 0;
 }
 
+/* ===== Table of Contents ===== */
+.toc {
+  position: fixed;
+  top: 72px;
+  right: 16px;
+  width: 210px;
+  max-height: calc(100vh - 88px);
+  overflow-y: auto;
+  z-index: 90;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  transition: opacity 0.2s, transform 0.2s;
+}
+.toc.toc-hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(6px);
+}
+.toc-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px 7px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  background: var(--bg-secondary);
+  position: sticky;
+  top: 0;
+}
+.toc-close {
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: 3px;
+  transition: all 0.15s;
+}
+.toc-close:hover { color: var(--fg-primary); background: var(--bg-hover); }
+.toc-list {
+  list-style: none;
+  padding: 6px 0;
+  margin: 0;
+}
+.toc-list li { margin: 0; }
+.toc-list a {
+  display: block;
+  padding: 3px 12px;
+  color: var(--fg-secondary);
+  text-decoration: none;
+  line-height: 1.45;
+  border-left: 2px solid transparent;
+  transition: color 0.1s, background 0.1s, border-color 0.1s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toc-list a:hover { color: var(--fg-primary); background: var(--bg-hover); }
+.toc-list a.toc-active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
 /* ===== Responsive ===== */
 @media (max-width: 900px) {
   .document-wrapper { padding-left: 8px; padding-right: 8px; }
   .comment-block, .comment-form-wrapper { padding-left: 8px; }
   .line-gutter { min-width: 36px; }
+}
+@media (max-width: 600px) {
+  .toc, #tocToggle { display: none !important; }
 }
 @media (max-width: 600px) {
   /* Header: 2-row grid layout
@@ -899,9 +975,18 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   </div>
   <div class="header-right">
     <span class="comment-count" id="commentCount"></span>
+    <button class="theme-toggle" id="tocToggle" title="Table of contents">&#9776;</button>
     <button class="theme-toggle" id="themeToggle" title="Toggle theme">&#9789;</button>
     <button class="btn btn-primary" id="finishBtn">Finish Review</button>
   </div>
+</div>
+
+<div id="toc" class="toc toc-hidden">
+  <div class="toc-header">
+    <span>Contents</span>
+    <button class="toc-close" title="Close">&#x2715;</button>
+  </div>
+  <ul class="toc-list"></ul>
 </div>
 
 <div id="staleNotice"></div>
@@ -950,6 +1035,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   let rawContent = '';
   let fileName = '';
   let lineBlocks = []; // { startLine, endLine, html }
+  let tocItems = []; // { level, text, startLine }
   let selectionStart = null;
   let selectionEnd = null;
   let activeForm = null; // { afterBlockIndex, startLine, endLine, editingId }
@@ -1015,6 +1101,34 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     });
     renderMermaidBlocks();
   }
+
+  // ===== ToC Toggle =====
+  (function() {
+    const tocEl = document.getElementById('toc');
+    const saved = localStorage.getItem('crit-toc');
+    if (saved === 'open' || (saved === null && window.innerWidth > 1200)) {
+      tocEl.classList.remove('toc-hidden');
+    }
+    document.getElementById('tocToggle').addEventListener('click', function() {
+      const isHidden = tocEl.classList.contains('toc-hidden');
+      tocEl.classList.toggle('toc-hidden', !isHidden);
+      localStorage.setItem('crit-toc', isHidden ? 'open' : 'closed');
+    });
+    tocEl.querySelector('.toc-close').addEventListener('click', function() {
+      tocEl.classList.add('toc-hidden');
+      localStorage.setItem('crit-toc', 'closed');
+    });
+  })();
+
+  // ===== Scroll Spy =====
+  var scrollSpyFrame = null;
+  window.addEventListener('scroll', function() {
+    if (scrollSpyFrame) return;
+    scrollSpyFrame = requestAnimationFrame(function() {
+      scrollSpyFrame = null;
+      updateTocActive();
+    });
+  }, { passive: true });
 
   // ===== Init =====
   async function init() {
@@ -1110,8 +1224,21 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 
     // Parse tokens to get source line mappings
     const tokens = md.parse(rawContent, {});
+
+    // Extract headings for ToC
+    tocItems = [];
+    for (let ti = 0; ti < tokens.length; ti++) {
+      const t = tokens[ti];
+      if (t.type === 'heading_open' && t.map) {
+        const level = parseInt(t.tag.slice(1));
+        const inlineToken = tokens[ti + 1];
+        tocItems.push({ level, text: inlineToken ? inlineToken.content : '', startLine: t.map[0] + 1 });
+      }
+    }
+
     lineBlocks = buildLineBlocks(tokens, md, rawContent);
     renderDocument();
+    buildToc(tocItems);
   }
 
   // Split highlighted code HTML into per-line chunks,
@@ -1476,6 +1603,64 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 
   function escapeHtml(str) {
     return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ===== Table of Contents =====
+  function buildToc(items) {
+    const tocEl = document.getElementById('toc');
+    const listEl = tocEl.querySelector('.toc-list');
+    const toggleBtn = document.getElementById('tocToggle');
+    listEl.innerHTML = '';
+
+    if (items.length === 0) {
+      toggleBtn.style.display = 'none';
+      return;
+    }
+    toggleBtn.style.display = '';
+
+    const minLevel = Math.min(...items.map(i => i.level));
+    for (const item of items) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = '#';
+      a.textContent = item.text;
+      a.dataset.startLine = item.startLine;
+      a.style.paddingLeft = (12 + (item.level - minLevel) * 10) + 'px';
+      a.addEventListener('click', function(e) {
+        e.preventDefault();
+        scrollToLine(item.startLine);
+      });
+      li.appendChild(a);
+      listEl.appendChild(li);
+    }
+    updateTocActive();
+  }
+
+  function scrollToLine(line) {
+    const el = document.querySelector('.line-block[data-start-line="' + line + '"]');
+    if (!el) return;
+    const headerEl = document.querySelector('.header');
+    const offset = headerEl ? headerEl.offsetHeight + 8 : 60;
+    const y = el.getBoundingClientRect().top + window.scrollY - offset;
+    window.scrollTo({ top: y, behavior: 'smooth' });
+  }
+
+  function updateTocActive() {
+    if (tocItems.length === 0) return;
+    const headerEl = document.querySelector('.header');
+    const threshold = (headerEl ? headerEl.offsetHeight : 52) + 10;
+
+    let activeLine = null;
+    for (const item of tocItems) {
+      const el = document.querySelector('.line-block[data-start-line="' + item.startLine + '"]');
+      if (el && el.getBoundingClientRect().top <= threshold) {
+        activeLine = item.startLine;
+      }
+    }
+
+    document.querySelectorAll('.toc-list a').forEach(function(a) {
+      a.classList.toggle('toc-active', parseInt(a.dataset.startLine) === activeLine);
+    });
   }
 
   // ===== Render Document =====
