@@ -198,6 +198,11 @@ func (d *Document) WriteFiles() {
 }
 
 func (d *Document) writeCommentsJSON(comments []Comment) {
+	if len(comments) == 0 {
+		os.Remove(d.commentsFilePath())
+		return
+	}
+
 	cf := CommentsFile{
 		File:      d.FileName,
 		FileHash:  d.FileHash,

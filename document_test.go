@@ -196,6 +196,19 @@ func TestReloadFile(t *testing.T) {
 	}
 }
 
+func TestWriteFiles_NoCommentsSkipsFiles(t *testing.T) {
+	doc := newTestDoc(t, "line1\nline2")
+
+	doc.WriteFiles()
+
+	if _, err := os.Stat(doc.commentsFilePath()); !os.IsNotExist(err) {
+		t.Error("expected comments file to not exist with no comments")
+	}
+	if _, err := os.Stat(doc.reviewFilePath()); !os.IsNotExist(err) {
+		t.Error("expected review file to not exist with no comments")
+	}
+}
+
 func TestWriteFiles(t *testing.T) {
 	doc := newTestDoc(t, "line1\nline2")
 	doc.AddComment(1, 1, "note")
