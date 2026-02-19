@@ -123,6 +123,23 @@ When `--share-url` (or `CRIT_SHARE_URL`) is set:
 - Unpublish calls `DELETE {share_url}/api/reviews?delete_token=...` then clears local state.
 - Share URL and delete token survive file-hash changes (loaded unconditionally from `.comments.json`).
 
+## Releasing
+
+Releases are fully automated via GitHub Actions (`.github/workflows/release.yml`). To cut a release:
+
+```bash
+git tag v0.x.y && git push origin v0.x.y
+```
+
+Pushing the tag triggers the workflow, which:
+1. Runs tests
+2. Cross-compiles binaries for darwin/linux (arm64/amd64) with the version injected via ldflags
+3. Generates SHA256 checksums
+4. Creates a GitHub release with auto-generated notes and all binaries attached
+5. Updates the Homebrew tap formula (`tomasz-tomczyk/homebrew-tap`)
+
+The version string lives in `main.go` as `var version = "dev"` and is overridden at build time. There is no version constant to update manually — the tag is the single source of truth.
+
 ## Output Files
 
 | File | Description |
