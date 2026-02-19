@@ -1052,19 +1052,21 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   .toc, #tocToggle { display: none !important; }
 }
 @media (max-width: 600px) {
-  /* Header: 2-row grid layout
-     Row 1: Crit  <theme-toggle>  Finish Review
-     Row 2: filename.md           N comments */
+  /* Header: 3-row grid layout
+     Row 1: Crit              theme-pill
+     Row 2: filename.md (full width, truncated)
+     Row 3: N comments  [Share]  Finish Review */
   .header {
     display: grid;
-    grid-template-columns: auto 1fr auto auto;
-    gap: 4px 8px;
-    padding: 8px 12px;
+    grid-template-columns: auto 1fr auto;
+    gap: 6px 8px;
+    padding: 10px 14px;
     align-items: center;
   }
   .header-left, .header-right {
     display: contents;
   }
+  /* Row 1: brand + theme */
   .header-title {
     grid-row: 1;
     grid-column: 1;
@@ -1076,30 +1078,42 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     align-self: center;
     width: fit-content;
   }
-  #finishBtn {
-    grid-row: 1;
-    grid-column: 4;
-    justify-self: end;
-  }
+  /* Row 2: filename full width */
   .header-filename {
     grid-row: 2;
-    grid-column: 1 / 3;
+    grid-column: 1 / -1;
     font-size: 12px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    width: fit-content;
+    margin-bottom: 4px;
   }
+  /* Row 3: actions */
   .comment-count {
-    grid-row: 2;
-    grid-column: 3 / -1;
+    grid-row: 3;
+    grid-column: 1;
+    justify-self: start;
+    align-self: center;
+  }
+  #shareBtn {
+    grid-row: 3;
+    grid-column: 2;
     justify-self: end;
+    font-size: 12px;
+    padding: 4px 10px;
+  }
+  #finishBtn {
+    grid-row: 3;
+    grid-column: 3;
+    justify-self: end;
+    font-size: 12px;
+    padding: 5px 10px;
   }
   .header-notify:empty {
     display: none;
   }
   .header-notify {
-    grid-row: 3;
+    grid-row: 4;
     grid-column: 1 / -1;
   }
 
