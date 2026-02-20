@@ -1162,6 +1162,32 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   text-decoration: line-through;
 }
 
+.diff-view-unified {
+  grid-column: 1 / -1;
+  max-width: 840px;
+  margin: 0 auto;
+  padding: 32px 0 120px 0;
+  width: 100%;
+}
+.btn-group {
+  display: inline-flex;
+}
+.btn-group .btn {
+  border-radius: 0;
+}
+.btn-group .btn:first-child {
+  border-radius: 6px 0 0 6px;
+}
+.btn-group .btn:last-child {
+  border-radius: 0 6px 6px 0;
+  border-left: none;
+}
+.btn.btn-active,
+.btn-group .btn-active {
+  background: var(--fg-muted);
+  color: var(--bg);
+}
+
 /* ===== Responsive ===== */
 @media (max-width: 900px) {
   .document-wrapper { padding-left: 8px; padding-right: 8px; }
@@ -1170,7 +1196,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 }
 @media (max-width: 600px) {
   .toc, #tocToggle { display: none !important; }
-  #diffToggle, #diffView { display: none !important; }
+  #diffToggle, #diffModeToggle { display: none !important; }
 }
 @media (max-width: 600px) {
   /* Header: 3-row grid layout
@@ -1264,6 +1290,10 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     <span class="comment-count" id="commentCount"></span>
     <span class="header-notify" id="headerNotify"></span>
     <button class="btn btn-sm" id="diffToggle" style="display:none">Toggle Diff</button>
+    <div id="diffModeToggle" class="btn-group" style="display:none">
+      <button class="btn btn-sm" id="diffModeSplit" title="Split view">Split</button>
+      <button class="btn btn-sm" id="diffModeUnified" title="Unified view">Unified</button>
+    </div>
     <button class="theme-toggle" id="tocToggle" title="Table of contents">&#9776;</button>
     <div class="theme-pill" role="group" aria-label="Theme">
       <div class="theme-pill-indicator"></div>
@@ -1354,6 +1384,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   let previousRoundContent = ''; // raw markdown from previous round
   let diffEntries = []; // cached from /api/diff
   let diffActive = false; // true when diff view is shown
+  let diffMode = 'split'; // 'split' | 'unified'
 
   // ===== Mermaid =====
   let mermaidCounter = 0;
@@ -2850,47 +2881,68 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     return '';
   }
 
-  function renderDiffSide(content, blocks, diffClass, resolvedMap) {
-    const container = document.createElement('div');
-    for (let bi = 0; bi < blocks.length; bi++) {
-      const block = blocks[bi];
-      const lineBlockEl = document.createElement('div');
-      lineBlockEl.className = 'line-block';
-      if (diffClass) {
-        const cls = diffClass(block);
-        if (cls) lineBlockEl.classList.add(cls);
-      }
+  function renderBlock(block, diffClassFn, resolvedMap) {
+    const frag = document.createDocumentFragment();
 
-      const gutter = document.createElement('div');
-      gutter.className = 'line-gutter';
-      const lineNum = document.createElement('span');
-      lineNum.className = 'line-num';
-      lineNum.textContent = block.startLine;
-      gutter.appendChild(lineNum);
+    const lineBlockEl = document.createElement('div');
+    lineBlockEl.className = 'line-block';
+    if (diffClassFn) {
+      const cls = diffClassFn(block);
+      if (cls) lineBlockEl.classList.add(cls);
+    }
 
-      const contentEl = document.createElement('div');
-      let contentClasses = 'line-content';
-      if (block.isEmpty) contentClasses += ' empty-line';
-      if (block.cssClass) contentClasses += ' ' + block.cssClass;
-      contentEl.className = contentClasses;
-      let html = block.html;
-      html = processTaskLists(html);
-      html = rewriteImageSrcs(html);
-      contentEl.innerHTML = html;
+    const gutter = document.createElement('div');
+    gutter.className = 'line-gutter';
+    const lineNum = document.createElement('span');
+    lineNum.className = 'line-num';
+    lineNum.textContent = block.startLine;
+    gutter.appendChild(lineNum);
 
-      lineBlockEl.appendChild(gutter);
-      lineBlockEl.appendChild(contentEl);
-      container.appendChild(lineBlockEl);
+    const contentEl = document.createElement('div');
+    let contentClasses = 'line-content';
+    if (block.isEmpty) contentClasses += ' empty-line';
+    if (block.cssClass) contentClasses += ' ' + block.cssClass;
+    contentEl.className = contentClasses;
+    let html = block.html;
+    html = processTaskLists(html);
+    html = rewriteImageSrcs(html);
+    contentEl.innerHTML = html;
 
-      // Resolved comments on the right (new) side
-      if (resolvedMap) {
-        const blockResolved = getResolvedForBlock(block, resolvedMap);
-        for (const rc of blockResolved) {
-          container.appendChild(createResolvedElement(rc));
-        }
+    lineBlockEl.appendChild(gutter);
+    lineBlockEl.appendChild(contentEl);
+    frag.appendChild(lineBlockEl);
+
+    // Resolved comments after the line-block
+    if (resolvedMap) {
+      const blockResolved = getResolvedForBlock(block, resolvedMap);
+      for (const rc of blockResolved) {
+        frag.appendChild(createResolvedElement(rc));
       }
     }
+
+    return frag;
+  }
+
+  function renderDiffSide(blocks, diffClass, resolvedMap) {
+    const container = document.createElement('div');
+    for (let bi = 0; bi < blocks.length; bi++) {
+      container.appendChild(renderBlock(blocks[bi], diffClass, resolvedMap));
+    }
     return container;
+  }
+
+  function buildPreviousRoundBlocks() {
+    const md = window.markdownit({ html: true, typographer: true, linkify: true,
+      highlight: function(str, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          try { return hljs.highlight(str, { language: lang }).value; } catch (_) {}
+        }
+        try { return hljs.highlightAuto(str).value; } catch (_) {}
+        return '';
+      }
+    });
+    const oldTokens = md.parse(previousRoundContent, {});
+    return buildLineBlocks(oldTokens, md, previousRoundContent);
   }
 
   function renderDiffView() {
@@ -2902,17 +2954,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     const sets = buildDiffLineSet(diffEntries);
 
     // Parse and build blocks for previous round
-    const md = window.markdownit({ html: true, typographer: true, linkify: true,
-      highlight: function(str, lang) {
-        if (lang && hljs.getLanguage(lang)) {
-          try { return hljs.highlight(str, { language: lang }).value; } catch (_) {}
-        }
-        try { return hljs.highlightAuto(str).value; } catch (_) {}
-        return '';
-      }
-    });
-    const oldTokens = md.parse(previousRoundContent, {});
-    const oldBlocks = buildLineBlocks(oldTokens, md, previousRoundContent);
+    const oldBlocks = buildPreviousRoundBlocks();
 
     // Use the current lineBlocks (already parsed)
     const newBlocks = lineBlocks;
@@ -2926,7 +2968,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     leftLabel.className = 'diff-view-side-label';
     leftLabel.textContent = 'Previous round';
     leftSide.appendChild(leftLabel);
-    leftSide.appendChild(renderDiffSide(previousRoundContent, oldBlocks, function(block) {
+    leftSide.appendChild(renderDiffSide(oldBlocks, function(block) {
       return classifyBlock(block, sets.added, sets.removed, 'old');
     }, null));
 
@@ -2937,7 +2979,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     rightLabel.className = 'diff-view-side-label';
     rightLabel.textContent = 'Current round';
     rightSide.appendChild(rightLabel);
-    rightSide.appendChild(renderDiffSide(rawContent, newBlocks, function(block) {
+    rightSide.appendChild(renderDiffSide(newBlocks, function(block) {
       return classifyBlock(block, sets.added, sets.removed, 'new');
     }, resolvedMap));
 
@@ -2945,23 +2987,94 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     diffEl.appendChild(rightSide);
   }
 
+  function renderUnifiedDiffView() {
+    if (!diffEntries.length || !previousRoundContent) return;
+
+    const sets = buildDiffLineSet(diffEntries);
+
+    // Parse and build blocks for previous round
+    const oldBlocks = buildPreviousRoundBlocks();
+
+    // Use the current lineBlocks (already parsed)
+    const newBlocks = lineBlocks;
+
+    const resolvedMap = buildResolvedMap();
+
+    const container = document.createElement('div');
+    container.className = 'diff-view-unified';
+
+    let oldIdx = 0;
+    let newIdx = 0;
+
+    while (oldIdx < oldBlocks.length || newIdx < newBlocks.length) {
+      if (oldIdx >= oldBlocks.length) {
+        container.appendChild(renderBlock(newBlocks[newIdx], function() { return 'diff-added'; }, resolvedMap));
+        newIdx++;
+      } else if (newIdx >= newBlocks.length) {
+        container.appendChild(renderBlock(oldBlocks[oldIdx], function() { return 'diff-removed'; }, null));
+        oldIdx++;
+      } else if (classifyBlock(oldBlocks[oldIdx], sets.added, sets.removed, 'old') === 'diff-removed') {
+        container.appendChild(renderBlock(oldBlocks[oldIdx], function() { return 'diff-removed'; }, null));
+        oldIdx++;
+      } else if (classifyBlock(newBlocks[newIdx], sets.added, sets.removed, 'new') === 'diff-added') {
+        container.appendChild(renderBlock(newBlocks[newIdx], function() { return 'diff-added'; }, resolvedMap));
+        newIdx++;
+      } else {
+        // Both unchanged — emit newBlock once (no diff class), advance both
+        container.appendChild(renderBlock(newBlocks[newIdx], null, resolvedMap));
+        newIdx++;
+        oldIdx++;
+      }
+    }
+
+    const diffEl = document.getElementById('diffView');
+    diffEl.innerHTML = '';
+    diffEl.appendChild(container);
+  }
+
   function setDiffActive(active) {
     diffActive = active;
+    document.getElementById('diffToggle').classList.toggle('btn-active', active);
     const diffEl = document.getElementById('diffView');
     const docEl = document.getElementById('document');
     if (active) {
-      renderDiffView();
+      document.getElementById('diffModeToggle').style.display = '';
+      if (diffMode === 'split') renderDiffView();
+      else renderUnifiedDiffView();
       diffEl.style.display = '';
       docEl.style.display = 'none';
     } else {
+      document.getElementById('diffModeToggle').style.display = 'none';
       diffEl.style.display = 'none';
       docEl.style.display = '';
+    }
+  }
+
+  function setDiffMode(mode) {
+    localStorage.setItem('crit-diff-mode', mode);
+    diffMode = mode;
+    document.getElementById('diffModeSplit').classList.toggle('btn-active', mode === 'split');
+    document.getElementById('diffModeUnified').classList.toggle('btn-active', mode === 'unified');
+    if (diffActive) {
+      if (mode === 'split') renderDiffView();
+      else renderUnifiedDiffView();
     }
   }
 
   document.getElementById('diffToggle').addEventListener('click', function() {
     setDiffActive(!diffActive);
   });
+
+  document.getElementById('diffModeSplit').addEventListener('click', () => setDiffMode('split'));
+  document.getElementById('diffModeUnified').addEventListener('click', () => setDiffMode('unified'));
+  (function() {
+    const saved = localStorage.getItem('crit-diff-mode');
+    if (saved === 'split' || saved === 'unified') {
+      setDiffMode(saved);
+    } else {
+      setDiffMode(window.innerWidth < 1200 ? 'unified' : 'split');
+    }
+  })();
 
   // ===== Start =====
   init();
