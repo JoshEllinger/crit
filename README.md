@@ -33,6 +33,13 @@ crit --no-open plan.md
 crit -o /tmp plan.md
 ```
 
+## Environment Variables
+
+| Variable | Description |
+| --- | --- |
+| `CRIT_SHARE_URL` | Base URL of a hosted Crit instance for the Share button (alternative to `--share-url`) |
+| `CRIT_NO_UPDATE_CHECK` | Set to any value to disable the update check on startup |
+
 ## Features
 
 ### Comments for single lines and blocks

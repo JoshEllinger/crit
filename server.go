@@ -8,17 +8,22 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 type Server struct {
-	doc      *Document
-	mux      *http.ServeMux
-	assets   fs.FS
-	shareURL string
+	doc            *Document
+	mux            *http.ServeMux
+	assets         fs.FS
+	shareURL       string
+	currentVersion string
+	latestVersion  string
+	versionMu      sync.RWMutex
 }
 
-func NewServer(doc *Document, frontendFS embed.FS, shareURL string) *Server {
-	s := &Server{doc: doc, shareURL: shareURL}
+func NewServer(doc *Document, frontendFS embed.FS, shareURL string, currentVersion string) *Server {
+	s := &Server{doc: doc, shareURL: shareURL, currentVersion: currentVersion}
 
 	assets, _ := fs.Sub(frontendFS, "frontend")
 	s.assets = assets
@@ -44,11 +49,42 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.versionMu.RLock()
+	latestVersion := s.latestVersion
+	s.versionMu.RUnlock()
 	writeJSON(w, map[string]string{
-		"share_url":    s.shareURL,
-		"hosted_url":   s.doc.GetSharedURL(),
-		"delete_token": s.doc.GetDeleteToken(),
+		"share_url":      s.shareURL,
+		"hosted_url":     s.doc.GetSharedURL(),
+		"delete_token":   s.doc.GetDeleteToken(),
+		"version":        s.currentVersion,
+		"latest_version": latestVersion,
 	})
+}
+
+func (s *Server) checkForUpdates() {
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/tomasz-tomczyk/crit/releases/latest", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "crit/"+s.currentVersion)
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return
+	}
+	s.versionMu.Lock()
+	s.latestVersion = release.TagName
+	s.versionMu.Unlock()
 }
 
 func (s *Server) handleShareURL(w http.ResponseWriter, r *http.Request) {

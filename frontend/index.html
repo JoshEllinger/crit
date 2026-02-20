@@ -203,6 +203,33 @@ body {
   color: var(--green);
 }
 
+.header-update {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.header-update a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.header-update a:hover {
+  text-decoration: underline;
+}
+.header-update-dismiss {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 11px;
+  padding: 0 2px;
+  line-height: 1;
+}
+.header-update-dismiss:hover {
+  color: var(--fg-primary);
+}
+
 .header-right {
   display: flex;
   align-items: center;
@@ -1116,6 +1143,9 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     grid-row: 4;
     grid-column: 1 / -1;
   }
+  #headerUpdate {
+    display: none !important;
+  }
 
   /* Wrap long code lines on mobile instead of per-line scrolling */
   .line-content.code-line {
@@ -1132,6 +1162,10 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     <span class="header-title">Crit</span>
     <span class="header-filename" id="filename"></span>
     <span class="header-notify" id="headerNotify"></span>
+    <span class="header-update" id="headerUpdate" style="display:none">
+      <a id="updateLink" href="https://github.com/tomasz-tomczyk/crit/releases/latest" target="_blank" rel="noopener noreferrer"></a>
+      <button class="header-update-dismiss" onclick="dismissUpdate()" title="Dismiss">&#x2715;</button>
+    </span>
   </div>
   <div class="header-right">
     <span class="comment-count" id="commentCount"></span>
@@ -1217,6 +1251,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   let activeForm = null; // { afterBlockIndex, startLine, endLine, editingId }
   let uiState = 'reviewing'; // 'reviewing' | 'waiting'
   let reviewRound = 1;
+  let latestAvailableVersion = '';
 
   // ===== Mermaid =====
   let mermaidCounter = 0;
@@ -1328,6 +1363,8 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
       if (shareURL) document.getElementById('shareBtn').style.display = '';
       if (hostedURL) showSharedNotice(hostedURL);
 
+      checkForUpdate(configRes.version || '', configRes.latest_version || '');
+
       document.getElementById('filename').textContent = fileName;
       document.title = `Crit — ${fileName}`;
 
@@ -1342,6 +1379,34 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
         `<div class="loading" style="color:var(--red)">Error loading document: ${err.message}</div>`;
     }
   }
+
+  // ===== Update Check =====
+  function checkForUpdate(currentVer, latestVer) {
+    if (!latestVer || !isNewerVersion(latestVer, currentVer)) return;
+    if (localStorage.getItem('crit-dismissed-version') === latestVer) return;
+    showUpdateNotice(latestVer);
+  }
+
+  function isNewerVersion(latest, current) {
+    if (current === 'dev') return true;
+    const parse = v => v.replace(/^v/, '').split('.').map(Number);
+    const [lMaj, lMin, lPat] = parse(latest);
+    const [cMaj, cMin, cPat] = parse(current);
+    if (lMaj !== cMaj) return lMaj > cMaj;
+    if (lMin !== cMin) return lMin > cMin;
+    return lPat > cPat;
+  }
+
+  function showUpdateNotice(version) {
+    latestAvailableVersion = version;
+    document.getElementById('updateLink').textContent = version + ' available';
+    document.getElementById('headerUpdate').style.display = 'flex';
+  }
+
+  window.dismissUpdate = function() {
+    document.getElementById('headerUpdate').style.display = 'none';
+    localStorage.setItem('crit-dismissed-version', latestAvailableVersion);
+  };
 
   // ===== Stale Notice =====
   function showStaleNotice(msg) {
