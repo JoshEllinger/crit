@@ -17,6 +17,24 @@ brew tap tomasz-tomczyk/tap
 brew install crit
 ```
 
+### Go
+
+```bash
+go install github.com/tomasz-tomczyk/crit@latest
+```
+
+### Nix
+
+```bash
+nix profile install github:tomasz-tomczyk/crit
+```
+
+Or in a `flake.nix`:
+
+```nix
+inputs.crit.url = "github:tomasz-tomczyk/crit";
+```
+
 ### Download Binary
 
 Grab the latest binary for your platform from [Releases](https://github.com/tomasz-tomczyk/crit/releases).

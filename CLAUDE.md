@@ -127,8 +127,17 @@ When `--share-url` (or `CRIT_SHARE_URL`) is set:
 
 Releases are fully automated via GitHub Actions (`.github/workflows/release.yml`). To cut a release:
 
+Before tagging, bump the version in `flake.nix`:
+
+```nix
+version = "0.x.y";
+```
+
+Then commit, tag, and push:
+
 ```bash
-git tag v0.x.y && git push origin v0.x.y
+git add flake.nix && git commit -m "chore: bump Nix flake version to v0.x.y"
+git tag v0.x.y && git push origin main v0.x.y
 ```
 
 Pushing the tag triggers the workflow, which:
