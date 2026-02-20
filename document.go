@@ -12,12 +12,15 @@ import (
 )
 
 type Comment struct {
-	ID        string `json:"id"`
-	StartLine int    `json:"start_line"`
-	EndLine   int    `json:"end_line"`
-	Body      string `json:"body"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID              string `json:"id"`
+	StartLine       int    `json:"start_line"`
+	EndLine         int    `json:"end_line"`
+	Body            string `json:"body"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+	Resolved        bool   `json:"resolved,omitempty"`
+	ResolutionNote  string `json:"resolution_note,omitempty"`
+	ResolutionLines []int  `json:"resolution_lines,omitempty"`
 }
 
 type CommentsFile struct {
@@ -36,21 +39,26 @@ type SSEEvent struct {
 }
 
 type Document struct {
-	FilePath    string
-	FileName    string
-	FileDir     string
-	Content     string
-	FileHash    string
-	OutputDir   string
-	Comments    []Comment
-	mu          sync.RWMutex
-	nextID      int
-	writeTimer  *time.Timer
-	staleNotice string
-	sharedURL   string
-	deleteToken string
-	subscribers map[chan SSEEvent]struct{}
-	subMu       sync.Mutex
+	FilePath         string
+	FileName         string
+	FileDir          string
+	Content          string
+	FileHash         string
+	OutputDir        string
+	Comments         []Comment
+	PreviousContent  string    // content from the previous round (empty on first round)
+	PreviousComments []Comment // comments from the previous round
+	mu               sync.RWMutex
+	nextID           int
+	writeTimer       *time.Timer
+	staleNotice      string
+	sharedURL        string
+	deleteToken      string
+	subscribers      map[chan SSEEvent]struct{}
+	subMu            sync.Mutex
+	pendingEdits     int           // number of file changes detected since last round-complete
+	roundComplete    chan struct{} // signaled when agent calls round-complete
+	reviewRound      int           // current review round (1-based)
 }
 
 func NewDocument(filePath, outputDir string) (*Document, error) {
@@ -63,15 +71,17 @@ func NewDocument(filePath, outputDir string) (*Document, error) {
 	hash := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
 
 	doc := &Document{
-		FilePath:    filePath,
-		FileName:    filepath.Base(filePath),
-		FileDir:     filepath.Dir(filePath),
-		Content:     content,
-		FileHash:    hash,
-		OutputDir:   outputDir,
-		Comments:    []Comment{},
-		nextID:      1,
-		subscribers: make(map[chan SSEEvent]struct{}),
+		FilePath:      filePath,
+		FileName:      filepath.Base(filePath),
+		FileDir:       filepath.Dir(filePath),
+		Content:       content,
+		FileHash:      hash,
+		OutputDir:     outputDir,
+		Comments:      []Comment{},
+		nextID:        1,
+		reviewRound:   1,
+		subscribers:   make(map[chan SSEEvent]struct{}),
+		roundComplete: make(chan struct{}, 1),
 	}
 
 	doc.loadComments()
@@ -221,6 +231,35 @@ func (d *Document) SetSharedURLAndToken(url, token string) {
 	d.scheduleWrite()
 }
 
+func (d *Document) IncrementEdits() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pendingEdits++
+}
+
+func (d *Document) GetPendingEdits() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.pendingEdits
+}
+
+func (d *Document) SignalRoundComplete() {
+	d.mu.Lock()
+	d.pendingEdits = 0
+	d.reviewRound++
+	d.Comments = []Comment{}
+	d.nextID = 1
+	d.mu.Unlock()
+	select {
+	case d.roundComplete <- struct{}{}:
+	default:
+	}
+}
+
+func (d *Document) RoundCompleteChan() <-chan struct{} {
+	return d.roundComplete
+}
+
 func (d *Document) scheduleWrite() {
 	if d.writeTimer != nil {
 		d.writeTimer.Stop()
@@ -317,7 +356,8 @@ func (d *Document) Shutdown() {
 }
 
 // ReloadFile re-reads the source file and clears in-memory comments.
-// The .review.md file is kept so the agent can still reference it while editing.
+// The .review.md and .comments.json files are kept so the agent can
+// reference and modify them while editing.
 func (d *Document) ReloadFile() error {
 	data, err := os.ReadFile(d.FilePath)
 	if err != nil {
@@ -325,6 +365,15 @@ func (d *Document) ReloadFile() error {
 	}
 
 	d.mu.Lock()
+	// Only snapshot on the first edit of a round (pendingEdits == 0).
+	// Subsequent edits within the same round keep the original snapshot
+	// so the diff covers all changes since the round started.
+	if d.pendingEdits == 0 {
+		d.PreviousContent = d.Content
+		d.PreviousComments = make([]Comment, len(d.Comments))
+		copy(d.PreviousComments, d.Comments)
+	}
+
 	d.Content = string(data)
 	d.FileHash = fmt.Sprintf("sha256:%x", sha256.Sum256(data))
 	d.Comments = []Comment{}
@@ -332,13 +381,29 @@ func (d *Document) ReloadFile() error {
 	d.staleNotice = ""
 	d.mu.Unlock()
 
-	os.Remove(d.commentsFilePath())
-
 	return nil
 }
 
+// loadResolvedComments reads the .comments.json file to pick up any
+// resolved fields the agent wrote during the editing round.
+func (d *Document) loadResolvedComments() {
+	data, err := os.ReadFile(d.commentsFilePath())
+	if err != nil {
+		return
+	}
+	var cf CommentsFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return
+	}
+	d.mu.Lock()
+	d.PreviousComments = cf.Comments
+	d.mu.Unlock()
+}
+
 // WatchFile polls the source file for changes every second.
-// On change, it reloads and notifies SSE subscribers.
+// On change, it reloads the file, increments the edit counter, and sends an
+// "edit-detected" SSE event. The full "file-changed" event is deferred until
+// the agent signals round completion via the roundComplete channel.
 func (d *Document) WatchFile(stop <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -363,17 +428,31 @@ func (d *Document) WatchFile(stop <-chan struct{}) {
 					fmt.Fprintf(os.Stderr, "Error reloading file: %v\n", err)
 					continue
 				}
+				d.IncrementEdits()
 
-				d.mu.RLock()
-				event := SSEEvent{
-					Type:     "file-changed",
+				// Notify frontend of edit detection (for counter in waiting modal)
+				d.notify(SSEEvent{
+					Type:     "edit-detected",
 					Filename: d.FileName,
-					Content:  d.Content,
-				}
-				d.mu.RUnlock()
-
-				d.notify(event)
+					Content:  fmt.Sprintf("%d", d.GetPendingEdits()),
+				})
 			}
+		case <-d.roundComplete:
+			// Load agent's resolved comments from .comments.json before cleanup
+			d.loadResolvedComments()
+			os.Remove(d.commentsFilePath())
+			os.Remove(d.reviewFilePath())
+
+			// Agent signaled round complete — send the full file-changed event
+			d.mu.RLock()
+			event := SSEEvent{
+				Type:     "file-changed",
+				Filename: d.FileName,
+				Content:  d.Content,
+			}
+			d.mu.RUnlock()
+
+			d.notify(event)
 		}
 	}
 }

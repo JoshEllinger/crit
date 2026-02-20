@@ -81,6 +81,37 @@ func TestGenerateReviewMD_MultilineBody(t *testing.T) {
 	}
 }
 
+func TestGenerateReviewMD_NoAgentInstructions(t *testing.T) {
+	content := "line one"
+	comments := []Comment{
+		{ID: "c1", StartLine: 1, EndLine: 1, Body: "Fix this"},
+	}
+	result := GenerateReviewMD(content, comments)
+
+	if strings.Contains(result, "Agent Instructions") {
+		t.Error("review MD should not contain agent instructions")
+	}
+	if strings.Contains(result, "crit go") {
+		t.Error("review MD should not contain crit go command")
+	}
+}
+
+func TestGenerateReviewMD_SkipsResolvedComments(t *testing.T) {
+	content := "line one\nline two"
+	comments := []Comment{
+		{ID: "c1", StartLine: 1, EndLine: 1, Body: "Fix this", Resolved: true},
+		{ID: "c2", StartLine: 2, EndLine: 2, Body: "And this"},
+	}
+	result := GenerateReviewMD(content, comments)
+
+	if strings.Contains(result, "Fix this") {
+		t.Error("resolved comment should not appear in review MD")
+	}
+	if !strings.Contains(result, "And this") {
+		t.Error("unresolved comment should appear in review MD")
+	}
+}
+
 func TestFormatComment_SingleLine(t *testing.T) {
 	c := Comment{StartLine: 5, EndLine: 5, Body: "hello"}
 	result := formatComment(c)

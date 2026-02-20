@@ -20,10 +20,11 @@ type Server struct {
 	currentVersion string
 	latestVersion  string
 	versionMu      sync.RWMutex
+	port           int
 }
 
-func NewServer(doc *Document, frontendFS embed.FS, shareURL string, currentVersion string) *Server {
-	s := &Server{doc: doc, shareURL: shareURL, currentVersion: currentVersion}
+func NewServer(doc *Document, frontendFS embed.FS, shareURL string, currentVersion string, port int) *Server {
+	s := &Server{doc: doc, shareURL: shareURL, currentVersion: currentVersion, port: port}
 
 	assets, _ := fs.Sub(frontendFS, "frontend")
 	s.assets = assets
@@ -37,6 +38,9 @@ func NewServer(doc *Document, frontendFS embed.FS, shareURL string, currentVersi
 	mux.HandleFunc("/api/finish", s.handleFinish)
 	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/stale", s.handleStale)
+	mux.HandleFunc("/api/round-complete", s.handleRoundComplete)
+	mux.HandleFunc("/api/previous-round", s.handlePreviousRound)
+	mux.HandleFunc("/api/diff", s.handleDiff)
 	mux.HandleFunc("/files/", s.handleFiles)
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 
@@ -141,6 +145,52 @@ func (s *Server) handleStale(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleRoundComplete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.doc.SignalRoundComplete()
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handlePreviousRound(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.doc.mu.RLock()
+	resp := map[string]interface{}{
+		"content":      s.doc.PreviousContent,
+		"comments":     s.doc.PreviousComments,
+		"review_round": s.doc.reviewRound,
+	}
+	s.doc.mu.RUnlock()
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.doc.mu.RLock()
+	prev := s.doc.PreviousContent
+	curr := s.doc.Content
+	s.doc.mu.RUnlock()
+
+	var entries []DiffEntry
+	if prev != "" {
+		entries = ComputeLineDiff(prev, curr)
+	}
+	if entries == nil {
+		entries = []DiffEntry{}
+	}
+	writeJSON(w, map[string]interface{}{
+		"entries": entries,
+	})
+}
+
 func (s *Server) handleComments(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -227,7 +277,11 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	reviewFile := s.doc.reviewFilePath()
 	prompt := ""
 	if len(s.doc.GetComments()) > 0 {
-		prompt = fmt.Sprintf("I've left review comments in %s — please address each comment and update the plan accordingly.", reviewFile)
+		prompt = fmt.Sprintf(
+			"Address review comments in %s. "+
+				"Mark resolved in %s (set \"resolved\": true, optionally \"resolution_note\" and \"resolution_lines\"). "+
+				"When done run: `crit go %d`",
+			reviewFile, s.doc.commentsFilePath(), s.port)
 	}
 
 	writeJSON(w, map[string]string{

@@ -348,6 +348,77 @@ func TestDeleteToken_PersistedAndLoaded(t *testing.T) {
 	}
 }
 
+func TestReloadFile_PreservesPreviousContent(t *testing.T) {
+	doc := newTestDoc(t, "original line 1\noriginal line 2")
+	doc.AddComment(1, 1, "fix this")
+
+	// Modify the file
+	if err := os.WriteFile(doc.FilePath, []byte("modified line 1\nnew line 2\nnew line 3"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := doc.ReloadFile(); err != nil {
+		t.Fatal(err)
+	}
+
+	if doc.PreviousContent != "original line 1\noriginal line 2" {
+		t.Errorf("PreviousContent = %q, want original content", doc.PreviousContent)
+	}
+	if len(doc.PreviousComments) != 1 {
+		t.Errorf("PreviousComments len = %d, want 1", len(doc.PreviousComments))
+	}
+	if doc.PreviousComments[0].Body != "fix this" {
+		t.Errorf("PreviousComments[0].Body = %q, want 'fix this'", doc.PreviousComments[0].Body)
+	}
+}
+
+func TestEditCounting(t *testing.T) {
+	doc := newTestDoc(t, "original")
+	doc.IncrementEdits()
+	doc.IncrementEdits()
+	if doc.GetPendingEdits() != 2 {
+		t.Errorf("pending edits = %d, want 2", doc.GetPendingEdits())
+	}
+	doc.SignalRoundComplete()
+	if doc.GetPendingEdits() != 0 {
+		t.Errorf("pending edits after round-complete = %d, want 0", doc.GetPendingEdits())
+	}
+}
+
+func TestSignalRoundComplete_IncrementsRound(t *testing.T) {
+	doc := newTestDoc(t, "original")
+	if doc.reviewRound != 1 {
+		t.Errorf("initial reviewRound = %d, want 1", doc.reviewRound)
+	}
+	doc.SignalRoundComplete()
+	if doc.reviewRound != 2 {
+		t.Errorf("reviewRound after first round-complete = %d, want 2", doc.reviewRound)
+	}
+	doc.SignalRoundComplete()
+	if doc.reviewRound != 3 {
+		t.Errorf("reviewRound after second round-complete = %d, want 3", doc.reviewRound)
+	}
+}
+
+func TestSignalRoundComplete_ClearsComments(t *testing.T) {
+	doc := newTestDoc(t, "line1\nline2")
+	doc.AddComment(1, 1, "fix this")
+	doc.AddComment(2, 2, "and this")
+	if len(doc.GetComments()) != 2 {
+		t.Fatalf("expected 2 comments before round-complete, got %d", len(doc.GetComments()))
+	}
+
+	doc.SignalRoundComplete()
+
+	if len(doc.GetComments()) != 0 {
+		t.Errorf("expected 0 comments after round-complete, got %d", len(doc.GetComments()))
+	}
+	// Verify nextID resets so new comments start at c1
+	c := doc.AddComment(1, 1, "new round comment")
+	if c.ID != "c1" {
+		t.Errorf("new comment ID = %q, want c1 (nextID should reset)", c.ID)
+	}
+}
+
 func TestDeleteToken_PersistsWhenStale(t *testing.T) {
 	doc := newTestDoc(t, "original")
 	doc.AddComment(1, 1, "note")
@@ -363,5 +434,108 @@ func TestDeleteToken_PersistsWhenStale(t *testing.T) {
 	}
 	if doc2.GetDeleteToken() != "staletoken123456789012" {
 		t.Errorf("delete token after stale reload = %q", doc2.GetDeleteToken())
+	}
+}
+
+func TestReloadFile_SnapshotsOnlyOnFirstEdit(t *testing.T) {
+	doc := newTestDoc(t, "original")
+	doc.AddComment(1, 1, "fix this")
+
+	// First edit (pendingEdits == 0) — should snapshot
+	if err := os.WriteFile(doc.FilePath, []byte("edit 1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	doc.ReloadFile()
+	doc.IncrementEdits() // simulate WatchFile behavior
+
+	// Second edit (pendingEdits == 1) — should NOT overwrite snapshot
+	if err := os.WriteFile(doc.FilePath, []byte("edit 2"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	doc.ReloadFile()
+
+	if doc.PreviousContent != "original" {
+		t.Errorf("PreviousContent = %q, want 'original' (should not be overwritten by second edit)", doc.PreviousContent)
+	}
+	if len(doc.PreviousComments) != 1 || doc.PreviousComments[0].Body != "fix this" {
+		t.Errorf("PreviousComments should preserve round-start comments, got %+v", doc.PreviousComments)
+	}
+	if doc.Content != "edit 2" {
+		t.Errorf("Content = %q, want 'edit 2'", doc.Content)
+	}
+}
+
+func TestLoadResolvedComments(t *testing.T) {
+	doc := newTestDoc(t, "line1\nline2")
+	doc.AddComment(1, 1, "fix this")
+
+	// Write comments JSON with resolved fields (as agent would)
+	cf := CommentsFile{
+		File:     doc.FileName,
+		FileHash: doc.FileHash,
+		Comments: []Comment{
+			{
+				ID: "c1", StartLine: 1, EndLine: 1, Body: "fix this",
+				Resolved: true, ResolutionNote: "Fixed it",
+				ResolutionLines: []int{3, 4},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(cf, "", "  ")
+	os.WriteFile(doc.commentsFilePath(), data, 0644)
+
+	doc.loadResolvedComments()
+
+	if len(doc.PreviousComments) != 1 {
+		t.Fatalf("expected 1 previous comment, got %d", len(doc.PreviousComments))
+	}
+	if !doc.PreviousComments[0].Resolved {
+		t.Error("expected comment to be resolved")
+	}
+	if doc.PreviousComments[0].ResolutionNote != "Fixed it" {
+		t.Errorf("resolution note = %q", doc.PreviousComments[0].ResolutionNote)
+	}
+}
+
+func TestLoadComments_WithResolved(t *testing.T) {
+	doc := newTestDoc(t, "line1\nline2")
+	doc.AddComment(1, 1, "fix this")
+
+	// Manually write a comments file with resolved fields
+	cf := CommentsFile{
+		File:     doc.FileName,
+		FileHash: doc.FileHash,
+		Comments: []Comment{
+			{
+				ID:              "c1",
+				StartLine:       1,
+				EndLine:         1,
+				Body:            "fix this",
+				Resolved:        true,
+				ResolutionNote:  "Refactored the function",
+				ResolutionLines: []int{3, 4, 5},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(cf, "", "  ")
+	os.WriteFile(doc.commentsFilePath(), data, 0644)
+
+	// Reload document
+	doc2, err := NewDocument(doc.FilePath, doc.OutputDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comments := doc2.GetComments()
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(comments))
+	}
+	if !comments[0].Resolved {
+		t.Error("expected comment to be resolved")
+	}
+	if comments[0].ResolutionNote != "Refactored the function" {
+		t.Errorf("resolution note = %q", comments[0].ResolutionNote)
+	}
+	if len(comments[0].ResolutionLines) != 3 {
+		t.Errorf("resolution lines = %v", comments[0].ResolutionLines)
 	}
 }

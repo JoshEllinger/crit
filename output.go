@@ -7,7 +7,15 @@ import (
 )
 
 func GenerateReviewMD(content string, comments []Comment) string {
-	if len(comments) == 0 {
+	// Filter out resolved comments
+	var activeComments []Comment
+	for _, c := range comments {
+		if !c.Resolved {
+			activeComments = append(activeComments, c)
+		}
+	}
+
+	if len(activeComments) == 0 {
 		return content
 	}
 
@@ -17,8 +25,8 @@ func GenerateReviewMD(content string, comments []Comment) string {
 	// Comments are inserted after their end_line.
 	// We need to find the end of the block that contains end_line.
 	// For simplicity, insert after end_line.
-	sorted := make([]Comment, len(comments))
-	copy(sorted, comments)
+	sorted := make([]Comment, len(activeComments))
+	copy(sorted, activeComments)
 	sort.Slice(sorted, func(i, j int) bool {
 		if sorted[i].EndLine == sorted[j].EndLine {
 			return sorted[i].StartLine < sorted[j].StartLine
@@ -48,6 +56,7 @@ func GenerateReviewMD(content string, comments []Comment) string {
 			}
 		}
 	}
+
 
 	return result.String()
 }

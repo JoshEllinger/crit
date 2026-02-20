@@ -32,6 +32,9 @@ func newTestServer(t *testing.T) (*Server, *Document) {
 	mux.HandleFunc("/api/comments/", s.handleCommentByID)
 	mux.HandleFunc("/api/finish", s.handleFinish)
 	mux.HandleFunc("/api/stale", s.handleStale)
+	mux.HandleFunc("/api/round-complete", s.handleRoundComplete)
+	mux.HandleFunc("/api/previous-round", s.handlePreviousRound)
+	mux.HandleFunc("/api/diff", s.handleDiff)
 	mux.HandleFunc("/files/", s.handleFiles)
 	s.mux = mux
 	return s, doc
@@ -533,5 +536,193 @@ func TestPostShareURL_InvalidJSON(t *testing.T) {
 	s.ServeHTTP(w, req)
 	if w.Code != 400 {
 		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestRoundComplete(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	req := httptest.NewRequest("POST", "/api/round-complete", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("status = %q, want ok", resp["status"])
+	}
+}
+
+func TestRoundComplete_MethodNotAllowed(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/api/round-complete", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestGetPreviousRound_Empty(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	req := httptest.NewRequest("GET", "/api/previous-round", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["content"] != "" {
+		t.Errorf("expected empty content for first round, got %q", resp["content"])
+	}
+}
+
+func TestGetPreviousRound_AfterReload(t *testing.T) {
+	s, doc := newTestServer(t)
+	doc.AddComment(1, 1, "fix this")
+
+	// Simulate file change
+	os.WriteFile(doc.FilePath, []byte("modified content"), 0644)
+	doc.ReloadFile()
+
+	req := httptest.NewRequest("GET", "/api/previous-round", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	var resp struct {
+		Content     string    `json:"content"`
+		Comments    []Comment `json:"comments"`
+		ReviewRound int       `json:"review_round"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp.Content != "line1\nline2\nline3\n" {
+		t.Errorf("previous content = %q", resp.Content)
+	}
+	if len(resp.Comments) != 1 || resp.Comments[0].Body != "fix this" {
+		t.Errorf("previous comments = %+v", resp.Comments)
+	}
+	if resp.ReviewRound != 1 {
+		t.Errorf("review_round = %d, want 1 (no round-complete yet)", resp.ReviewRound)
+	}
+}
+
+func TestGetPreviousRound_ReviewRoundIncrementsAfterRoundComplete(t *testing.T) {
+	s, doc := newTestServer(t)
+	doc.AddComment(1, 1, "fix this")
+
+	// Simulate file change + round complete
+	os.WriteFile(doc.FilePath, []byte("modified content"), 0644)
+	doc.ReloadFile()
+	doc.SignalRoundComplete()
+	// Drain the channel so it doesn't block
+	select {
+	case <-doc.RoundCompleteChan():
+	default:
+	}
+
+	req := httptest.NewRequest("GET", "/api/previous-round", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	var resp struct {
+		ReviewRound int `json:"review_round"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp.ReviewRound != 2 {
+		t.Errorf("review_round = %d, want 2 after one round-complete", resp.ReviewRound)
+	}
+}
+
+func TestGetPreviousRound_MethodNotAllowed(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("POST", "/api/previous-round", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestGetDiff_NoPreviousRound(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/api/diff", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp struct {
+		Entries []DiffEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Entries) != 0 {
+		t.Errorf("expected empty diff entries for first round, got %d", len(resp.Entries))
+	}
+}
+
+func TestGetDiff_AfterReload(t *testing.T) {
+	s, doc := newTestServer(t)
+
+	os.WriteFile(doc.FilePath, []byte("modified line 1\nnew line"), 0644)
+	doc.ReloadFile()
+
+	req := httptest.NewRequest("GET", "/api/diff", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp struct {
+		Entries []DiffEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Entries) == 0 {
+		t.Error("expected non-empty diff entries after reload")
+	}
+
+	// Verify diff contains expected types
+	hasAdded := false
+	hasRemoved := false
+	for _, e := range resp.Entries {
+		if e.Type == "added" {
+			hasAdded = true
+		}
+		if e.Type == "removed" {
+			hasRemoved = true
+		}
+	}
+	if !hasAdded {
+		t.Error("expected at least one added entry in diff")
+	}
+	if !hasRemoved {
+		t.Error("expected at least one removed entry in diff")
+	}
+}
+
+func TestGetDiff_MethodNotAllowed(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("POST", "/api/diff", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
 	}
 }

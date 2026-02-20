@@ -823,6 +823,47 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   color: var(--fg-dimmed);
 }
 
+/* ===== Resolved Comments ===== */
+.resolved-comment {
+  max-width: 840px;
+  margin: 4px auto 4px 48px;
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  border-left: 3px solid var(--green);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.resolved-comment:hover {
+  background: var(--bg-hover);
+}
+.resolved-comment .resolved-check {
+  color: var(--green);
+  font-weight: 600;
+}
+.resolved-comment .resolved-body {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.resolved-comment .resolved-note {
+  font-style: italic;
+  color: var(--fg-dimmed);
+}
+.resolved-comment.expanded {
+  flex-direction: column;
+  align-items: flex-start;
+}
+.resolved-comment.expanded .resolved-body {
+  white-space: normal;
+  overflow: visible;
+}
+
 /* ===== Comment Input Form ===== */
 .comment-form-wrapper {
   max-width: 840px;
@@ -917,6 +958,13 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   margin-bottom: 12px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.waiting-dialog .waiting-edits {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--green);
+  margin-top: 12px;
+}
 
 .waiting-prompt {
   background: var(--bg-tertiary);
@@ -1069,6 +1117,51 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   background: var(--accent-subtle);
 }
 
+/* ===== Diff View ===== */
+.diff-view {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  max-width: 100%;
+  padding: 0 16px;
+}
+.diff-view-side {
+  min-width: 0;
+  overflow-x: auto;
+  border-right: 1px solid var(--border);
+}
+.diff-view-side:last-child {
+  border-right: none;
+}
+.diff-view-side-label {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-muted);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+}
+.diff-view .line-block {
+  grid-template-columns: 32px 1fr;
+}
+.diff-view .line-gutter {
+  min-width: 32px;
+  cursor: default;
+}
+.diff-view .line-gutter .line-add { display: none; }
+.diff-view .line-block.diff-added .line-content {
+  background: rgba(158, 206, 106, 0.12);
+}
+.diff-view .line-block.diff-removed .line-content {
+  background: rgba(247, 118, 142, 0.12);
+  opacity: 0.7;
+}
+.diff-view .line-block.diff-removed .line-content * {
+  text-decoration: line-through;
+}
+
 /* ===== Responsive ===== */
 @media (max-width: 900px) {
   .document-wrapper { padding-left: 8px; padding-right: 8px; }
@@ -1077,6 +1170,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 }
 @media (max-width: 600px) {
   .toc, #tocToggle { display: none !important; }
+  #diffToggle, #diffView { display: none !important; }
 }
 @media (max-width: 600px) {
   /* Header: 3-row grid layout
@@ -1161,7 +1255,6 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   <div class="header-left">
     <span class="header-title">Crit</span>
     <span class="header-filename" id="filename"></span>
-    <span class="header-notify" id="headerNotify"></span>
     <span class="header-update" id="headerUpdate" style="display:none">
       <a id="updateLink" href="https://github.com/tomasz-tomczyk/crit/releases/latest" target="_blank" rel="noopener noreferrer"></a>
       <button class="header-update-dismiss" onclick="dismissUpdate()" title="Dismiss">&#x2715;</button>
@@ -1169,6 +1262,8 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   </div>
   <div class="header-right">
     <span class="comment-count" id="commentCount"></span>
+    <span class="header-notify" id="headerNotify"></span>
+    <button class="btn btn-sm" id="diffToggle" style="display:none">Toggle Diff</button>
     <button class="theme-toggle" id="tocToggle" title="Table of contents">&#9776;</button>
     <div class="theme-pill" role="group" aria-label="Theme">
       <div class="theme-pill-indicator"></div>
@@ -1198,6 +1293,8 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 <div id="staleNotice"></div>
 <div id="shareNotice"></div>
 
+<div id="diffView" class="diff-view" style="display:none"></div>
+
 <div class="document-wrapper" id="document">
   <div class="loading">Loading document...</div>
 </div>
@@ -1207,6 +1304,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     <div class="waiting-spinner"></div>
     <h3>Review Complete</h3>
     <p id="waitingMessage"></p>
+    <p class="waiting-edits" id="waitingEdits"></p>
     <div class="waiting-prompt" id="waitingPrompt"></div>
     <p style="font-size: 12px; color: var(--fg-muted); margin-top: 8px;" id="waitingClipboard"></p>
     <button class="btn btn-sm" id="backToEditing" style="margin-top: 16px;">Back to editing</button>
@@ -1252,6 +1350,10 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   let uiState = 'reviewing'; // 'reviewing' | 'waiting'
   let reviewRound = 1;
   let latestAvailableVersion = '';
+  let previousComments = [];
+  let previousRoundContent = ''; // raw markdown from previous round
+  let diffEntries = []; // cached from /api/diff
+  let diffActive = false; // true when diff view is shown
 
   // ===== Mermaid =====
   let mermaidCounter = 0;
@@ -1374,6 +1476,27 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 
       parseAndRender();
       updateCommentCount();
+
+      // Restore round state on refresh — if previous round data exists, we're in round 2+
+      try {
+        const [diffResp, prevResp] = await Promise.all([
+          fetch('/api/diff').then(r => r.json()),
+          fetch('/api/previous-round').then(r => r.json()),
+        ]);
+        if (prevResp.content) {
+          diffEntries = diffResp.entries || [];
+          previousComments = prevResp.comments || [];
+          previousRoundContent = prevResp.content || '';
+          reviewRound = prevResp.review_round || 2;
+          updateHeaderRound();
+          if (diffEntries.length && previousRoundContent) {
+            document.getElementById('diffToggle').style.display = '';
+            parseAndRender(); // re-render with resolved comments
+          } else if (previousComments.some(function(c) { return c.resolved; })) {
+            parseAndRender();
+          }
+        }
+      } catch (_) {}
     } catch (err) {
       document.getElementById('document').innerHTML =
         `<div class="loading" style="color:var(--red)">Error loading document: ${err.message}</div>`;
@@ -1919,6 +2042,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     container.innerHTML = '';
 
     const commentsMap = buildCommentsMap();
+    const resolvedMap = buildResolvedMap();
 
     for (let bi = 0; bi < lineBlocks.length; bi++) {
       const block = lineBlocks[bi];
@@ -1983,6 +2107,12 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
         container.appendChild(createCommentElement(comment));
       }
 
+      // Render resolved comments from previous round
+      const blockResolved = getResolvedForBlock(block, resolvedMap);
+      for (const rc of blockResolved) {
+        container.appendChild(createResolvedElement(rc));
+      }
+
       // Render comment form if it's after this block
       if (activeForm && !activeForm.editingId && activeForm.afterBlockIndex === bi) {
         container.appendChild(createCommentForm());
@@ -2012,6 +2142,41 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
       }
     }
     return result;
+  }
+
+  function buildResolvedMap() {
+    const map = {};
+    for (const c of previousComments) {
+      if (!c.resolved || !c.resolution_lines || c.resolution_lines.length === 0) continue;
+      // Place the resolved comment after the last resolution line
+      const targetLine = Math.max(...c.resolution_lines);
+      if (!map[targetLine]) map[targetLine] = [];
+      map[targetLine].push(c);
+    }
+    return map;
+  }
+
+  function getResolvedForBlock(block, resolvedMap) {
+    const result = [];
+    for (let ln = block.startLine; ln <= block.endLine; ln++) {
+      if (resolvedMap[ln]) {
+        result.push(...resolvedMap[ln]);
+      }
+    }
+    return result;
+  }
+
+  function createResolvedElement(comment) {
+    const el = document.createElement('div');
+    el.className = 'resolved-comment';
+    el.innerHTML =
+      '<span class="resolved-check">\u2713</span>' +
+      '<span class="resolved-body">' + escapeHtml(comment.body) + '</span>' +
+      (comment.resolution_note ? '<span class="resolved-note">' + escapeHtml(comment.resolution_note) + '</span>' : '');
+    el.addEventListener('click', function() {
+      el.classList.toggle('expanded');
+    });
+    return el;
   }
 
   // ===== Gutter Drag Selection (GitHub-style) =====
@@ -2400,12 +2565,14 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
         finishBtn.textContent = 'Finish Review';
         finishBtn.disabled = false;
         finishBtn.classList.add('btn-primary');
+        document.getElementById('waitingEdits').textContent = '';
         waitingOverlay.classList.remove('active');
         break;
       case 'waiting':
         finishBtn.textContent = 'Waiting...';
         finishBtn.disabled = true;
         finishBtn.classList.remove('btn-primary');
+        document.getElementById('waitingEdits').textContent = '';
         waitingOverlay.classList.add('active');
         break;
     }
@@ -2585,7 +2752,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
   function connectSSE() {
     const source = new EventSource('/api/events');
 
-    source.addEventListener('file-changed', function(e) {
+    source.addEventListener('file-changed', async function(e) {
       try {
         const data = JSON.parse(e.data);
         rawContent = data.content;
@@ -2605,8 +2772,40 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
         reviewRound++;
         updateHeaderRound();
         setUIState('reviewing');
+
+        // Fetch diff and previous round data
+        try {
+          const [diffResp, prevResp] = await Promise.all([
+            fetch('/api/diff').then(r => r.json()),
+            fetch('/api/previous-round').then(r => r.json()),
+          ]);
+          diffEntries = diffResp.entries || [];
+          previousComments = prevResp.comments || [];
+          previousRoundContent = prevResp.content || '';
+          if (diffEntries.length && previousRoundContent) {
+            document.getElementById('diffToggle').style.display = '';
+            // Re-render to pick up resolved comments
+            parseAndRender();
+            setDiffActive(false);
+          } else if (previousComments.some(function(c) { return c.resolved; })) {
+            parseAndRender();
+          }
+        } catch (_) {}
       } catch (err) {
         console.error('Error handling file-changed event:', err);
+      }
+    });
+
+    source.addEventListener('edit-detected', function(e) {
+      try {
+        const data = JSON.parse(e.data);
+        const count = parseInt(data.content, 10);
+        const el = document.getElementById('waitingEdits');
+        if (el && uiState === 'waiting') {
+          el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-right:4px"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><line x1="12" y1="7" x2="12" y2="11"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>Your agent made ' + count + ' edit' + (count === 1 ? '' : 's');
+        }
+      } catch (err) {
+        console.error('Error handling edit-detected:', err);
       }
     });
 
@@ -2629,6 +2828,140 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
     overlay.appendChild(box);
     document.body.appendChild(overlay);
   }
+
+  // ===== Diff View (rendered markdown) =====
+  function buildDiffLineSet(entries, side) {
+    // Build sets of line numbers that are added/removed
+    const added = new Set();
+    const removed = new Set();
+    for (const e of entries) {
+      if (e.type === 'added') added.add(e.new_line);
+      if (e.type === 'removed') removed.add(e.old_line);
+    }
+    return { added: added, removed: removed };
+  }
+
+  function classifyBlock(block, addedLines, removedLines, side) {
+    // Check if any source line in this block overlaps with changed lines
+    for (let ln = block.startLine; ln <= block.endLine; ln++) {
+      if (side === 'new' && addedLines.has(ln)) return 'diff-added';
+      if (side === 'old' && removedLines.has(ln)) return 'diff-removed';
+    }
+    return '';
+  }
+
+  function renderDiffSide(content, blocks, diffClass, resolvedMap) {
+    const container = document.createElement('div');
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const block = blocks[bi];
+      const lineBlockEl = document.createElement('div');
+      lineBlockEl.className = 'line-block';
+      if (diffClass) {
+        const cls = diffClass(block);
+        if (cls) lineBlockEl.classList.add(cls);
+      }
+
+      const gutter = document.createElement('div');
+      gutter.className = 'line-gutter';
+      const lineNum = document.createElement('span');
+      lineNum.className = 'line-num';
+      lineNum.textContent = block.startLine;
+      gutter.appendChild(lineNum);
+
+      const contentEl = document.createElement('div');
+      let contentClasses = 'line-content';
+      if (block.isEmpty) contentClasses += ' empty-line';
+      if (block.cssClass) contentClasses += ' ' + block.cssClass;
+      contentEl.className = contentClasses;
+      let html = block.html;
+      html = processTaskLists(html);
+      html = rewriteImageSrcs(html);
+      contentEl.innerHTML = html;
+
+      lineBlockEl.appendChild(gutter);
+      lineBlockEl.appendChild(contentEl);
+      container.appendChild(lineBlockEl);
+
+      // Resolved comments on the right (new) side
+      if (resolvedMap) {
+        const blockResolved = getResolvedForBlock(block, resolvedMap);
+        for (const rc of blockResolved) {
+          container.appendChild(createResolvedElement(rc));
+        }
+      }
+    }
+    return container;
+  }
+
+  function renderDiffView() {
+    if (!diffEntries.length || !previousRoundContent) return;
+
+    const diffEl = document.getElementById('diffView');
+    diffEl.innerHTML = '';
+
+    const sets = buildDiffLineSet(diffEntries);
+
+    // Parse and build blocks for previous round
+    const md = window.markdownit({ html: true, typographer: true, linkify: true,
+      highlight: function(str, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          try { return hljs.highlight(str, { language: lang }).value; } catch (_) {}
+        }
+        try { return hljs.highlightAuto(str).value; } catch (_) {}
+        return '';
+      }
+    });
+    const oldTokens = md.parse(previousRoundContent, {});
+    const oldBlocks = buildLineBlocks(oldTokens, md, previousRoundContent);
+
+    // Use the current lineBlocks (already parsed)
+    const newBlocks = lineBlocks;
+
+    const resolvedMap = buildResolvedMap();
+
+    // Left side (previous)
+    const leftSide = document.createElement('div');
+    leftSide.className = 'diff-view-side';
+    const leftLabel = document.createElement('div');
+    leftLabel.className = 'diff-view-side-label';
+    leftLabel.textContent = 'Previous round';
+    leftSide.appendChild(leftLabel);
+    leftSide.appendChild(renderDiffSide(previousRoundContent, oldBlocks, function(block) {
+      return classifyBlock(block, sets.added, sets.removed, 'old');
+    }, null));
+
+    // Right side (current)
+    const rightSide = document.createElement('div');
+    rightSide.className = 'diff-view-side';
+    const rightLabel = document.createElement('div');
+    rightLabel.className = 'diff-view-side-label';
+    rightLabel.textContent = 'Current round';
+    rightSide.appendChild(rightLabel);
+    rightSide.appendChild(renderDiffSide(rawContent, newBlocks, function(block) {
+      return classifyBlock(block, sets.added, sets.removed, 'new');
+    }, resolvedMap));
+
+    diffEl.appendChild(leftSide);
+    diffEl.appendChild(rightSide);
+  }
+
+  function setDiffActive(active) {
+    diffActive = active;
+    const diffEl = document.getElementById('diffView');
+    const docEl = document.getElementById('document');
+    if (active) {
+      renderDiffView();
+      diffEl.style.display = '';
+      docEl.style.display = 'none';
+    } else {
+      diffEl.style.display = 'none';
+      docEl.style.display = '';
+    }
+  }
+
+  document.getElementById('diffToggle').addEventListener('click', function() {
+    setDiffActive(!diffActive);
+  });
 
   // ===== Start =====
   init();

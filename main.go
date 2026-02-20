@@ -23,6 +23,27 @@ var frontendFS embed.FS
 var version = "dev"
 
 func main() {
+	// Handle "crit go [port]" subcommand — signals round-complete to a running crit server
+	if len(os.Args) >= 2 && os.Args[1] == "go" {
+		port := "3000" // default
+		if len(os.Args) >= 3 {
+			port = os.Args[2]
+		}
+		resp, err := http.Post("http://localhost:"+port+"/api/round-complete", "application/json", nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: could not reach crit on port %s: %v\n", port, err)
+			os.Exit(1)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			fmt.Println("Round complete — crit will reload.")
+		} else {
+			fmt.Fprintf(os.Stderr, "Unexpected status: %d\n", resp.StatusCode)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	port := flag.Int("port", 0, "Port to listen on (default: random available port)")
 	flag.IntVar(port, "p", 0, "Port to listen on (shorthand)")
 	outputDir := flag.String("output", "", "Output directory for review files (default: same dir as input file)")
@@ -84,7 +105,7 @@ func main() {
 		*shareURL = "https://crit.live"
 	}
 
-	srv := NewServer(doc, frontendFS, *shareURL, version)
+	srv := NewServer(doc, frontendFS, *shareURL, version, addr.Port)
 	if os.Getenv("CRIT_NO_UPDATE_CHECK") == "" {
 		go srv.checkForUpdates()
 	}
@@ -128,7 +149,11 @@ func main() {
 
 	reviewPath := doc.reviewFilePath()
 	if len(doc.GetComments()) > 0 {
-		prompt := fmt.Sprintf("I've left review comments in %s — please address each comment and update the plan accordingly.", reviewPath)
+		prompt := fmt.Sprintf(
+			"I've left review comments in %s — please address each comment and update the plan accordingly. "+
+				"Mark each resolved comment in %s by setting \"resolved\": true (optionally add \"resolution_note\" and \"resolution_lines\" pointing to relevant lines in the updated file). "+
+				"When done, run: crit go %d",
+			reviewPath, doc.commentsFilePath(), addr.Port)
 		fmt.Println()
 		fmt.Println(prompt)
 		fmt.Println()
