@@ -1,10 +1,48 @@
 # Crit
 
-A lightweight CLI tool for reviewing markdown plans with GitHub PR-style inline comments. Built for the workflow of iterating on plans with AI coding agents.
+Your AI agent just generated a plan. Before you let it write 2,000 lines of code, you should review that plan.
 
-You write a plan in markdown. You run `crit` against it. You leave inline comments — single-line or multi-line ranges, just like a GitHub PR review. The tool writes a `.review.md` file in real-time with your comments interleaved, ready to hand back to your AI agent.
+Crit opens any markdown file in your browser as a reviewable document. Click to select lines, leave inline comments, then hand the annotated result back to your agent. Repeat until the plan is right.
+
+## Workflow
+
+Crit fits into the plan-then-implement cycle that AI coding agents work best with. The review stays local. No account, no upload, no waiting for a build.
+
+```bash
+# 1. Ask your agent to write a plan (example using Claude Code)
+claude "Write an implementation plan for the auth service" > auth-plan.md
+
+# 2. Review it
+crit auth-plan.md
+# → Browser opens with the plan rendered and commentable
+# → Drag to select lines, leave comments
+# → Click "Finish Review". A ready-made agent prompt is copied to clipboard
+
+# 3. Hand the review back
+# Paste the clipboard into your agent, or:
+claude "I've reviewed auth-plan.md. See auth-plan.review.md for comments."
+
+# 4. Your agent edits the file and signals it's done
+# → crit go $PORT triggers a new round with a diff of what changed
+# → Review the diff, leave more comments, repeat
+```
+
+One command. Browser opens. You review. Your agent gets structured feedback. When it's done editing, it runs `crit go <port>` to signal completion. Crit starts a new round and shows a diff of what changed.
+
+Works with Claude Code, Cursor, GitHub Copilot, Aider, or any agent that reads files. There's nothing to configure. Your agent gets a markdown file with your comments in it.
+
+### Output
+
+Crit generates a structured `.review.md` file with your comments interleaved as blockquotes at the exact lines they reference.
+
+| File                  | Purpose                                                                         |
+| --------------------- | ------------------------------------------------------------------------------- |
+| `plan.review.md`      | Original plan + comments as blockquotes. Hand to your AI agent                  |
+| `.plan.comments.json` | Comment state and session data. Your agent marks comments resolved in this file |
 
 ## Demo
+
+A 2-minute walkthrough: reviewing a plan, leaving inline comments, handing off to an agent.
 
 [![Crit demo](https://github.com/user-attachments/assets/dec9c069-9a99-4254-9b05-6d8db30820ed)](https://www.youtube.com/watch?v=w_Dswm2Ft-o)
 
@@ -13,8 +51,7 @@ You write a plan in markdown. You run `crit` against it. You leave inline commen
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew tap tomasz-tomczyk/tap
-brew install crit
+brew install tomasz-tomczyk/tap/crit
 ```
 
 ### Go
@@ -39,36 +76,15 @@ inputs.crit.url = "github:tomasz-tomczyk/crit";
 
 Grab the latest binary for your platform from [Releases](https://github.com/tomasz-tomczyk/crit/releases).
 
-## Usage
-
-```bash
-# Review a markdown file (opens browser automatically)
-crit plan.md
-
-# Specify a port
-crit -p 3000 plan.md
-
-# Don't auto-open browser
-crit --no-open plan.md
-
-# Custom output directory for .review.md
-crit -o /tmp plan.md
-```
-
-## Environment Variables
-
-| Variable               | Description                                                                            |
-| ---------------------- | -------------------------------------------------------------------------------------- |
-| `CRIT_SHARE_URL`       | Base URL of a hosted Crit instance for the Share button (alternative to `--share-url`) |
-| `CRIT_NO_UPDATE_CHECK` | Set to any value to disable the update check on startup                                |
-
 ## Features
 
-### Comments for single lines and blocks
+### Inline comments: single lines and ranges
+
+Click a line number to comment. Drag to select a range. Comments are rendered inline after their referenced lines, just like a GitHub PR review.
 
 ![Simple comments](images/simple-comments.gif)
 
-Generated Markdown:
+The generated `.review.md` places each comment as a blockquote immediately after the referenced lines:
 
 ```markdown
 > **Note**: This plan covers the MVP scope. SAML integration is deferred to Phase 2
@@ -88,28 +104,65 @@ Generated Markdown:
 > **[REVIEW COMMENT — Lines 16-21]**: Can you be more specific here?
 ```
 
-### Insert suggestion
+### Suggestion mode
 
-Copies the selected lines for you to easily edit
+Select lines and use "Insert suggestion" to pre-fill the comment with the original text. Edit it to show exactly what the replacement should look like. Your agent gets a concrete before/after.
 
 ![Insert suggestion](images/suggestion.gif)
 
-### Mermaid diagram support
+### Round-to-round diff
+
+After your agent edits the file, Crit shows a split or unified diff between the previous and current version. Resolved comments are marked. Open ones stay visible so you can verify nothing was skipped.
+
+### Mermaid diagrams
+
+Architecture diagrams in fenced ` ```mermaid ` blocks render inline. You can comment on the diagram source just like any other block.
 
 ![Mermaid diagram](images/mermaid.png)
 
-### Prompt agent when you're finished
+### Finish review: prompt copied to clipboard
+
+When you click "Finish Review", Crit collects all your comments, formats them into a structured prompt, and copies it to your clipboard. Paste directly into your agent.
 
 ![Agent prompt](images/prompt.png)
 
-### Other
+### Share for async review
 
-- Real-time `.review.md` output updated on every comment change
-- Live file watching with SSE — automatic reload when the source file changes
-- Multi-round review workflow (review → finish → agent edits → new round)
-- Syntax-highlighted code blocks (via highlight.js)
-- Dark/light theme with persistence
-- Single binary with embedded frontend
+Want a second opinion before handing off to the agent? The Share button uploads your review to [crit.live](https://crit.live) and gives you a public URL anyone can open in a browser, no install needed. Each reviewer's comments are color-coded by author. Unpublish anytime.
+
+### Everything else
+
+- Real-time `.review.md` written on every keystroke (200ms debounce)
+- Live file watching via SSE. Browser reloads when the source changes
+- Syntax highlighting inside code blocks, per-line commentable
+- Dark/light/system theme with persistence
+- Draft autosave. Close your browser mid-review and pick up where you left off
+- Vim keybindings (`j`/`k` navigate, `c` comment, `f` finish, `?` for full reference)
+- Single binary. No daemon, no dependencies, no install friction
+- Runs on `127.0.0.1`. Your files stay local unless you explicitly share
+
+## Usage
+
+```bash
+# Review a markdown file (opens browser automatically)
+crit plan.md
+
+# Specify a port
+crit -p 3000 plan.md
+
+# Don't auto-open browser
+crit --no-open plan.md
+
+# Custom output directory for .review.md
+crit -o /tmp plan.md
+```
+
+## Environment Variables
+
+| Variable               | Description                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------ |
+| `CRIT_SHARE_URL`       | Override the Share button URL (defaults to crit.live, useful for self-hosted or local dev) |
+| `CRIT_NO_UPDATE_CHECK` | Set to any value to disable the update check on startup                                    |
 
 ## Build from Source
 
@@ -136,41 +189,10 @@ make build-all
 #   crit-linux-arm64
 ```
 
-## Workflow
-
-```bash
-# 1. AI agent generates a plan
-agent "Write a plan for the new auth service" > auth-plan.md
-
-# 2. Review it
-crit auth-plan.md
-# → Leave comments in the browser
-# → Click "Finish Review" — prompt copied to clipboard
-
-# 3. Hand the review back to your agent
-# (paste the clipboard, or:)
-agent "I've left review comments in auth-plan.review.md — please address
-       each comment and update the plan accordingly."
-
-# 4. The file watcher detects changes, reloads automatically
-# → New round starts, leave more comments, repeat
-```
-
-### Live Reload
-
-Crit watches the source file for changes. After you click "Finish Review" and your agent edits the file, the browser automatically reloads with the updated content and clears previous comments for a fresh review round.
-
-### Output Files
-
-| File                  | Purpose                                                         |
-| --------------------- | --------------------------------------------------------------- |
-| `plan.review.md`      | Original plan + comments as blockquotes — hand to your AI agent |
-| `.plan.comments.json` | Hidden file for session resume (auto-managed)                   |
-
 ## Acknowledgments
 
 Crit embeds the following open-source libraries:
 
-- [markdown-it](https://github.com/markdown-it/markdown-it) — Markdown parser
-- [highlight.js](https://github.com/highlightjs/highlight.js) — Syntax highlighting
-- [Mermaid](https://github.com/mermaid-js/mermaid) — Diagram rendering
+- [markdown-it](https://github.com/markdown-it/markdown-it): Markdown parser
+- [highlight.js](https://github.com/highlightjs/highlight.js): Syntax highlighting
+- [Mermaid](https://github.com/mermaid-js/mermaid): Diagram rendering

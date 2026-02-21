@@ -65,8 +65,8 @@ golangci-lint run ./...           # Lint (should be clean)
 
 - `GET  /api/document` — raw markdown content + filename
 - `GET  /api/comments` — all comments
-- `POST /api/comments` — add comment `{start_line, end_line, body}` (1MB body limit)
-- `PUT  /api/comments/:id` — edit comment `{body}` (1MB body limit)
+- `POST /api/comments` — add comment `{start_line, end_line, body}` (10MB body limit)
+- `PUT  /api/comments/:id` — edit comment `{body}` (10MB body limit)
 - `DELETE /api/comments/:id` — delete comment
 - `POST /api/finish` — write final files, return prompt for agent
 - `GET  /api/events` — SSE stream for file-changed events
@@ -84,7 +84,7 @@ golangci-lint run ./...           # Lint (should be clean)
 
 - Server binds to `127.0.0.1` only
 - `/files/` endpoint validates paths, blocks `..` traversal, verifies resolved path stays within document directory
-- Request body size limited to 1MB via `http.MaxBytesReader`
+- Request body size limited to 10MB for comments, 1MB for share-url via `http.MaxBytesReader`
 - HTTP server has `ReadTimeout: 15s`, `IdleTimeout: 60s` (no `WriteTimeout` — SSE needs open connections)
 - Comment renderer uses `html: false` to prevent XSS in user comments
 - Document renderer uses `html: true` intentionally (reviewing your own local files)
