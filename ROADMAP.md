@@ -43,6 +43,18 @@ Allow comments to be marked as questions with an explicit expected answer. The a
 
 Draft PR: https://github.com/tomasz-tomczyk/crit/pull/11
 
+### Review completion sound
+
+A subtle `AudioContext`-generated tone when the agent signals round complete. The browser tab is likely backgrounded — sound gets attention. Disable with `CRIT_NO_SOUND=1` env var. Small touch, high delight.
+
+### Comment templates
+
+A small "Insert template" dropdown in the comment form with pre-defined starters: "Consider using X instead of Y", "This will fail when...", "Missing error handling for...". Stored in `localStorage`, user-editable. Reduces friction of typing the same comment patterns.
+
+### "Reviewing as..." identity pill (crit.live)
+
+On shared reviews at crit.live, show a persistent header pill: `Reviewing as: Tomasz (purple)`. Makes multi-reviewer sessions feel collaborative rather than anonymous. The color-coding per identity already exists — this surfaces it explicitly.
+
 ---
 
 ## Long-term / Exploratory

@@ -22,7 +22,7 @@ jobs:
         run: go test ./...
 
       - name: Build binaries
-        run: make build-all VERSION=${{ github.ref_name }}
+        run: make build-all VERSION=${{ github.ref_name }} COMMIT=${{ github.sha }} DATE=$(date -u +%Y-%m-%d)
 
       - name: Generate checksums
         working-directory: dist

@@ -143,6 +143,17 @@ Want a second opinion before handing off to the agent? The Share button uploads 
 
 Crit ships with drop-in configuration files for popular AI coding tools. Each one teaches your agent to write a plan, launch `crit` for review, and wait for your feedback before implementing.
 
+The fastest way to set up an integration:
+
+```bash
+crit install claude-code   # or: cursor, windsurf, github-copilot, cline
+crit install all           # install all integrations at once
+```
+
+This copies the right files to the right places in your project. Safe to re-run — existing files are skipped (use `--force` to overwrite).
+
+Or set up manually:
+
 | Tool | Setup |
 |------|-------|
 | **Claude Code** | Copy `integrations/claude-code/crit.md` to `.claude/commands/crit.md` |

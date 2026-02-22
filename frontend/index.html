@@ -375,6 +375,28 @@ html[data-theme="dark"]  .theme-pill-btn[data-for-theme="dark"] { color: var(--a
   from { opacity: 1; transform: translateY(0) scale(1); }
   to { opacity: 0; transform: translateY(-8px) scale(0.98); }
 }
+.bottom-toast-container {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  pointer-events: none;
+}
+.bottom-toast-container .toast {
+  animation: bottom-toast-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+.bottom-toast-container .toast.toast-out {
+  animation: bottom-toast-out 0.2s cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+@keyframes bottom-toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes bottom-toast-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(8px) scale(0.98); }
+}
 .toast.warning {
   background: rgba(255, 158, 100, 0.14);
   border: 1px solid rgba(255, 158, 100, 0.3);
@@ -1027,16 +1049,25 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 .waiting-dialog p { color: var(--fg-secondary); font-size: 14px; margin-bottom: 8px; }
 
 .waiting-spinner {
-  display: inline-block;
-  width: 24px;
-  height: 24px;
-  border: 3px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-  margin-bottom: 12px;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
+.waiting-spinner .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.waiting-spinner .dot:nth-child(2) { animation-delay: 0.2s; }
+.waiting-spinner .dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes pulse {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1.2); }
+}
 
 .waiting-dialog .waiting-edits {
   font-size: 14px;
@@ -1476,6 +1507,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
+<div class="bottom-toast-container" id="bottomToastContainer"></div>
 
 <div id="diffView" class="diff-view" style="display:none"></div>
 
@@ -1485,7 +1517,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
 
 <div class="waiting-overlay" id="waitingOverlay">
   <div class="waiting-dialog">
-    <div class="waiting-spinner"></div>
+    <div class="waiting-spinner"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
     <h3>Review Complete</h3>
     <p id="waitingMessage"></p>
     <p class="waiting-edits" id="waitingEdits"></p>
@@ -1705,10 +1737,28 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
       } catch (_) {}
 
       restoreDraft();
+      showKeyboardHint();
     } catch (err) {
       document.getElementById('document').innerHTML =
         `<div class="loading" style="color:var(--red)">Error loading document: ${err.message}</div>`;
     }
+  }
+
+  function showKeyboardHint() {
+    if (document.cookie.includes('crit-hint=1')) return;
+    document.cookie = 'crit-hint=1; path=/; max-age=315360000; SameSite=Lax';
+    const container = document.getElementById('bottomToastContainer');
+    const el = document.createElement('div');
+    el.className = 'toast success';
+    el.dataset.toastId = 'keyboard-hint';
+    el.innerHTML = `
+      <span>Press <kbd style="background:var(--bg-tertiary);padding:2px 6px;border-radius:4px;font-family:var(--font-mono);font-size:12px;">?</kbd> for keyboard shortcuts</span>
+      <div class="toast-actions">
+        <button class="toast-btn toast-btn-ghost" onclick="dismissToast('keyboard-hint')">Got it</button>
+      </div>
+    `;
+    container.appendChild(el);
+    setTimeout(function() { dismissToast('keyboard-hint'); }, 5000);
   }
 
   // ===== Update Check =====
