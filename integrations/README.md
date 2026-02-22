@@ -8,9 +8,11 @@ Copy the file for your tool into your project.
 |------|-------------|----------------------------|
 | Claude Code | `claude-code/crit.md` | `.claude/commands/crit.md` |
 | Claude Code | `claude-code/CLAUDE.md` (optional) | Append to your `CLAUDE.md` |
-| Cursor | `cursor/crit.mdc` | `.cursor/rules/crit.mdc` |
+| Cursor | `cursor/crit-command.md` | `.cursor/commands/crit.md` |
+| Cursor | `cursor/crit.mdc` (optional) | `.cursor/rules/crit.mdc` |
 | Windsurf | `windsurf/crit.md` | `.windsurf/rules/crit.md` |
-| GitHub Copilot | `github-copilot/copilot-instructions.md` | Append to `.github/copilot-instructions.md` |
+| GitHub Copilot | `github-copilot/crit.prompt.md` | `.github/prompts/crit.prompt.md` |
+| GitHub Copilot | `github-copilot/copilot-instructions.md` (optional) | Append to `.github/copilot-instructions.md` |
 | Aider | `aider/CONVENTIONS.md` | Append to your `CONVENTIONS.md` |
 | Cline | `cline/crit.md` | `.clinerules/crit.md` |
 
@@ -23,4 +25,4 @@ All integrations follow the same pattern:
 3. **Address feedback** - after review, the agent reads the `.review.md` file and revises the plan
 4. **Implement after approval** - only after you approve does the agent write code
 
-The Claude Code integration goes further with a `/crit` slash command that automates the full loop: find the plan, launch Crit, read comments, revise, and signal for another round.
+Claude Code, Cursor, and GitHub Copilot all support a `/crit` slash command that automates the full loop: find the plan, launch Crit, read comments, revise, and signal for another round.

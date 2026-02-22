@@ -136,6 +136,7 @@ Want a second opinion before handing off to the agent? The Share button uploads 
 - Draft autosave. Close your browser mid-review and pick up where you left off
 - Vim keybindings (`j`/`k` navigate, `c` comment, `f` finish, `?` for full reference)
 - Single binary. No daemon, no dependencies, no install friction
+- Concurrent reviews. Each instance runs on its own port, so you can review multiple plans at once
 - Runs on `127.0.0.1`. Your files stay local unless you explicitly share
 
 ## Agent Integrations
@@ -144,25 +145,25 @@ Crit ships with drop-in configuration files for popular AI coding tools. Each on
 
 | Tool | Setup |
 |------|-------|
-| **Claude Code** | Copy `integrations/claude-code/crit.md` to `.claude/commands/crit.md` for the `/crit` slash command. Optionally append the `CLAUDE.md` snippet to your project's `CLAUDE.md` |
-| **Cursor** | Copy `integrations/cursor/crit.mdc` to `.cursor/rules/crit.mdc` |
+| **Claude Code** | Copy `integrations/claude-code/crit.md` to `.claude/commands/crit.md` |
+| **Cursor** | Copy `integrations/cursor/crit-command.md` to `.cursor/commands/crit.md` |
+| **GitHub Copilot** | Copy `integrations/github-copilot/crit.prompt.md` to `.github/prompts/crit.prompt.md` |
 | **Windsurf** | Copy `integrations/windsurf/crit.md` to `.windsurf/rules/crit.md` |
-| **GitHub Copilot** | Append `integrations/github-copilot/copilot-instructions.md` to `.github/copilot-instructions.md` |
 | **Aider** | Append `integrations/aider/CONVENTIONS.md` to your `CONVENTIONS.md` |
 | **Cline** | Copy `integrations/cline/crit.md` to `.clinerules/crit.md` |
 
 See [`integrations/`](integrations/) for the full files and details.
 
-### Claude Code `/crit` command
+### `/crit` command
 
-The Claude Code integration includes a slash command that automates the full loop:
+Claude Code, Cursor, and GitHub Copilot support a `/crit` slash command that automates the full review loop:
 
 ```
 /crit              # Auto-detects the current plan file
 /crit my-plan.md   # Review a specific file
 ```
 
-It launches Crit, waits for your review, reads your comments, revises the plan, and signals Crit for another round.
+It launches Crit, waits for your review, reads your comments, revises the plan, and signals Crit for another round. Other tools use rules files that teach the agent to suggest Crit when writing plans.
 
 ## Usage
 
