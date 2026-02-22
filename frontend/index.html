@@ -1504,7 +1504,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
       <tr><td><kbd>c</kbd></td><td>Comment on focused block</td></tr>
       <tr><td><kbd>e</kbd></td><td>Edit comment on focused block</td></tr>
       <tr><td><kbd>d</kbd></td><td>Delete comment on focused block</td></tr>
-      <tr><td><kbd>f</kbd></td><td>Finish review</td></tr>
+      <tr><td><kbd>Shift</kbd>+<kbd>F</kbd></td><td>Finish review</td></tr>
       <tr><td><kbd>t</kbd></td><td>Toggle table of contents</td></tr>
       <tr><td><kbd>Esc</kbd></td><td>Cancel / clear focus</td></tr>
       <tr><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>Submit comment</td></tr>
@@ -3466,6 +3466,9 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
       return;
     }
 
+    // Let browser handle modifier combos (Cmd+F, Ctrl+C, etc.)
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
     switch (e.key) {
       case 'j': {
         e.preventDefault();
@@ -3540,7 +3543,7 @@ body.dragging .line-block.selected .line-gutter .line-add { display: flex; }
         document.addEventListener('keydown', handleDeleteConfirm, true);
         break;
       }
-      case 'f': {
+      case 'F': {
         e.preventDefault();
         if (uiState !== 'reviewing') return;
         document.getElementById('finishBtn').click();

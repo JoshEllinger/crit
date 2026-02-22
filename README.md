@@ -134,7 +134,7 @@ Want a second opinion before handing off to the agent? The Share button uploads 
 - Syntax highlighting inside code blocks, per-line commentable
 - Dark/light/system theme with persistence
 - Draft autosave. Close your browser mid-review and pick up where you left off
-- Vim keybindings (`j`/`k` navigate, `c` comment, `f` finish, `?` for full reference)
+- Vim keybindings (`j`/`k` navigate, `c` comment, `Shift+F` finish, `?` for full reference)
 - Single binary. No daemon, no dependencies, no install friction
 - Concurrent reviews. Each instance runs on its own port, so you can review multiple plans at once
 - Runs on `127.0.0.1`. Your files stay local unless you explicitly share

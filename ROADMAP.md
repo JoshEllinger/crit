@@ -5,7 +5,7 @@
 - Inline comments (single line + range selection via gutter drag)
 - Split & unified diff between review rounds
 - AI review loop (finish review → clipboard prompt → agent edits → diff)
-- Vim keybindings (`j`/`k`/`c`/`f`)
+- Vim keybindings (`j`/`k`/`c`/`Shift+F`)
 - Share reviews via crit.live
 - Syntax highlighting (13+ languages)
 - Mermaid diagrams
