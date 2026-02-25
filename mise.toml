@@ -1,0 +1,10 @@
+[tools]
+go = "1.26.0"
+
+[env]
+PORT = "8080"
+
+[tasks.up]
+description = "Build and run crit"
+run = "make build && ./crit test-plan.md"
+raw = true
