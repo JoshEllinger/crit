@@ -49,6 +49,24 @@ A 2-minute walkthrough: reviewing a plan, leaving inline comments, handing off t
 
 ## Install
 
+### Quick install (macOS / Linux)
+
+```bash
+# macOS Apple Silicon
+curl -L https://github.com/JoshEllinger/crit/releases/latest/download/crit-darwin-arm64 -o ~/.local/bin/crit && chmod +x ~/.local/bin/crit
+
+# macOS Intel
+curl -L https://github.com/JoshEllinger/crit/releases/latest/download/crit-darwin-amd64 -o ~/.local/bin/crit && chmod +x ~/.local/bin/crit
+
+# Linux x86_64
+curl -L https://github.com/JoshEllinger/crit/releases/latest/download/crit-linux-amd64 -o ~/.local/bin/crit && chmod +x ~/.local/bin/crit
+
+# Linux ARM64
+curl -L https://github.com/JoshEllinger/crit/releases/latest/download/crit-linux-arm64 -o ~/.local/bin/crit && chmod +x ~/.local/bin/crit
+```
+
+Make sure `~/.local/bin` is on your `PATH`. To update, just re-run the same command.
+
 ### Go
 
 ```bash
@@ -57,7 +75,7 @@ go install github.com/JoshEllinger/crit@latest
 
 ### Download Binary
 
-Grab the latest binary for your platform from [Releases](https://github.com/JoshEllinger/crit/releases).
+Or grab the latest binary for your platform from [Releases](https://github.com/JoshEllinger/crit/releases).
 
 ## Features
 
