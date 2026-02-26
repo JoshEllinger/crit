@@ -137,10 +137,6 @@ func main() {
 	if *shareURL == "" {
 		*shareURL = os.Getenv("CRIT_SHARE_URL")
 	}
-	if *shareURL == "" {
-		*shareURL = "https://crit.live"
-	}
-
 	srv, err := NewServer(doc, frontendFS, *shareURL, version, addr.Port)
 	if err != nil {
 		log.Fatalf("Error creating server: %v", err)
@@ -206,14 +202,13 @@ Options:
   -p, --port <port>           Port to listen on (default: random)
   -o, --output <dir>          Output directory for review files
       --no-open               Don't auto-open browser
-      --share-url <url>       Share service URL (default: https://crit.live)
+      --share-url <url>       Share service URL (no default)
   -v, --version               Print version
 
 Environment:
   CRIT_SHARE_URL              Override the share service URL
   CRIT_NO_UPDATE_CHECK        Disable update check on startup
 
-Learn more: https://crit.live
 `)
 }
 

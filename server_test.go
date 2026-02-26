@@ -372,7 +372,7 @@ func TestHandleFiles_MethodNotAllowed(t *testing.T) {
 
 func TestGetConfig(t *testing.T) {
 	s, _ := newTestServer(t)
-	s.shareURL = "https://crit.live"
+	s.shareURL = "https://example.com/share"
 	s.currentVersion = "v1.2.3"
 
 	req := httptest.NewRequest("GET", "/api/config", nil)
@@ -386,8 +386,8 @@ func TestGetConfig(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp["share_url"] != "https://crit.live" {
-		t.Errorf("share_url = %q, want https://crit.live", resp["share_url"])
+	if resp["share_url"] != "https://example.com/share" {
+		t.Errorf("share_url = %q, want https://example.com/share", resp["share_url"])
 	}
 	if resp["hosted_url"] != "" {
 		t.Errorf("hosted_url should be empty initially, got %q", resp["hosted_url"])
@@ -402,7 +402,7 @@ func TestGetConfig(t *testing.T) {
 
 func TestCheckForUpdates(t *testing.T) {
 	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/tomasz-tomczyk/crit/releases/latest" {
+		if r.URL.Path != "/repos/JoshEllinger/crit/releases/latest" {
 			http.NotFound(w, r)
 			return
 		}
@@ -415,10 +415,10 @@ func TestCheckForUpdates(t *testing.T) {
 	s.currentVersion = "v1.0.0"
 
 	// Swap the GitHub URL for the mock server
-	origURL := "https://api.github.com/repos/tomasz-tomczyk/crit/releases/latest"
+	origURL := "https://api.github.com/repos/JoshEllinger/crit/releases/latest"
 	_ = origURL // not used directly — checkForUpdates has it hardcoded, so we test via integration
 	// Instead, call the handler directly with our mock to test the parsing logic
-	req, _ := http.NewRequest("GET", gh.URL+"/repos/tomasz-tomczyk/crit/releases/latest", nil)
+	req, _ := http.NewRequest("GET", gh.URL+"/repos/JoshEllinger/crit/releases/latest", nil)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -468,7 +468,7 @@ func TestGetConfig_MethodNotAllowed(t *testing.T) {
 func TestPostShareURL(t *testing.T) {
 	s, doc := newTestServer(t)
 
-	body := `{"url":"https://crit.live/r/abc123"}`
+	body := `{"url":"https://example.com/share/r/abc123"}`
 	req := httptest.NewRequest("POST", "/api/share-url", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -477,8 +477,8 @@ func TestPostShareURL(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
-	if doc.GetSharedURL() != "https://crit.live/r/abc123" {
-		t.Errorf("shared URL = %q, want https://crit.live/r/abc123", doc.GetSharedURL())
+	if doc.GetSharedURL() != "https://example.com/share/r/abc123" {
+		t.Errorf("shared URL = %q, want https://example.com/share/r/abc123", doc.GetSharedURL())
 	}
 
 	// Verify config now reflects the stored URL
@@ -489,8 +489,8 @@ func TestPostShareURL(t *testing.T) {
 	if err := json.Unmarshal(w2.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp["hosted_url"] != "https://crit.live/r/abc123" {
-		t.Errorf("hosted_url = %q, want https://crit.live/r/abc123", resp["hosted_url"])
+	if resp["hosted_url"] != "https://example.com/share/r/abc123" {
+		t.Errorf("hosted_url = %q, want https://example.com/share/r/abc123", resp["hosted_url"])
 	}
 }
 
@@ -524,7 +524,7 @@ func TestGetConfig_IncludesDeleteToken(t *testing.T) {
 func TestPostShareURL_SavesDeleteToken(t *testing.T) {
 	s, doc := newTestServer(t)
 
-	body := `{"url":"https://crit.live/r/abc","delete_token":"deletetoken1234567890x"}`
+	body := `{"url":"https://example.com/share/r/abc","delete_token":"deletetoken1234567890x"}`
 	req := httptest.NewRequest("POST", "/api/share-url", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -540,7 +540,7 @@ func TestPostShareURL_SavesDeleteToken(t *testing.T) {
 
 func TestDeleteShareURL(t *testing.T) {
 	s, doc := newTestServer(t)
-	doc.SetSharedURL("https://crit.live/r/abc")
+	doc.SetSharedURL("https://example.com/share/r/abc")
 	doc.SetDeleteToken("sometoken1234567890123")
 
 	req := httptest.NewRequest("DELETE", "/api/share-url", nil)

@@ -49,8 +49,8 @@ go build -o crit .                                    # Build
 go test ./...                                         # Run all tests
 ./crit test-plan.md                                   # Run (opens browser)
 ./crit --no-open --port 3000 test-plan.md             # Headless on fixed port
-./crit --share-url https://crit.live test-plan.md     # Enable Share button
-CRIT_SHARE_URL=https://crit.live ./crit test-plan.md  # Same via env var
+./crit --share-url https://share.example.com test-plan.md  # Enable Share button (requires self-hosted crit-web)
+CRIT_SHARE_URL=https://share.example.com ./crit test-plan.md  # Same via env var
 make build-all                                        # Cross-compile to dist/
 ```
 
@@ -118,7 +118,7 @@ The header has a 3-button theme pill (System / Light / Dark) replacing the old s
 
 ## Share Feature
 
-When `--share-url` (or `CRIT_SHARE_URL`) is set:
+The Share feature requires an explicit `--share-url` or `CRIT_SHARE_URL` pointing to a self-hosted crit-web instance. When set:
 - The Share button appears in the header.
 - Clicking it POSTs the current document + comments to `{share_url}/api/reviews` (crit-web API).
 - The response `{url, delete_token}` is persisted to `.comments.json` via `POST /api/share-url`.
@@ -137,16 +137,9 @@ When the agent runs `crit go <PORT>` (or calls `POST /api/round-complete`), the 
 
 Releases are fully automated via GitHub Actions (`.github/workflows/release.yml`). To cut a release:
 
-Before tagging, bump the version in `flake.nix`:
-
-```nix
-version = "0.x.y";
-```
-
-Then commit, tag, and push:
+To cut a release, tag and push:
 
 ```bash
-git add flake.nix && git commit -m "chore: bump Nix flake version to v0.x.y"
 git tag v0.x.y && git push origin main v0.x.y
 ```
 
@@ -155,15 +148,14 @@ Pushing the tag triggers the workflow, which:
 2. Cross-compiles binaries for darwin/linux (arm64/amd64) with the version injected via ldflags
 3. Generates SHA256 checksums
 4. Creates a GitHub release with auto-generated notes and all binaries attached
-5. Updates the Homebrew tap formula (`tomasz-tomczyk/homebrew-tap`)
 
 The version string lives in `main.go` as `var version = "dev"` and is overridden at build time. There is no version constant to update manually — the tag is the single source of truth.
 
 ### Release Notes
 
 After CI creates the release, update it with proper release notes using `gh release edit`. List each change as a bullet point:
-- PRs: link to the PR (e.g., `[#4](https://github.com/tomasz-tomczyk/crit/pull/4)`)
-- Direct commits: link to the commit with short SHA (e.g., `` [`e283708`](https://github.com/tomasz-tomczyk/crit/commit/<full-sha>) ``)
+- PRs: link to the PR (e.g., `[#4](https://github.com/JoshEllinger/crit/pull/4)`)
+- Direct commits: link to the commit with short SHA (e.g., `` [`e283708`](https://github.com/JoshEllinger/crit/commit/<full-sha>) ``)
 - Exclude the version bump commit itself
 - End with a Full Changelog compare link
 
@@ -175,10 +167,10 @@ Example:
 gh release edit v0.x.y --notes "$(cat <<'EOF'
 ## What's Changed
 
-- Description of change ([#N](https://github.com/tomasz-tomczyk/crit/pull/N))
-- Description of change ([`abcdef0`](https://github.com/tomasz-tomczyk/crit/commit/<full-sha>))
+- Description of change ([#N](https://github.com/JoshEllinger/crit/pull/N))
+- Description of change ([`abcdef0`](https://github.com/JoshEllinger/crit/commit/<full-sha>))
 
-**Full Changelog**: https://github.com/tomasz-tomczyk/crit/compare/v0.x.y-1...v0.x.y
+**Full Changelog**: https://github.com/JoshEllinger/crit/compare/v0.x.y-1...v0.x.y
 EOF
 )"
 ```

@@ -6,6 +6,8 @@ Your agent wrote a plan. Before it starts rewriting your codebase, review that p
 
 Works with Claude Code, Cursor, GitHub Copilot, Aider, Cline, Windsurf, or any agent that reads files.
 
+> **Note:** This is a fork of [tomasz-tomczyk/crit](https://github.com/tomasz-tomczyk/crit). The only difference is that the built-in sharing to crit.live is removed, so you don't accidentally upload your plans to a third-party service. Sharing still works if you self-host a crit-web instance and pass `--share-url`.
+
 ![Crit review UI](images/demo-overview.png)
 
 ## Workflow
@@ -47,33 +49,15 @@ A 2-minute walkthrough: reviewing a plan, leaving inline comments, handing off t
 
 ## Install
 
-### Homebrew (macOS / Linux)
-
-```bash
-brew install tomasz-tomczyk/tap/crit
-```
-
 ### Go
 
 ```bash
-go install github.com/tomasz-tomczyk/crit@latest
-```
-
-### Nix
-
-```bash
-nix profile install github:tomasz-tomczyk/crit
-```
-
-Or in a `flake.nix`:
-
-```nix
-inputs.crit.url = "github:tomasz-tomczyk/crit";
+go install github.com/JoshEllinger/crit@latest
 ```
 
 ### Download Binary
 
-Grab the latest binary for your platform from [Releases](https://github.com/tomasz-tomczyk/crit/releases).
+Grab the latest binary for your platform from [Releases](https://github.com/JoshEllinger/crit/releases).
 
 ## Features
 
@@ -103,7 +87,7 @@ Select lines and use "Insert suggestion" to pre-fill the comment with the origin
 
 ### Share for async review
 
-Want a second opinion before handing off to the agent? The Share button uploads your review to [crit.live](https://crit.live) and gives you a public URL anyone can open in a browser, no install needed. Each reviewer's comments are color-coded by author. Unpublish anytime.
+Share reviews with others by running with `--share-url` pointed at a self-hosted crit-web instance. The Share button uploads your review and gives you a URL anyone can open in a browser. Each reviewer's comments are color-coded by author. Unpublish anytime.
 
 ### Finish review: prompt copied to clipboard
 
@@ -186,7 +170,7 @@ crit -o /tmp plan.md
 
 | Variable               | Description                                                                                |
 | ---------------------- | ------------------------------------------------------------------------------------------ |
-| `CRIT_SHARE_URL`       | Override the Share button URL (defaults to crit.live, useful for self-hosted or local dev) |
+| `CRIT_SHARE_URL`       | Share service URL for the Share button (requires a self-hosted crit-web instance) |
 | `CRIT_NO_UPDATE_CHECK` | Set to any value to disable the update check on startup                                    |
 
 ## Build from Source
@@ -195,7 +179,7 @@ Requires Go 1.25+ (install via [asdf](https://asdf-vm.com/), Homebrew, or [go.de
 
 ```bash
 # Clone and build
-git clone https://github.com/tomasz-tomczyk/crit.git
+git clone https://github.com/JoshEllinger/crit.git
 cd crit
 go build -o crit .
 

@@ -70,7 +70,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) checkForUpdates() {
 	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest("GET", "https://api.github.com/repos/tomasz-tomczyk/crit/releases/latest", nil)
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/JoshEllinger/crit/releases/latest", nil)
 	if err != nil {
 		return
 	}

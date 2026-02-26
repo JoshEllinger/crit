@@ -247,9 +247,9 @@ func TestSetGetSharedURL(t *testing.T) {
 	if doc.GetSharedURL() != "" {
 		t.Error("expected empty shared URL initially")
 	}
-	doc.SetSharedURL("https://crit.live/r/abc123")
-	if doc.GetSharedURL() != "https://crit.live/r/abc123" {
-		t.Errorf("shared URL = %q, want https://crit.live/r/abc123", doc.GetSharedURL())
+	doc.SetSharedURL("https://example.com/share/r/abc123")
+	if doc.GetSharedURL() != "https://example.com/share/r/abc123" {
+		t.Errorf("shared URL = %q, want https://example.com/share/r/abc123", doc.GetSharedURL())
 	}
 }
 
@@ -265,7 +265,7 @@ func writeAndStop(doc *Document) {
 func TestSharedURL_PersistedAndLoaded(t *testing.T) {
 	doc := newTestDoc(t, "line1\nline2")
 	doc.AddComment(1, 1, "note")
-	doc.SetSharedURL("https://crit.live/r/persisted")
+	doc.SetSharedURL("https://example.com/share/r/persisted")
 	writeAndStop(doc)
 
 	// Reload from same path/dir — should restore shared URL
@@ -273,15 +273,15 @@ func TestSharedURL_PersistedAndLoaded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if doc2.GetSharedURL() != "https://crit.live/r/persisted" {
-		t.Errorf("shared URL after reload = %q, want https://crit.live/r/persisted", doc2.GetSharedURL())
+	if doc2.GetSharedURL() != "https://example.com/share/r/persisted" {
+		t.Errorf("shared URL after reload = %q, want https://example.com/share/r/persisted", doc2.GetSharedURL())
 	}
 }
 
 func TestSharedURL_PersistsWhenStale(t *testing.T) {
 	doc := newTestDoc(t, "original")
 	doc.AddComment(1, 1, "note")
-	doc.SetSharedURL("https://crit.live/r/stale-test")
+	doc.SetSharedURL("https://example.com/share/r/stale-test")
 	writeAndStop(doc)
 
 	// Change the file so the hash won't match on next load
@@ -294,8 +294,8 @@ func TestSharedURL_PersistsWhenStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Even though file changed (stale), shared URL should still be loaded
-	if doc2.GetSharedURL() != "https://crit.live/r/stale-test" {
-		t.Errorf("shared URL after stale reload = %q, want https://crit.live/r/stale-test", doc2.GetSharedURL())
+	if doc2.GetSharedURL() != "https://example.com/share/r/stale-test" {
+		t.Errorf("shared URL after stale reload = %q, want https://example.com/share/r/stale-test", doc2.GetSharedURL())
 	}
 	// Comments should NOT be loaded (stale)
 	if len(doc2.GetComments()) != 0 {
@@ -306,7 +306,7 @@ func TestSharedURL_PersistsWhenStale(t *testing.T) {
 func TestWriteFiles_SharedURLOnlyCreatesFile(t *testing.T) {
 	doc := newTestDoc(t, "line1")
 	// No comments — only a shared URL
-	doc.SetSharedURL("https://crit.live/r/urlonly")
+	doc.SetSharedURL("https://example.com/share/r/urlonly")
 	writeAndStop(doc)
 
 	// Comments file should exist even though there are no comments
@@ -318,8 +318,8 @@ func TestWriteFiles_SharedURLOnlyCreatesFile(t *testing.T) {
 	if err := json.Unmarshal(data, &cf); err != nil {
 		t.Fatal(err)
 	}
-	if cf.ShareURL != "https://crit.live/r/urlonly" {
-		t.Errorf("share_url in file = %q, want https://crit.live/r/urlonly", cf.ShareURL)
+	if cf.ShareURL != "https://example.com/share/r/urlonly" {
+		t.Errorf("share_url in file = %q, want https://example.com/share/r/urlonly", cf.ShareURL)
 	}
 }
 

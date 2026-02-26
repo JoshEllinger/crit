@@ -41,7 +41,7 @@ Allow comments to be marked as questions with an explicit expected answer. The a
 
 ### More themes
 
-Draft PR: https://github.com/tomasz-tomczyk/crit/pull/11
+Draft PR: https://github.com/JoshEllinger/crit/pull/11
 
 ### Review completion sound
 
