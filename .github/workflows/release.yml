@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,8 +21,55 @@ jobs:
       - name: Run tests
         run: go test ./...
 
-      - name: Build binaries
-        run: make build-all VERSION=${{ github.ref_name }} COMMIT=${{ github.sha }} DATE=$(date -u +%Y-%m-%d)
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build Linux binaries
+        run: make build-linux VERSION=${{ github.ref_name }} COMMIT=${{ github.sha }} DATE=$(date -u +%Y-%m-%d)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/
+
+  build-macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build macOS binaries
+        run: make build-macos VERSION=${{ github.ref_name }} COMMIT=${{ github.sha }} DATE=$(date -u +%Y-%m-%d)
+
+      - name: Sign macOS binaries
+        run: |
+          codesign --force --sign - dist/crit-darwin-arm64
+          codesign --force --sign - dist/crit-darwin-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries
+          path: dist/
+
+  release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
 
       - name: Generate checksums
         working-directory: dist
@@ -35,4 +82,3 @@ jobs:
           files: |
             dist/crit-*
             dist/checksums.txt
-
