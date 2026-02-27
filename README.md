@@ -138,8 +138,9 @@ Crit ships with drop-in configuration files for popular AI coding tools. Each on
 The fastest way to set up an integration:
 
 ```bash
-crit install claude-code   # or: cursor, windsurf, github-copilot, cline
-crit install all           # install all integrations at once
+crit install claude-code          # or: cursor, windsurf, github-copilot, cline
+crit install all                  # install all integrations at once
+crit install claude-code --global # install to ~/.claude/commands/ (available in all projects)
 ```
 
 This copies the right files to the right places in your project. Safe to re-run - existing files are skipped (use `--force` to overwrite).

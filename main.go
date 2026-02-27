@@ -72,6 +72,12 @@ func main() {
 		}
 		target := os.Args[2]
 		if target == "all" {
+			for _, arg := range os.Args[3:] {
+				if arg == "--global" || arg == "-g" {
+					fmt.Fprintln(os.Stderr, "Error: --global is not supported with 'all'")
+					os.Exit(1)
+				}
+			}
 			for _, name := range availableIntegrations() {
 				installIntegration(name)
 			}
@@ -271,16 +277,35 @@ func installIntegration(name string) {
 	}
 
 	force := false
+	global := false
 	for _, arg := range os.Args[3:] {
 		if arg == "--force" || arg == "-f" {
 			force = true
 		}
+		if arg == "--global" || arg == "-g" {
+			global = true
+		}
+	}
+
+	var homeDir string
+	if global {
+		var err error
+		homeDir, err = os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting home directory: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	for _, f := range files {
+		dest := f.dest
+		if global {
+			dest = filepath.Join(homeDir, f.dest)
+		}
+
 		if !force {
-			if _, err := os.Stat(f.dest); err == nil {
-				fmt.Printf("  Skipped:   %s (already exists, use --force to overwrite)\n", f.dest)
+			if _, err := os.Stat(dest); err == nil {
+				fmt.Printf("  Skipped:   %s (already exists, use --force to overwrite)\n", dest)
 				continue
 			}
 		}
@@ -291,18 +316,18 @@ func installIntegration(name string) {
 			os.Exit(1)
 		}
 
-		dir := filepath.Dir(f.dest)
+		dir := filepath.Dir(dest)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", dir, err)
 			os.Exit(1)
 		}
 
-		if err := os.WriteFile(f.dest, data, 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", f.dest, err)
+		if err := os.WriteFile(dest, data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", dest, err)
 			os.Exit(1)
 		}
 
-		fmt.Printf("  Installed: %s\n", f.dest)
+		fmt.Printf("  Installed: %s\n", dest)
 	}
 	if files[0].hint != "" {
 		fmt.Printf("  %s\n", files[0].hint)
