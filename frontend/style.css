@@ -361,15 +361,7 @@ body {
   align-items: flex-start;
   justify-content: flex-end;
 }
-/* Hide line numbers in document view — keep gutter for comment interaction */
-.document-wrapper .line-gutter {
-  min-width: 0;
-  width: 0;
-  padding: 0;
-}
-.document-wrapper .line-num {
-  display: none;
-}
+/* Line numbers visible in document view */
 .document-wrapper .line-comment-gutter {
   margin-left: 0;
 }
@@ -529,6 +521,16 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   border: none;
   padding: 0;
   font-size: inherit;
+}
+/* Wrap long code lines in document view (file-mode code files, markdown fences) */
+.document-wrapper .line-content.code-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Full-file code document view — no borders */
+.document-wrapper.code-document .line-content.code-line {
+  border-left: none;
+  border-right: none;
 }
 .line-content.code-first {
   border-top: 1px solid var(--border);

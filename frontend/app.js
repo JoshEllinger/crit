@@ -106,6 +106,11 @@
       if (f.fileType === 'code') {
         f.highlightCache = preHighlightFile(f);
         f.lang = langFromPath(f.path);
+
+        // In file mode, build line blocks so code files render as document view
+        if (session.mode !== 'git') {
+          f.lineBlocks = buildCodeLineBlocks(f);
+        }
       }
 
       // Parse markdown content into line blocks
@@ -390,6 +395,29 @@
       result.push(fullLine + suffix);
     }
     return result;
+  }
+
+  // Build line blocks for code files in file mode (document view)
+  function buildCodeLineBlocks(file) {
+    const lines = file.content.split('\n');
+    const blocks = [];
+    for (let i = 0; i < lines.length; i++) {
+      const lineNum = i + 1;
+      let html;
+      if (file.highlightCache && file.highlightCache[lineNum]) {
+        html = '<code class="hljs">' + file.highlightCache[lineNum] + '</code>';
+      } else {
+        html = '<code class="hljs">' + escapeHtml(lines[i] || '') + '</code>';
+      }
+      blocks.push({
+        startLine: lineNum,
+        endLine: lineNum,
+        html: html,
+        isEmpty: lines[i].trim() === '',
+        cssClass: 'code-line'
+      });
+    }
+    return blocks;
   }
 
   function buildLineBlocks(tokens, md, content) {
@@ -1169,7 +1197,7 @@
     const body = document.createElement('div');
     body.className = 'file-body';
 
-    var showDiff = file.viewMode === 'diff' || file.fileType === 'code';
+    var showDiff = file.viewMode === 'diff' || (file.fileType === 'code' && session.mode === 'git');
 
     if (file.status === 'deleted' && (!file.diffHunks || file.diffHunks.length === 0)) {
       const deleted = document.createElement('div');
@@ -1521,7 +1549,7 @@
   // ===== Document View (Markdown) =====
   function renderDocumentView(file) {
     const container = document.createElement('div');
-    container.className = 'document-wrapper';
+    container.className = 'document-wrapper' + (file.fileType === 'code' ? ' code-document' : '');
     if (!file.lineBlocks) return container;
 
     const commentsMap = buildCommentsMap(file.comments);

@@ -103,12 +103,43 @@ test.describe('File Mode — Scope Cookie Resilience', () => {
 });
 
 test.describe('File Mode — Code Files', () => {
-  test('code files show "No changes" placeholder (no git diff available)', async ({ page }) => {
+  test('code files render in document view with line blocks', async ({ page }) => {
     await loadPage(page);
-    // handler.js is a code file — in file mode it has no diff data
     const jsSection = page.locator('.file-section').filter({ hasText: 'handler.js' });
-    const noChanges = jsSection.locator('.diff-no-changes, :text("No changes")');
-    await expect(noChanges.first()).toBeVisible();
+    const docWrapper = jsSection.locator('.document-wrapper');
+    await expect(docWrapper).toBeVisible();
+    const lineBlocks = jsSection.locator('.line-block');
+    const count = await lineBlocks.count();
+    expect(count).toBeGreaterThan(0);
+  });
+
+  test('code files have syntax-highlighted content', async ({ page }) => {
+    await loadPage(page);
+    const jsSection = page.locator('.file-section').filter({ hasText: 'handler.js' });
+    // Code lines should contain hljs-highlighted code
+    const codeLine = jsSection.locator('.line-content.code-line').first();
+    await expect(codeLine).toBeVisible();
+    await expect(codeLine.locator('code.hljs')).toBeVisible();
+  });
+
+  test('code files have commentable line gutters', async ({ page }) => {
+    await loadPage(page);
+    const jsSection = page.locator('.file-section').filter({ hasText: 'handler.js' });
+    const lineBlock = jsSection.locator('.line-block').first();
+    await lineBlock.hover();
+    const commentGutter = jsSection.locator('.line-comment-gutter').first();
+    await expect(commentGutter).toBeVisible();
+  });
+
+  test('go file renders with line numbers', async ({ page }) => {
+    await loadPage(page);
+    const goSection = page.locator('.file-section').filter({ hasText: 'server.go' });
+    const docWrapper = goSection.locator('.document-wrapper');
+    await expect(docWrapper).toBeVisible();
+    // Check line numbers exist
+    const lineNums = goSection.locator('.line-num');
+    const count = await lineNums.count();
+    expect(count).toBeGreaterThan(0);
   });
 
   test('markdown file has commentable line gutters in file mode', async ({ page }) => {
