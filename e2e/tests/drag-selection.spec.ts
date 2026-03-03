@@ -72,6 +72,85 @@ test.describe('Markdown Drag Selection — Git Mode', () => {
 });
 
 // ============================================================
+// Line highlight cleared after comment submit/cancel
+// ============================================================
+test.describe('Line Highlight Cleared — Markdown Git Mode', () => {
+  test.beforeEach(async ({ page, request }) => {
+    await clearAllComments(request);
+    await loadPage(page);
+    await switchToDocumentView(page);
+  });
+
+  test('drag-select then submit clears all selected/focused classes', async ({ page }) => {
+    const section = mdSection(page);
+    const gutters = section.locator('.line-comment-gutter');
+    const firstGutter = gutters.nth(0);
+    const thirdGutter = gutters.nth(2);
+
+    await expect(firstGutter).toBeAttached();
+    await expect(thirdGutter).toBeAttached();
+    await dragBetween(page, firstGutter, thirdGutter);
+
+    // Verify selection exists before submit
+    const form = page.locator('.comment-form');
+    await expect(form).toBeVisible();
+
+    // Submit the comment
+    await page.locator('.comment-form textarea').fill('Test comment');
+    await page.locator('.comment-form .btn-primary').click();
+    await expect(page.locator('.comment-card')).toBeVisible();
+
+    // No line blocks should have .selected or .focused
+    await expect(section.locator('.line-block.selected')).toHaveCount(0);
+    await expect(section.locator('.line-block.focused')).toHaveCount(0);
+  });
+
+  test('drag-select then cancel clears all selected/focused classes', async ({ page }) => {
+    const section = mdSection(page);
+    const gutters = section.locator('.line-comment-gutter');
+    const firstGutter = gutters.nth(0);
+    const thirdGutter = gutters.nth(2);
+
+    await expect(firstGutter).toBeAttached();
+    await expect(thirdGutter).toBeAttached();
+    await dragBetween(page, firstGutter, thirdGutter);
+
+    const form = page.locator('.comment-form');
+    await expect(form).toBeVisible();
+
+    // Cancel the comment
+    await page.locator('.comment-form button', { hasText: 'Cancel' }).click();
+    await expect(form).toBeHidden();
+
+    // No line blocks should have .selected or .focused
+    await expect(section.locator('.line-block.selected')).toHaveCount(0);
+    await expect(section.locator('.line-block.focused')).toHaveCount(0);
+  });
+
+  test('single-line click then submit clears all selected/focused classes', async ({ page }) => {
+    const section = mdSection(page);
+    const lineBlock = section.locator('.line-block').first();
+    await lineBlock.hover();
+
+    const gutterBtn = section.locator('.line-comment-gutter').first();
+    await expect(gutterBtn).toBeVisible();
+    await gutterBtn.click();
+
+    const form = page.locator('.comment-form');
+    await expect(form).toBeVisible();
+
+    // Submit
+    await page.locator('.comment-form textarea').fill('Single line comment');
+    await page.locator('.comment-form .btn-primary').click();
+    await expect(page.locator('.comment-card')).toBeVisible();
+
+    // No line blocks should have .selected or .focused
+    await expect(section.locator('.line-block.selected')).toHaveCount(0);
+    await expect(section.locator('.line-block.focused')).toHaveCount(0);
+  });
+});
+
+// ============================================================
 // Diff Drag Selection — Split Mode (git mode — code files)
 // ============================================================
 test.describe('Diff Drag Selection — Split Mode', () => {
