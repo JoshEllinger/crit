@@ -2697,6 +2697,9 @@
     activeFilePath = null;
     selectionStart = null;
     selectionEnd = null;
+    focusedBlockIndex = null;
+    focusedFilePath = null;
+    focusedElement = null;
     renderFileByPath(rerenderPath);
     renderFileSummary();
     updateCommentCount();
@@ -2709,6 +2712,9 @@
     activeFilePath = null;
     selectionStart = null;
     selectionEnd = null;
+    focusedBlockIndex = null;
+    focusedFilePath = null;
+    focusedElement = null;
     if (rerenderPath) {
       renderFileByPath(rerenderPath);
     } else {
