@@ -64,6 +64,7 @@ type Session struct {
 	Branch      string
 	BaseRef     string
 	RepoRoot    string
+	OutputDir   string // custom output directory for .crit.json (empty = RepoRoot)
 	ReviewRound int
 
 	mu             sync.RWMutex
@@ -602,7 +603,11 @@ func (s *Session) scheduleWrite() {
 
 // critJSONPath returns the path to the .crit.json file.
 func (s *Session) critJSONPath() string {
-	return filepath.Join(s.RepoRoot, ".crit.json")
+	dir := s.RepoRoot
+	if s.OutputDir != "" {
+		dir = s.OutputDir
+	}
+	return filepath.Join(dir, ".crit.json")
 }
 
 // WriteFiles writes the .crit.json file to disk.

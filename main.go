@@ -88,6 +88,8 @@ func main() {
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.BoolVar(showVersion, "v", false, "Print version and exit (shorthand)")
 	shareURL := flag.String("share-url", "", "Base URL of hosted Crit service for sharing reviews (overrides CRIT_SHARE_URL env var)")
+	outputDir := flag.String("output", "", "Output directory for .crit.json (default: repo root or file directory)")
+	flag.StringVar(outputDir, "o", "", "Output directory for .crit.json (shorthand)")
 	quiet := flag.Bool("quiet", false, "Suppress status output")
 	flag.BoolVar(quiet, "q", false, "Suppress status output (shorthand)")
 	flag.Usage = func() {
@@ -121,6 +123,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error: %v", err)
 		}
+	}
+
+	if *outputDir != "" {
+		abs, err := filepath.Abs(*outputDir)
+		if err != nil {
+			log.Fatalf("Error resolving output directory: %v", err)
+		}
+		session.OutputDir = abs
 	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
@@ -204,6 +214,7 @@ Agents:
 
 Options:
   -p, --port <port>           Port to listen on (default: random)
+  -o, --output <dir>          Output directory for .crit.json
       --no-open               Don't auto-open browser
   -q, --quiet                 Suppress status output
       --share-url <url>       Share service URL (default: https://crit.live)

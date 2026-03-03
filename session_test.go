@@ -459,6 +459,87 @@ func TestSession_GetFileContent(t *testing.T) {
 	}
 }
 
+func TestSession_CritJSONPath_Default(t *testing.T) {
+	s := newTestSession(t)
+	want := filepath.Join(s.RepoRoot, ".crit.json")
+	if got := s.critJSONPath(); got != want {
+		t.Errorf("critJSONPath() = %q, want %q", got, want)
+	}
+}
+
+func TestSession_CritJSONPath_OutputDir(t *testing.T) {
+	s := newTestSession(t)
+	outDir := t.TempDir()
+	s.OutputDir = outDir
+
+	want := filepath.Join(outDir, ".crit.json")
+	if got := s.critJSONPath(); got != want {
+		t.Errorf("critJSONPath() = %q, want %q", got, want)
+	}
+}
+
+func TestSession_WriteFiles_OutputDir(t *testing.T) {
+	s := newTestSession(t)
+	outDir := t.TempDir()
+	s.OutputDir = outDir
+
+	s.AddComment("plan.md", 1, 1, "", "output dir comment")
+	s.mu.Lock()
+	if s.writeTimer != nil {
+		s.writeTimer.Stop()
+	}
+	s.mu.Unlock()
+	s.WriteFiles()
+
+	// Should be written to OutputDir, not RepoRoot
+	outPath := filepath.Join(outDir, ".crit.json")
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf(".crit.json not written to output dir: %v", err)
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		t.Fatal(err)
+	}
+	if len(cj.Files["plan.md"].Comments) != 1 {
+		t.Errorf("expected 1 comment, got %d", len(cj.Files["plan.md"].Comments))
+	}
+
+	// Should NOT exist in RepoRoot
+	repoPath := filepath.Join(s.RepoRoot, ".crit.json")
+	if _, err := os.Stat(repoPath); !os.IsNotExist(err) {
+		t.Error("expected .crit.json to NOT be written to RepoRoot when OutputDir is set")
+	}
+}
+
+func TestSession_LoadCritJSON_OutputDir(t *testing.T) {
+	s := newTestSession(t)
+	outDir := t.TempDir()
+	s.OutputDir = outDir
+
+	s.AddComment("plan.md", 1, 1, "", "persisted in output dir")
+	s.mu.Lock()
+	if s.writeTimer != nil {
+		s.writeTimer.Stop()
+	}
+	s.mu.Unlock()
+	s.WriteFiles()
+
+	// Create a new session pointing to same output dir
+	s2 := newTestSession(t)
+	s2.OutputDir = outDir
+	s2.Files[0].FileHash = s.Files[0].FileHash
+	s2.loadCritJSON()
+
+	comments := s2.GetComments("plan.md")
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 loaded comment, got %d", len(comments))
+	}
+	if comments[0].Body != "persisted in output dir" {
+		t.Errorf("Body = %q", comments[0].Body)
+	}
+}
+
 func TestSession_PerFileCommentIDs(t *testing.T) {
 	s := newTestSession(t)
 	c1, _ := s.AddComment("plan.md", 1, 1, "", "md comment")
