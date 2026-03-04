@@ -155,9 +155,9 @@ test.describe('Markdown Document/Diff Toggle — Git Mode', () => {
     await section.locator('.file-header-toggle .toggle-btn[data-mode="document"]').click();
     await expect(section.locator('.document-wrapper')).toBeVisible();
 
-    // Line blocks should exist but none should have the changed indicator
+    // Line blocks should exist but none should have any change indicator
     await expect(section.locator('.line-block').first()).toBeVisible();
-    await expect(section.locator('.line-block-changed')).toHaveCount(0);
+    await expect(section.locator('.line-block-added, .line-block-modified, .deletion-marker')).toHaveCount(0);
 
     // Change navigation widget should not be visible
     await expect(section.locator('.change-nav')).not.toBeVisible();

@@ -1096,7 +1096,11 @@
 
   function buildChangeGroups() {
     changeGroups = [];
-    var all = document.querySelectorAll('.line-block-changed');
+    // Document view: color-coded change blocks + deletion markers
+    var docEls = document.querySelectorAll('.line-block-added, .line-block-modified, .deletion-marker');
+    // Diff view: diff-added and diff-removed blocks in rendered diff (file mode)
+    var diffEls = document.querySelectorAll('.diff-view .line-block.diff-added, .diff-view .line-block.diff-removed, .diff-view-unified .line-block.diff-added, .diff-view-unified .line-block.diff-removed');
+    var all = docEls.length > 0 ? docEls : diffEls;
     if (all.length === 0) { currentChangeIdx = -1; updateChangeCounters(); return; }
     var group = null;
     for (var i = 0; i < all.length; i++) {
@@ -1118,7 +1122,14 @@
     // Check if b immediately follows a, skipping comment elements between them
     var node = a.nextElementSibling;
     while (node && node !== b) {
-      if (node.classList.contains('line-block')) return false; // non-changed block in between
+      // A non-changed line-block in between breaks the group
+      if (node.classList.contains('line-block') &&
+          !node.classList.contains('line-block-added') &&
+          !node.classList.contains('line-block-modified') &&
+          !node.classList.contains('diff-added') &&
+          !node.classList.contains('diff-removed')) return false;
+      // Deletion markers don't break the group
+      if (node.classList.contains('deletion-marker')) { node = node.nextElementSibling; continue; }
       node = node.nextElementSibling;
     }
     return node === b;
@@ -1174,7 +1185,8 @@
     group.elements.forEach(function(el) { el.classList.add('change-flash'); });
     focusedElement = group.elements[0];
     focusedFilePath = group.filePath;
-    focusedBlockIndex = parseInt(group.elements[0].dataset.blockIndex);
+    var bi = parseInt(group.elements[0].dataset.blockIndex);
+    if (!isNaN(bi)) focusedBlockIndex = bi;
     updateChangeCounters();
   }
 
@@ -1292,8 +1304,8 @@
       });
       header.appendChild(toggle);
 
-      // Change navigation widget (only in document view, file mode only)
-      if (file.viewMode === 'document' && session.mode !== 'git') {
+      // Change navigation widget (file mode, both document and diff view)
+      if (session.mode !== 'git') {
         var changeNav = document.createElement('div');
         changeNav.className = 'change-nav';
         changeNav.innerHTML =
@@ -1404,12 +1416,12 @@
 
       var lineBlockEl = document.createElement('div');
       lineBlockEl.className = 'line-block';
+      lineBlockEl.dataset.filePath = file.path;
       if (enableComments) {
         lineBlockEl.classList.add('kb-nav');
         lineBlockEl.dataset.blockIndex = bi;
         lineBlockEl.dataset.startLine = block.startLine;
         lineBlockEl.dataset.endLine = block.endLine;
-        lineBlockEl.dataset.filePath = file.path;
       }
 
       if (block.isDiff) lineBlockEl.classList.add(diffClass);
@@ -1543,12 +1555,12 @@
 
     var lineBlockEl = document.createElement('div');
     lineBlockEl.className = 'line-block';
+    lineBlockEl.dataset.filePath = file.path;
     if (commentable) {
       lineBlockEl.classList.add('kb-nav');
       lineBlockEl.dataset.blockIndex = blockIndex;
       lineBlockEl.dataset.startLine = block.startLine;
       lineBlockEl.dataset.endLine = block.endLine;
-      lineBlockEl.dataset.filePath = file.path;
     }
     if (diffClass) lineBlockEl.classList.add(diffClass);
 
@@ -1680,16 +1692,53 @@
   }
 
   // ===== Change Detection (for inter-round diffs in document view) =====
-  function getChangedLineNumbers(file) {
+  // Returns { added: Set<NewNum>, modified: Set<NewNum>, deletionPoints: [{afterLine, count}] }
+  // added = pure additions (green), modified = changed lines (amber), deletionPoints = where lines were removed (red)
+  function getChangeInfo(file) {
     if (!file.diffHunks || file.diffHunks.length === 0) return null;
-    var changed = new Set();
+    var added = new Set();
+    var modified = new Set();
+    var deletionPoints = [];
+
     for (var h = 0; h < file.diffHunks.length; h++) {
       var lines = file.diffHunks[h].Lines || [];
-      for (var i = 0; i < lines.length; i++) {
-        if (lines[i].Type === 'add' && lines[i].NewNum) changed.add(lines[i].NewNum);
+      var lastContextNewNum = file.diffHunks[h].NewStart > 0 ? file.diffHunks[h].NewStart - 1 : 0;
+      var i = 0;
+      while (i < lines.length) {
+        if (lines[i].Type === 'context') {
+          lastContextNewNum = lines[i].NewNum;
+          i++;
+        } else {
+          // Collect consecutive change group (dels then adds, or interleaved)
+          var dels = [], adds = [];
+          while (i < lines.length && lines[i].Type !== 'context') {
+            if (lines[i].Type === 'del') dels.push(lines[i]);
+            if (lines[i].Type === 'add') adds.push(lines[i]);
+            i++;
+          }
+          if (dels.length > 0 && adds.length > 0) {
+            // Modification: mark add lines as modified (amber)
+            for (var a = 0; a < adds.length; a++) {
+              if (adds[a].NewNum) modified.add(adds[a].NewNum);
+            }
+          } else if (adds.length > 0) {
+            // Pure addition (green)
+            for (var a = 0; a < adds.length; a++) {
+              if (adds[a].NewNum) added.add(adds[a].NewNum);
+            }
+          } else if (dels.length > 0) {
+            // Pure deletion — record where marker should appear
+            deletionPoints.push({ afterLine: lastContextNewNum, count: dels.length });
+          }
+          // Update last context position if we saw adds
+          if (adds.length > 0) {
+            lastContextNewNum = adds[adds.length - 1].NewNum;
+          }
+        }
       }
     }
-    return changed.size > 0 ? changed : null;
+    if (added.size === 0 && modified.size === 0 && deletionPoints.length === 0) return null;
+    return { added: added, modified: modified, deletionPoints: deletionPoints };
   }
 
   // ===== Document View (Markdown) =====
@@ -1702,7 +1751,15 @@
 
     const commentRangeSet = buildCommentedRangeSet(file.comments);
 
-    const changedLines = (file.viewMode === 'document' && session.mode !== 'git') ? getChangedLineNumbers(file) : null;
+    const changeInfo = (file.viewMode === 'document' && session.mode !== 'git') ? getChangeInfo(file) : null;
+    // Build a map of afterLine -> deletion marker for quick lookup
+    var deletionMarkerMap = {};
+    if (changeInfo) {
+      for (var dp = 0; dp < changeInfo.deletionPoints.length; dp++) {
+        var pt = changeInfo.deletionPoints[dp];
+        deletionMarkerMap[pt.afterLine] = pt;
+      }
+    }
 
     for (let bi = 0; bi < file.lineBlocks.length; bi++) {
       const block = file.lineBlocks[bi];
@@ -1722,11 +1779,15 @@
       }
       if (blockInCommentRange) lineBlockEl.classList.add('has-comment');
 
-      // Mark blocks that overlap inter-round changes
-      if (changedLines) {
+      // Mark blocks that overlap inter-round changes (color-coded)
+      if (changeInfo) {
+        var blockChangeType = null;
         for (let ln = block.startLine; ln <= block.endLine; ln++) {
-          if (changedLines.has(ln)) { lineBlockEl.classList.add('line-block-changed'); break; }
+          if (changeInfo.modified.has(ln)) { blockChangeType = 'modified'; break; }
+          if (changeInfo.added.has(ln)) { blockChangeType = 'added'; }
         }
+        if (blockChangeType === 'modified') lineBlockEl.classList.add('line-block-modified');
+        else if (blockChangeType === 'added') lineBlockEl.classList.add('line-block-added');
       }
 
       // Selection highlight (during drag or when form is open)
@@ -1798,7 +1859,26 @@
       gutter.appendChild(commentGutter);
       lineBlockEl.appendChild(gutter);
       lineBlockEl.appendChild(content);
+
+      // Insert deletion marker before this block if deletions occurred before it
+      if (changeInfo && bi === 0 && deletionMarkerMap[0]) {
+        var marker0 = document.createElement('div');
+        marker0.className = 'deletion-marker';
+        marker0.dataset.filePath = file.path;
+        marker0.textContent = '\u2212' + deletionMarkerMap[0].count + ' line' + (deletionMarkerMap[0].count !== 1 ? 's' : '');
+        container.appendChild(marker0);
+      }
+
       container.appendChild(lineBlockEl);
+
+      // Insert deletion marker after this block if deletions occurred after it
+      if (changeInfo && deletionMarkerMap[block.endLine]) {
+        var marker = document.createElement('div');
+        marker.className = 'deletion-marker';
+        marker.dataset.filePath = file.path;
+        marker.textContent = '\u2212' + deletionMarkerMap[block.endLine].count + ' line' + (deletionMarkerMap[block.endLine].count !== 1 ? 's' : '');
+        container.appendChild(marker);
+      }
 
       // Comments after block
       for (const comment of blockComments) {
@@ -3719,13 +3799,13 @@
         break;
       }
       case 'n': {
-        if (session.mode === 'git') break;
+        if (changeGroups.length === 0) break;
         e.preventDefault();
         navigateToChange(1);
         break;
       }
       case 'N': {
-        if (session.mode === 'git') break;
+        if (changeGroups.length === 0) break;
         e.preventDefault();
         navigateToChange(-1);
         break;

@@ -87,8 +87,8 @@ test.describe('Change Navigation — File Mode', () => {
     const section = mdSection(page);
     await expect(section.locator('.document-wrapper')).toBeVisible();
 
-    // No blocks should have the changed indicator
-    await expect(section.locator('.line-block-changed')).toHaveCount(0);
+    // No blocks should have any change indicator
+    await expect(section.locator('.line-block-added, .line-block-modified, .deletion-marker')).toHaveCount(0);
   });
 
   test('no change-nav widget in round 1', async ({ page }) => {
@@ -99,7 +99,7 @@ test.describe('Change Navigation — File Mode', () => {
     await expect(section.locator('.change-nav')).toHaveCount(0);
   });
 
-  test('changed blocks get orange indicator after round-complete with edits', async ({ page, request }) => {
+  test('changed blocks get color-coded indicators after round-complete with edits', async ({ page, request }) => {
     await loadPage(page);
 
     const modified = makeModified(originalContent);
@@ -108,8 +108,8 @@ test.describe('Change Navigation — File Mode', () => {
     const section = mdSection(page);
     await expect(section.locator('.document-wrapper')).toBeVisible();
 
-    // At least one block should have the changed indicator
-    const changedBlocks = section.locator('.line-block-changed');
+    // At least one block should have a change indicator (modified = amber for replacements)
+    const changedBlocks = section.locator('.line-block-added, .line-block-modified');
     await expect(changedBlocks.first()).toBeVisible();
     const count = await changedBlocks.count();
     expect(count).toBeGreaterThan(0);
@@ -158,7 +158,7 @@ test.describe('Change Navigation — File Mode', () => {
 
     const section = mdSection(page);
     await expect(section.locator('.document-wrapper')).toBeVisible();
-    await expect(section.locator('.line-block-changed')).not.toHaveCount(0);
+    await expect(section.locator('.line-block-added, .line-block-modified')).not.toHaveCount(0);
 
     // Press n to navigate to first change
     await page.keyboard.press('n');
@@ -176,7 +176,7 @@ test.describe('Change Navigation — File Mode', () => {
 
     const section = mdSection(page);
     await expect(section.locator('.document-wrapper')).toBeVisible();
-    await expect(section.locator('.line-block-changed')).not.toHaveCount(0);
+    await expect(section.locator('.line-block-added, .line-block-modified')).not.toHaveCount(0);
 
     // Press Shift+N to navigate to previous change (wraps to last)
     await page.keyboard.press('Shift+N');
@@ -282,7 +282,7 @@ test.describe('Change Navigation — File Mode', () => {
     await expect(section.locator('.line-block.change-flash').first()).toBeVisible();
 
     // Get document-level Y of the first change group
-    const firstChangeAbsY = await section.locator('.line-block-changed').first().evaluate(
+    const firstChangeAbsY = await section.locator('.line-block-added, .line-block-modified').first().evaluate(
       el => el.getBoundingClientRect().top + window.scrollY
     );
 
@@ -364,17 +364,17 @@ test.describe('Change Navigation — File Mode', () => {
     await expect(overlay.locator('text=Previous change')).toBeVisible();
   });
 
-  test('changed blocks have orange left border (box-shadow)', async ({ page, request }) => {
+  test('changed blocks have colored left border (box-shadow)', async ({ page, request }) => {
     await loadPage(page);
 
     const modified = makeModified(originalContent);
     await doRoundWithEdit(page, request, fixtureDir, 'plan.md', modified);
 
     const section = mdSection(page);
-    const changedBlock = section.locator('.line-block-changed').first();
+    const changedBlock = section.locator('.line-block-added, .line-block-modified').first();
     await expect(changedBlock).toBeVisible();
 
-    // Verify the block has a box-shadow (the orange indicator)
+    // Verify the block has a box-shadow (the colored indicator)
     const boxShadow = await changedBlock.evaluate(el => getComputedStyle(el).boxShadow);
     expect(boxShadow).not.toBe('none');
   });
