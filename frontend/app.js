@@ -157,13 +157,6 @@
     } catch (_) {}
   }
 
-  function clearViewedState() {
-    for (var i = 0; i < files.length; i++) {
-      files[i].viewed = false;
-    }
-    try { localStorage.removeItem(viewedStorageKey()); } catch (_) {}
-  }
-
   function toggleViewed(filePath) {
     var file = getFileByPath(filePath);
     if (!file) return;
@@ -3392,6 +3385,7 @@
             viewMode: files[pi].viewMode,
             collapsed: files[pi].collapsed,
             diffLoaded: files[pi].diffLoaded,
+            viewed: files[pi].viewed,
           };
         }
 
@@ -3409,6 +3403,7 @@
             files[fi].viewMode = prev.viewMode;
             files[fi].collapsed = prev.collapsed;
             if (prev.diffLoaded) files[fi].diffLoaded = prev.diffLoaded;
+            if (prev.viewed) files[fi].viewed = true;
           }
         }
 
@@ -3423,7 +3418,7 @@
         focusedElement = null;
         diffActive = false;
 
-        clearViewedState();
+        saveViewedState();
         updateHeaderRound();
         updateDiffModeToggle();
         renderFileTree();

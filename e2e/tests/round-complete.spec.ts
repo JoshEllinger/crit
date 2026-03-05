@@ -385,6 +385,23 @@ test.describe('Multi-Round — Frontend', () => {
     await expect(resolved).not.toHaveClass(/expanded/);
   });
 
+  test('viewed state persists across round-complete', async ({ page, request }) => {
+    // Mark the first non-.crit.json file as viewed
+    const section = page.locator('.file-section').filter({ hasNotText: '.crit.json' }).first();
+    const viewedCheckbox = section.locator('.file-header-viewed input');
+    await viewedCheckbox.check();
+    await expect(viewedCheckbox).toBeChecked();
+
+    // Trigger round-complete
+    await page.locator('#finishBtn').click();
+    await expect(page.locator('#waitingOverlay')).toHaveClass(/active/);
+    await request.post('/api/round-complete');
+    await expect(page.locator('#waitingOverlay')).not.toHaveClass(/active/, { timeout: 5_000 });
+
+    // Viewed checkbox should still be checked after the round transition
+    await expect(section.locator('.file-header-viewed input')).toBeChecked();
+  });
+
   test('file sections are re-rendered after round-complete', async ({ page, request }) => {
     // Count non-.crit.json file sections before (its presence depends on disk state)
     const sections = page.locator('.file-section').filter({ hasNotText: '.crit.json' });
