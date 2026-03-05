@@ -117,7 +117,7 @@ Select lines and use "Insert suggestion" to pre-fill the comment with the origin
 
 ### Share for async review
 
-Want a second opinion before handing off to the agent? The Share button uploads your review to [crit.live](https://crit.live) and gives you a public URL anyone can open in a browser, no install needed. Each reviewer's comments are color-coded by author. Unpublish anytime.
+Want a second opinion before handing off to the agent? Enable sharing by setting `CRIT_SHARE_URL=https://crit.live` (or pass `--share-url`), then click the Share button to upload your review and get a public URL anyone can open in a browser, no install needed. Each reviewer's comments are color-coded by author. Unpublish anytime.
 
 ### Finish review: prompt copied to clipboard
 
@@ -201,7 +201,7 @@ crit --no-open plan.md
 
 | Variable               | Description                                                                                |
 | ---------------------- | ------------------------------------------------------------------------------------------ |
-| `CRIT_SHARE_URL`       | Override the Share button URL (defaults to crit.live, useful for self-hosted or local dev) |
+| `CRIT_SHARE_URL`       | Enable the Share button (e.g. `https://crit.live` or a self-hosted instance) |
 | `CRIT_NO_UPDATE_CHECK` | Set to any value to disable the update check on startup                                    |
 
 ## Build from Source

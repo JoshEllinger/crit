@@ -63,7 +63,7 @@ go test ./...                                         # Run all tests
 ./crit                                                # Git mode (auto-detect changed files)
 ./crit test-plan.md                                   # Review specific file(s)
 ./crit --no-open --port 3000 test-plan.md             # Headless on fixed port
-./crit --share-url https://crit.live test-plan.md     # Enable Share button
+./crit --share-url https://crit.live test-plan.md     # Enable sharing via crit.live
 CRIT_SHARE_URL=https://crit.live ./crit test-plan.md  # Same via env var
 make build-all                                        # Cross-compile to dist/
 ```

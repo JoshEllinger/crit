@@ -142,9 +142,6 @@ func main() {
 	if *shareURL == "" {
 		*shareURL = os.Getenv("CRIT_SHARE_URL")
 	}
-	if *shareURL == "" {
-		*shareURL = "https://crit.live"
-	}
 
 	srv, err := NewServer(session, frontendFS, *shareURL, version, addr.Port)
 	if err != nil {
@@ -217,7 +214,7 @@ Options:
   -o, --output <dir>          Output directory for .crit.json
       --no-open               Don't auto-open browser
   -q, --quiet                 Suppress status output
-      --share-url <url>       Share service URL (default: https://crit.live)
+      --share-url <url>       Share service URL (e.g. https://crit.live)
   -v, --version               Print version
 
 Environment:

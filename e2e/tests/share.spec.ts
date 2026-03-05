@@ -12,10 +12,10 @@ test.describe('Share — Git Mode', () => {
     await expect(shareBtn).toBeHidden();
   });
 
-  test('config API still returns share_url', async ({ request }) => {
+  test('config API returns empty share_url by default', async ({ request }) => {
     const res = await request.get('/api/config');
     const config = await res.json();
-    expect(config.share_url).toBeTruthy();
+    expect(config.share_url).toBe('');
   });
 
   test('config API returns empty hosted_url initially', async ({ request }) => {
