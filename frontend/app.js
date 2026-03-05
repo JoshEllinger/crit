@@ -2972,6 +2972,7 @@
 
     const card = document.createElement('div');
     card.className = 'comment-card' + (comment.carried_forward ? ' carried-forward' : '');
+    card.dataset.commentId = comment.id;
 
     const header = document.createElement('div');
     header.className = 'comment-header';
@@ -3118,6 +3119,7 @@
   function createResolvedElement(comment) {
     const el = document.createElement('div');
     el.className = 'resolved-comment';
+    el.dataset.commentId = comment.id;
     el.innerHTML =
       '<div class="resolved-comment-header">' +
         '<span class="resolved-check">\u2713</span>' +
@@ -3130,14 +3132,154 @@
 
   // ===== Comment Count =====
   function updateCommentCount() {
-    let total = 0;
+    let unresolved = 0, resolved = 0;
     for (const f of files) {
       for (const c of f.comments) {
-        if (!c.resolved) total++;
+        if (c.resolved) resolved++; else unresolved++;
       }
     }
+    const total = unresolved + resolved;
     const el = document.getElementById('commentCount');
-    el.innerHTML = total === 0 ? '' : '<strong>' + total + '</strong> comment' + (total === 1 ? '' : 's');
+    if (total === 0) {
+      el.style.display = 'none';
+      el.title = 'Toggle comments panel';
+    } else if (unresolved > 0) {
+      el.style.display = '';
+      el.classList.remove('comment-count-resolved');
+      el.title = unresolved + ' unresolved comment' + (unresolved === 1 ? '' : 's') + ' — toggle panel';
+    } else {
+      el.style.display = '';
+      el.classList.add('comment-count-resolved');
+      el.title = total + ' resolved comment' + (total === 1 ? '' : 's') + ' — toggle panel';
+    }
+    renderCommentsPanel();
+  }
+
+  function updateTocPosition() {
+    var toc = document.getElementById('toc');
+    var panel = document.getElementById('commentsPanel');
+    if (!toc || !panel) return;
+    var panelOpen = !panel.classList.contains('comments-panel-hidden');
+    var tocBaseRight = 16; // matches the default right: 16px in CSS
+    toc.style.right = panelOpen ? (panel.offsetWidth + tocBaseRight) + 'px' : '';
+  }
+
+  function toggleCommentsPanel() {
+    var panel = document.getElementById('commentsPanel');
+    var isHidden = panel.classList.contains('comments-panel-hidden');
+    panel.classList.toggle('comments-panel-hidden');
+    if (isHidden) {
+      renderCommentsPanel();
+    }
+    updateTocPosition();
+  }
+
+  function renderCommentsPanel() {
+    var panel = document.getElementById('commentsPanel');
+    if (panel.classList.contains('comments-panel-hidden')) return;
+
+    var showResolved = document.getElementById('showResolvedToggle').checked;
+    var body = document.getElementById('commentsPanelBody');
+    body.innerHTML = '';
+
+    // Show/hide the filter bar only when resolved comments exist
+    var hasResolved = files.some(function(f) { return f.comments.some(function(c) { return c.resolved; }); });
+    document.getElementById('commentsPanelFilter').style.display = hasResolved ? '' : 'none';
+
+    var hasComments = false;
+
+    for (var i = 0; i < files.length; i++) {
+      var file = files[i];
+      var visibleComments = file.comments.filter(function(c) {
+        return showResolved ? true : !c.resolved;
+      });
+      if (visibleComments.length === 0) continue;
+      hasComments = true;
+
+      // Sort by start_line
+      visibleComments.sort(function(a, b) { return a.start_line - b.start_line; });
+
+      var group = document.createElement('div');
+      group.className = 'comments-panel-file-group';
+
+      // File name header (only in multi-file mode)
+      if (files.length > 1) {
+        var fileName = document.createElement('div');
+        fileName.className = 'comments-panel-file-name';
+        fileName.textContent = file.path;
+        fileName.title = file.path;
+        group.appendChild(fileName);
+      }
+
+      for (var j = 0; j < visibleComments.length; j++) {
+        var comment = visibleComments[j];
+        var card = document.createElement('div');
+        card.className = 'comments-panel-card' + (comment.resolved ? ' comments-panel-card-resolved' : '');
+        card.dataset.commentId = comment.id;
+        card.dataset.filePath = file.path;
+
+        var lineRef = document.createElement('div');
+        lineRef.className = 'comments-panel-card-line';
+        lineRef.textContent = comment.start_line === comment.end_line
+          ? 'Line ' + comment.start_line
+          : 'Lines ' + comment.start_line + '-' + comment.end_line;
+        if (comment.carried_forward) {
+          var badge = document.createElement('span');
+          if (comment.resolved) {
+            badge.className = 'comments-panel-badge comments-panel-badge-resolved';
+            badge.textContent = 'Resolved';
+          } else {
+            badge.className = 'comments-panel-badge comments-panel-badge-unresolved';
+            badge.textContent = 'Unresolved';
+          }
+          lineRef.appendChild(badge);
+        }
+
+        var bodyEl = document.createElement('div');
+        bodyEl.className = 'comments-panel-card-body';
+        bodyEl.innerHTML = commentMd.render(comment.body);
+
+        card.appendChild(lineRef);
+        card.appendChild(bodyEl);
+        card.addEventListener('click', (function(commentId, filePath) {
+          return function() { scrollToComment(commentId, filePath); };
+        })(comment.id, file.path));
+
+        group.appendChild(card);
+      }
+
+      body.appendChild(group);
+    }
+
+    if (!hasComments) {
+      var empty = document.createElement('div');
+      empty.className = 'comments-panel-empty';
+      empty.textContent = showResolved ? 'No comments yet' : 'No unresolved comments';
+      body.appendChild(empty);
+    }
+  }
+
+  function scrollToComment(commentId, filePath) {
+    // 1. Find the file section and expand if collapsed
+    var section = document.getElementById('file-section-' + filePath);
+    if (!section) return;
+    if (!section.open) section.open = true;
+
+    // 2. Find the inline comment card by comment ID
+    var commentCard = section.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]')
+      || section.querySelector('.resolved-comment[data-comment-id="' + CSS.escape(commentId) + '"]');
+    if (!commentCard) return;
+
+    // 3. Scroll into view
+    commentCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    // 4. Flash highlight
+    commentCard.classList.remove('comment-card-highlight');
+    void commentCard.offsetWidth;
+    commentCard.classList.add('comment-card-highlight');
+    commentCard.addEventListener('animationend', function() {
+      commentCard.classList.remove('comment-card-highlight');
+    }, { once: true });
   }
 
   function updateViewedCount() {
@@ -3679,6 +3821,23 @@
     setCookie('crit-toc', 'closed');
   });
 
+  // ===== Comments Panel Toggle =====
+  document.getElementById('commentCount').addEventListener('click', function() {
+    toggleCommentsPanel();
+  });
+  document.getElementById('commentCount').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCommentsPanel(); }
+  });
+
+  document.querySelector('.comments-panel-close').addEventListener('click', function() {
+    document.getElementById('commentsPanel').classList.add('comments-panel-hidden');
+    updateTocPosition();
+  });
+
+  document.getElementById('showResolvedToggle').addEventListener('change', function() {
+    renderCommentsPanel();
+  });
+
   // ===== Keyboard Shortcuts =====
   function toggleShortcutsOverlay() {
     document.getElementById('shortcutsOverlay').classList.toggle('active');
@@ -3806,6 +3965,11 @@
         e.preventDefault();
         if (uiState !== 'reviewing') return;
         document.getElementById('finishBtn').click();
+        break;
+      }
+      case 'C': {
+        e.preventDefault();
+        toggleCommentsPanel();
         break;
       }
       case 't': {

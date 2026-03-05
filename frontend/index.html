@@ -29,7 +29,11 @@
   </div>
   <div class="header-right">
     <span class="viewed-count" id="viewedCount"></span>
-    <span class="comment-count" id="commentCount"></span>
+    <button class="comment-count-btn" id="commentCount" style="display:none" title="Toggle comments panel" aria-label="Toggle comments panel">
+      <svg class="comment-count-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+        <path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Z" stroke-linejoin="round"/>
+      </svg>
+    </button>
     <div class="scope-toggle" id="scopeToggle" style="display:none">
       <button class="toggle-btn active" data-scope="all" title="All changes">All</button>
       <button class="toggle-btn" data-scope="branch" title="Committed changes">Branch</button>
@@ -84,6 +88,22 @@
       <div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">Loading...</div>
     </div>
   </div>
+  <div class="comments-panel comments-panel-hidden" id="commentsPanel">
+    <div class="comments-panel-header">
+      <span class="comments-panel-title">Comments</span>
+      <button class="comments-panel-close" title="Close comments panel" aria-label="Close comments panel">&#x2715;</button>
+    </div>
+    <div class="comments-panel-filter" id="commentsPanelFilter" style="display:none">
+      <label class="comments-panel-switch">
+        <input type="checkbox" id="showResolvedToggle">
+        <span class="comments-panel-switch-track">
+          <span class="comments-panel-switch-thumb"></span>
+        </span>
+        <span class="comments-panel-switch-text">Show resolved</span>
+      </label>
+    </div>
+    <div class="comments-panel-body" id="commentsPanelBody" aria-live="polite" aria-label="Comments list"></div>
+  </div>
 </div>
 
 <div class="waiting-overlay" id="waitingOverlay">
@@ -110,6 +130,7 @@
       <tr class="shortcut-filemode-only"><td><kbd>n</kbd></td><td>Next change</td></tr>
       <tr class="shortcut-filemode-only"><td><kbd>N</kbd></td><td>Previous change</td></tr>
       <tr><td><kbd>Shift</kbd>+<kbd>F</kbd></td><td>Finish review</td></tr>
+      <tr><td><kbd>Shift</kbd>+<kbd>C</kbd></td><td>Toggle comments panel</td></tr>
       <tr class="shortcut-toc-only"><td><kbd>t</kbd></td><td>Toggle table of contents</td></tr>
       <tr><td><kbd>Esc</kbd></td><td>Cancel / clear focus</td></tr>
       <tr><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>Submit comment</td></tr>
