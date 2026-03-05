@@ -177,15 +177,13 @@ test.describe('Keyboard UI Toggles — File Mode', () => {
     await expect(overlay).not.toHaveClass(/active/);
   });
 
-  test('t toggles table of contents', async ({ page }) => {
+  test('t does nothing in multi-file mode (TOC is disabled)', async ({ page }) => {
     const toc = page.locator('#toc');
 
-    // In file mode, the toc toggle is visible and toc starts hidden
+    // In multi-file mode, TOC is disabled so toc starts hidden
     await expect(toc).toHaveClass(/toc-hidden/);
 
-    await page.keyboard.press('t');
-    await expect(toc).not.toHaveClass(/toc-hidden/);
-
+    // Press t — should be a no-op since TOC is hidden in multi-file mode
     await page.keyboard.press('t');
     await expect(toc).toHaveClass(/toc-hidden/);
   });
