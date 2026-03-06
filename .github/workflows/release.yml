@@ -49,18 +49,8 @@ jobs:
           path: e2e/test-results/
           retention-days: 7
 
-  release:
-    needs: [test, e2e]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
   build-linux:
-    needs: test
+    needs: [test, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,7 +68,7 @@ jobs:
           path: dist/
 
   build-macos:
-    needs: test
+    needs: [test, e2e]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
