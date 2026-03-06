@@ -8,3 +8,4 @@ crit.exe
 
 # Dependencies
 node_modules/
+.worktrees/
