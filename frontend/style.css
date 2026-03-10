@@ -1035,14 +1035,13 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   white-space: nowrap;
 }
 .template-chip-delete {
-  display: none;
+  display: inline;
   font-size: 13px;
   font-weight: 600;
   color: var(--fg-muted);
   flex-shrink: 0;
   line-height: 1;
 }
-.template-chip:hover .template-chip-delete { display: inline; }
 .template-chip-delete:hover { color: var(--red, #e55); }
 
 .template-chip:hover {

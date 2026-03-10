@@ -65,8 +65,7 @@ test.describe('Comment Templates — File Mode', () => {
     await chip.click();
     await expect(textarea).toHaveValue('This duplicates logic in …');
 
-    // Hover chip to reveal ×, then click it
-    await chip.hover();
+    // Click × to delete chip
     const del = chip.locator('.template-chip-delete');
     await expect(del).toBeVisible();
     await del.click();

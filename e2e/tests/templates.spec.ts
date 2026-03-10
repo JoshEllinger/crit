@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import { clearAllComments, loadPage, mdSection, switchToDocumentView } from './helpers';
 
 // Helper: open comment form on the first markdown line block
-async function openCommentForm(page: ReturnType<typeof mdSection extends (p: infer P) => any ? () => P : never> extends never ? any : any) {
+async function openCommentForm(page: any) {
   const section = mdSection(page);
   const lineBlock = section.locator('.line-block').first();
   await lineBlock.hover();
@@ -106,9 +106,8 @@ test.describe('Comment Templates — Git Mode', () => {
     const bar = page.locator('.comment-template-bar');
     await expect(bar).toBeVisible();
 
-    // Hover chip to reveal ×, then click it
+    // Click × to delete chip
     const chip = bar.locator('.template-chip').first();
-    await chip.hover();
     const del = chip.locator('.template-chip-delete');
     await expect(del).toBeVisible();
     await del.click();
@@ -148,7 +147,7 @@ test.describe('Comment Templates — Git Mode', () => {
 
     // Dialog should not appear
     const overlay = page.locator('.save-template-overlay');
-    await expect(overlay).toHaveCount(0);
+    await expect(overlay).toBeHidden();
   });
 
   test('save dialog can be cancelled', async ({ page }) => {

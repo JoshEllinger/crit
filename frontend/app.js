@@ -2750,6 +2750,33 @@
     return bar;
   }
 
+  function attachTemplateUI(form, textarea, actions) {
+    var templateBar = createTemplateBar(textarea);
+
+    var saveTemplateBtn = document.createElement('button');
+    saveTemplateBtn.className = 'btn btn-sm';
+    saveTemplateBtn.textContent = '+ Save as template';
+    saveTemplateBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      showSaveTemplateDialog(textarea, templateBar);
+    });
+
+    var suggestBtn = document.createElement('button');
+    suggestBtn.className = 'btn btn-sm';
+    suggestBtn.textContent = '\u00B1 Suggest';
+    suggestBtn.title = 'Insert the selected lines as a suggestion';
+    suggestBtn.addEventListener('click', function() { insertSuggestion(textarea); });
+
+    var leftGroup = document.createElement('div');
+    leftGroup.className = 'comment-form-actions-left';
+    leftGroup.appendChild(suggestBtn);
+    leftGroup.appendChild(saveTemplateBtn);
+    leftGroup.style.marginRight = 'auto';
+
+    actions.insertBefore(leftGroup, actions.firstChild);
+    form.insertBefore(templateBar, form.querySelector('textarea'));
+  }
+
   function showSaveTemplateDialog(textarea, templateBar) {
     var text = textarea.value.trim();
     if (!text) {
@@ -2860,29 +2887,6 @@
     const actions = document.createElement('div');
     actions.className = 'comment-form-actions';
 
-    const suggestBtn = document.createElement('button');
-    suggestBtn.className = 'btn btn-sm';
-    suggestBtn.textContent = '\u00B1 Suggest';
-    suggestBtn.title = 'Insert the selected lines as a suggestion';
-    suggestBtn.addEventListener('click', () => insertSuggestion(textarea));
-
-    var templateBar = createTemplateBar(textarea);
-
-    const saveTemplateBtn = document.createElement('button');
-    saveTemplateBtn.className = 'btn btn-sm';
-    saveTemplateBtn.textContent = '+ Save as template';
-    saveTemplateBtn.addEventListener('click', function(e) {
-      e.preventDefault();
-      showSaveTemplateDialog(textarea, templateBar);
-    });
-
-    // Left group: Suggest + Save as template, pushed left via marginRight:auto on wrapper
-    var leftGroup = document.createElement('div');
-    leftGroup.className = 'comment-form-actions-left';
-    leftGroup.appendChild(suggestBtn);
-    leftGroup.appendChild(saveTemplateBtn);
-    leftGroup.style.marginRight = 'auto';
-
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn btn-sm';
     cancelBtn.textContent = 'Cancel';
@@ -2893,14 +2897,13 @@
     submitBtn.textContent = activeForm.editingId ? 'Update Comment' : 'Add Comment';
     submitBtn.addEventListener('click', () => submitComment(textarea.value));
 
-    actions.appendChild(leftGroup);
     actions.appendChild(cancelBtn);
     actions.appendChild(submitBtn);
 
     form.appendChild(header);
-    form.appendChild(templateBar);
     form.appendChild(textarea);
     form.appendChild(actions);
+    attachTemplateUI(form, textarea, actions);
     wrapper.appendChild(form);
     return wrapper;
   }
@@ -3206,27 +3209,6 @@
     const actions = document.createElement('div');
     actions.className = 'comment-form-actions';
 
-    const suggestBtn = document.createElement('button');
-    suggestBtn.className = 'btn btn-sm';
-    suggestBtn.textContent = '\u00B1 Suggest';
-    suggestBtn.addEventListener('click', () => insertSuggestion(textarea));
-
-    var templateBar = createTemplateBar(textarea);
-
-    const saveTemplateBtn = document.createElement('button');
-    saveTemplateBtn.className = 'btn btn-sm';
-    saveTemplateBtn.textContent = '+ Save as template';
-    saveTemplateBtn.addEventListener('click', function(e) {
-      e.preventDefault();
-      showSaveTemplateDialog(textarea, templateBar);
-    });
-
-    var leftGroup = document.createElement('div');
-    leftGroup.className = 'comment-form-actions-left';
-    leftGroup.appendChild(suggestBtn);
-    leftGroup.appendChild(saveTemplateBtn);
-    leftGroup.style.marginRight = 'auto';
-
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn btn-sm';
     cancelBtn.textContent = 'Cancel';
@@ -3237,14 +3219,13 @@
     submitBtn.textContent = 'Update Comment';
     submitBtn.addEventListener('click', () => submitComment(textarea.value));
 
-    actions.appendChild(leftGroup);
     actions.appendChild(cancelBtn);
     actions.appendChild(submitBtn);
 
     form.appendChild(header);
-    form.appendChild(templateBar);
     form.appendChild(textarea);
     form.appendChild(actions);
+    attachTemplateUI(form, textarea, actions);
     wrapper.appendChild(form);
 
     requestAnimationFrame(() => textarea.focus());
