@@ -3175,6 +3175,13 @@
       authorBadge.textContent = '@' + comment.author;
       headerLeft.appendChild(authorBadge);
     }
+    if (comment.review_round >= 1) {
+      const roundBadge = document.createElement('span');
+      var rc = comment.review_round === session.review_round ? ' round-current' : comment.review_round === session.review_round - 1 ? ' round-latest' : '';
+      roundBadge.className = 'comment-round-badge' + rc;
+      roundBadge.textContent = 'R' + comment.review_round;
+      headerLeft.appendChild(roundBadge);
+    }
     headerLeft.appendChild(lineRef);
     if (comment.carried_forward) {
       const label = document.createElement('span');
@@ -3313,6 +3320,13 @@
     body.innerHTML = commentMd.render(comment.body);
 
     header.appendChild(check);
+    if (comment.review_round >= 1) {
+      const roundBadge = document.createElement('span');
+      var rc = comment.review_round === session.review_round ? ' round-current' : comment.review_round === session.review_round - 1 ? ' round-latest' : '';
+      roundBadge.className = 'comment-round-badge' + rc;
+      roundBadge.textContent = 'R' + comment.review_round;
+      header.appendChild(roundBadge);
+    }
     header.appendChild(body);
     el.appendChild(header);
 
@@ -3430,6 +3444,13 @@
             badge.textContent = 'Unresolved';
           }
           lineRef.appendChild(badge);
+        }
+        if (comment.review_round >= 1) {
+          var roundBadge = document.createElement('span');
+          var rc = comment.review_round === session.review_round ? ' round-current' : comment.review_round === session.review_round - 1 ? ' round-latest' : '';
+      roundBadge.className = 'comment-round-badge' + rc;
+          roundBadge.textContent = 'R' + comment.review_round;
+          lineRef.appendChild(roundBadge);
         }
 
         var bodyEl = document.createElement('div');
@@ -3735,12 +3756,14 @@
     const payload = {
       content: files.map(f => f.content).join('\n'),
       filename: files.length === 1 ? files[0].path : session.branch || 'review',
+      review_round: session.review_round || 1,
       comments: [],
     };
     for (const f of files) {
       for (const c of f.comments) {
         const shared = { file: f.path, start_line: c.start_line, end_line: c.end_line, body: c.body };
         if (c.author) shared.author_display_name = c.author;
+        if (c.review_round >= 1) shared.review_round = c.review_round;
         payload.comments.push(shared);
       }
     }
