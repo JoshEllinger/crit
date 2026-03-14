@@ -10,7 +10,7 @@ Choose what to review based on context:
 2. If no argument, check if a plan was written earlier in this conversation. If so, review that file
 3. Otherwise, run `crit` with no arguments — it auto-detects what to review: uncommitted changes, or all changes on the current branch vs the default branch. Works on clean branches too.
 
-Show the selected mode/file to the user and ask for confirmation before proceeding.
+Don't ask for confirmation — just proceed with whichever mode applies.
 
 ## Step 2: Run crit for review
 
