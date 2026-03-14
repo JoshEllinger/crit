@@ -211,10 +211,13 @@ crit config --help                             # document all config keys
 
 ```json
 {
-  "port": 3456,
+  "port": 0,
+  "no_open": false,
   "share_url": "https://crit.live",
-  "author": "Alice",
-  "ignore_patterns": ["*.lock", "*.min.js", "vendor/", "generated/*.pb.go"]
+  "quiet": false,
+  "output": "",
+  "author": "John",
+  "ignore_patterns": [".crit.json"]
 }
 ```
 
