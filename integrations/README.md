@@ -1,39 +1,64 @@
 # Crit Integrations
 
-Drop-in configuration files that teach your AI coding tool to write plans, launch Crit for review, and wait for your feedback before implementing.
+Drop-in configuration files that teach your AI coding tool to use Crit for reviewing plans and code changes.
 
-Copy the file or files for your tool into your project.
+## Quick install
 
-| Tool | File to copy | Destination in your project |
-|------|-------------|----------------------------|
-| Claude Code | `claude-code/crit.md` | `.claude/commands/crit.md` |
-| Claude Code | `claude-code/crit-comment.md` | `.claude/commands/crit-comment.md` |
-| Claude Code | `claude-code/CLAUDE.md` (optional) | Append to your `CLAUDE.md` |
-| Cursor | `cursor/crit-command.md` | `.cursor/commands/crit.md` |
-| Cursor | `cursor/crit-comment.md` | `.cursor/commands/crit-comment.md` |
-| Cursor | `cursor/crit.mdc` (optional) | `.cursor/rules/crit.mdc` |
-| OpenCode | `opencode/crit.md` | `.opencode/commands/crit.md` |
-| OpenCode | `opencode/crit-comment.md` | `.opencode/commands/crit-comment.md` |
-| OpenCode | `opencode/SKILL.md` | `.opencode/skills/crit-review/SKILL.md` |
-| Windsurf | `windsurf/crit.md` | `.windsurf/rules/crit.md` |
-| Windsurf | `windsurf/crit-comment.md` | `.windsurf/rules/crit-comment.md` |
-| GitHub Copilot | `github-copilot/crit.prompt.md` | `.github/prompts/crit.prompt.md` |
-| GitHub Copilot | `github-copilot/crit-comment.md` | `.github/prompts/crit-comment.prompt.md` |
-| GitHub Copilot | `github-copilot/copilot-instructions.md` (optional) | Append to `.github/copilot-instructions.md` |
-| Aider | `aider/CONVENTIONS.md` | Append to your `CONVENTIONS.md` |
-| Aider | `aider/crit-comment.md` | Copy to your project root |
-| Cline | `cline/crit.md` | `.clinerules/crit.md` |
-| Cline | `cline/crit-comment.md` | `.clinerules/crit-comment.md` |
+```bash
+crit install <tool>     # Install for a specific tool
+crit install all        # Install for all supported tools
+```
+
+This installs a `/crit` slash command into your project. Safe to re-run — existing files are skipped (use `--force` to overwrite).
+
+| Tool | Install command | Destination |
+|------|----------------|-------------|
+| Claude Code | `crit install claude-code` | `.claude/commands/crit.md` |
+| Cursor | `crit install cursor` | `.cursor/commands/crit.md` |
+| GitHub Copilot | `crit install github-copilot` | `.github/prompts/crit.prompt.md` |
+| OpenCode | `crit install opencode` | `.opencode/commands/crit.md` + `.opencode/skills/crit/SKILL.md` |
+| Windsurf | `crit install windsurf` | `.windsurf/rules/crit.md` |
+| Cline | `crit install cline` | `.clinerules/crit.md` |
+| Aider | — (copy manually) | Append `aider/CONVENTIONS.md` to your `CONVENTIONS.md` |
+
+## Plugin marketplace (Claude Code, Cursor)
+
+For the full experience, install via the plugin marketplace. This gives you:
+- A `/crit` slash command for the review loop
+- A `crit` skill that auto-activates when working with `.crit.json`, `crit comment`, `crit pull/push`, etc.
+
+**Claude Code:**
+```
+/plugin marketplace add tomasz-tomczyk/crit
+/plugin install crit
+```
+
+**Cursor:**
+Add `tomasz-tomczyk/crit` as a marketplace source in Cursor settings, then install the `crit` plugin.
+
+The marketplace manifests live at the repo root (`.claude-plugin/marketplace.json`, `.cursor-plugin/marketplace.json`) and point to the plugin files in `integrations/claude-code/` and `integrations/cursor/` respectively.
+
+### `crit install` vs plugin marketplace
+
+| | `crit install` | Plugin marketplace |
+|---|---|---|
+| **Scope** | Per-project (committed to repo) | Global (user-wide) |
+| **What's installed** | `/crit` command only | `/crit` command + `crit` skill |
+| **Good for** | Teams — everyone gets the integration | Individual users — works across all projects |
+| **Setup** | Run once per project | Install once, works everywhere |
+
+Both approaches give you the `/crit` slash command. The plugin marketplace additionally installs the `crit` skill which auto-teaches the agent about `crit comment`, `.crit.json` format, `crit pull/push`, and resolution workflow.
 
 ## What these do
 
 All integrations follow the same pattern:
 
-1. **Plan first** - the agent writes an implementation plan as a markdown file before writing any code
-2. **Launch Crit** - the agent runs `crit $PLAN_FILE` to open the plan for review in your browser
-3. **Address feedback** - after review, the agent reads `.crit.json` to find your inline comments and revises the plan
-4. **Implement after approval** - only after you approve does the agent write code
+1. **Plan first** — the agent writes an implementation plan as a markdown file before writing any code
+2. **Launch Crit** — the agent runs `crit $PLAN_FILE` to open the plan for review in your browser
+3. **Address feedback** — after review, the agent reads `.crit.json` to find your inline comments and revises the plan
+4. **Implement after approval** — only after you approve does the agent write code
 
-Claude Code, Cursor, OpenCode, and GitHub Copilot all support a `/crit` slash command that automates the full loop: find the plan, launch Crit, read comments, revise, and signal for another round. OpenCode can also load the `crit-review` skill on demand.
-
-Each integration also includes a `crit-comment` skill that teaches your agent to use `crit comment` to add inline review comments programmatically — no browser needed. The agent learns the syntax and can leave comments on specific lines or ranges as part of its workflow.
+Each integration also teaches the agent about:
+- **`crit comment`** — leave inline review comments programmatically without opening the browser
+- **`.crit.json` format** — how to read comments, resolve them with `resolution_note` and `resolution_lines`
+- **`crit pull/push`** — sync reviews with GitHub PRs

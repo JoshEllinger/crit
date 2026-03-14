@@ -27,7 +27,9 @@ Show the selected mode/file to the user and ask for confirmation.
 
 ## Step 2: Run crit for review
 
-Run `crit` **in the background** using `run_in_background: true`:
+If a crit server is already running from earlier in this conversation, skip launching and run `crit go <port>` to trigger a new round instead.
+
+Otherwise, run `crit` **in the background** using `run_in_background: true`:
 
 ```bash
 # For a specific file:
@@ -59,7 +61,7 @@ The file contains structured JSON with comments per file:
 }
 ```
 
-Identify all comments where `"resolved": false`.
+Identify all comments where `"resolved": false` or where the `resolved` field is missing (missing means unresolved).
 
 ## Step 4: Address each review comment
 
@@ -69,6 +71,7 @@ For each unresolved comment:
 2. If a comment contains a suggestion block, apply that specific change
 3. Revise the **referenced file** to address the feedback - this could be the plan file or any code file from the git diff
 4. Use the Edit tool to make targeted changes
+5. Mark it resolved in `.crit.json`: set `"resolved": true`, optionally add `"resolution_note"` (what you did) and `"resolution_lines"` (where in the updated file, e.g. `"12-15"`)
 
 Editing the plan file triggers Crit's live reload - the user sees changes in the browser immediately.
 
