@@ -326,10 +326,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "       crit comment [--output <dir>] --clear")
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "Examples:")
-			fmt.Fprintln(os.Stderr, "  crit comment main.go:42 'Fix this bug'")
-			fmt.Fprintln(os.Stderr, "  crit comment src/auth.go:10-25 'This block needs refactoring'")
 			fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' main.go:42 'Fix this bug'")
+			fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' src/auth.go:10-25 'This block needs refactoring'")
 			fmt.Fprintln(os.Stderr, "  crit comment --output /tmp/reviews main.go:42 'Fix this bug'")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "Tips:")
+			fmt.Fprintln(os.Stderr, "  Use --author to identify who left the comment (recommended for AI agents)")
+			fmt.Fprintln(os.Stderr, "  Use single quotes for the body to avoid shell interpretation of backticks")
 			os.Exit(1)
 		}
 
