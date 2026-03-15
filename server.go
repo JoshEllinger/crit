@@ -41,6 +41,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, author st
 	mux.HandleFunc("/api/share-url", s.handleShareURL)
 	mux.HandleFunc("/api/finish", s.handleFinish)
 	mux.HandleFunc("/api/events", s.handleEvents)
+	mux.HandleFunc("/api/wait-for-event", s.handleWaitForEvent)
 	mux.HandleFunc("/api/round-complete", s.handleRoundComplete)
 
 	mux.HandleFunc("/api/comments", s.handleClearComments)
@@ -332,11 +333,39 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		"prompt":      prompt,
 	})
 
+	s.session.notify(SSEEvent{
+		Type:    "finish",
+		Content: prompt,
+	})
+
 	if s.status != nil {
 		round := s.session.GetReviewRound()
 		s.status.RoundFinished(round, newComments, unresolvedComments > 0)
 		if unresolvedComments > 0 {
 			s.status.WaitingForAgent()
+		}
+	}
+}
+
+func (s *Server) handleWaitForEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ch := s.session.Subscribe()
+	defer s.session.Unsubscribe(ch)
+
+	for {
+		select {
+		case event := <-ch:
+			if event.Type == "finish" {
+				writeJSON(w, event)
+				return
+			}
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
 		}
 	}
 }

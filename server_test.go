@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestServer(t *testing.T) (*Server, *Session) {
@@ -978,6 +980,114 @@ func TestGetFile_NotInSession_PathTraversal(t *testing.T) {
 		if w.Code != 404 {
 			t.Errorf("path %q: status = %d, want 404", path, w.Code)
 		}
+	}
+}
+
+func TestHandleFinishEmitsSSEEvent(t *testing.T) {
+	srv, session := newTestServer(t)
+	session.AddComment(session.Files[0].Path, 1, 1, "", "test", "")
+
+	// Subscribe before triggering finish
+	ch := session.Subscribe()
+	defer session.Unsubscribe(ch)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/finish", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	select {
+	case event := <-ch:
+		if event.Type != "finish" {
+			t.Errorf("expected finish event, got %s", event.Type)
+		}
+		if event.Content == "" {
+			t.Error("expected non-empty prompt in finish event")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no finish event received")
+	}
+}
+
+func TestWaitForEventReturnsOnFinish(t *testing.T) {
+	srv, session := newTestServer(t)
+	session.AddComment(session.Files[0].Path, 1, 1, "", "test", "")
+
+	var resp *httptest.ResponseRecorder
+	done := make(chan struct{})
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/api/wait-for-event", nil)
+		resp = httptest.NewRecorder()
+		srv.ServeHTTP(resp, req)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	finishReq := httptest.NewRequest(http.MethodPost, "/api/finish", nil)
+	finishW := httptest.NewRecorder()
+	srv.ServeHTTP(finishW, finishReq)
+
+	select {
+	case <-done:
+		if resp.Code != 200 {
+			t.Fatalf("expected 200, got %d", resp.Code)
+		}
+		var event map[string]string
+		json.NewDecoder(resp.Body).Decode(&event)
+		if event["type"] != "finish" {
+			t.Errorf("expected finish event, got %s", event["type"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("long-poll did not return after finish")
+	}
+}
+
+func TestWaitForEventIgnoresOtherEvents(t *testing.T) {
+	srv, session := newTestServer(t)
+	session.AddComment(session.Files[0].Path, 1, 1, "", "test", "")
+
+	done := make(chan struct{})
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/api/wait-for-event", nil)
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	session.notify(SSEEvent{Type: "comments-changed"})
+
+	select {
+	case <-done:
+		t.Fatal("long-poll should not return on comments-changed event")
+	case <-time.After(200 * time.Millisecond):
+		// Good — still blocking
+	}
+}
+
+func TestWaitForEventRespectsCancel(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/wait-for-event", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Errorf("expected 504, got %d", w.Code)
+	}
+}
+
+func TestWaitForEvent_MethodNotAllowed(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req := httptest.NewRequest("POST", "/api/wait-for-event", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
 	}
 }
 
