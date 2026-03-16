@@ -14,6 +14,66 @@
     }
   });
 
+  // ===== Suggestion Diff Renderer =====
+  function renderSuggestionDiff(suggestionContent, originalLines) {
+    var sugLines = suggestionContent.replace(/\n$/, '').split('\n');
+    var html = '<div class="suggestion-diff">';
+    html += '<div class="suggestion-header">Suggested change</div>';
+
+    var origLen = (originalLines && originalLines.length > 0) ? originalLines.length : 0;
+    var isEmptySuggestion = sugLines.length === 1 && sugLines[0] === '' && origLen > 0;
+    var sugLen = isEmptySuggestion ? 0 : sugLines.length;
+    var pairedLen = Math.min(origLen, sugLen);
+
+    // Compute word-level diffs for paired lines
+    var delContents = [];
+    var addContents = [];
+    for (var i = 0; i < pairedLen; i++) {
+      var wd = wordDiff(originalLines[i], sugLines[i]);
+      if (wd) {
+        delContents.push(applyWordDiffToHtml(escapeHtml(originalLines[i]), wd.oldRanges, 'diff-word-del'));
+        addContents.push(applyWordDiffToHtml(escapeHtml(sugLines[i]), wd.newRanges, 'diff-word-add'));
+      } else {
+        delContents.push(escapeHtml(originalLines[i]));
+        addContents.push(escapeHtml(sugLines[i]));
+      }
+    }
+
+    // All deletion lines first (paired + unpaired)
+    for (var j = 0; j < origLen; j++) {
+      var dc = j < pairedLen ? delContents[j] : escapeHtml(originalLines[j]);
+      html += '<div class="suggestion-line suggestion-line-del">'
+        + '<span class="suggestion-line-sign">\u2212</span>'
+        + '<span class="suggestion-line-content">' + dc + '</span></div>';
+    }
+
+    // All addition lines (paired + unpaired)
+    for (var k = 0; k < sugLen; k++) {
+      var ac = k < pairedLen ? addContents[k] : escapeHtml(sugLines[k]);
+      html += '<div class="suggestion-line suggestion-line-add">'
+        + '<span class="suggestion-line-sign">+</span>'
+        + '<span class="suggestion-line-content">' + ac + '</span></div>';
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  (function() {
+    var defaultFence = commentMd.renderer.rules.fence;
+    commentMd.renderer.rules.fence = function(tokens, idx, options, env, self) {
+      var token = tokens[idx];
+      var info = token.info ? token.info.trim() : '';
+      if (info === 'suggestion') {
+        return renderSuggestionDiff(token.content, env && env.originalLines);
+      }
+      if (defaultFence) {
+        return defaultFence(tokens, idx, options, env, self);
+      }
+      return self.renderToken(tokens, idx, options);
+    };
+  })();
+
   // ===== Document Markdown Renderer =====
   const documentMd = window.markdownit({
     html: true,
@@ -1557,7 +1617,7 @@
       if (enableComments && blockComments) {
         for (var ci = 0; ci < blockComments.length; ci++) {
           if (blockComments[ci].resolved) {
-            container.appendChild(createResolvedElement(blockComments[ci]));
+            container.appendChild(createResolvedElement(blockComments[ci], file.path));
           } else {
             container.appendChild(createCommentElement(blockComments[ci], file.path));
           }
@@ -1756,7 +1816,7 @@
     if (commentable && blockComments) {
       for (var ci = 0; ci < blockComments.length; ci++) {
         if (blockComments[ci].resolved) {
-          frag.appendChild(createResolvedElement(blockComments[ci]));
+          frag.appendChild(createResolvedElement(blockComments[ci], file.path));
         } else {
           frag.appendChild(createCommentElement(blockComments[ci], file.path));
         }
@@ -2041,7 +2101,7 @@
       // Comments after block
       for (const comment of blockComments) {
         if (comment.resolved) {
-          container.appendChild(createResolvedElement(comment));
+          container.appendChild(createResolvedElement(comment, file.path));
         } else {
           container.appendChild(createCommentElement(comment, file.path));
         }
@@ -2485,7 +2545,7 @@
     const lineComments = commentsMap[key] || [];
     for (const comment of lineComments) {
       var el = comment.resolved
-        ? createResolvedElement(comment)
+        ? createResolvedElement(comment, filePath)
         : createCommentElement(comment, filePath);
       if (side === 'old') el.classList.add('diff-comment-left');
       else el.classList.add('diff-comment-right');
@@ -2667,7 +2727,7 @@
           ];
           for (var ci = 0; ci < ctxComments.length; ci++) {
             var el = ctxComments[ci].resolved
-              ? createResolvedElement(ctxComments[ci])
+              ? createResolvedElement(ctxComments[ci], file.path)
               : createCommentElement(ctxComments[ci], file.path);
             el.classList.add('diff-comment-right');
             container.appendChild(el);
@@ -3564,6 +3624,15 @@
   }
 
   // ===== Comment Display =====
+  function buildCommentEnv(comment, filePath) {
+    var env = {};
+    var file = getFileByPath(filePath);
+    if (file && file.content && comment.start_line && comment.end_line && !comment.side) {
+      env.originalLines = file.content.split('\n').slice(comment.start_line - 1, comment.end_line);
+    }
+    return env;
+  }
+
   function createCommentElement(comment, filePath) {
     if (findFormForEdit(comment.id)) {
       return createInlineEditor(comment);
@@ -3637,7 +3706,7 @@
 
     const bodyEl = document.createElement('div');
     bodyEl.className = 'comment-body';
-    bodyEl.innerHTML = commentMd.render(comment.body);
+    bodyEl.innerHTML = commentMd.render(comment.body, buildCommentEnv(comment, filePath));
 
     card.appendChild(header);
     card.appendChild(bodyEl);
@@ -3732,7 +3801,7 @@
     updateCommentCount();
   }
 
-  function createResolvedElement(comment) {
+  function createResolvedElement(comment, filePath) {
     const el = document.createElement('div');
     el.className = 'resolved-comment';
     el.dataset.commentId = comment.id;
@@ -3746,7 +3815,7 @@
 
     const body = document.createElement('div');
     body.className = 'resolved-body';
-    body.innerHTML = commentMd.render(comment.body);
+    body.innerHTML = commentMd.render(comment.body, buildCommentEnv(comment, filePath));
 
     header.appendChild(check);
     if (comment.review_round >= 1) {
@@ -3888,7 +3957,7 @@
 
         var bodyEl = document.createElement('div');
         bodyEl.className = 'comments-panel-card-body';
-        bodyEl.innerHTML = commentMd.render(comment.body);
+        bodyEl.innerHTML = commentMd.render(comment.body, buildCommentEnv(comment, file.path));
 
         card.appendChild(lineRef);
         card.appendChild(bodyEl);
