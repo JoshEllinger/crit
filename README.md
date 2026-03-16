@@ -116,7 +116,7 @@ crit share plan.md --qr               # also print a QR code in the terminal
 crit unpublish                        # remove the shared review
 ```
 
-Sharing requires `CRIT_SHARE_URL=https://crit.live` (or `--share-url`, or `share_url` in config).
+Sharing uses [crit.live](https://crit.live) by default. To self-host, deploy [`crit-web`](https://github.com/tomasz-tomczyk/crit-web) (Elixir/Phoenix) and point `CRIT_SHARE_URL` (or `--share-url`, or `share_url` in config) at your instance. Set `share_url` to `""` to disable sharing entirely.
 
 ### GitHub PR Sync
 
