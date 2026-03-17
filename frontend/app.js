@@ -4105,6 +4105,9 @@
       numEl.textContent = total;
     }
     renderCommentsPanel();
+    if (uiState === 'reviewing') {
+      document.getElementById('finishBtn').textContent = total === 0 ? 'Approve' : 'Finish Review';
+    }
   }
 
   function updateTocPosition() {
@@ -4267,7 +4270,11 @@
 
     switch (state) {
       case 'reviewing':
-        finishBtn.textContent = 'Finish Review';
+        var totalComments = 0;
+        for (var fi = 0; fi < files.length; fi++) {
+          if (files[fi].comments) totalComments += files[fi].comments.length;
+        }
+        finishBtn.textContent = totalComments === 0 ? 'Approve' : 'Finish Review';
         finishBtn.disabled = false;
         finishBtn.classList.add('btn-primary');
         document.getElementById('waitingEdits').textContent = '';
@@ -4307,8 +4314,9 @@
       } else {
         document.getElementById('waitingMessage').textContent =
           'You can close this browser tab, or leave it open for another round.';
-        document.getElementById('waitingClipboard').style.display = 'none';
-        document.getElementById('waitingPrompt').style.display = 'none';
+        const clipEl = document.getElementById('waitingClipboard');
+        clipEl.textContent = 'Copy prompt';
+        clipEl.classList.remove('clipboard-confirm');
       }
 
       try { await navigator.clipboard.writeText(prompt); } catch (_) {}
