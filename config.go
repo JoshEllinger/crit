@@ -37,7 +37,7 @@ func defaultConfig() generatedConfig {
 	return generatedConfig{
 		Port:       0,
 		NoOpen:     false,
-		ShareURL:   "https://crit.live",
+		ShareURL:   "",
 		Quiet:      false,
 		Output:     "",
 		Author:     "",
@@ -164,9 +164,6 @@ func LoadConfig(projectDir string) Config {
 	merged := mergeConfigs(global, project)
 
 	// 4. Apply runtime defaults for fields not explicitly set in any config file
-	if !globalPresence.ShareURL && !projectPresence.ShareURL {
-		merged.ShareURL = "https://crit.live"
-	}
 	if !globalPresence.IgnorePatterns && !projectPresence.IgnorePatterns {
 		merged.IgnorePatterns = []string{".crit.json"}
 	}
