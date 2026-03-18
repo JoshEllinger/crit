@@ -22,17 +22,23 @@ crit $PLAN_FILE
 crit
 ```
 
-If background tasks are supported, run `crit listen <port>` in the background to be notified automatically when the user clicks Finish Review — do NOT ask the user to type anything.
+**CRITICAL — you MUST run `crit listen <port>` after launching crit.** Run it in the background if supported:
 
-Otherwise, tell the user: "I've opened your changes in Crit for review. Leave inline comments, then click Finish Review. Let me know when you're done."
+```bash
+crit listen <port>
+```
 
-Do NOT begin implementation until the review is complete.
+**Do NOT proceed until `crit listen` completes.** Do NOT ask the user to type anything. Do NOT read `.crit.json` early. `crit listen` blocks until the user clicks Finish Review — that is how you know they are done.
+
+**Fallback:** If background tasks are NOT supported, tell the user: "Leave inline comments, then click Finish Review. Let me know when you're done." and wait for a response.
 
 ## After review
 
-Read `.crit.json` to find the user's inline comments. Comments are grouped per file with `start_line`/`end_line` referencing the source. A comment is unresolved if `"resolved": false` or if the `resolved` field is missing. Address each unresolved comment by revising the referenced file. After addressing, set `"resolved": true` and optionally `"resolution_note"` and `"resolution_lines"`. When done, run `crit go <port>` to trigger a new round.
+Read `.crit.json` to find the user's inline comments. Comments are grouped per file with `start_line`/`end_line` referencing the source. A comment is unresolved if `"resolved": false` or if the `resolved` field is missing. Address each unresolved comment by revising the referenced file. After addressing, set `"resolved": true` and optionally `"resolution_note"` and `"resolution_lines"`.
 
-Only proceed after the user approves.
+When done, run `crit go <port>` to trigger a new round, then **immediately run `crit listen <port>` again** to wait for the next review. Do NOT skip `crit listen` between rounds.
+
+Only proceed after the user approves (finishes a round with zero comments).
 
 ## Leaving comments programmatically
 

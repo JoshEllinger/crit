@@ -19,9 +19,9 @@ Choose what to review based on context:
 
 Don't ask for confirmation — just proceed with whichever mode applies.
 
-## Step 2: Run crit for review
+## Step 2: Launch crit server
 
-If a crit server is already running from earlier in this conversation, skip launching and run `crit go <port>` to trigger a new round instead. Then skip to Step 2b.
+If a crit server is already running from earlier in this conversation, skip to Step 3 and run `crit go <port>` there instead.
 
 Run `crit` in a terminal:
 
@@ -35,13 +35,23 @@ crit
 
 Note the port from Crit's startup output.
 
-### Step 2b: Listen for review completion
+## Step 3: Block until review completes
 
-If background tasks are supported, run `crit listen <port>` in the background and wait for it to complete — do NOT ask the user to type anything.
+**CRITICAL — you MUST run this step. Do NOT skip it. Do NOT proceed without it.**
 
-Otherwise, tell the user: **"Crit is open in your browser. Leave inline comments, then click 'Finish Review'. Type 'go' here when you're done."** and wait for the user to respond.
+If background tasks are supported, run `crit listen <port>` in the background:
 
-## Step 3: Read the review output
+```bash
+crit listen <port>
+```
+
+Tell the user: **"Crit is open in your browser. Leave inline comments, then click Finish Review."**
+
+**Do NOT proceed until `crit listen` completes.** Do NOT ask the user to type anything. Do NOT read `.crit.json` early. Wait for the background task to finish — that is how you know the human is done reviewing.
+
+**Fallback:** If background tasks are NOT supported, tell the user: **"Type 'go' here when you're done."** and wait for the user to respond.
+
+## Step 4: Read the review output
 
 Read the `.crit.json` file in the repo root (or working directory).
 
@@ -61,7 +71,7 @@ The file contains structured JSON with comments per file:
 
 Identify all comments where `"resolved": false` or where the `resolved` field is missing (missing means unresolved). If a comment has a `"quote"` field, it contains the specific text the reviewer selected — focus your changes on the quoted text rather than the entire line range.
 
-## Step 4: Address each review comment
+## Step 5: Address each review comment
 
 For each unresolved comment:
 
@@ -74,7 +84,7 @@ Editing the plan file triggers Crit's live reload - the user sees changes in the
 
 If there are zero review comments, inform the user that no changes were requested.
 
-## Step 5: Signal completion
+## Step 6: Signal completion and start next round
 
 After all comments are addressed, signal to Crit that edits are done:
 
@@ -82,15 +92,17 @@ After all comments are addressed, signal to Crit that edits are done:
 crit go <port>
 ```
 
-The port is shown in Crit's startup output. This triggers a new review round in the browser with a diff of what changed.
+This triggers a new review round in the browser with a diff of what changed.
 
-## Step 6: Next round
+**CRITICAL — immediately after `crit go`, you MUST run `crit listen <port>` again.** This is the same as Step 3. Do NOT skip it.
 
-After `crit go <port>` triggers a new round, listen for the next review completion (same as Step 2b).
+```bash
+crit listen <port>
+```
 
 Tell the user: **"Changes applied. Review the diff in your browser and click Finish Review when ready."**
 
-If the user finishes with zero comments, the review is approved — stop the loop and proceed.
+**Do NOT proceed until `crit listen` completes.** When it does, go back to Step 4. If the user finishes with zero comments, the review is approved — stop the loop and proceed.
 
 ## Sharing
 
