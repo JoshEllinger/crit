@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,22 +17,33 @@ func fileHash(data []byte) string {
 	return fmt.Sprintf("sha256:%x", sha256.Sum256(data))
 }
 
+// Reply represents a single reply in a comment thread.
+type Reply struct {
+	ID        string `json:"id"`
+	Body      string `json:"body"`
+	Author    string `json:"author,omitempty"`
+	CreatedAt string `json:"created_at"`
+	GitHubID  int64  `json:"github_id,omitempty"`
+}
+
 // Comment represents a single inline review comment.
 type Comment struct {
-	ID              string `json:"id"`
-	StartLine       int    `json:"start_line"`
-	EndLine         int    `json:"end_line"`
-	Side            string `json:"side,omitempty"`
-	Body            string `json:"body"`
-	Quote           string `json:"quote,omitempty"`
-	Author          string `json:"author,omitempty"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
-	Resolved        bool   `json:"resolved,omitempty"`
-	ResolutionNote  string `json:"resolution_note,omitempty"`
-	ResolutionLines any    `json:"resolution_lines,omitempty"`
-	CarriedForward  bool   `json:"carried_forward,omitempty"`
-	ReviewRound     int    `json:"review_round,omitempty"`
+	ID              string  `json:"id"`
+	StartLine       int     `json:"start_line"`
+	EndLine         int     `json:"end_line"`
+	Side            string  `json:"side,omitempty"`
+	Body            string  `json:"body"`
+	Quote           string  `json:"quote,omitempty"`
+	Author          string  `json:"author,omitempty"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
+	Resolved        bool    `json:"resolved,omitempty"`
+	ResolutionNote  string  `json:"resolution_note,omitempty"`
+	ResolutionLines any     `json:"resolution_lines,omitempty"`
+	CarriedForward  bool    `json:"carried_forward,omitempty"`
+	ReviewRound     int     `json:"review_round,omitempty"`
+	Replies         []Reply `json:"replies,omitempty"`
+	GitHubID        int64   `json:"github_id,omitempty"`
 }
 
 // SSEEvent is sent to the browser via server-sent events.
@@ -446,6 +458,30 @@ func (s *Session) UpdateComment(filePath, id, body string) (Comment, bool) {
 	return Comment{}, false
 }
 
+// SetCommentResolved sets or clears the resolved flag on a comment.
+func (s *Session) SetCommentResolved(filePath, id string, resolved bool, note string) (Comment, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.fileByPathLocked(filePath)
+	if f == nil {
+		return Comment{}, false
+	}
+	for i, c := range f.Comments {
+		if c.ID == id {
+			f.Comments[i].Resolved = resolved
+			if resolved {
+				f.Comments[i].ResolutionNote = note
+			} else {
+				f.Comments[i].ResolutionNote = ""
+			}
+			f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			s.scheduleWrite()
+			return f.Comments[i], true
+		}
+	}
+	return Comment{}, false
+}
+
 // DeleteComment deletes a comment from a specific file.
 func (s *Session) DeleteComment(filePath, id string) bool {
 	s.mu.Lock()
@@ -464,6 +500,96 @@ func (s *Session) DeleteComment(filePath, id string) bool {
 	return false
 }
 
+// nextReplyID generates the next reply ID for a comment, e.g. "c1-r1", "c1-r2".
+// It finds the max existing reply number with the prefix and increments.
+func nextReplyID(commentID string, existing []Reply) string {
+	prefix := commentID + "-r"
+	max := 0
+	for _, r := range existing {
+		if strings.HasPrefix(r.ID, prefix) {
+			numStr := r.ID[len(prefix):]
+			if n, err := strconv.Atoi(numStr); err == nil && n > max {
+				max = n
+			}
+		}
+	}
+	return fmt.Sprintf("%s-r%d", commentID, max+1)
+}
+
+// AddReply adds a reply to a specific comment on a file.
+func (s *Session) AddReply(filePath, commentID, body, author string) (Reply, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.fileByPathLocked(filePath)
+	if f == nil {
+		return Reply{}, false
+	}
+	for i, c := range f.Comments {
+		if c.ID == commentID {
+			now := time.Now().UTC().Format(time.RFC3339)
+			r := Reply{
+				ID:        nextReplyID(commentID, c.Replies),
+				Body:      body,
+				Author:    author,
+				CreatedAt: now,
+			}
+			f.Comments[i].Replies = append(f.Comments[i].Replies, r)
+			f.Comments[i].UpdatedAt = now
+			s.scheduleWrite()
+			return r, true
+		}
+	}
+	return Reply{}, false
+}
+
+// UpdateReply updates a reply's body on a specific comment.
+func (s *Session) UpdateReply(filePath, commentID, replyID, body string) (Reply, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.fileByPathLocked(filePath)
+	if f == nil {
+		return Reply{}, false
+	}
+	for i, c := range f.Comments {
+		if c.ID == commentID {
+			for j, r := range c.Replies {
+				if r.ID == replyID {
+					f.Comments[i].Replies[j].Body = body
+					f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+					s.scheduleWrite()
+					return f.Comments[i].Replies[j], true
+				}
+			}
+			return Reply{}, false
+		}
+	}
+	return Reply{}, false
+}
+
+// DeleteReply removes a reply from a specific comment.
+func (s *Session) DeleteReply(filePath, commentID, replyID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.fileByPathLocked(filePath)
+	if f == nil {
+		return false
+	}
+	for i, c := range f.Comments {
+		if c.ID == commentID {
+			for j, r := range c.Replies {
+				if r.ID == replyID {
+					f.Comments[i].Replies = append(f.Comments[i].Replies[:j], f.Comments[i].Replies[j+1:]...)
+					f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+					s.scheduleWrite()
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return false
+}
+
 // GetComments returns comments for a specific file.
 func (s *Session) GetComments(filePath string) []Comment {
 	s.mu.RLock()
@@ -474,6 +600,12 @@ func (s *Session) GetComments(filePath string) []Comment {
 	}
 	result := make([]Comment, len(f.Comments))
 	copy(result, f.Comments)
+	for i, c := range result {
+		if len(c.Replies) > 0 {
+			result[i].Replies = make([]Reply, len(c.Replies))
+			copy(result[i].Replies, c.Replies)
+		}
+	}
 	return result
 }
 
@@ -486,6 +618,12 @@ func (s *Session) GetAllComments() map[string][]Comment {
 		if len(f.Comments) > 0 {
 			comments := make([]Comment, len(f.Comments))
 			copy(comments, f.Comments)
+			for i, c := range comments {
+				if len(c.Replies) > 0 {
+					comments[i].Replies = make([]Reply, len(c.Replies))
+					copy(comments[i].Replies, c.Replies)
+				}
+			}
 			result[f.Path] = comments
 		}
 	}
@@ -954,6 +1092,30 @@ func (s *Session) mergeExternalCritJSON() bool {
 					f.nextID = id + 1
 				}
 				changed = true
+			} else {
+				// Comment exists in memory — merge replies and resolved state from disk.
+				for i, mc := range f.Comments {
+					if mc.ID != dc.ID {
+						continue
+					}
+					// Merge new replies from disk
+					memReplyIDs := make(map[string]struct{}, len(mc.Replies))
+					for _, r := range mc.Replies {
+						memReplyIDs[r.ID] = struct{}{}
+					}
+					for _, dr := range dc.Replies {
+						if _, exists := memReplyIDs[dr.ID]; !exists {
+							f.Comments[i].Replies = append(f.Comments[i].Replies, dr)
+							changed = true
+						}
+					}
+					// Sync resolved state from disk
+					if dc.Resolved && !mc.Resolved {
+						f.Comments[i].Resolved = true
+						changed = true
+					}
+					break
+				}
 			}
 		}
 
