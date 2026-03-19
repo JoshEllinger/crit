@@ -699,11 +699,19 @@ func ParseUnifiedDiff(diff string) []DiffHunk {
 
 // WorkingTreeFingerprint returns a string representing the current working tree state.
 // Compare consecutive calls to detect changes.
+// .crit.json is excluded because it is crit's own output file, not a user edit.
 func WorkingTreeFingerprint() string {
 	cmd := exec.Command("git", "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
-	return string(out)
+	lines := strings.Split(string(out), "\n")
+	filtered := lines[:0]
+	for _, line := range lines {
+		if !strings.HasSuffix(strings.TrimSpace(line), ".crit.json") {
+			filtered = append(filtered, line)
+		}
+	}
+	return strings.Join(filtered, "\n")
 }
