@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Install crit — inline code review for AI agent workflows
+# Usage: curl -fsSL https://github.com/JoshEllinger/crit/releases/latest/download/install.sh | sh
+# Custom dir: INSTALL_DIR=~/.local/bin curl -fsSL ... | sh
 set -euo pipefail
 
 REPO="JoshEllinger/crit"

@@ -23,11 +23,14 @@ Works with Claude Code, Cursor, GitHub Copilot, Aider, Cline, Windsurf - any age
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JoshEllinger/crit/main/install.sh | sh
+curl -fsSL https://github.com/JoshEllinger/crit/releases/latest/download/install.sh | sh
 ```
 
 Works on macOS (arm64/amd64), Linux (amd64/arm64), and Windows via WSL.
-To install to a custom location: `INSTALL_DIR=~/.local/bin bash <(curl -fsSL ...)`
+To install to a custom location:
+```bash
+INSTALL_DIR=~/.local/bin curl -fsSL https://github.com/JoshEllinger/crit/releases/latest/download/install.sh | sh
+```
 
 Also available via [Go, Nix, or binary download](#other-install-methods).
 
