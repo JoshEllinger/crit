@@ -4905,6 +4905,7 @@
   });
 
   // ===== SSE Client =====
+
   function connectSSE() {
     const source = new EventSource('/api/events');
 

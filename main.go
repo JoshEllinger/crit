@@ -37,17 +37,15 @@ var (
 
 func main() {
 	if len(os.Args) < 2 {
-		runServer(os.Args[1:])
+		runReview(nil)
 		return
 	}
 
 	switch os.Args[1] {
 	case "help", "--help", "-h":
 		printHelp()
-	case "go":
-		runGo(os.Args[2:])
-	case "listen":
-		runListen(os.Args[2:])
+	case "--version", "-v":
+		printVersion()
 	case "share":
 		runShare(os.Args[2:])
 	case "unpublish":
@@ -62,47 +60,18 @@ func main() {
 		runPush(os.Args[2:])
 	case "comment":
 		runComment(os.Args[2:])
+	case "review":
+		runReview(os.Args[2:])
+	case "stop":
+		runStop()
+	case "_serve":
+		runServe(os.Args[2:])
 	default:
-		runServer(os.Args[1:])
+		runReview(os.Args[1:])
 	}
 }
 
-func runGo(args []string) {
-	port := requirePort(args, "crit go <port>")
-	resp, err := http.Post("http://localhost:"+port+"/api/round-complete", "application/json", nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: could not reach crit on port %s: %v\n", port, err)
-		os.Exit(1)
-	}
-	resp.Body.Close()
-	if resp.StatusCode == 200 {
-		fmt.Println("Round complete — crit will reload.")
-		newStatus(os.Stdout).ListenHint(port)
-	} else {
-		fmt.Fprintf(os.Stderr, "Unexpected status: %d\n", resp.StatusCode)
-		os.Exit(1)
-	}
-}
 
-func runListen(args []string) {
-	port := requirePort(args, "crit listen <port>")
-	client := &http.Client{Timeout: 24 * time.Hour}
-	resp, err := client.Get("http://localhost:" + port + "/api/wait-for-event")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: could not reach crit on port %s: %v\n", port, err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusGatewayTimeout {
-		fmt.Fprintln(os.Stderr, "Timeout waiting for event")
-		os.Exit(1)
-	}
-	_, err = io.Copy(os.Stdout, resp.Body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
-		os.Exit(1)
-	}
-}
 
 func runShare(args []string) {
 	shareOutputDir := ""
@@ -728,6 +697,96 @@ func runComment(args []string) {
 	fmt.Printf("Added comment on %s:%s\n", filePath, lineSpec)
 }
 
+// runReview always uses the daemon pattern: starts a background daemon if needed,
+// connects as a review client, blocks for one review cycle, then exits.
+// Used by `crit review` and by agents.
+func runReview(args []string) {
+	// Resolve port from config (same precedence as server)
+	configPort := 0
+	dir, _ := os.Getwd()
+	cfg := LoadConfig(dir)
+	if cfg.Port != 0 {
+		configPort = cfg.Port
+	}
+	if envPort := os.Getenv("CRIT_PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil {
+			configPort = p
+		}
+	}
+
+	// Check for running daemon
+	statePath := critJSONPathForDaemon()
+	state, err := readDaemonState(statePath)
+	weStartedDaemon := false
+
+	if err == nil && isDaemonAlive(state) && len(args) == 0 {
+		// No file args — connect to existing daemon
+		fmt.Fprintf(os.Stderr, "Connected to crit daemon on port %d\n", state.Port)
+		go openBrowser(fmt.Sprintf("http://localhost:%d", state.Port))
+	} else {
+		// Start new daemon (file args given, or no daemon running)
+		state, err = startDaemon(args, configPort)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Started crit daemon on port %d (PID %d)\n", state.Port, state.PID)
+		weStartedDaemon = true
+	}
+
+	// If we started the daemon, clean it up on Ctrl+C
+	if weStartedDaemon {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			// Kill the daemon we started
+			if proc, err := os.FindProcess(state.PID); err == nil {
+				proc.Signal(syscall.SIGTERM)
+			}
+			os.Exit(0)
+		}()
+	}
+
+	runReviewClient(state)
+}
+
+// runReviewClient connects to a running daemon/server, blocks until the user
+// finishes reviewing, prints feedback to stdout, and exits.
+func runReviewClient(state daemonState) {
+	client := &http.Client{Timeout: 24 * time.Hour}
+	resp, err := client.Post(
+		fmt.Sprintf("http://localhost:%d/api/review-cycle", state.Port),
+		"application/json",
+		nil,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: could not reach crit daemon on port %d: %v\n", state.Port, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusGatewayTimeout {
+		fmt.Fprintln(os.Stderr, "Timeout waiting for review")
+		os.Exit(1)
+	}
+
+	// Print feedback to stdout (same format as crit listen)
+	_, err = io.Copy(os.Stdout, resp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runStop() {
+	if err := stopDaemon(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Daemon stopped.")
+}
+
 func plural(n int) string {
 	if n == 1 {
 		return ""
@@ -946,38 +1005,94 @@ func runServer(args []string) {
 	_ = httpServer.Shutdown(shutCtx)
 }
 
-// requirePort resolves the port from CLI args, then config, or exits with an error.
-func requirePort(args []string, usage string) string {
-	port := ""
-	if len(args) > 0 {
-		port = args[0]
+func runServe(args []string) {
+	sc, err := resolveServerConfig(args)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
 	}
-	if port == "" {
-		port = resolvePort()
+	if sc == nil {
+		return
 	}
-	if port == "" {
-		fmt.Fprintf(os.Stderr, "Error: port is required. Usage: %s\n", usage)
-		os.Exit(1)
+
+	// Force quiet mode — daemon runs in background, no terminal output
+	sc.quiet = true
+
+	var session *Session
+	if len(sc.files) == 0 {
+		if !IsGitRepo() {
+			fmt.Fprintln(os.Stderr, "Error: not in a git repository and no files specified")
+			os.Exit(1)
+		}
+		session, err = NewSessionFromGit(sc.ignorePatterns)
+	} else {
+		session, err = NewSessionFromFiles(sc.files, sc.ignorePatterns)
 	}
-	if _, err := strconv.Atoi(port); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid port %q\n", port)
-		os.Exit(1)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
 	}
-	return port
+
+	if sc.outputDir != "" {
+		abs, _ := filepath.Abs(sc.outputDir)
+		session.OutputDir = abs
+	}
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", sc.port))
+	if err != nil {
+		log.Fatalf("Error starting server: %v", err)
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+
+	srv, err := NewServer(session, frontendFS, sc.shareURL, sc.author, version, addr.Port)
+	if err != nil {
+		log.Fatalf("Error creating server: %v", err)
+	}
+
+	httpServer := &http.Server{
+		Handler:     srv,
+		ReadTimeout: 15 * time.Second,
+		IdleTimeout: 60 * time.Second,
+	}
+
+	// Write daemon state file so clients can discover us
+	statePath := critJSONPathForDaemon()
+	if err := writeDaemonState(statePath, daemonState{
+		PID:  os.Getpid(),
+		Port: addr.Port,
+	}); err != nil {
+		log.Fatalf("Error writing daemon state: %v", err)
+	}
+
+	if !sc.noOpen {
+		go openBrowser(fmt.Sprintf("http://localhost:%d", addr.Port))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	watchStop := make(chan struct{})
+	go session.Watch(watchStop)
+
+	go func() {
+		if err := httpServer.Serve(listener); err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	close(watchStop)
+
+	// Cleanup daemon state
+	removeDaemonState(statePath)
+
+	session.Shutdown()
+	session.WriteFiles()
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(shutCtx)
 }
 
-// resolvePort returns the configured port as a string, or empty if not configured.
-func resolvePort() string {
-	dir, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	cfg := LoadConfig(dir)
-	if cfg.Port != 0 {
-		return fmt.Sprintf("%d", cfg.Port)
-	}
-	return ""
-}
+
 
 func printHelp() {
 	fmt.Fprintf(os.Stderr, `crit — inline code review for AI agent workflows
@@ -985,8 +1100,7 @@ func printHelp() {
 Usage:
   crit                                       Auto-detect changed files via git
   crit <file|dir> [...]                      Review specific files or directories
-  crit go <port>                             Signal round-complete to a running crit instance
-  crit listen <port>                         Wait for review to finish on a running crit instance
+  crit stop                                  Stop the background crit daemon
   crit comment <path>:<line[-end]> <body>    Add a review comment to .crit.json
   crit comment --reply-to <id> [--resolve] [--author <name>] <body>  Reply to a comment
   crit comment --json [--author <name>] [--output <dir>]    Read comments from stdin as JSON

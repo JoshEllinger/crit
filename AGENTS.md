@@ -80,9 +80,9 @@ make build-all                                        # Cross-compile to dist/
 ## CLI Subcommands
 
 ```bash
-crit                          # Start review server (git mode or file mode)
-crit go <port>                # Signal round-complete to a running server
-crit listen [port]            # Block until review finishes on a running crit instance
+crit                          # Review git changes (starts daemon, blocks for feedback)
+crit <file|dir> [...]         # Review specific files or directories
+crit stop                     # Stop the background daemon
 crit pull [pr-number]         # Fetch GitHub PR comments into .crit.json
 crit push [--dry-run] [pr]    # Post .crit.json comments as a GitHub PR review
 crit comment <path>:<line[-end]> <body>         # Add a comment to .crit.json (no server needed)
@@ -235,7 +235,7 @@ Session-scoped:
 - `GET  /api/config` — returns `{share_url, hosted_url, delete_token, version, latest_version}`
 - `POST /api/finish` — write `.crit.json`, return prompt for agent
 - `GET  /api/events` — SSE stream (file-changed, edit-detected, server-shutdown events)
-- `GET  /api/wait-for-event` — long-poll that blocks until finish, returns event JSON (used by `crit listen`)
+- `GET  /api/wait-for-event` — long-poll that blocks until finish, returns event JSON (used by `crit` in daemon mode)
 - `POST /api/round-complete` — agent signals all edits are done; triggers new round
 - `POST /api/share-url` — persist `{url, delete_token}` to `.crit.json` after upload
 - `DELETE /api/share-url` — unpublish: calls crit-web DELETE and clears local persisted URL
@@ -328,13 +328,26 @@ Sharing is opt-in. When `--share-url` (or `CRIT_SHARE_URL` env var, or `share_ur
 
 ## Multi-Round Review
 
-When the agent runs `crit go <PORT>` (or calls `POST /api/round-complete`):
+When the agent runs `crit` (or calls `POST /api/round-complete`):
 
 - **Markdown files**: Snapshot content, carry forward unresolved comments, re-read from disk
 - **Code files**: Re-run git diff against base ref to get updated hunks
 - **File list**: Re-run `ChangedFiles()` to detect new/removed files
 - The waiting modal shows a live count of file edits while the agent is working
 - Diff toggle for markdown files shows inter-round changes
+
+## Daemon Architecture
+
+`crit` manages a background daemon for seamless multi-round reviews:
+
+1. **First `crit`**: starts background daemon (`crit _serve`), opens browser, blocks for feedback
+2. **Subsequent `crit`**: connects to existing daemon, signals round-complete, blocks for feedback
+3. **`crit <file>`**: always starts a new daemon (supports multiple concurrent reviews)
+4. **Ctrl+C**: kills the daemon the client started
+5. **`crit stop`**: kills the most recent daemon
+
+Daemon state (`daemon_pid`, `daemon_port`) is stored in `.crit.json` alongside review data.
+Internal command: `crit _serve` runs the server in foreground (used by daemon spawning, not user-facing).
 
 ## Releasing
 

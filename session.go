@@ -81,20 +81,21 @@ type Session struct {
 	ReviewRound    int
 	IgnorePatterns []string
 
-	mu                sync.RWMutex
-	subscribers       map[chan SSEEvent]struct{}
-	subMu             sync.Mutex
-	writeTimer        *time.Timer
-	writeGen          int
-	pendingWrite      bool
-	sharedURL         string
-	deleteToken       string
-	shareScope        string
-	status            *Status
-	roundComplete     chan struct{}
-	pendingEdits      int
-	lastRoundEdits    int
-	lastCritJSONMtime time.Time // mtime after our last WriteFiles(); used to detect external changes
+	mu                  sync.RWMutex
+	subscribers         map[chan SSEEvent]struct{}
+	subMu               sync.Mutex
+	writeTimer          *time.Timer
+	writeGen            int
+	pendingWrite        bool
+	sharedURL           string
+	deleteToken         string
+	shareScope          string
+	status              *Status
+	roundComplete       chan struct{}
+	pendingEdits        int
+	lastRoundEdits      int
+	lastCritJSONMtime   time.Time // mtime after our last WriteFiles(); used to detect external changes
+	awaitingFirstReview bool      // true until first review-cycle completes
 }
 
 // CritJSON is the on-disk format for .crit.json.
@@ -106,6 +107,8 @@ type CritJSON struct {
 	ShareURL    string                  `json:"share_url,omitempty"`
 	DeleteToken string                  `json:"delete_token,omitempty"`
 	ShareScope  string                  `json:"share_scope,omitempty"`
+	DaemonPID   int                     `json:"daemon_pid,omitempty"`
+	DaemonPort  int                     `json:"daemon_port,omitempty"`
 	Files       map[string]CritJSONFile `json:"files"`
 }
 
@@ -155,14 +158,15 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 	}
 
 	s := &Session{
-		Mode:           "git",
-		Branch:         branch,
-		BaseRef:        baseRef,
-		RepoRoot:       root,
-		ReviewRound:    1,
-		IgnorePatterns: ignorePatterns,
-		subscribers:    make(map[chan SSEEvent]struct{}),
-		roundComplete:  make(chan struct{}, 1),
+		Mode:                "git",
+		Branch:              branch,
+		BaseRef:             baseRef,
+		RepoRoot:            root,
+		ReviewRound:         1,
+		IgnorePatterns:      ignorePatterns,
+		subscribers:         make(map[chan SSEEvent]struct{}),
+		roundComplete:       make(chan struct{}, 1),
+		awaitingFirstReview: true,
 	}
 
 	for _, fc := range changes {
@@ -274,14 +278,15 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 	}
 
 	s := &Session{
-		Mode:           "files",
-		Branch:         branch,
-		BaseRef:        baseRef,
-		RepoRoot:       root,
-		ReviewRound:    1,
-		IgnorePatterns: ignorePatterns,
-		subscribers:    make(map[chan SSEEvent]struct{}),
-		roundComplete:  make(chan struct{}, 1),
+		Mode:                "files",
+		Branch:              branch,
+		BaseRef:             baseRef,
+		RepoRoot:            root,
+		ReviewRound:         1,
+		IgnorePatterns:      ignorePatterns,
+		subscribers:         make(map[chan SSEEvent]struct{}),
+		roundComplete:       make(chan struct{}, 1),
+		awaitingFirstReview: true,
 	}
 
 	for _, absPath := range expandedPaths {
@@ -810,6 +815,20 @@ func (s *Session) GetLastRoundEdits() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastRoundEdits
+}
+
+// IsAwaitingFirstReview returns true if no review cycle has completed yet.
+func (s *Session) IsAwaitingFirstReview() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.awaitingFirstReview
+}
+
+// SetAwaitingFirstReview sets the awaitingFirstReview flag.
+func (s *Session) SetAwaitingFirstReview(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.awaitingFirstReview = v
 }
 
 // SignalRoundComplete transitions to a new review round.

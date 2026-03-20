@@ -39,6 +39,8 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, author st
 	mux := http.NewServeMux()
 
 	// Session-scoped endpoints
+	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/review-cycle", s.handleReviewCycle)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/session", s.handleSession)
 	mux.HandleFunc("/api/share", s.handleShare)
@@ -488,8 +490,8 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 				"Read the file, address each comment in the relevant file and location. "+
 				"For each comment: reply explaining what you did using `crit comment --reply-to <comment-id> --author <your-name> --resolve \"<explanation>\"`, "+
 				"or edit .crit.json directly to add a reply to the comment's \"replies\" array and set \"resolved\": true. "+
-				"When done run: `crit go %d`",
-			critJSON, s.port)
+				"When done run: `crit`",
+			critJSON)
 	} else if totalComments > 0 && unresolvedComments == 0 {
 		prompt = "All comments are resolved — no changes needed, please proceed."
 	}
@@ -510,6 +512,55 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		s.status.RoundFinished(round, newComments, unresolvedComments > 0)
 		if unresolvedComments > 0 {
 			s.status.WaitingForAgent()
+		}
+	}
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// handleReviewCycle is the unified endpoint for the daemon-client pattern.
+// On first call (awaitingFirstReview=true): just blocks until user finishes review.
+// On subsequent calls: signals round-complete first, then blocks.
+// Returns the same feedback payload as handleFinish.
+func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Subscribe BEFORE round-complete to avoid missing the finish event
+	// if the user clicks "Finish Review" in the brief window between
+	// SignalRoundComplete and Subscribe.
+	ch := s.session.Subscribe()
+	defer s.session.Unsubscribe(ch)
+
+	if !s.session.IsAwaitingFirstReview() {
+		// Agent finished changes — signal round-complete so browser refreshes
+		s.session.SignalRoundComplete()
+	}
+
+	for {
+		select {
+		case event := <-ch:
+			if event.Type == "finish" {
+				s.session.SetAwaitingFirstReview(false)
+				// Return the same shape as handleFinish for consistent agent output
+				writeJSON(w, map[string]string{
+					"status":      "finished",
+					"review_file": s.session.critJSONPath(),
+					"prompt":      event.Content,
+				})
+				return
+			}
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
 		}
 	}
 }
