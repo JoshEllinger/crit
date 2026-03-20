@@ -411,10 +411,28 @@ func critJSONToGHComments(cj CritJSON) []map[string]any {
 	return result
 }
 
+// parsePushEvent maps a user-facing event flag value to the GitHub API event string.
+// Valid values: "" or "comment" -> "COMMENT", "approve" -> "APPROVE", "request-changes" -> "REQUEST_CHANGES".
+func parsePushEvent(flag string) (string, error) {
+	switch flag {
+	case "", "comment":
+		return "COMMENT", nil
+	case "approve":
+		return "APPROVE", nil
+	case "request-changes":
+		return "REQUEST_CHANGES", nil
+	default:
+		return "", fmt.Errorf("invalid --event value %q (valid: comment, approve, request-changes)", flag)
+	}
+}
+
 // buildReviewPayload constructs the JSON body for a GitHub PR review request.
-func buildReviewPayload(comments []map[string]any, message string) ([]byte, error) {
+func buildReviewPayload(comments []map[string]any, message string, event string) ([]byte, error) {
+	if comments == nil {
+		comments = []map[string]any{}
+	}
 	review := map[string]any{
-		"event":    "COMMENT",
+		"event":    event,
 		"body":     message,
 		"comments": comments,
 	}
@@ -424,8 +442,8 @@ func buildReviewPayload(comments []map[string]any, message string) ([]byte, erro
 // createGHReview posts a review with inline comments to a GitHub PR.
 // message is the top-level review body (empty string posts no top-level comment).
 // Returns a map of "path:endLine" -> GitHubID for each created comment.
-func createGHReview(prNumber int, comments []map[string]any, message string) (map[string]int64, error) {
-	data, err := buildReviewPayload(comments, message)
+func createGHReview(prNumber int, comments []map[string]any, message string, event string) (map[string]int64, error) {
+	data, err := buildReviewPayload(comments, message, event)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling review: %w", err)
 	}

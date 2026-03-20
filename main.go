@@ -391,6 +391,7 @@ func runPush(args []string) {
 	dryRun := false
 	message := ""
 	pushOutputDir := ""
+	eventFlag := ""
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--dry-run" {
@@ -415,12 +416,31 @@ func runPush(args []string) {
 			pushOutputDir = args[i]
 			continue
 		}
+		if arg == "--event" || arg == "-e" {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: --event requires a value (comment, approve, request-changes)\n")
+				os.Exit(1)
+			}
+			i++
+			eventFlag = args[i]
+			continue
+		}
 		n, err := strconv.Atoi(arg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Usage: crit push [--dry-run] [--message <msg>] [--output <dir>] [pr-number]\n")
+			fmt.Fprintf(os.Stderr, "Usage: crit push [--dry-run] [--event <type>] [--message <msg>] [--output <dir>] [pr-number]\n")
 			os.Exit(1)
 		}
 		prFlag = n
+	}
+
+	event, err := parsePushEvent(eventFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if event == "REQUEST_CHANGES" && message == "" {
+		fmt.Fprintf(os.Stderr, "Error: --event request-changes requires --message\n")
+		os.Exit(1)
 	}
 
 	prNumber, err := detectPR(prFlag)
@@ -447,7 +467,7 @@ func runPush(args []string) {
 	}
 
 	ghComments := critJSONToGHComments(cj)
-	if len(ghComments) == 0 {
+	if len(ghComments) == 0 && event == "COMMENT" {
 		fmt.Println("No unresolved comments to push.")
 		return
 	}
@@ -459,7 +479,11 @@ func runPush(args []string) {
 	}
 
 	if dryRun {
-		fmt.Printf("Would post %d comments to PR #%d:\n\n", len(ghComments), prNumber)
+		displayEvent := strings.ToLower(strings.ReplaceAll(event, "_", "-"))
+		fmt.Printf("Would post %d comments to PR #%d (event: %s):\n\n", len(ghComments), prNumber, displayEvent)
+		if message != "" {
+			fmt.Printf("  Review body: %s\n\n", message)
+		}
 		for _, c := range ghComments {
 			path := c["path"].(string)
 			line := c["line"].(int)
@@ -477,13 +501,14 @@ func runPush(args []string) {
 		return
 	}
 
-	fmt.Printf("Pushing %d comments to PR #%d...\n", len(ghComments), prNumber)
-	commentIDs, err := createGHReview(prNumber, ghComments, message)
+	displayEvent := strings.ToLower(strings.ReplaceAll(event, "_", "-"))
+	fmt.Printf("Pushing %d comments to PR #%d (%s)...\n", len(ghComments), prNumber, displayEvent)
+	commentIDs, err := createGHReview(prNumber, ghComments, message, event)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Posted %d review comments to PR #%d\n", len(ghComments), prNumber)
+	fmt.Printf("Posted %d review comments to PR #%d (%s)\n", len(ghComments), prNumber, displayEvent)
 
 	// Phase 2: Post new replies individually
 	replyCount := 0
@@ -1164,7 +1189,7 @@ Usage:
   crit share <file> [file...]                Share files to crit-web and print the URL
   crit unpublish                             Remove a shared review from crit-web
   crit pull [--output <dir>] [pr-number]     Fetch GitHub PR comments to .crit.json
-  crit push [--dry-run] [--message <msg>] [--output <dir>] [pr-number]  Post .crit.json comments to a GitHub PR
+  crit push [--dry-run] [--event <type>] [-m <msg>] [-o <dir>] [pr-number]  Post .crit.json comments to a GitHub PR
   crit install <agent>                       Install integration files for an AI coding tool
   crit config [--generate]                    Show resolved configuration
   crit help                                  Show this help message
