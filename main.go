@@ -1012,8 +1012,8 @@ func runServe(args []string) {
 		log.Fatalf("Error writing session file: %v", err)
 	}
 
-	// Idle timeout: exit after 4 hours of no HTTP activity
-	const idleTimeout = 4 * time.Hour
+	// Idle timeout: exit after 1 hour of no HTTP activity
+	const idleTimeout = 1 * time.Hour
 	var idleMu sync.Mutex
 	lastActivity := time.Now()
 	resetActivity := func() {

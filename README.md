@@ -14,7 +14,7 @@ Works with Claude Code, Cursor, GitHub Copilot, Aider, Cline, Windsurf and any o
 ## Why Crit
 
 - **Browser UI, not terminal.** A persistent tab with rendered markdown and visual diffs. No tmux, no TUI.
-- **Single binary, zero dependencies.** `brew install` and you're done. No daemon, no Docker, no MCP.
+- **Single binary, zero dependencies.** `brew install` and you're done. No Docker, no MCP.
 - **Round-to-round diffs.** See exactly what your agent changed between iterations. Previous comments show as resolved or still open.
 - **Works with any agent.** Not locked to one editor or AI provider.
 
