@@ -63,4 +63,9 @@ else
   sudo mv "$TMP" "${INSTALL_DIR}/${BINARY}"
 fi
 
+# macOS: re-sign with local ad-hoc signature so macOS 15+ doesn't block the binary
+if [ "$OS" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - "${INSTALL_DIR}/${BINARY}" 2>/dev/null || true
+fi
+
 echo "Installed: $(${INSTALL_DIR}/${BINARY} --version)"
