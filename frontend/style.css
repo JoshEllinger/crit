@@ -1973,7 +1973,7 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   .comment-block, .comment-form-wrapper { padding-left: 8px; }
   .line-gutter { min-width: 36px; }
   .file-tree-panel { width: 220px; }
-  .comments-panel, .pr-panel { width: 260px; }
+  .comments-panel, .pr-panel { width: 380px; }
   .pr-toggle-btn .pr-toggle-number { display: none; }
 }
 @media (max-width: 600px) {
@@ -2185,7 +2185,7 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 
 /* ===== Comments Panel (Right Sidebar) ===== */
 .comments-panel {
-  width: 340px;
+  width: 480px;
   flex-shrink: 0;
   background: var(--bg-secondary);
   border-left: 1px solid var(--border);
@@ -2217,6 +2217,23 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   letter-spacing: 0.5px;
   color: var(--fg-muted);
 }
+.comments-panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.comments-panel-add-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+.comments-panel-add-btn:hover { background: var(--bg-hover); color: var(--fg); border-color: var(--fg-muted); }
 .comments-panel-close {
   background: none;
   border: none;
@@ -2228,6 +2245,26 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   line-height: 1;
 }
 .comments-panel-close:hover { background: var(--bg-hover); color: var(--fg); }
+
+/* Panel comment cards — real .comment-card inside the panel */
+.panel-comment-block {
+  padding: 0 12px;
+  margin: 0;
+}
+.panel-comment-block .comment-header-left {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+/* Panel general comment form */
+.comments-panel-body > .comment-form-wrapper {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  margin: 0;
+}
+.comments-panel-body > .comment-form-wrapper .comment-form {
+  margin: 0;
+}
 
 /* Filter bar with custom switch */
 .comments-panel-filter {
@@ -2308,7 +2345,7 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   border-top: 1px solid var(--border);
 }
 .comments-panel-file-name {
-  padding: 10px 16px 2px;
+  padding: 10px 12px 2px;
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 500;
@@ -2316,107 +2353,6 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-/* Comment cards */
-.comments-panel-card {
-  padding: 10px 16px 10px 19px;
-  cursor: pointer;
-  border-left: 3px solid transparent;
-  transition: background 0.12s, border-color 0.12s;
-  position: relative;
-}
-.comments-panel-card:hover {
-  background: var(--bg-hover);
-  border-left-color: var(--accent);
-}
-.comments-panel-card + .comments-panel-card {
-  box-shadow: inset 0 1px 0 var(--border);
-}
-.comments-panel-card-line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--fg-muted);
-  margin-bottom: 4px;
-  font-variant-numeric: tabular-nums;
-}
-.comments-panel-card-body {
-  font-size: 13px;
-  line-height: 1.55;
-  color: var(--fg-primary);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-}
-.comments-panel-card-body p { margin: 0; }
-.comments-panel-card-body p + p { margin-top: 4px; }
-.comments-panel-card-body code {
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  padding: 1px 5px;
-  background: var(--bg-tertiary);
-  border-radius: 3px;
-}
-.comments-panel-card-body a {
-  color: var(--accent);
-  text-decoration: none;
-  border-bottom: 1px solid var(--accent-subtle);
-  transition: color 0.15s, border-color 0.15s;
-}
-.comments-panel-card-body a:hover {
-  color: var(--accent-hover);
-  border-bottom-color: var(--accent-hover);
-}
-
-/* Resolved state */
-.comments-panel-card-resolved {
-  opacity: 0.5;
-}
-
-/* Carried-forward badges */
-.comments-panel-badge {
-  font-family: var(--font-body);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-  text-transform: uppercase;
-  padding: 2px 6px;
-  border-radius: 3px;
-  margin-left: 6px;
-  vertical-align: middle;
-}
-.comments-panel-badge-resolved {
-  color: var(--green);
-  background: var(--badge-resolved-bg);
-}
-.comments-panel-badge-unresolved {
-  color: var(--orange);
-  background: var(--badge-unresolved-bg);
-}
-
-.comments-panel-badge-replies {
-  font-size: 11px;
-  color: var(--fg-muted);
-  margin-left: 6px;
-}
-
-.comments-panel-reply-preview {
-  font-size: 12px;
-  color: var(--fg-muted);
-  margin-top: 6px;
-  padding-left: 8px;
-  border-left: 2px solid var(--border);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.reply-preview-author {
-  font-weight: 600;
 }
 
 .comment-card-highlight {
@@ -2429,7 +2365,7 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 
 /* ===== PR Overview Panel ===== */
 .pr-panel {
-  width: 340px;
+  width: 480px;
   flex-shrink: 0;
   background: var(--bg-secondary);
   border-left: 1px solid var(--border);
@@ -2732,15 +2668,6 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 }
 .file-header-stats .add { color: var(--green); }
 .file-header-stats .del { color: var(--red); }
-.file-header-comment-count {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  color: var(--accent);
-  font-weight: 500;
-}
-.file-header-comment-count svg { width: 13px; height: 13px; }
 
 /* Viewed checkbox in file header */
 .file-header-viewed {
@@ -3302,4 +3229,36 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   background: var(--accent);
   color: #fff;
   border-color: var(--accent);
+}
+
+/* ===== File-Level Comments ===== */
+.file-comments {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  max-width: 900px;
+}
+
+.file-comments .comment-card {
+  margin-bottom: 8px;
+}
+
+.file-comments .comment-card:last-child {
+  margin-bottom: 0;
+}
+
+.file-comment-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--accent);
+  padding: 2px 6px;
+  border-radius: 4px;
+  margin-left: 8px;
+  transition: opacity 0.15s;
+}
+
+.file-comment-btn svg { width: 13px; height: 13px; }
+
+.file-comment-btn:hover {
+  opacity: 0.8;
 }

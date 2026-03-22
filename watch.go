@@ -249,6 +249,7 @@ func carryForwardComment(old Comment, newID string, now string) Comment {
 		Side:           old.Side,
 		Body:           old.Body,
 		Author:         old.Author,
+		Scope:          old.Scope,
 		CreatedAt:      old.CreatedAt,
 		UpdatedAt:      now,
 		Resolved:       old.Resolved,
@@ -401,6 +402,17 @@ func (s *Session) loadResolvedComments() {
 			f.PreviousComments = nil
 		}
 	}
+	// Restore review-level comments so they survive round-complete.
+	// Always overwrite (even when disk has 0) to clear stale in-memory state.
+	s.reviewComments = cj.ReviewComments
+	s.reviewNextID = 0
+	for _, c := range s.reviewComments {
+		id := 0
+		fmt.Sscanf(c.ID, "r%d", &id)
+		if id >= s.reviewNextID {
+			s.reviewNextID = id + 1
+		}
+	}
 	// Record the current mtime so mergeExternalCritJSON does not re-process
 	// this same file. Without this, the file watcher could detect the
 	// externally-written .crit.json (e.g. from a test or crit comment) as a
@@ -446,6 +458,13 @@ func (s *Session) carryForwardComments() {
 		s.mu.Lock()
 		now := time.Now().UTC().Format(time.RFC3339)
 		for _, c := range prevComments {
+			// File-level comments have no line references — carry forward as-is.
+			if c.Scope == "file" {
+				carried := carryForwardComment(c, fmt.Sprintf("c%d", s.nextID), now)
+				s.nextID++
+				f.Comments = append(f.Comments, carried)
+				continue
+			}
 			newStart := lineMap[c.StartLine]
 			newEnd := lineMap[c.EndLine]
 			if newStart == 0 {

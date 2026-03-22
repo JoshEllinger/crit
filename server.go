@@ -53,7 +53,8 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, prInfo *P
 	mux.HandleFunc("/api/round-complete", s.handleRoundComplete)
 
 	mux.HandleFunc("/api/commits", s.handleCommits)
-	mux.HandleFunc("/api/comments", s.handleClearComments)
+	mux.HandleFunc("/api/comments", s.handleReviewComments)
+	mux.HandleFunc("/api/review-comment/", s.handleReviewCommentByID)
 	mux.HandleFunc("/api/qr", s.handleQR)
 	mux.HandleFunc("/api/files/list", s.handleFilesList)
 
@@ -305,6 +306,7 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 			Body      string `json:"body"`
 			Quote     string `json:"quote"`
 			Author    string `json:"author"`
+			Scope     string `json:"scope"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -314,15 +316,27 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Comment body is required", http.StatusBadRequest)
 			return
 		}
-		if req.StartLine < 1 || req.EndLine < req.StartLine {
-			http.Error(w, "Invalid line range", http.StatusBadRequest)
-			return
-		}
 
 		// Ensure the file is registered in the session. Files that appear after
 		// startup (e.g. user creates a new file while reviewing) may be visible in
 		// scoped views but not yet in s.Files.
 		s.session.EnsureFileEntry(path)
+
+		if req.Scope == "file" {
+			c, ok := s.session.AddFileComment(path, req.Body, req.Author)
+			if !ok {
+				http.Error(w, "File not found", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			writeJSON(w, c)
+			return
+		}
+
+		if req.StartLine < 1 || req.EndLine < req.StartLine {
+			http.Error(w, "Invalid line range", http.StatusBadRequest)
+			return
+		}
 
 		c, ok := s.session.AddComment(path, req.StartLine, req.EndLine, req.Side, req.Body, req.Quote, req.Author)
 		if !ok {
@@ -489,13 +503,169 @@ func (s *Server) handleReplyRoute(w http.ResponseWriter, r *http.Request, filePa
 	}
 }
 
-func (s *Server) handleClearComments(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+func (s *Server) handleReviewCommentReplyRoute(w http.ResponseWriter, r *http.Request, commentID, replyID string) {
+	switch {
+	case r.Method == http.MethodPost && replyID == "":
+		// POST /api/review-comment/{id}/replies — add reply
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		var req struct {
+			Body   string `json:"body"`
+			Author string `json:"author"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if req.Body == "" {
+			http.Error(w, "Reply body is required", http.StatusBadRequest)
+			return
+		}
+		reply, ok := s.session.AddReviewCommentReply(commentID, req.Body, req.Author)
+		if !ok {
+			http.Error(w, "Comment not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, reply)
+
+	case r.Method == http.MethodPut && replyID != "":
+		// PUT /api/review-comment/{id}/replies/{rid} — edit reply
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		var req struct {
+			Body string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if req.Body == "" {
+			http.Error(w, "Reply body is required", http.StatusBadRequest)
+			return
+		}
+		reply, ok := s.session.UpdateReviewCommentReply(commentID, replyID, req.Body)
+		if !ok {
+			http.Error(w, "Reply not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, reply)
+
+	case r.Method == http.MethodDelete && replyID != "":
+		// DELETE /api/review-comment/{id}/replies/{rid} — delete reply
+		if !s.session.DeleteReviewCommentReply(commentID, replyID) {
+			http.Error(w, "Reply not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleReviewComments(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		comments := s.session.GetReviewComments()
+		writeJSON(w, comments)
+
+	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		var req struct {
+			Body   string `json:"body"`
+			Author string `json:"author"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if req.Body == "" {
+			http.Error(w, "Comment body is required", http.StatusBadRequest)
+			return
+		}
+		c := s.session.AddReviewComment(req.Body, req.Author)
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, c)
+
+	case http.MethodDelete:
+		s.session.ClearAllComments()
+		writeJSON(w, map[string]string{"status": "ok"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleReviewCommentByID(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/review-comment/")
+	if trimmed == "" {
+		http.Error(w, "Comment ID required", http.StatusBadRequest)
 		return
 	}
-	s.session.ClearAllComments()
-	writeJSON(w, map[string]string{"status": "ok"})
+
+	// Check if this is a reply route: {id}/replies or {id}/replies/{rid}
+	if parts := strings.SplitN(trimmed, "/replies", 2); len(parts) == 2 {
+		commentID := parts[0]
+		replyID := strings.TrimPrefix(parts[1], "/")
+		s.handleReviewCommentReplyRoute(w, r, commentID, replyID)
+		return
+	}
+
+	// Check if this is a resolve route: {id}/resolve
+	if parts := strings.SplitN(trimmed, "/resolve", 2); len(parts) == 2 && parts[1] == "" {
+		commentID := parts[0]
+		if r.Method != http.MethodPut {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Resolved bool `json:"resolved"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		c, ok := s.session.ResolveReviewComment(commentID, req.Resolved)
+		if !ok {
+			http.Error(w, "Comment not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, c)
+		return
+	}
+
+	id := trimmed
+	switch r.Method {
+	case http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		var req struct {
+			Body string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if req.Body == "" {
+			http.Error(w, "Comment body is required", http.StatusBadRequest)
+			return
+		}
+		c, ok := s.session.UpdateReviewComment(id, req.Body)
+		if !ok {
+			http.Error(w, "Comment not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, c)
+
+	case http.MethodDelete:
+		if !s.session.DeleteReviewComment(id) {
+			http.Error(w, "Comment not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleRoundComplete(w http.ResponseWriter, r *http.Request) {
@@ -523,6 +693,8 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	if totalComments > 0 && unresolvedComments > 0 {
 		prompt = fmt.Sprintf(
 			"Review comments are in %s — comments are grouped per file with start_line/end_line referencing the source. "+
+				"Each comment has a scope field: \"line\" for inline comments, \"file\" for file-level comments, or \"review\" for review-level comments. "+
+				"Review-level comments appear in the top-level review_comments array (not tied to any file). "+
 				"Read the file, address each comment in the relevant file and location. "+
 				"For each comment: reply explaining what you did using `crit comment --reply-to <comment-id> --author <your-name> --resolve \"<explanation>\"`, "+
 				"or edit .crit.json directly to add a reply to the comment's \"replies\" array and set \"resolved\": true. "+

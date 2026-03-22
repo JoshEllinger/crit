@@ -43,19 +43,25 @@ Tell the user: **"Crit is open in your browser. Leave inline comments, then clic
 
 When `crit` completes, read the `.crit.json` file in the repo root (or working directory) using the Read tool.
 
-The file contains structured JSON with comments per file:
+The file contains structured JSON with comments per file and review-level comments:
 
 ```json
 {
+  "review_comments": [
+    { "id": "r0", "body": "Overall feedback", "resolved": false }
+  ],
   "files": {
     "plan.md": {
       "comments": [
-        { "id": "c1", "start_line": 5, "end_line": 10, "body": "Clarify this step", "quote": "specific words", "resolved": false }
+        { "id": "c1", "start_line": 5, "end_line": 10, "body": "Clarify this step", "quote": "specific words", "resolved": false },
+        { "id": "c2", "body": "File needs restructuring", "resolved": false }
       ]
     }
   }
 }
 ```
+
+There are three types of comments: `review_comments` (general feedback, `r`-prefixed IDs), file comments (in per-file `comments` array with no `start_line`/`end_line`), and line comments (with `start_line`/`end_line`). If a comment has lines, it's about those lines. If not, it's about the file as a whole.
 
 Identify all comments where `"resolved": false` or where the `resolved` field is missing (missing means unresolved). If a comment has a `"quote"` field, it contains the specific text the reviewer selected — focus your changes on the quoted text rather than the entire line range.
 
