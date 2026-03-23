@@ -956,16 +956,16 @@ func pluralReply(n int) string {
 // serverConfig holds the resolved configuration for running the server.
 // It combines CLI flags, environment variables, and config file settings.
 type serverConfig struct {
-	port           int
-	noOpen         bool
-	quiet          bool
-	shareURL       string
-	outputDir      string
-	author         string
-	ignorePatterns []string
-	files               []string // explicit file arguments (empty = git mode)
-	noIntegrationCheck  bool
-	agentCmd            string
+	port               int
+	noOpen             bool
+	quiet              bool
+	shareURL           string
+	outputDir          string
+	author             string
+	ignorePatterns     []string
+	files              []string // explicit file arguments (empty = git mode)
+	noIntegrationCheck bool
+	agentCmd           string
 }
 
 // resolveServerConfig parses flags, loads config files, and resolves the
@@ -1049,12 +1049,12 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 	}
 
 	return &serverConfig{
-		port:           *port,
-		noOpen:         *noOpen,
-		quiet:          *quiet,
-		shareURL:       *shareURL,
-		outputDir:      *outputDir,
-		author:         cfg.Author,
+		port:               *port,
+		noOpen:             *noOpen,
+		quiet:              *quiet,
+		shareURL:           *shareURL,
+		outputDir:          *outputDir,
+		author:             cfg.Author,
 		ignorePatterns:     ignorePatterns,
 		noIntegrationCheck: cfg.NoIntegrationCheck,
 		agentCmd:           cfg.AgentCmd,
@@ -1348,10 +1348,14 @@ var integrationMap = map[string][]integration{
 	"cline": {
 		{source: "integrations/cline/crit.md", dest: ".clinerules/crit.md", hint: "Cline will suggest Crit when writing plans"},
 	},
+	"codex": {
+		{source: "integrations/codex/skills/crit/SKILL.md", dest: ".agents/skills/crit/SKILL.md", hint: "Use $crit in Codex to start a review loop"},
+		{source: "integrations/codex/skills/crit-cli/SKILL.md", dest: ".agents/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Codex agents when needed"},
+	},
 }
 
 func availableIntegrations() []string {
-	return []string{"claude-code", "cursor", "opencode", "windsurf", "github-copilot", "cline"}
+	return []string{"claude-code", "codex", "cursor", "opencode", "windsurf", "github-copilot", "cline"}
 }
 
 func installIntegration(name string, force bool) {
