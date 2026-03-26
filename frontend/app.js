@@ -126,6 +126,7 @@
   let deleteToken = '';
   let configAuthor = '';
   let uiState = 'reviewing';
+  let waitingHasComments = false;
   let pendingUpdates = [];
   let pendingUpdatesVersion = '';
   let updateModalEl = null;
@@ -5447,6 +5448,7 @@
 
   function setUIState(state) {
     uiState = state;
+    if (state === 'reviewing') waitingHasComments = false;
     const finishBtn = document.getElementById('finishBtn');
     const waitingOverlay = document.getElementById('waitingOverlay');
 
@@ -5486,6 +5488,7 @@
       const resp = await fetch('/api/finish', { method: 'POST' });
       const data = await resp.json();
       const hasComments = !!data.prompt;
+      waitingHasComments = hasComments;
       const prompt = data.prompt || 'I reviewed the changes, no feedback, good to go!';
 
       document.getElementById('waitingPrompt').textContent = prompt;
@@ -5608,7 +5611,9 @@
           const clipEl = document.getElementById('waitingClipboard');
           if (promptEl) promptEl.style.display = 'none';
           if (clipEl) clipEl.style.display = 'none';
-          document.getElementById('waitingMessage').textContent = 'Waiting for your agent to finish...';
+          if (waitingHasComments) {
+            document.getElementById('waitingMessage').textContent = 'Waiting for your agent to finish...';
+          }
         }
       } catch (_) {}
     });
