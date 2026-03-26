@@ -4203,7 +4203,7 @@
         : 'Lines ' + comment.start_line + '-' + comment.end_line;
       headerLeft.appendChild(lineRef);
     }
-    if (opts.showCarriedForward && comment.carried_forward) {
+    if (opts.showCarriedForward && comment.carried_forward && !comment.resolved) {
       const label = document.createElement('span');
       label.className = 'carried-forward-label';
       label.textContent = 'Unresolved';
