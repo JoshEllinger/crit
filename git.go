@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -621,6 +622,28 @@ func fileDiffUnified(path, baseRef, dir string) ([]DiffHunk, error) {
 	return ParseUnifiedDiff(string(out)), nil
 }
 
+// fileDiffUnifiedCtx is like fileDiffUnified but accepts a context for timeout control.
+func fileDiffUnifiedCtx(ctx context.Context, path, baseRef, dir string) ([]DiffHunk, error) {
+	var cmd *exec.Cmd
+	if baseRef == "" {
+		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", "HEAD", "--", path)
+	} else {
+		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", baseRef, "--", path)
+	}
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// git diff exits 1 when there are differences
+		} else {
+			return nil, fmt.Errorf("git diff failed: %w", err)
+		}
+	}
+	return ParseUnifiedDiff(string(out)), nil
+}
+
 // FileDiffUnifiedNewFile returns parsed diff hunks showing the entire file as added.
 // Used for untracked files that don't have a git diff.
 func FileDiffUnifiedNewFile(content string) []DiffHunk {
@@ -648,6 +671,52 @@ func FileDiffUnifiedNewFile(content string) []DiffHunk {
 		})
 	}
 	return []DiffHunk{hunk}
+}
+
+// NumstatEntry holds per-file addition/deletion counts from git diff --numstat.
+type NumstatEntry struct {
+	Additions int
+	Deletions int
+}
+
+// DiffNumstat runs git diff --numstat against the given base ref and returns per-file stats.
+func DiffNumstat(baseRef string) (map[string]NumstatEntry, error) {
+	return DiffNumstatDir(baseRef, "")
+}
+
+// DiffNumstatDir is like DiffNumstat but runs in a specific directory.
+func DiffNumstatDir(baseRef, dir string) (map[string]NumstatEntry, error) {
+	cmd := exec.Command("git", "diff", "--numstat", baseRef)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// git diff exits 1 when there are differences — normal
+		} else {
+			return nil, fmt.Errorf("git diff --numstat failed: %w", err)
+		}
+	}
+
+	stats := make(map[string]NumstatEntry)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		path := parts[2]
+		adds, err1 := strconv.Atoi(parts[0])
+		dels, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil {
+			adds, dels = 0, 0
+		}
+		stats[path] = NumstatEntry{Additions: adds, Deletions: dels}
+	}
+	return stats, nil
 }
 
 var hunkHeaderRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$`)

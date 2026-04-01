@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// lazyFileThreshold is the maximum number of files to eagerly load
+// content and diffs for. Files beyond this threshold are loaded on demand
+// when the user expands them in the UI. Only applies when >threshold files.
+const lazyFileThreshold = 100
 
 // fileHash returns a stable hash string for file content.
 func fileHash(data []byte) string {
@@ -70,6 +76,53 @@ type FileEntry struct {
 	// Multi-round (markdown files only)
 	PreviousContent  string    `json:"-"`
 	PreviousComments []Comment `json:"-"`
+
+	// Lazy loading: when true, Content and DiffHunks are not yet populated.
+	// Call ensureLoaded() before accessing them. Only used when >100 files.
+	Lazy     bool      `json:"-"`
+	loadOnce sync.Once // guards one-time loading of content + diffs
+	loadErr  error     // error from loading, if any
+
+	// Stats for lazy files (populated from git diff --numstat)
+	LazyAdditions int `json:"-"`
+	LazyDeletions int `json:"-"`
+}
+
+// ensureLoaded loads content and diff hunks for a lazy file on first access.
+// For non-lazy files, this is an immediate no-op.
+func (fe *FileEntry) ensureLoaded(repoRoot, baseRef string) error {
+	if !fe.Lazy {
+		return nil
+	}
+	fe.loadOnce.Do(func() {
+		if fe.Status != "deleted" {
+			data, err := os.ReadFile(fe.AbsPath)
+			if err != nil {
+				fe.loadErr = fmt.Errorf("reading %s: %w", fe.Path, err)
+				return
+			}
+			fe.Content = string(data)
+			fe.FileHash = fileHash(data)
+		}
+
+		if fe.Status != "deleted" {
+			if fe.Status == "added" || fe.Status == "untracked" {
+				fe.DiffHunks = FileDiffUnifiedNewFile(fe.Content)
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				hunks, err := fileDiffUnifiedCtx(ctx, fe.Path, baseRef, repoRoot)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: git diff failed for %s: %v\n", fe.Path, err)
+				} else {
+					fe.DiffHunks = hunks
+				}
+			}
+		}
+
+		fe.Lazy = false
+	})
+	return fe.loadErr
 }
 
 // Session is the top-level state manager for a multi-file review.
@@ -181,7 +234,13 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 		awaitingFirstReview: true,
 	}
 
-	for _, fc := range changes {
+	// Fetch per-file stats upfront if we'll have lazy files.
+	var numstats map[string]NumstatEntry
+	if len(changes) > lazyFileThreshold && baseRef != "" {
+		numstats, _ = DiffNumstatDir(baseRef, root)
+	}
+
+	for i, fc := range changes {
 		absPath := filepath.Join(root, fc.Path)
 		fe := &FileEntry{
 			Path:    fc.Path,
@@ -189,6 +248,26 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 			Status:  fc.Status,
 		}
 		fe.FileType = detectFileType(fc.Path)
+
+		// Beyond the threshold: store metadata only, defer content + diff loading
+		if len(changes) > lazyFileThreshold && i >= lazyFileThreshold {
+			fe.Lazy = true
+			fe.Comments = []Comment{}
+			if ns, ok := numstats[fc.Path]; ok {
+				fe.LazyAdditions = ns.Additions
+				fe.LazyDeletions = ns.Deletions
+			} else if fc.Status == "untracked" || fc.Status == "added" {
+				// Untracked/added files won't appear in numstat; count lines
+				if data, err := os.ReadFile(absPath); err == nil {
+					fe.LazyAdditions = strings.Count(string(data), "\n")
+					if len(data) > 0 && data[len(data)-1] != '\n' {
+						fe.LazyAdditions++
+					}
+				}
+			}
+			s.Files = append(s.Files, fe)
+			continue
+		}
 
 		// Read content (skip for deleted files)
 		if fc.Status != "deleted" {
@@ -695,7 +774,7 @@ func (s *Session) RefreshFileContent() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, f := range s.Files {
-		if f.AbsPath == "" {
+		if f.AbsPath == "" || f.Lazy {
 			continue
 		}
 		data, err := os.ReadFile(f.AbsPath)
@@ -1761,11 +1840,22 @@ func (s *Session) Shutdown() {
 // GetFileSnapshot returns a JSON-ready map for the /api/file endpoint.
 func (s *Session) GetFileSnapshot(path string) (map[string]any, bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	f := s.fileByPathLocked(path)
 	if f == nil {
+		s.mu.RUnlock()
 		return nil, false
 	}
+	repoRoot := s.RepoRoot
+	baseRef := s.BaseRef
+	s.mu.RUnlock()
+
+	// Load content on demand for lazy files
+	if err := f.ensureLoaded(repoRoot, baseRef); err != nil {
+		return nil, false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return map[string]any{
 		"path":      f.Path,
 		"status":    f.Status,
@@ -1810,7 +1900,16 @@ func (s *Session) GetFileDiffSnapshot(path string) (map[string]any, bool) {
 		s.mu.RUnlock()
 		return nil, false
 	}
+	repoRoot := s.RepoRoot
+	baseRef := s.BaseRef
+	s.mu.RUnlock()
 
+	// Load content + diffs on demand for lazy files
+	if err := f.ensureLoaded(repoRoot, baseRef); err != nil {
+		return nil, false
+	}
+
+	s.mu.RLock()
 	if f.FileType == "code" || s.Mode == "git" {
 		hunks := f.DiffHunks
 		s.mu.RUnlock()
@@ -1856,6 +1955,7 @@ type SessionFileInfo struct {
 	CommentCount int    `json:"comment_count"`
 	Additions    int    `json:"additions"`
 	Deletions    int    `json:"deletions"`
+	Lazy         bool   `json:"lazy,omitempty"`
 }
 
 // GetSessionInfo returns a snapshot of session metadata.
@@ -1882,15 +1982,22 @@ func (s *Session) GetSessionInfo() SessionInfo {
 			Status:       f.Status,
 			FileType:     f.FileType,
 			CommentCount: len(f.Comments),
+			Lazy:         f.Lazy,
 		}
-		// Count additions/deletions from diff hunks
-		for _, h := range f.DiffHunks {
-			for _, l := range h.Lines {
-				switch l.Type {
-				case "add":
-					fi.Additions++
-				case "del":
-					fi.Deletions++
+		if f.Lazy {
+			// Use pre-computed stats from git diff --numstat
+			fi.Additions = f.LazyAdditions
+			fi.Deletions = f.LazyDeletions
+		} else {
+			// Count additions/deletions from diff hunks
+			for _, h := range f.DiffHunks {
+				for _, l := range h.Lines {
+					switch l.Type {
+					case "add":
+						fi.Additions++
+					case "del":
+						fi.Deletions++
+					}
 				}
 			}
 		}
@@ -1952,10 +2059,14 @@ func (s *Session) GetSessionInfoScoped(scope, commit string) SessionInfo {
 	branch := s.Branch
 	reviewRound := s.ReviewRound
 	ignorePatterns := s.IgnorePatterns
-	// Build a map of comment counts (comments are scope-independent)
+	// Build maps of comment counts and lazy state (scope-independent)
 	commentCounts := make(map[string]int, len(s.Files))
+	lazyFiles := make(map[string]*FileEntry, len(s.Files))
 	for _, f := range s.Files {
 		commentCounts[f.Path] = len(f.Comments)
+		if f.Lazy {
+			lazyFiles[f.Path] = f
+		}
 	}
 	reviewComments := make([]Comment, len(s.reviewComments))
 	copy(reviewComments, s.reviewComments)
@@ -1992,6 +2103,15 @@ func (s *Session) GetSessionInfoScoped(scope, commit string) SessionInfo {
 			Status:       fc.Status,
 			FileType:     detectFileType(fc.Path),
 			CommentCount: commentCounts[fc.Path],
+		}
+
+		// Preserve lazy state from the session — skip expensive diff computation
+		if lf, ok := lazyFiles[fc.Path]; ok {
+			fi.Lazy = true
+			fi.Additions = lf.LazyAdditions
+			fi.Deletions = lf.LazyDeletions
+			info.Files = append(info.Files, fi)
+			continue
 		}
 
 		// Compute diff stats for the scoped view
@@ -2043,12 +2163,20 @@ func (s *Session) GetFileDiffSnapshotScoped(path, scope, commit string) (map[str
 	if f != nil {
 		baseRef = s.BaseRef
 		status = f.Status
-		content = f.Content
 	} else {
 		baseRef = s.BaseRef
 	}
 	repoRoot = s.RepoRoot
 	s.mu.RUnlock()
+
+	// Load content on demand for lazy files
+	if f != nil {
+		if err := f.ensureLoaded(repoRoot, baseRef); err == nil {
+			s.mu.RLock()
+			content = f.Content
+			s.mu.RUnlock()
+		}
+	}
 
 	// If the file is not in the session (e.g. created after startup), read it
 	// from disk and determine its status so we can generate the correct diff.

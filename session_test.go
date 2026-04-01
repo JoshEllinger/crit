@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2386,5 +2387,212 @@ func TestDeleteReviewCommentReply_NotFound(t *testing.T) {
 	c := s.AddReviewComment("needs work", "reviewer")
 	if s.DeleteReviewCommentReply(c.ID, "nonexistent") {
 		t.Error("expected DeleteReviewCommentReply to return false for nonexistent reply")
+	}
+}
+
+func TestEnsureLoaded(t *testing.T) {
+	dir := initTestRepo(t)
+
+	writeFile(t, filepath.Join(dir, "lazy.go"), "package main\n\nfunc lazy() {}\n")
+	runGit(t, dir, "add", "lazy.go")
+	runGit(t, dir, "commit", "-m", "add lazy.go")
+	runGit(t, dir, "checkout", "-b", "feature-lazy")
+	writeFile(t, filepath.Join(dir, "lazy.go"), "package main\n\nfunc lazy() {\n\tfmt.Println(\"loaded\")\n}\n")
+	runGit(t, dir, "add", "lazy.go")
+	runGit(t, dir, "commit", "-m", "modify lazy.go")
+
+	base := strings.TrimSpace(runGit(t, dir, "merge-base", "main", "HEAD"))
+
+	fe := &FileEntry{
+		Path:    "lazy.go",
+		AbsPath: filepath.Join(dir, "lazy.go"),
+		Status:  "modified",
+		Lazy:    true,
+	}
+
+	if fe.Content != "" {
+		t.Fatal("expected empty content before ensureLoaded")
+	}
+	if len(fe.DiffHunks) != 0 {
+		t.Fatal("expected no diff hunks before ensureLoaded")
+	}
+
+	err := fe.ensureLoaded(dir, base)
+	if err != nil {
+		t.Fatalf("ensureLoaded failed: %v", err)
+	}
+
+	if fe.Content == "" {
+		t.Fatal("expected non-empty content after ensureLoaded")
+	}
+	if !strings.Contains(fe.Content, "loaded") {
+		t.Fatalf("content should contain 'loaded', got: %s", fe.Content)
+	}
+	if len(fe.DiffHunks) == 0 {
+		t.Fatal("expected diff hunks after ensureLoaded")
+	}
+	if fe.Lazy {
+		t.Fatal("expected Lazy=false after ensureLoaded")
+	}
+
+	// Second call is a no-op (sync.Once)
+	err = fe.ensureLoaded(dir, base)
+	if err != nil {
+		t.Fatalf("second ensureLoaded should not fail: %v", err)
+	}
+}
+
+func TestEnsureLoadedNotLazy(t *testing.T) {
+	fe := &FileEntry{
+		Path:    "eager.go",
+		Content: "already loaded",
+		Lazy:    false,
+	}
+	err := fe.ensureLoaded("/tmp", "abc123")
+	if err != nil {
+		t.Fatalf("ensureLoaded on non-lazy file should be no-op, got: %v", err)
+	}
+	if fe.Content != "already loaded" {
+		t.Fatal("content should be unchanged for non-lazy file")
+	}
+}
+
+func TestNewSessionFromGitLazyThreshold(t *testing.T) {
+	dir := initTestRepo(t)
+	defaultBranchOverride = ""
+	defer func() { defaultBranchOverride = "" }()
+
+	runGit(t, dir, "checkout", "-b", "feature-many-files")
+	for i := 0; i < 120; i++ {
+		name := fmt.Sprintf("file%03d.go", i)
+		writeFile(t, filepath.Join(dir, name), fmt.Sprintf("package main\n// file %d\n", i))
+	}
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "add 120 files")
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	s, err := NewSessionFromGit(nil)
+	if err != nil {
+		t.Fatalf("NewSessionFromGit failed: %v", err)
+	}
+
+	if len(s.Files) != 120 {
+		t.Fatalf("expected 120 files, got %d", len(s.Files))
+	}
+
+	eagerCount, lazyCount := 0, 0
+	for _, f := range s.Files {
+		if f.Lazy {
+			lazyCount++
+			if f.Content != "" {
+				t.Errorf("lazy file %s should not have content loaded", f.Path)
+			}
+		} else {
+			eagerCount++
+			if f.Content == "" && f.Status != "deleted" {
+				t.Errorf("eager file %s should have content", f.Path)
+			}
+		}
+	}
+
+	if eagerCount != 100 {
+		t.Errorf("expected 100 eager files, got %d", eagerCount)
+	}
+	if lazyCount != 20 {
+		t.Errorf("expected 20 lazy files, got %d", lazyCount)
+	}
+}
+
+func TestNewSessionFromGitUnderThreshold(t *testing.T) {
+	dir := initTestRepo(t)
+	defaultBranchOverride = ""
+	defer func() { defaultBranchOverride = "" }()
+
+	runGit(t, dir, "checkout", "-b", "feature-few-files")
+	for i := 0; i < 5; i++ {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("small%d.go", i)), "package main\n")
+	}
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "add 5 files")
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	s, err := NewSessionFromGit(nil)
+	if err != nil {
+		t.Fatalf("NewSessionFromGit failed: %v", err)
+	}
+
+	for _, f := range s.Files {
+		if f.Lazy {
+			t.Errorf("file %s should not be lazy when under threshold", f.Path)
+		}
+		if f.Content == "" && f.Status != "deleted" {
+			t.Errorf("file %s should have content loaded", f.Path)
+		}
+	}
+}
+
+func TestGetFileSnapshotLazy(t *testing.T) {
+	dir := initTestRepo(t)
+
+	runGit(t, dir, "checkout", "-b", "feature-snap")
+	writeFile(t, filepath.Join(dir, "snap.go"), "package main\nfunc snap() {}\n")
+	runGit(t, dir, "add", "snap.go")
+	runGit(t, dir, "commit", "-m", "add snap.go")
+
+	base := strings.TrimSpace(runGit(t, dir, "merge-base", "main", "HEAD"))
+
+	s := &Session{
+		Mode:     "git",
+		BaseRef:  base,
+		RepoRoot: dir,
+		Files: []*FileEntry{
+			{
+				Path:          "snap.go",
+				AbsPath:       filepath.Join(dir, "snap.go"),
+				Status:        "added",
+				FileType:      "code",
+				Lazy:          true,
+				LazyAdditions: 2,
+				Comments:      []Comment{},
+			},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// GetFileSnapshot should trigger ensureLoaded
+	snapshot, ok := s.GetFileSnapshot("snap.go")
+	if !ok {
+		t.Fatal("expected file to be found")
+	}
+	content, _ := snapshot["content"].(string)
+	if content == "" {
+		t.Fatal("expected content to be loaded on demand")
+	}
+	if !strings.Contains(content, "func snap") {
+		t.Fatalf("unexpected content: %s", content)
+	}
+
+	// GetFileDiffSnapshot should also work for the now-loaded file
+	diffSnap, ok := s.GetFileDiffSnapshot("snap.go")
+	if !ok {
+		t.Fatal("expected diff snapshot to be found")
+	}
+	hunks, _ := diffSnap["hunks"].([]DiffHunk)
+	if len(hunks) == 0 {
+		t.Fatal("expected diff hunks after lazy load")
+	}
+
+	// GetSessionInfo should show Lazy=false now (file was loaded)
+	info := s.GetSessionInfo()
+	for _, fi := range info.Files {
+		if fi.Path == "snap.go" && fi.Lazy {
+			t.Error("expected Lazy=false in session info after file was loaded")
+		}
 	}
 }
