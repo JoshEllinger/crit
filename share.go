@@ -263,9 +263,9 @@ func loadCommentsForShare(dir string, filePaths []string) ([]shareComment, int) 
 			continue
 		}
 		sc := shareComment{
-			Body:  c.Body,
+			Body:   c.Body,
 			Author: c.Author,
-			Scope: "review",
+			Scope:  "review",
 		}
 		if c.ReviewRound >= 1 {
 			sc.ReviewRound = c.ReviewRound
@@ -670,7 +670,6 @@ func clearShareState(dir string) error {
 
 	return saveCritJSON(critPath, cj)
 }
-
 
 // loadShareConfig loads the merged Config from the current directory context.
 // Used by share/fetch/unpublish commands to avoid redundant config parsing.

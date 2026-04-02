@@ -1963,12 +1963,12 @@ func (s *Session) GetSessionInfo() SessionInfo {
 	copy(reviewComments, s.reviewComments)
 
 	info := SessionInfo{
-		Mode:            s.Mode,
-		Branch:          s.Branch,
-		BaseRef:         s.BaseRef,
-		BaseBranchName:  s.BaseBranchName,
-		ReviewRound:     s.ReviewRound,
-		ReviewComments:  reviewComments,
+		Mode:           s.Mode,
+		Branch:         s.Branch,
+		BaseRef:        s.BaseRef,
+		BaseBranchName: s.BaseBranchName,
+		ReviewRound:    s.ReviewRound,
+		ReviewComments: reviewComments,
 	}
 
 	info.AvailableScopes = availableScopes(info.BaseRef)

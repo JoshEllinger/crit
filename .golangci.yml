@@ -1,0 +1,12 @@
+linters:
+  enable:
+    - gofmt
+    - govet
+    - gocyclo
+    - ineffassign
+    - misspell
+    - staticcheck
+
+linters-settings:
+  gocyclo:
+    min-complexity: 20
