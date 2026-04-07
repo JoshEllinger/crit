@@ -392,6 +392,50 @@
     }
   }
 
+  async function fetchWhenReady(url) {
+    var start = Date.now();
+    var maxWait = 5 * 60 * 1000; // 5 minutes
+    while (true) {
+      var r;
+      try {
+        r = await fetch(url);
+      } catch (_) {
+        // Network error — server may have shut down during init
+        var el = document.getElementById('filesContainer');
+        if (el) {
+          el.innerHTML =
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+            'Server disconnected</div>';
+        }
+        throw new Error('Server disconnected');
+      }
+      if (r.status === 503) {
+        if (Date.now() - start > maxWait) {
+          throw new Error('Server did not finish initializing within 5 minutes');
+        }
+        var elapsed = Math.round((Date.now() - start) / 1000);
+        var loadingEl = document.getElementById('filesContainer');
+        if (loadingEl) {
+          loadingEl.innerHTML =
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+            'Initializing\u2026 (' + elapsed + 's)</div>';
+        }
+        await new Promise(function(resolve) { setTimeout(resolve, 500); });
+        continue;
+      }
+      if (r.status === 500) {
+        var body = {};
+        try { body = await r.json(); } catch (_) {}
+        var msg = body.message || 'Server initialization failed';
+        document.getElementById('filesContainer').innerHTML =
+          '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+          msg + '</div>';
+        throw new Error(msg);
+      }
+      return r;
+    }
+  }
+
   // ===== Init =====
   async function init() {
     initTheme();
@@ -404,9 +448,12 @@
     updateHeaderHeight();
     window.addEventListener('resize', updateHeaderHeight);
 
+    document.getElementById('filesContainer').innerHTML =
+      '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">Loading...</div>';
+
     const [sessionRes, configRes] = await Promise.all([
-      fetch('/api/session?scope=' + enc(diffScope)).then(r => r.json()),
-      fetch('/api/config').then(r => r.json()),
+      fetchWhenReady('/api/session?scope=' + enc(diffScope)).then(r => r.json()),
+      fetchWhenReady('/api/config').then(r => r.json()),
     ]);
 
     session = sessionRes;
@@ -7147,7 +7194,8 @@
   });
 
   // ===== Start =====
-  init();
-  connectSSE();
+  init().then(connectSSE).catch(function(err) {
+    console.error('Init failed:', err.message);
+  });
 
 })();

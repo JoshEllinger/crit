@@ -1376,6 +1376,41 @@ func runReview(args []string) {
 // review was approved (no unresolved comments).
 func runReviewClient(entry sessionEntry) (approved bool) {
 	client := &http.Client{Timeout: 24 * time.Hour}
+
+	// Wait for the server to finish initializing before calling review-cycle.
+	// The daemon signals readiness as soon as the port is bound, but session
+	// creation (git operations) may still be in progress.
+	initDeadline := time.Now().Add(5 * time.Minute)
+	for {
+		resp, err := client.Get(fmt.Sprintf("http://localhost:%d/api/session", entry.Port))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: could not reach crit daemon on port %d: %v\n", entry.Port, err)
+			os.Exit(1)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			if time.Now().After(initDeadline) {
+				fmt.Fprintf(os.Stderr, "Error: server did not finish initializing within 5 minutes\n")
+				os.Exit(1)
+			}
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if resp.StatusCode == http.StatusInternalServerError {
+			var status struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(body, &status) == nil && status.Message != "" {
+				fmt.Fprintf(os.Stderr, "Error: %s\n", status.Message)
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: %s\n", body)
+			}
+			os.Exit(1)
+		}
+		break
+	}
+
 	resp, err := client.Post(
 		fmt.Sprintf("http://localhost:%d/api/review-cycle", entry.Port),
 		"application/json",
@@ -1701,26 +1736,13 @@ func runServe(args []string) {
 	}
 	sc.quiet = true
 
-	session, err := createSession(sc)
-	if err != nil {
-		daemonFatal(pipe, "Error: %v", err)
-	}
-	applySessionOverrides(session, sc)
-
-	var prInfo *PRInfo
-	if session.Mode == "git" {
-		prInfo = detectPRInfo()
-	}
-
 	listener, err := bindListener(sc.port)
 	if err != nil {
 		daemonFatal(pipe, "Error starting server: %v", err)
 	}
 	addr := listener.Addr().(*net.TCPAddr)
 
-	session.CLIArgs = sc.files
-
-	srv, err := NewServer(session, frontendFS, sc.shareURL, sc.authToken, prInfo, sc.author, version, addr.Port, sc.agentCmd)
+	srv, err := NewServer(nil, frontendFS, sc.shareURL, sc.authToken, nil, sc.author, version, addr.Port, sc.agentCmd)
 	if err != nil {
 		daemonFatal(pipe, "Error creating server: %v", err)
 	}
@@ -1736,8 +1758,6 @@ func runServe(args []string) {
 	}); err != nil {
 		daemonFatal(pipe, "Error writing session file: %v", err)
 	}
-
-	checkStaleIntegrations(sc, srv, cwd)
 
 	var idleMu sync.Mutex
 	lastActivity := time.Now()
@@ -1756,17 +1776,8 @@ func runServe(args []string) {
 		IdleTimeout: 60 * time.Second,
 	}
 
-	if !sc.noOpen {
-		go openBrowser(fmt.Sprintf("http://localhost:%d", addr.Port))
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
-
-	go runIdleTimeoutChecker(ctx, stop, &idleMu, &lastActivity)
-
-	watchStop := make(chan struct{})
-	go session.Watch(watchStop)
 
 	go func() {
 		if err := httpServer.Serve(listener); err != http.ErrServerClosed {
@@ -1776,6 +1787,38 @@ func runServe(args []string) {
 	}()
 
 	signalReadiness(pipe, addr.Port)
+
+	if !sc.noOpen {
+		go openBrowser(fmt.Sprintf("http://localhost:%d", addr.Port))
+	}
+
+	go runIdleTimeoutChecker(ctx, stop, &idleMu, &lastActivity)
+
+	session, err := createSession(sc)
+	if err != nil {
+		log.Printf("Error: %v", err)
+		srv.SetInitErr(err)
+		<-ctx.Done()
+		removeSessionFile(key)
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutCtx)
+		return
+	}
+	applySessionOverrides(session, sc)
+	session.CLIArgs = sc.files
+
+	var prInfo *PRInfo
+	if session.Mode == "git" {
+		prInfo = detectPRInfo()
+	}
+
+	checkStaleIntegrations(sc, srv, cwd)
+
+	srv.SetSession(session, prInfo)
+
+	watchStop := make(chan struct{})
+	go session.Watch(watchStop)
 
 	<-ctx.Done()
 	close(watchStop)
