@@ -17,6 +17,12 @@ crit/
 ├── config.go            # Config file loading: ~/.crit.config.json + .crit.config.json merge, ignore patterns
 ├── diff.go              # LCS-based line diff for inter-round markdown comparison
 ├── status.go            # Terminal status output formatting
+├── daemon.go            # Daemon lifecycle: spawn, connect, stop, session registry
+├── share.go             # Share/unpublish to crit-web, share CLI subcommand
+├── plans.go             # Plan file detection and handling
+├── integrations.go      # Integration config installation (crit install <agent>)
+├── gen_integration_hashes.go     # Script to regenerate integration content hashes
+├── integration_hashes_gen.go     # Generated integration content hashes
 ├── main_test.go         # Subcommand argument parsing tests
 ├── testutil_test.go     # Shared test helpers (initTestRepo, runGit, writeFile, flushWrites)
 ├── *_test.go            # Tests for all Go files above
@@ -26,8 +32,7 @@ crit/
 │   ├── style.css        # Layout, diff rendering, file sections, components
 │   ├── theme.css        # Color themes (light/dark/system CSS variables)
 │   ├── markdown-it.min.js    # Markdown parser (provides source line mappings via token.map)
-│   ├── highlight.min.js      # Syntax highlighter core
-│   ├── hljs-*.min.js         # Language packs (js, ts, go, python, elixir, etc.)
+│   ├── highlight.min.js      # Syntax highlighter core (languages bundled)
 │   └── mermaid.min.js        # Mermaid diagram renderer
 ├── integrations/        # Drop-in config files for AI coding tools (claude-code, cursor, aider, etc.)
 ├── e2e/                 # Playwright E2E tests for the frontend
@@ -159,54 +164,64 @@ make e2e-report                                       # View HTML report with sc
 
 ### Test organization
 
-| File | Mode | What it covers |
-| --- | --- | --- |
-| `loading.spec.ts` | git | Branch name, title, file tree, status icons, stats |
-| `loading.filemode.spec.ts` | file | Title, no branch, no diff toggle, document view defaults |
-| `diff-rendering.spec.ts` | git | Split/unified diffs, hunk headers, spacer expand, mode persistence |
-| `markdown.spec.ts` | git | Headings, tables, code blocks, lists, blockquotes, line gutters |
-| `comments.spec.ts` | git | Add/edit/delete comments on markdown and diff lines, cross-file |
-| `comments.filemode.spec.ts` | file | Comment CRUD on markdown in file mode |
-| `comments-panel.spec.ts` | git | View all comments panel |
-| `comment-count-badge.spec.ts` | git | Comment count badge in header |
-| `comment-range-highlight.spec.ts` | git | Highlighted line ranges for comments |
-| `multi-form.spec.ts` | git | Multiple comment forms open simultaneously |
-| `cli-comment.spec.ts` | git | `crit comment` CLI writes synced to running server via SSE |
-| `templates.spec.ts` | git | Comment template chips |
-| `keyboard.spec.ts` | git | j/k navigation, c/e/d shortcuts, ?, t, Shift+F, Escape |
-| `keyboard.filemode.spec.ts` | file | Same keyboard shortcuts in file mode |
-| `theme.spec.ts` | git | Light/dark/system toggle, persistence, file sections, finish review |
-| `theme.filemode.spec.ts` | file | Theme, TOC, file sections, finish review in file mode |
-| `drag-selection.spec.ts` | git | Gutter drag on markdown and diff (split + unified) |
-| `drag-selection.filemode.spec.ts` | file | Gutter drag on markdown in file mode |
-| `md-toggle.spec.ts` | git | Document/diff toggle for markdown, cross-view comment persistence |
-| `rendered-diff.filemode.spec.ts` | file | Rendered markdown diff view in file mode |
-| `syntax-highlighting.spec.ts` | git | Syntax highlighting in diff code blocks |
-| `expanded-comments.spec.ts` | git | Comments on spacer-expanded context lines |
-| `draft-autosave.spec.ts` | git | Draft persistence to localStorage, toast notification |
-| `file-tree.spec.ts` | git | File tree panel, status icons, active state, comment badges |
-| `file-tree.filemode.spec.ts` | file | File tree panel, clicking, comment badges in file mode |
-| `scope-toggle.spec.ts` | git | Diff scope toggle (all/branch/staged/unstaged) |
-| `round-complete.spec.ts` | git | Multi-round API (finish, round-complete), SSE refresh, UI state |
-| `round-complete.filemode.spec.ts` | file | Multi-round API + frontend in file mode |
-| `share.spec.ts` | git | Share button visibility, config API defaults |
-| `share.filemode.spec.ts` | file | Share in file mode |
-| `share.multifile.spec.ts` | multi | Share in multi-file mode |
-| `viewed.spec.ts` | git | Viewed state persistence across round transitions |
-| `change-nav.filemode.spec.ts` | file | File change navigation |
-| `select-to-comment.spec.ts` | git | Text selection to comment |
-| `word-diff.spec.ts` | git | Word-level diff rendering |
-| `suggestion-diff.spec.ts` | git | Suggestion diff display |
-| `old-side-suggest.spec.ts` | git | Suggestions on old-side (deletion) lines |
-| `toc.singlefile.spec.ts` | single | Table of contents |
-| `toc-scrollspy.singlefile.spec.ts` | single | TOC scroll-spy highlighting |
-| `multifile.multifile.spec.ts` | multi | Loading, code rendering, comments on Go/Elixir, directory files |
-| `threading.spec.ts` | git | Comment threading: replies, resolve/unresolve, collapse |
-| `commit-selection.spec.ts` | git | Commit selection sidebar, per-commit file list and diffs |
-| `file-picker.spec.ts` | git | @-triggered file picker autocomplete in comment forms |
-| `file-picker.filemode.spec.ts` | file | @-triggered file picker in file mode |
-| `toc-refresh.singlefile.spec.ts` | single | TOC refresh when file content changes |
-| `nogit.nogit.spec.ts` | no-git | Git-absence invariants: no branch, no diff toggle, session mode |
+| File                               | Mode   | What it covers                                                      |
+| ---------------------------------- | ------ | ------------------------------------------------------------------- |
+| `loading.spec.ts`                  | git    | Branch name, title, file tree, status icons, stats                  |
+| `loading.filemode.spec.ts`         | file   | Title, no branch, no diff toggle, document view defaults            |
+| `diff-rendering.spec.ts`           | git    | Split/unified diffs, hunk headers, spacer expand, mode persistence  |
+| `markdown.spec.ts`                 | git    | Headings, tables, code blocks, lists, blockquotes, line gutters     |
+| `comments.spec.ts`                 | git    | Add/edit/delete comments on markdown and diff lines, cross-file     |
+| `comments.filemode.spec.ts`        | file   | Comment CRUD on markdown in file mode                               |
+| `comments-panel.spec.ts`           | git    | View all comments panel                                             |
+| `comment-count-badge.spec.ts`      | git    | Comment count badge in header                                       |
+| `comment-nav.spec.ts`              | git    | Comment navigation: ] / [ shortcuts, prev/next buttons              |
+| `comment-range-highlight.spec.ts`  | git    | Highlighted line ranges for comments                                |
+| `multi-form.spec.ts`               | git    | Multiple comment forms open simultaneously                          |
+| `cli-comment.spec.ts`              | git    | `crit comment` CLI writes synced to running server via SSE          |
+| `agent-request.spec.ts`            | git    | Send to agent button and integration                                |
+| `approve-button.spec.ts`           | git    | Approve button: finish/approve text reacts to resolve state         |
+| `templates.spec.ts`                | git    | Comment template chips                                              |
+| `keyboard.spec.ts`                 | git    | j/k navigation, c/e/d shortcuts, ?, t, Shift+F, Escape              |
+| `keyboard.filemode.spec.ts`        | file   | Same keyboard shortcuts in file mode                                |
+| `theme.spec.ts`                    | git    | Light/dark/system toggle, persistence, file sections, finish review |
+| `theme.filemode.spec.ts`           | file   | Theme, TOC, file sections, finish review in file mode               |
+| `drag-selection.spec.ts`           | git    | Gutter drag on markdown and diff (split + unified)                  |
+| `drag-selection.filemode.spec.ts`  | file   | Gutter drag on markdown in file mode                                |
+| `md-toggle.spec.ts`                | git    | Document/diff toggle for markdown, cross-view comment persistence   |
+| `rendered-diff.filemode.spec.ts`   | file   | Rendered markdown diff view in file mode                            |
+| `syntax-highlighting.spec.ts`      | git    | Syntax highlighting in diff code blocks                             |
+| `lazy-loading.spec.ts`             | git    | Lazy loading of file diffs                                          |
+| `expanded-comments.spec.ts`        | git    | Comments on spacer-expanded context lines                           |
+| `draft-autosave.spec.ts`           | git    | Draft persistence to localStorage, toast notification               |
+| `file-comments.spec.ts`            | git    | File-level (non-line) comments                                      |
+| `file-comments.filemode.spec.ts`   | file   | File-level comments in file mode                                    |
+| `file-tree.spec.ts`                | git    | File tree panel, status icons, active state, comment badges         |
+| `file-tree.filemode.spec.ts`       | file   | File tree panel, clicking, comment badges in file mode              |
+| `scope-toggle.spec.ts`             | git    | Diff scope toggle (all/branch/staged/unstaged)                      |
+| `round-complete.spec.ts`           | git    | Multi-round API (finish, round-complete), SSE refresh, UI state     |
+| `round-complete.filemode.spec.ts`  | file   | Multi-round API + frontend in file mode                             |
+| `share.spec.ts`                    | git    | Share button visibility, config API defaults                        |
+| `share.filemode.spec.ts`           | file   | Share in file mode                                                  |
+| `share.multifile.spec.ts`          | multi  | Share in multi-file mode                                            |
+| `viewed.spec.ts`                   | git    | Viewed state persistence across round transitions                   |
+| `change-nav.filemode.spec.ts`      | file   | File change navigation                                              |
+| `review-comments.spec.ts`          | git    | Review-level (general) comments                                     |
+| `review-comments.filemode.spec.ts` | file   | Review-level comments in file mode                                  |
+| `select-to-comment.spec.ts`        | git    | Text selection to comment                                           |
+| `select-to-comment.filemode.spec.ts` | file | Text selection to comment in file mode (document view for code)     |
+| `word-diff.spec.ts`                | git    | Word-level diff rendering                                           |
+| `suggestion-diff.spec.ts`          | git    | Suggestion diff display                                             |
+| `old-side-suggest.spec.ts`         | git    | Suggestions on old-side (deletion) lines                            |
+| `toc.singlefile.spec.ts`           | single | Table of contents                                                   |
+| `toc-scrollspy.singlefile.spec.ts` | single | TOC scroll-spy highlighting                                         |
+| `multifile.multifile.spec.ts`      | multi  | Loading, code rendering, comments on Go/Elixir, directory files     |
+| `threading.spec.ts`                | git    | Comment threading: replies, resolve/unresolve, collapse             |
+| `commit-selection.spec.ts`         | git    | Commit selection sidebar, per-commit file list and diffs            |
+| `file-picker.spec.ts`              | git    | @-triggered file picker autocomplete in comment forms               |
+| `file-picker.filemode.spec.ts`     | file   | @-triggered file picker in file mode                                |
+| `toc-refresh.singlefile.spec.ts`   | single | TOC refresh when file content changes                               |
+| `unstaged-comments.spec.ts`        | git    | Comments on unstaged changes                                        |
+| `nogit.nogit.spec.ts`              | no-git | Git-absence invariants: no branch, no diff toggle, session mode     |
 
 ### Writing new tests
 
@@ -429,8 +444,36 @@ EOF
 )"
 ```
 
+## Code Conventions & Review Standards
+
+When reviewing or writing code for this project, apply these calibrated standards:
+
+### Go Backend
+
+- **Unexport what isn't needed.** This is `package main` (a binary, not a library). If a function/type is only used within the package, it should be unexported. Check before adding new exports.
+- **CSS variables for all colors.** Frontend colors must use CSS custom properties from `theme.css`, never hardcoded hex values. The theme system (light/dark/system) depends on this.
+- **Don't add context.Context to local git operations.** All git commands in this codebase are read-only local operations (diff, status, log, rev-parse). They complete in milliseconds and don't touch the network. The one path that benefits from context (`fileDiffUnifiedCtx` for lazy loading) already has it. Don't cargo-cult server patterns into a localhost CLI.
+- **O(n) scans over file lists are fine.** Typical sessions have 5-50 files. A linear scan of `fileByPathLocked` is nanoseconds. Don't add map indices unless profiling shows a real bottleneck.
+- **Mechanical duplication can be OK.** The comment CRUD operations (review vs file-scoped) are structurally identical but stable and rarely touched. Don't abstract stable boilerplate unless you're adding new operations and the duplication would grow.
+
+### Frontend (Vanilla JS)
+
+- **Use `let`/`const`, not `var`** for new code. Don't mass-convert existing `var` in unrelated changes (churn risk in a 7200-line file), but always use modern declarations in new or modified functions.
+- **Use `addEventListener`, not inline `onclick`** for new code. Existing inline handlers in toast HTML are acceptable (localhost, no CSP).
+- **Don't fight browser built-ins.** `EventSource` auto-reconnects natively. `<details>`/`<summary>` handles keyboard natively. Don't add custom logic that reimplements or breaks built-in behavior.
+- **Remove unused parameters and dead CSS.** Unused function parameters in JS aren't caught by a type checker — they accumulate confusion. Dead CSS rules are invisible clutter.
+
+### Code Review Calibration
+
+When reviewing this project, apply these filters to avoid false positives:
+
+- **"Is this a real problem at this tool's scale?"** This is a localhost-only, single-user CLI. Patterns that matter for cloud services (context propagation, map-based lookups, connection pooling) often don't apply here.
+- **"Does the execution model make this possible?"** JavaScript is single-threaded — there are no race conditions between synchronous scope assignments and async fetches. Verify the threading model before claiming races.
+- **"What are realistic inputs?"** Markdown files can be 10,000+ lines (AI-generated plans). File lists are <100 entries. Comment counts are <50. Performance concerns for large markdown files are legitimate; performance concerns for file-list or comment-list operations are not.
+- **"Is the abstraction simpler than the duplication?"** For a single-file vanilla JS app and a flat Go CLI, inline code is often clearer than extracted helpers. Don't abstract for fewer than 3 call sites.
+
 ## Output Files
 
-| File         | Description                                                |
-| ------------ | ---------------------------------------------------------- |
+| File         | Description                                                                                                                                                                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `.crit.json` | Structured JSON with per-file comments and review-level comments — read by AI agents. Comments have a `scope` field: `"line"` (inline), `"file"` (file-level), or `"review"` (general). Review-level comments live in the top-level `review_comments` array. |
