@@ -28,6 +28,27 @@ brew install tomasz-tomczyk/tap/crit
 
 Also available via [Go, Nix, or binary download](#other-install-methods).
 
+## Agent Integrations
+
+Crit ships with plugins and configuration files for popular AI coding tools. Each one teaches your agent to write a plan, launch `crit` for review, and wait for your feedback before implementing.
+
+See [`integrations/`](integrations/) for all install methods and details.
+
+### Plugin install (Claude Code)
+
+For the full experience — installs globally with a `/crit` command plus a `crit` skill that auto-activates when your agent works with `.crit.json`, `crit comment`, `crit pull/push`, etc:
+
+```
+/plugin marketplace add tomasz-tomczyk/crit
+/plugin install crit
+```
+
+### `/crit` command
+
+Claude Code, Cursor, OpenCode, and GitHub Copilot support a `/crit` slash command that automates the full review loop.
+
+It launches Crit, waits for your review; your agent acts on the feedback and you go back and forth until the work is approved.
+
 ## Demo
 
 A 5-minute walkthrough of plan review and branch review.
@@ -36,16 +57,12 @@ A 5-minute walkthrough of plan review and branch review.
 
 ## Usage
 
+The recommended way is to use `/crit` command with your agent after any piece of work - whether it wrote a plan or made some code changes. You can however, launch it in your terminal by yourself and paste the prompt when you finish to your agent.
+
 ```bash
 crit                          # auto-detect changed files in your repo
 crit plan.md                  # review a specific file
 crit plan.md api-spec.md      # review multiple files
-```
-
-When you finish a review, Crit writes `.crit.json` - structured comment data your agent reads and acts on. Add it to your `.gitignore`:
-
-```bash
-echo '.crit.json' >> .gitignore
 ```
 
 ## Features
@@ -82,13 +99,9 @@ Click a line number to comment. Drag to select a range. Comments are rendered in
 
 Select lines and use "Insert suggestion" to pre-fill the comment with the original text. Edit it to show exactly what the replacement should look like. Your agent gets a concrete before/after.
 
-![Insert suggestion](images/suggestion.gif)
-
 ### Finish review: agent notified automatically
 
-When you click "Finish Review", Crit writes `.crit.json` and notifies your agent via `crit listen`. If your agent was listening, it picks up the prompt automatically — no copy-paste needed. A fallback "Copy prompt" button is available if the agent wasn't listening.
-
-![Agent prompt](images/prompt.png)
+When you click "Finish Review", Crit writes `.crit.json` and notifies your agent If your agent was listening, it picks up the prompt automatically — no copy-paste needed.
 
 ### Programmatic comments
 
@@ -107,8 +120,6 @@ Comments are appended to `.crit.json` - created automatically if it doesn't exis
 
 Architecture diagrams in fenced ` ```mermaid ` blocks render inline. You can comment on the diagram source just like any other block.
 
-![Mermaid diagram](images/mermaid.png)
-
 ### Share for Async Review
 
 Want a second opinion before handing off to the agent? Click the Share button to upload your review and get a public URL anyone can open in a browser, no install needed. Each reviewer's comments are color-coded by author. Unpublish anytime.
@@ -123,13 +134,17 @@ crit unpublish                        # remove the shared review
 
 Sharing uses [crit.md](https://crit.md) by default. To self-host, deploy [`crit-web`](https://github.com/tomasz-tomczyk/crit-web) and point `CRIT_SHARE_URL` (or `--share-url`, or `share_url` in config) at your instance. Set `share_url` to `""` to disable sharing entirely.
 
-If your crit-web instance requires authentication, set `auth_token` in your global config (`~/.crit.config.json`):
+#### Authentication
 
-```json
-{"auth_token": "your-token-here"}
+You can share anonymously or you can create a free crit.md account (using GitHub oAuth). To authenticate with crit-web (for sharing and other features that require an account):
+
+```bash
+crit auth login                    # opens browser to log in
+crit auth whoami                   # show current user info
+crit auth logout                   # log out and revoke token
 ```
 
-> **Security note:** Like `agent_cmd`, `auth_token` is read exclusively from your global `~/.crit.config.json`. Project-level config cannot set it.
+`crit auth login` uses the OAuth Device Flow — it opens your browser, you confirm, and the CLI receives a token automatically. The token is stored in your global config (`~/.crit.config.json`).
 
 ### GitHub PR Sync
 
@@ -160,7 +175,7 @@ inline — all while you continue reviewing.
 Configure in `~/.crit.config.json` (global config only):
 
 ```json
-{"agent_cmd": "claude --dangerously-skip-permissions -p"}
+{ "agent_cmd": "claude --dangerously-skip-permissions -p" }
 ```
 
 > **Security note:** `agent_cmd` is read exclusively from your global `~/.crit.config.json`. Project-level `.crit.config.json` files cannot set it. This prevents a malicious repository from executing arbitrary commands when you trigger "Send to agent".
@@ -169,11 +184,11 @@ Configure in `~/.crit.config.json` (global config only):
 
 Agents need tool permissions to edit files on your behalf. How you grant them depends on your trust level:
 
-| Mode | Command | What the agent can do |
-| --- | --- | --- |
-| Full access | `claude --dangerously-skip-permissions -p` | Read, write, and run any tool. Simplest option — recommended for trusted repos. |
-| Selective access | `claude --allowedTools Edit,Read,Bash,Write,Glob,Grep -p` | Only the listed tools are permitted. Good middle ground. |
-| No permissions | `claude -p` | The agent can respond to comments but **cannot edit files**. Useful for Q&A-only workflows. |
+| Mode             | Command                                                   | What the agent can do                                                                       |
+| ---------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Full access      | `claude --dangerously-skip-permissions -p`                | Read, write, and run any tool. Simplest option — recommended for trusted repos.             |
+| Selective access | `claude --allowedTools Edit,Read,Bash,Write,Glob,Grep -p` | Only the listed tools are permitted. Good middle ground.                                    |
+| No permissions   | `claude -p`                                               | The agent can respond to comments but **cannot edit files**. Useful for Q&A-only workflows. |
 
 #### How it works
 
@@ -192,13 +207,13 @@ After the first agent interaction, the comment becomes a **live thread**:
 
 #### Supported agents
 
-| Agent | `agent_cmd` value |
-| --- | --- |
-| Claude Code | `claude -p` |
-| OpenCode | `opencode ask` |
-| Cline | `cline --pipe` |
-| Aider | `aider --message-file -` |
-| Cursor (experimental) | `cursor --pipe` |
+| Agent                 | `agent_cmd` value        |
+| --------------------- | ------------------------ |
+| Claude Code           | `claude -p`              |
+| OpenCode              | `opencode ask`           |
+| Cline                 | `cline --pipe`           |
+| Aider                 | `aider --message-file -` |
+| Cursor (experimental) | `cursor --pipe`          |
 
 > **Tip:** Claude Code still prompts for permission in `-p` mode. To let it edit files freely, use `claude --dangerously-skip-permissions -p` instead. The other agents already operate without permission prompts in their pipe/non-interactive modes.
 >
@@ -211,48 +226,10 @@ After the first agent interaction, the comment becomes a **live thread**:
 - **Concurrent reviews.** Each instance runs on its own port - review multiple plans at once.
 - **Syntax highlighting.** Code blocks are highlighted and split per-line, so you can comment on individual lines inside a fence.
 - **Live file watching.** The browser reloads automatically when the source file changes.
-- **Real-time output.** `.crit.json` is written on every comment change (200ms debounce), so your agent always has the latest review state.
 - **Dark/light/system theme.** Three-button pill in the header, persisted to localStorage.
 - **Local by default.** Server binds to `127.0.0.1`. Your files stay on your machine unless you explicitly share.
 - **No analytics or tracking.** Crit collects zero telemetry. No usage stats, no crash reports, no phone-home. If we ever add anonymous usage statistics in the future, they will be explicitly opt-in.
 - **Update check.** On startup, Crit makes one network request to check for a newer version and prints a notice if one is available. Set `CRIT_NO_UPDATE_CHECK=1` to disable it.
-
-## Agent Integrations
-
-Crit ships with plugins and configuration files for popular AI coding tools. Each one teaches your agent to write a plan, launch `crit` for review, and wait for your feedback before implementing.
-
-### Per-project install
-
-The fastest way to get started. Installs a `/crit` slash command plus any integration companion files available for that tool (for example `SKILL.md` files) into your project:
-
-```bash
-crit install claude-code   # or: cursor, opencode, windsurf, github-copilot, cline
-crit install all           # install all integrations at once
-```
-
-Safe to re-run — existing files are skipped (use `--force` to overwrite). Good for teams since the files are committed to the repo.
-
-### Plugin install (Claude Code)
-
-For the full experience — installs globally with a `/crit` command plus a `crit` skill that auto-activates when your agent works with `.crit.json`, `crit comment`, `crit pull/push`, etc:
-
-```
-/plugin marketplace add tomasz-tomczyk/crit
-/plugin install crit
-```
-
-See [`integrations/`](integrations/) for all install methods and details.
-
-### `/crit` command
-
-Claude Code, Cursor, OpenCode, and GitHub Copilot support a `/crit` slash command that automates the full review loop:
-
-```
-/crit              # Auto-detects the current plan file
-/crit my-plan.md   # Review a specific file
-```
-
-It launches Crit, waits for your review, reads your comments, revises the plan, and signals Crit for another round.
 
 ## Configuration
 
