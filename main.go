@@ -392,7 +392,7 @@ func runUnpublish(args []string) {
 
 func runInstall(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: crit install <agent>")
+		fmt.Fprintln(os.Stderr, "Usage: crit install <agent> [--global]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Available agents:")
 		for _, a := range availableIntegrations() {
@@ -403,19 +403,27 @@ func runInstall(args []string) {
 	}
 
 	force := false
+	global := false
 	for _, arg := range args[1:] {
 		if arg == "--force" || arg == "-f" {
 			force = true
+		}
+		if arg == "--global" || arg == "-g" {
+			global = true
 		}
 	}
 
 	target := args[0]
 	if target == "all" {
+		if global {
+			fmt.Fprintln(os.Stderr, "Error: --global is not supported with 'all'")
+			os.Exit(1)
+		}
 		for _, name := range availableIntegrations() {
-			installIntegration(name, force)
+			installIntegration(name, force, false)
 		}
 	} else {
-		installIntegration(target, force)
+		installIntegration(target, force, global)
 	}
 }
 
@@ -1859,7 +1867,7 @@ Usage:
   crit push [--dry-run] [--event <type>] [-m <msg>] [-o <dir>] [pr-number]  Post .crit.json comments to a GitHub PR
   crit plan --name <slug> <file>             Review a plan file (manages versioned copies)
   crit plan --name <slug>                    Read plan from stdin
-  crit install <agent>                       Install integration files for an AI coding tool
+  crit install <agent> [--global]            Install integration files for an AI coding tool (--global: user-wide)
   crit check                                 Check if installed integrations are up to date
   crit config [--generate]                    Show resolved configuration
   crit help                                  Show this help message
@@ -2000,7 +2008,7 @@ func availableIntegrations() []string {
 	return []string{"claude-code", "codex", "cursor", "opencode", "windsurf", "github-copilot", "cline"}
 }
 
-func installIntegration(name string, force bool) {
+func installIntegration(name string, force bool, global bool) {
 	files, ok := integrationMap[name]
 	if !ok {
 		fmt.Fprintf(os.Stderr, "Unknown agent: %s\n\nAvailable agents:\n", name)
@@ -2010,11 +2018,26 @@ func installIntegration(name string, force bool) {
 		os.Exit(1)
 	}
 
+	var baseDir string
+	if global {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting home directory: %v\n", err)
+			os.Exit(1)
+		}
+		baseDir = home
+	}
+
 	var hints []string
 	for _, f := range files {
+		dest := f.dest
+		if global {
+			dest = filepath.Join(baseDir, f.dest)
+		}
+
 		if !force {
-			if _, err := os.Stat(f.dest); err == nil {
-				fmt.Printf("  Skipped:   %s (already exists, use --force to overwrite)\n", f.dest)
+			if _, err := os.Stat(dest); err == nil {
+				fmt.Printf("  Skipped:   %s (already exists, use --force to overwrite)\n", dest)
 				if f.hint != "" {
 					hints = append(hints, f.hint)
 				}
@@ -2028,18 +2051,18 @@ func installIntegration(name string, force bool) {
 			os.Exit(1)
 		}
 
-		dir := filepath.Dir(f.dest)
+		dir := filepath.Dir(dest)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", dir, err)
 			os.Exit(1)
 		}
 
-		if err := os.WriteFile(f.dest, data, 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", f.dest, err)
+		if err := os.WriteFile(dest, data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", dest, err)
 			os.Exit(1)
 		}
 
-		fmt.Printf("  Installed: %s\n", f.dest)
+		fmt.Printf("  Installed: %s\n", dest)
 		if f.hint != "" {
 			hints = append(hints, f.hint)
 		}
