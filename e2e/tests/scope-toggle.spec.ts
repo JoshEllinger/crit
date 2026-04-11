@@ -18,6 +18,12 @@ test.afterEach(async ({ page }) => {
   });
 });
 
+async function pressShiftScope(page: Page, digit: string, scope: string) {
+  const keyMap: Record<string, string> = { '1': '!', '2': '@', '3': '#', '4': '$' };
+  await page.keyboard.press(keyMap[digit]);
+  await expect(page.locator(`#scopeToggle .toggle-btn[data-scope="${scope}"]`)).toHaveClass(/active/);
+}
+
 test.describe('Scope Toggle', () => {
   test('scope toggle is visible in git mode with All active by default', async ({ page }) => {
     await loadPage(page);
@@ -135,6 +141,82 @@ test.describe('Scope Toggle', () => {
     // Should fall back to "all"
     await expect(page.locator('#scopeToggle .toggle-btn[data-scope="all"]')).toHaveClass(/active/);
     await expect(page.locator('#scopeToggle .toggle-btn[data-scope="staged"]')).not.toHaveClass(/active/);
+  });
+
+  test('falls back to all and re-fetches files when stale scope returns empty list', async ({ page }) => {
+    // Simulate: user was on a feature branch with "branch" scope, then switched to
+    // the default branch where branch scope returns no files.
+    await page.context().addCookies([{
+      name: 'crit-diff-scope',
+      value: 'branch',
+      domain: 'localhost',
+      path: '/',
+    }]);
+
+    let requestCount = 0;
+    await page.route('**/api/session*', async route => {
+      requestCount++;
+      const url = new URL(route.request().url());
+      const scope = url.searchParams.get('scope');
+      const response = await route.fetch();
+      const json = await response.json();
+      if (scope === 'branch') {
+        // Simulate being on the default branch: branch scope has no files
+        json.files = [];
+        json.available_scopes = ['all', 'staged', 'unstaged'];
+      }
+      await route.fulfill({ json });
+    });
+
+    await loadPage(page);
+
+    // Should fall back to "all" and re-fetch — files must render
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="all"]')).toHaveClass(/active/);
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="branch"]')).not.toHaveClass(/active/);
+    await expect(async () => {
+      const count = await page.locator('.file-section').count();
+      expect(count).toBeGreaterThanOrEqual(1);
+    }).toPass({ timeout: 5000 });
+    // Must have made at least 2 session requests: initial (branch) + corrected (all)
+    expect(requestCount).toBeGreaterThanOrEqual(2);
+  });
+
+  test('Shift+1 activates All scope', async ({ page }) => {
+    await loadPage(page);
+    // Start on branch scope so the shortcut has a visible effect
+    await switchScope(page, 'branch');
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="branch"]')).toHaveClass(/active/);
+
+    await pressShiftScope(page, '1', 'all');
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="branch"]')).not.toHaveClass(/active/);
+  });
+
+  test('Shift+2 activates Branch scope', async ({ page }) => {
+    await loadPage(page);
+    await pressShiftScope(page, '2', 'branch');
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="all"]')).not.toHaveClass(/active/);
+  });
+
+  test('Shift+3 activates Staged scope', async ({ page }) => {
+    await loadPage(page);
+    await pressShiftScope(page, '3', 'staged');
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="all"]')).not.toHaveClass(/active/);
+  });
+
+  test('Shift+4 activates Unstaged scope', async ({ page }) => {
+    await loadPage(page);
+    await pressShiftScope(page, '4', 'unstaged');
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="all"]')).not.toHaveClass(/active/);
+  });
+
+  test('pressing Shift+1 when All is already active does nothing', async ({ page }) => {
+    await loadPage(page);
+    // All is active by default
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="all"]')).toHaveClass(/active/);
+
+    // Press Shift+1 — no API call expected since scope is unchanged, just assert stable state
+    await page.keyboard.press('!');
+    await expect(page.locator('#scopeToggle .toggle-btn[data-scope="all"]')).toHaveClass(/active/);
   });
 
   test('clicking a disabled scope button does nothing', async ({ page }) => {

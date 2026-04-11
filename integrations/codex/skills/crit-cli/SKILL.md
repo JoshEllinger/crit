@@ -5,7 +5,7 @@ description: Use when working with crit CLI commands, .crit.json files, addressi
 
 # Crit CLI Reference
 
-> If a plan was just written and the user said `/crit` or `crit`, invoke the `/crit` command — do not use this reference skill. This skill covers CLI operations like `crit comment`, `crit pull/push`, and `crit share`.
+> If a plan was just written and the user said "crit" or "review", use the `$crit` skill instead — it covers the full review loop. This skill covers CLI operations like `crit comment`, `crit pull/push`, and `crit share`.
 
 ## .crit.json Format
 
@@ -25,7 +25,7 @@ After a crit review session, comments are in `.crit.json`. Comments have three s
       "author": "User Name",
       "resolved": false,
       "replies": [
-        { "id": "r0-r1", "body": "Thanks, addressed the minor issues", "author": "Copilot" }
+        { "id": "r0-r1", "body": "Thanks, addressed the minor issues", "author": "Codex" }
       ]
     }
   ],
@@ -41,7 +41,7 @@ After a crit review session, comments are in `.crit.json`. Comments have three s
           "author": "User Name",
           "resolved": false,
           "replies": [
-            { "id": "c1-r1", "body": "Fixed by extracting to helper", "author": "Copilot" }
+            { "id": "c1-r1", "body": "Fixed by extracting to helper", "author": "Codex" }
           ]
         }
       ]
@@ -65,8 +65,8 @@ After a crit review session, comments are in `.crit.json`. Comments have three s
 After addressing a comment, reply to it using the CLI:
 
 ```bash
-crit comment --reply-to c1 --author 'Copilot' 'Fixed by extracting to helper'
-crit comment --reply-to r0 --author 'Copilot' 'All issues addressed'
+crit comment --reply-to c1 --author 'Codex' 'Fixed by extracting to helper'
+crit comment --reply-to r0 --author 'Codex' 'All issues addressed'
 ```
 
 This adds a reply to the comment thread. Works for both file comment IDs (`c1`, `c2`, ...) and review comment IDs (`r0`, `r1`, ...). Resolving is a user action — do not mark comments resolved from AI.
@@ -86,35 +86,35 @@ Use `crit comment` to add review comments to `.crit.json` programmatically — n
 
 ```bash
 # Review-level comment (general feedback, not tied to any file)
-crit comment --author 'Copilot' '<body>'
+crit comment --author 'Codex' '<body>'
 
 # File-level comment (about a file overall, no line numbers)
-crit comment --author 'Copilot' <path> '<body>'
+crit comment --author 'Codex' <path> '<body>'
 
 # Line comment (single line)
-crit comment --author 'Copilot' <path>:<line> '<body>'
+crit comment --author 'Codex' <path>:<line> '<body>'
 
 # Line comment (range)
-crit comment --author 'Copilot' <path>:<start>-<end> '<body>'
+crit comment --author 'Codex' <path>:<start>-<end> '<body>'
 
 # Reply to an existing comment (with optional --resolve)
-crit comment --reply-to <id> --author 'Copilot' '<body>'
-crit comment --reply-to <id> --resolve --author 'Copilot' '<body>'
+crit comment --reply-to <id> --author 'Codex' '<body>'
+crit comment --reply-to <id> --resolve --author 'Codex' '<body>'
 ```
 
 Examples:
 
 ```bash
-crit comment --author 'Copilot' 'Overall architecture looks solid'
-crit comment --author 'Copilot' src/auth.go 'This file needs restructuring'
-crit comment --author 'Copilot' src/auth.go:42 'Missing null check on user.session — will panic if session expired'
-crit comment --author 'Copilot' src/handler.go:15-28 'This error is swallowed silently'
-crit comment --reply-to c1 --author 'Copilot' 'Added null check on line 42'
-crit comment --reply-to r0 --author 'Copilot' 'All issues addressed'
+crit comment --author 'Codex' 'Overall architecture looks solid'
+crit comment --author 'Codex' src/auth.go 'This file needs restructuring'
+crit comment --author 'Codex' src/auth.go:42 'Missing null check on user.session — will panic if session expired'
+crit comment --author 'Codex' src/handler.go:15-28 'This error is swallowed silently'
+crit comment --reply-to c1 --author 'Codex' 'Added null check on line 42'
+crit comment --reply-to r0 --author 'Codex' 'All issues addressed'
 ```
 
 Rules:
-- **Always use `--author 'Copilot'`** (or your agent name) so comments are attributed correctly
+- **Always use `--author 'Codex'`** so comments are attributed correctly
 - **Always use single quotes** for the body — double quotes will break on backticks and special characters
 - **Paths** are relative to the current working directory
 - **Line numbers** reference the file as it exists on disk (1-indexed), not diff line numbers
@@ -134,7 +134,7 @@ echo '[
   {"file": "src/auth.go", "line": "50-55", "body": "Extract to helper"},
   {"reply_to": "c1", "body": "Fixed — added null check"},
   {"reply_to": "r0", "body": "Done"}
-]' | crit comment --json --author 'GitHub Copilot'
+]' | crit comment --json --author 'Codex'
 ```
 
 JSON schema per entry:
@@ -183,18 +183,8 @@ crit share --qr <file>        # Also print QR code (terminal only)
 crit unpublish                # Remove shared review
 ```
 
-Examples:
-
-```bash
-crit share <file>                                # Share a single file
-crit share <file1> <file2>                       # Share multiple files
-crit share --share-url https://crit.md <file>  # Explicit share URL
-```
-
 Rules:
 - **No server needed** — `crit share` reads files directly from disk
-- **`--qr` is terminal-only** — only use when the user has a real terminal with monospace font rendering. Do not use in mobile apps (e.g. Claude Code mobile), web chat UIs, or any environment where Unicode block characters won't render correctly
 - **Comments included** — if `.crit.json` exists, comments for the shared files are included automatically
-- **Relay the output** — always copy the URL (and QR code if `--qr` was used) from the command output and include it directly in your response to the user. Do not make them dig through tool output
-- **State persisted** — share URL and delete token are saved to `.crit.json`
+- **Relay the output** — always copy the URL from the command output and include it directly in your response to the user
 - **Unpublish reads `.crit.json`** — uses the stored delete token to remove the review

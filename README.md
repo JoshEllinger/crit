@@ -129,6 +129,14 @@ crit unpublish                        # remove the shared review
 
 Sharing uses [crit.md](https://crit.md) by default. To self-host, deploy [`crit-web`](https://github.com/tomasz-tomczyk/crit-web) and point `CRIT_SHARE_URL` (or `--share-url`, or `share_url` in config) at your instance. Set `share_url` to `""` to disable sharing entirely.
 
+If your crit-web instance requires authentication, set `auth_token` in your global config (`~/.crit.config.json`):
+
+```json
+{"auth_token": "your-token-here"}
+```
+
+> **Security note:** Like `agent_cmd`, `auth_token` is read exclusively from your global `~/.crit.config.json`. Project-level config cannot set it.
+
 ### GitHub PR Sync
 
 Crit can sync review comments bidirectionally with GitHub PRs. Requires the [GitHub CLI](https://cli.github.com) (`gh`) to be installed and authenticated.
@@ -155,11 +163,13 @@ Click "Send now" on any comment during a review to get an AI agent response in r
 The agent reads the comment context, addresses it (editing code if needed), and replies
 inline — all while you continue reviewing.
 
-Configure in `.crit.config.json`:
+Configure in `~/.crit.config.json` (global config only):
 
 ```json
 {"agent_cmd": "claude --dangerously-skip-permissions -p"}
 ```
+
+> **Security note:** `agent_cmd` is read exclusively from your global `~/.crit.config.json`. Project-level `.crit.config.json` files cannot set it. This prevents a malicious repository from executing arbitrary commands when you trigger "Send to agent".
 
 #### Permission modes
 
@@ -210,6 +220,8 @@ After the first agent interaction, the comment becomes a **live thread**:
 - **Real-time output.** `.crit.json` is written on every comment change (200ms debounce), so your agent always has the latest review state.
 - **Dark/light/system theme.** Three-button pill in the header, persisted to localStorage.
 - **Local by default.** Server binds to `127.0.0.1`. Your files stay on your machine unless you explicitly share.
+- **No analytics or tracking.** Crit collects zero telemetry. No usage stats, no crash reports, no phone-home. If we ever add anonymous usage statistics in the future, they will be explicitly opt-in.
+- **Update check.** On startup, Crit makes one network request to check for a newer version and prints a notice if one is available. Set `CRIT_NO_UPDATE_CHECK=1` to disable it.
 
 ## Agent Integrations
 
@@ -277,6 +289,7 @@ crit config --help                             # document all config keys
   "output": "",
   "author": "John",
   "agent_cmd": "claude -p",
+  "auth_token": "",
   "ignore_patterns": [".crit.json"]
 }
 ```

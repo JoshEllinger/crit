@@ -41,7 +41,7 @@ func newTestServer(t *testing.T) (*Server, *Session) {
 		},
 	}
 
-	s, err := NewServer(session, frontendFS, "", nil, "", "test", 0, "")
+	s, err := NewServer(session, frontendFS, "", "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1303,7 +1303,7 @@ func TestGetFilesList(t *testing.T) {
 		Files:         []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", nil, "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1367,7 +1367,7 @@ func TestGetFilesList_RespectsIgnorePatterns(t *testing.T) {
 		Files:          []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", nil, "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1401,7 +1401,7 @@ func TestGetFilesList_FilesMode(t *testing.T) {
 		Files:         []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", nil, "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1472,7 +1472,7 @@ func TestGetFilesList_MethodNotAllowed(t *testing.T) {
 		subscribers:   make(map[chan SSEEvent]struct{}),
 		roundComplete: make(chan struct{}, 1),
 	}
-	srv, _ := NewServer(session, frontendFS, "", nil, "", "", 0, "")
+	srv, _ := NewServer(session, frontendFS, "", "", "", "", 0, "")
 	req := httptest.NewRequest("POST", "/api/files/list", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
@@ -1756,5 +1756,362 @@ func TestHandleConfig_AgentCmdEnabled(t *testing.T) {
 	json.Unmarshal(w2.Body.Bytes(), &data)
 	if data["agent_cmd_enabled"] != true {
 		t.Fatal("expected agent_cmd_enabled=true when configured")
+	}
+}
+
+func TestFuzzyScore(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		text    string
+		wantHit bool // true if score >= 0 (match), false if -1 (no match)
+	}{
+		{name: "empty query on empty text", query: "", text: "", wantHit: true},
+		{name: "empty query penalized by length", query: "", text: "anything.go", wantHit: false},
+		{name: "exact match", query: "main.go", text: "main.go", wantHit: true},
+		{name: "substring match", query: "main", text: "main.go", wantHit: true},
+		{name: "fuzzy match scattered", query: "mgo", text: "main.go", wantHit: true},
+		{name: "no match missing char", query: "xyz", text: "main.go", wantHit: false},
+		{name: "case insensitive", query: "main", text: "MAIN.GO", wantHit: true},
+		{name: "query longer than text", query: "toolongquery", text: "short", wantHit: false},
+		{name: "path separator bonus", query: "sg", text: "src/git.go", wantHit: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			score := fuzzyScore(tt.query, tt.text)
+			gotHit := score >= 0
+			if gotHit != tt.wantHit {
+				t.Errorf("fuzzyScore(%q, %q) = %v, wantHit=%v", tt.query, tt.text, score, tt.wantHit)
+			}
+		})
+	}
+}
+
+func TestFuzzyScore_Ranking(t *testing.T) {
+	// Exact prefix match should score higher than scattered match
+	exactScore := fuzzyScore("main", "main.go")
+	scatteredScore := fuzzyScore("main", "middleware/auth_interceptor.go")
+	if exactScore <= scatteredScore {
+		t.Errorf("exact prefix score (%v) should beat scattered score (%v)", exactScore, scatteredScore)
+	}
+
+	// Shorter path with same match should score higher (length penalty)
+	shortScore := fuzzyScore("srv", "server.go")
+	longScore := fuzzyScore("srv", "internal/services/server_runner.go")
+	if shortScore <= longScore {
+		t.Errorf("short path score (%v) should beat long path score (%v)", shortScore, longScore)
+	}
+}
+
+func TestFuzzyFilterPaths(t *testing.T) {
+	paths := []string{
+		"main.go",
+		"server.go",
+		"session.go",
+		"internal/middleware.go",
+		"README.md",
+		"config.go",
+	}
+
+	t.Run("empty query returns nothing because length penalty", func(t *testing.T) {
+		results := fuzzyFilterPaths(paths, "", 3)
+		if len(results) != 0 {
+			t.Errorf("got %d results, want 0 (length penalty makes score < 0)", len(results))
+		}
+	})
+
+	t.Run("no matches returns empty", func(t *testing.T) {
+		results := fuzzyFilterPaths(paths, "xyz", 10)
+		if len(results) != 0 {
+			t.Errorf("got %d results, want 0", len(results))
+		}
+	})
+
+	t.Run("exact match appears first", func(t *testing.T) {
+		results := fuzzyFilterPaths(paths, "server.go", 5)
+		if len(results) == 0 {
+			t.Fatal("expected at least one result")
+		}
+		if results[0] != "server.go" {
+			t.Errorf("first result = %q, want %q", results[0], "server.go")
+		}
+	})
+
+	t.Run("substring match works", func(t *testing.T) {
+		results := fuzzyFilterPaths(paths, "sess", 5)
+		found := false
+		for _, r := range results {
+			if r == "session.go" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected session.go in results: %v", results)
+		}
+	})
+
+	t.Run("limit caps results", func(t *testing.T) {
+		results := fuzzyFilterPaths(paths, "go", 2)
+		if len(results) > 2 {
+			t.Errorf("got %d results, want at most 2", len(results))
+		}
+	})
+
+	t.Run("nil paths returns empty", func(t *testing.T) {
+		results := fuzzyFilterPaths(nil, "test", 10)
+		if len(results) != 0 {
+			t.Errorf("got %d results, want 0", len(results))
+		}
+	})
+}
+
+func TestHandleSession_PlanMode(t *testing.T) {
+	session := &Session{
+		Mode:    "plan",
+		PlanDir: "/tmp/test-plan",
+		Files: []*FileEntry{
+			{Path: "auth-flow.md", FileType: "markdown", Content: "# Plan", Comments: []Comment{}},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+	srv, _ := NewServer(session, frontendFS, "", "", "", "dev", 0, "")
+
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["mode"] != "plan" {
+		t.Errorf("mode = %v, want 'plan'", resp["mode"])
+	}
+}
+
+func TestReadinessGate_Returns503WhenNotReady(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	endpoints := []string{
+		"/api/session",
+		"/api/config",
+		"/api/comments",
+	}
+	for _, ep := range endpoints {
+		req := httptest.NewRequest("GET", ep, nil)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s: got status %d, want 503", ep, w.Code)
+		}
+		var body map[string]string
+		json.Unmarshal(w.Body.Bytes(), &body)
+		if body["status"] != "loading" {
+			t.Errorf("%s: got status=%q, want 'loading'", ep, body["status"])
+		}
+	}
+}
+
+func TestReadinessGate_HealthAlwaysOK(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/health", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("health: got status %d, want 200", w.Code)
+	}
+}
+
+func TestReadinessGate_Returns200AfterSetSession(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.md")
+	os.WriteFile(path, []byte("hello\n"), 0644)
+
+	session := &Session{
+		Mode:          "files",
+		RepoRoot:      dir,
+		ReviewRound:   1,
+		nextID:        1,
+		subscribers:   make(map[chan SSEEvent]struct{}),
+		roundComplete: make(chan struct{}, 1),
+		Files: []*FileEntry{
+			{
+				Path:     "test.md",
+				AbsPath:  path,
+				Status:   "added",
+				FileType: "markdown",
+				Content:  "hello\n",
+				FileHash: "sha256:testhash",
+				Comments: []Comment{},
+			},
+		},
+	}
+
+	s.SetSession(session)
+
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("session after SetSession: got status %d, want 200", w.Code)
+	}
+}
+
+func TestRouteCommentByID(t *testing.T) {
+	tests := []struct {
+		name    string
+		trimmed string
+		want    commentRoute
+		ok      bool
+	}{
+		{"empty", "", commentRoute{}, false},
+		{"plain ID", "c5", commentRoute{kind: "comment", id: "c5"}, true},
+		{"replies", "c5/replies", commentRoute{kind: "reply", id: "c5", sub: ""}, true},
+		{"reply ID", "c5/replies/r2", commentRoute{kind: "reply", id: "c5", sub: "r2"}, true},
+		{"resolve", "c5/resolve", commentRoute{kind: "resolve", id: "c5"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := routeCommentByID(tt.trimmed)
+			if ok != tt.ok {
+				t.Fatalf("ok = %v, want %v", ok, tt.ok)
+			}
+			if got != tt.want {
+				t.Errorf("route = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReadinessGate_Returns500OnInitError(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.SetInitErr(fmt.Errorf("no changed files detected"))
+
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", w.Code)
+	}
+	var body map[string]string
+	json.Unmarshal(w.Body.Bytes(), &body)
+	if body["status"] != "error" {
+		t.Errorf("got status=%q, want 'error'", body["status"])
+	}
+	if !strings.Contains(body["message"], "no changed files") {
+		t.Errorf("got message=%q, want it to contain 'no changed files'", body["message"])
+	}
+}
+
+func TestSetPRInfo_AppearsInConfig(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// Config should have no PR fields before SetPRInfo.
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	var before map[string]any
+	json.Unmarshal(w.Body.Bytes(), &before)
+	if _, ok := before["pr_url"]; ok {
+		t.Fatal("pr_url should be absent before SetPRInfo")
+	}
+
+	// Set PR info asynchronously.
+	s.SetPRInfo(&PRInfo{
+		URL:         "https://github.com/test/repo/pull/42",
+		Number:      42,
+		Title:       "fix: something",
+		IsDraft:     false,
+		State:       "OPEN",
+		BaseRefName: "main",
+		HeadRefName: "fix-branch",
+		AuthorLogin: "testuser",
+	})
+
+	// Config should now include PR fields.
+	req = httptest.NewRequest("GET", "/api/config", nil)
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	var after map[string]any
+	json.Unmarshal(w.Body.Bytes(), &after)
+	if after["pr_url"] != "https://github.com/test/repo/pull/42" {
+		t.Errorf("pr_url = %v, want https://github.com/test/repo/pull/42", after["pr_url"])
+	}
+	if after["pr_number"].(float64) != 42 {
+		t.Errorf("pr_number = %v, want 42", after["pr_number"])
+	}
+	if after["pr_title"] != "fix: something" {
+		t.Errorf("pr_title = %v, want 'fix: something'", after["pr_title"])
+	}
+	if after["pr_author"] != "testuser" {
+		t.Errorf("pr_author = %v, want 'testuser'", after["pr_author"])
+	}
+}
+
+func TestSetPRInfo_ConcurrentSafe(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// Simulate the async pattern: SetSession makes server ready,
+	// then SetPRInfo fires from a goroutine while config requests arrive.
+	done := make(chan struct{})
+	go func() {
+		s.SetPRInfo(&PRInfo{
+			URL:    "https://github.com/test/repo/pull/1",
+			Number: 1,
+			Title:  "concurrent PR",
+		})
+		close(done)
+	}()
+
+	// Hit config concurrently — should not panic or race.
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest("GET", "/api/config", nil)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("config: got status %d, want 200", w.Code)
+		}
+	}
+	<-done
+}
+
+func TestWithReady_503WhenNotReady(t *testing.T) {
+	// Create a server without a session — the server should not be ready.
+	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want %q", got, "1")
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to decode response body: %v", err)
+	}
+	if body["status"] != "loading" {
+		t.Errorf("status = %q, want %q", body["status"], "loading")
 	}
 }

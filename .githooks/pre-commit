@@ -13,6 +13,17 @@ if [ -n "$UNFORMATTED" ]; then
     exit 1
 fi
 
+# Run golangci-lint (includes gocyclo, staticcheck, misspell, ineffassign)
+if command -v golangci-lint >/dev/null 2>&1; then
+    echo "  Running golangci-lint..."
+    if ! golangci-lint run ./... 2>&1; then
+        echo "  FAIL: Lint issues found"
+        exit 1
+    fi
+else
+    echo "  Skipping golangci-lint (not installed). Run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"
+fi
+
 # Run tests
 echo "  Running tests..."
 if ! go test ./... 2>&1; then

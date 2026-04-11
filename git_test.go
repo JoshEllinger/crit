@@ -367,6 +367,47 @@ func TestDefaultBranchOverride(t *testing.T) {
 	}
 }
 
+func TestRemoteBranches(t *testing.T) {
+	dir := initTestRepo(t)
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	// Create a bare remote and push branches
+	bare := t.TempDir()
+	runGit(t, bare, "init", "--bare")
+	runGit(t, dir, "remote", "add", "origin", bare)
+	runGit(t, dir, "push", "origin", "main")
+
+	runGit(t, dir, "checkout", "-b", "production")
+	writeFile(t, filepath.Join(dir, "prod.go"), "package main\n")
+	runGit(t, dir, "add", "prod.go")
+	runGit(t, dir, "commit", "-m", "prod")
+	runGit(t, dir, "push", "origin", "production")
+
+	runGit(t, dir, "checkout", "main")
+
+	branches, err := RemoteBranches(dir)
+	if err != nil {
+		t.Fatalf("RemoteBranches: %v", err)
+	}
+
+	// Should contain "main" and "production", not "HEAD"
+	has := map[string]bool{}
+	for _, b := range branches {
+		has[b] = true
+	}
+	if !has["main"] {
+		t.Errorf("expected 'main' in branches, got %v", branches)
+	}
+	if !has["production"] {
+		t.Errorf("expected 'production' in branches, got %v", branches)
+	}
+	if has["HEAD"] {
+		t.Error("HEAD should be filtered out")
+	}
+}
+
 func TestChangedFilesBranch(t *testing.T) {
 	dir := initTestRepo(t)
 	origDir, _ := os.Getwd()
@@ -1283,6 +1324,69 @@ func TestWalkFiles_SkipsNodeModules(t *testing.T) {
 	for _, f := range files {
 		if strings.HasPrefix(f, "node_modules/") {
 			t.Errorf("node_modules file should not appear: %s", f)
+		}
+	}
+}
+
+func TestDiffNumstat(t *testing.T) {
+	dir := initTestRepo(t)
+
+	writeFile(t, filepath.Join(dir, "stats.go"), "package main\n\nfunc hello() {}\n")
+	runGit(t, dir, "add", "stats.go")
+	runGit(t, dir, "commit", "-m", "add stats.go")
+	runGit(t, dir, "checkout", "-b", "feature-numstat")
+	writeFile(t, filepath.Join(dir, "stats.go"), "package main\n\nfunc hello() {\n\tfmt.Println(\"hi\")\n}\n\nfunc world() {}\n")
+	writeFile(t, filepath.Join(dir, "newfile.txt"), "line1\nline2\nline3\n")
+	runGit(t, dir, "add", "stats.go", "newfile.txt")
+	runGit(t, dir, "commit", "-m", "modify stats and add newfile")
+
+	base := strings.TrimSpace(runGit(t, dir, "merge-base", "main", "HEAD"))
+	stats, err := DiffNumstatDir(base, dir)
+	if err != nil {
+		t.Fatalf("DiffNumstat failed: %v", err)
+	}
+
+	if s, ok := stats["stats.go"]; !ok {
+		t.Fatal("missing stats.go in numstat output")
+	} else {
+		if s.Additions != 5 || s.Deletions != 1 {
+			t.Errorf("stats.go: got +%d/-%d, want +5/-1", s.Additions, s.Deletions)
+		}
+	}
+
+	if s, ok := stats["newfile.txt"]; !ok {
+		t.Fatal("missing newfile.txt in numstat output")
+	} else {
+		if s.Additions != 3 || s.Deletions != 0 {
+			t.Errorf("newfile.txt: got +%d/-%d, want +3/-0", s.Additions, s.Deletions)
+		}
+	}
+}
+
+func TestDiffNumstatBinary(t *testing.T) {
+	dir := initTestRepo(t)
+
+	writeFile(t, filepath.Join(dir, "notes.txt"), "hello\n")
+	runGit(t, dir, "add", "notes.txt")
+	runGit(t, dir, "commit", "-m", "add notes")
+	runGit(t, dir, "checkout", "-b", "feature-binary")
+
+	binPath := filepath.Join(dir, "image.png")
+	os.WriteFile(binPath, []byte{0x89, 0x50, 0x4E, 0x47, 0x00, 0x00}, 0644)
+	runGit(t, dir, "add", "image.png")
+	runGit(t, dir, "commit", "-m", "add binary")
+
+	base := strings.TrimSpace(runGit(t, dir, "merge-base", "main", "HEAD"))
+	stats, err := DiffNumstatDir(base, dir)
+	if err != nil {
+		t.Fatalf("DiffNumstat failed: %v", err)
+	}
+
+	if s, ok := stats["image.png"]; !ok {
+		t.Fatal("missing image.png in numstat output")
+	} else {
+		if s.Additions != 0 || s.Deletions != 0 {
+			t.Errorf("image.png: got +%d/-%d, want +0/-0", s.Additions, s.Deletions)
 		}
 	}
 }

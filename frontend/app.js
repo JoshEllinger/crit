@@ -126,6 +126,7 @@
   let deleteToken = '';
   let configAuthor = '';
   let uiState = 'reviewing';
+  let waitingHasComments = false;
   let pendingUpdates = [];
   let pendingUpdatesVersion = '';
   let updateModalEl = null;
@@ -140,6 +141,7 @@
   let diffActive = false; // rendered diff view toggle for file mode
 
   let filePickerReady = false;  // set true once /api/files/list is confirmed working
+  let userActedThisRound = false; // tracks if user made any comment/resolve/edit action this round
 
   // Per-file active form state
   let activeFilePath = null;
@@ -224,69 +226,119 @@
   }
 
   // Fetch and build file objects from the API for a list of file infos.
+  // Files marked as lazy by the backend are returned with metadata only;
+  // their content/diff/comments are fetched on demand when expanded.
   async function loadAllFileData(fileInfos, scope) {
-    return Promise.all(fileInfos.map(async (fi) => {
-      let diffUrl = '/api/file/diff?path=' + enc(fi.path);
-      if (scope && scope !== 'all') {
-        diffUrl += '&scope=' + enc(scope);
-      }
-      if (diffCommit) {
-        diffUrl += '&commit=' + enc(diffCommit);
-      }
-      const [fileRes, commentsRes, diffRes] = await Promise.all([
-        fetch('/api/file?path=' + enc(fi.path)).then(function(r) { return r.ok ? r.json() : { content: '' }; }).catch(function() { return { content: '' }; }),
-        fetch('/api/file/comments?path=' + enc(fi.path)).then(function(r) { return r.ok ? r.json() : []; }).catch(function() { return []; }),
-        fetch(diffUrl).then(function(r) { return r.ok ? r.json() : { hunks: [] }; }).catch(function() { return { hunks: [] }; }),
-      ]);
+    const hasLazy = fileInfos.some(function(fi) { return fi.lazy; });
 
-      const f = {
+    // If no lazy files, load everything eagerly (identical to previous behavior)
+    if (!hasLazy) {
+      return Promise.all(fileInfos.map(function(fi) { return loadSingleFile(fi, scope); }));
+    }
+
+    // Split into eager and lazy batches
+    var eager = [];
+    var lazy = [];
+    for (var i = 0; i < fileInfos.length; i++) {
+      if (fileInfos[i].lazy) {
+        lazy.push(fileInfos[i]);
+      } else {
+        eager.push(fileInfos[i]);
+      }
+    }
+
+    // Load eager files fully
+    var eagerFiles = await Promise.all(eager.map(function(fi) { return loadSingleFile(fi, scope); }));
+
+    // Create lightweight placeholders for lazy files
+    var lazyFiles = lazy.map(function(fi) {
+      return {
         path: fi.path,
         status: fi.status,
         fileType: fi.file_type,
-        content: fileRes.content || '',
-        previousContent: diffRes.previous_content || '',
-        comments: Array.isArray(commentsRes) ? commentsRes : [],
-        diffHunks: diffRes.hunks || [],
+        content: '',
+        previousContent: '',
+        comments: [],
+        diffHunks: [],
         lineBlocks: null,
         previousLineBlocks: null,
         tocItems: [],
-        collapsed: fi.status === 'deleted',
+        collapsed: true,
         viewMode: (session.mode === 'git') ? 'diff' : 'document',
         additions: fi.additions || 0,
         deletions: fi.deletions || 0,
+        lazy: true,
+        diffTooLarge: false,
+        diffLoaded: false,
       };
+    });
 
-      // Mark large diffs for deferred rendering
-      let diffLineCount = 0;
-      for (let h = 0; h < f.diffHunks.length; h++) {
-        diffLineCount += (f.diffHunks[h].Lines || []).length;
+    return eagerFiles.concat(lazyFiles);
+  }
+
+  // Load a single file's content, comments, and diff from the API.
+  async function loadSingleFile(fi, scope) {
+    var diffUrl = '/api/file/diff?path=' + enc(fi.path);
+    if (scope && scope !== 'all') {
+      diffUrl += '&scope=' + enc(scope);
+    }
+    if (diffCommit) {
+      diffUrl += '&commit=' + enc(diffCommit);
+    }
+    const [fileRes, commentsRes, diffRes] = await Promise.all([
+      fetch('/api/file?path=' + enc(fi.path)).then(function(r) { return r.ok ? r.json() : { content: '' }; }).catch(function() { return { content: '' }; }),
+      fetch('/api/file/comments?path=' + enc(fi.path)).then(function(r) { return r.ok ? r.json() : []; }).catch(function() { return []; }),
+      fetch(diffUrl).then(function(r) { return r.ok ? r.json() : { hunks: [] }; }).catch(function() { return { hunks: [] }; }),
+    ]);
+
+    const f = {
+      path: fi.path,
+      status: fi.status,
+      fileType: fi.file_type,
+      content: fileRes.content || '',
+      previousContent: diffRes.previous_content || '',
+      comments: Array.isArray(commentsRes) ? commentsRes : [],
+      diffHunks: diffRes.hunks || [],
+      lineBlocks: null,
+      previousLineBlocks: null,
+      tocItems: [],
+      collapsed: fi.status === 'deleted',
+      viewMode: (session.mode === 'git') ? 'diff' : 'document',
+      additions: fi.additions || 0,
+      deletions: fi.deletions || 0,
+      lazy: false,
+    };
+
+    // Mark large diffs for deferred rendering
+    var diffLineCount = 0;
+    for (var h = 0; h < f.diffHunks.length; h++) {
+      diffLineCount += (f.diffHunks[h].Lines || []).length;
+    }
+    f.diffTooLarge = diffLineCount > 1000;
+    f.diffLoaded = !f.diffTooLarge;
+
+    // Pre-highlight code files for diff rendering
+    if (f.fileType === 'code') {
+      f.highlightCache = preHighlightFile(f);
+      f.lang = langFromPath(f.path);
+
+      // In file mode, build line blocks so code files render as document view
+      if (session.mode !== 'git') {
+        f.lineBlocks = buildCodeLineBlocks(f);
       }
-      f.diffTooLarge = diffLineCount > 1000;
-      f.diffLoaded = !f.diffTooLarge;
+    }
 
-      // Pre-highlight code files for diff rendering
-      if (f.fileType === 'code') {
-        f.highlightCache = preHighlightFile(f);
-        f.lang = langFromPath(f.path);
-
-        // In file mode, build line blocks so code files render as document view
-        if (session.mode !== 'git') {
-          f.lineBlocks = buildCodeLineBlocks(f);
-        }
+    // Parse markdown content into line blocks
+    if (f.fileType === 'markdown') {
+      const parsed = parseMarkdown(f.content);
+      f.lineBlocks = parsed.blocks;
+      f.tocItems = parsed.tocItems;
+      if (f.previousContent) {
+        f.previousLineBlocks = parseMarkdown(f.previousContent).blocks;
       }
+    }
 
-      // Parse markdown content into line blocks
-      if (f.fileType === 'markdown') {
-        const parsed = parseMarkdown(f.content);
-        f.lineBlocks = parsed.blocks;
-        f.tocItems = parsed.tocItems;
-        if (f.previousContent) {
-          f.previousLineBlocks = parseMarkdown(f.previousContent).blocks;
-        }
-      }
-
-      return f;
-    }));
+    return f;
   }
 
   // ===== Viewed State =====
@@ -340,6 +392,53 @@
     }
   }
 
+  async function fetchWhenReady(url) {
+    var start = Date.now();
+    var maxWait = 5 * 60 * 1000; // 5 minutes
+    while (true) {
+      var r;
+      try {
+        r = await fetch(url);
+      } catch (_) {
+        // Network error — server may have shut down during init
+        var el = document.getElementById('filesContainer');
+        if (el) {
+          el.innerHTML =
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+            'Server disconnected</div>';
+        }
+        throw new Error('Server disconnected');
+      }
+      if (r.status === 503) {
+        if (Date.now() - start > maxWait) {
+          throw new Error('Server did not finish initializing within 5 minutes');
+        }
+        var elapsed = Math.round((Date.now() - start) / 1000);
+        var loadingEl = document.getElementById('filesContainer');
+        if (loadingEl) {
+          loadingEl.innerHTML =
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+            'Initializing\u2026 (' + elapsed + 's)</div>';
+        }
+        await new Promise(function(resolve) { setTimeout(resolve, 500); });
+        continue;
+      }
+      if (r.status === 500) {
+        var body = {};
+        try { body = await r.json(); } catch (_) {}
+        var msg = body.message || 'Server initialization failed';
+        document.getElementById('filesContainer').innerHTML =
+          '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+          msg + '</div>';
+        throw new Error(msg);
+      }
+      if (!r.ok) {
+        throw new Error('Unexpected server response: ' + r.status);
+      }
+      return r;
+    }
+  }
+
   // ===== Init =====
   async function init() {
     initTheme();
@@ -352,9 +451,12 @@
     updateHeaderHeight();
     window.addEventListener('resize', updateHeaderHeight);
 
+    document.getElementById('filesContainer').innerHTML =
+      '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">Loading...</div>';
+
     const [sessionRes, configRes] = await Promise.all([
-      fetch('/api/session?scope=' + enc(diffScope)).then(r => r.json()),
-      fetch('/api/config').then(r => r.json()),
+      fetchWhenReady('/api/session?scope=' + enc(diffScope)).then(r => r.json()),
+      fetchWhenReady('/api/config').then(r => r.json()),
     ]);
 
     session = sessionRes;
@@ -409,6 +511,13 @@
     if (session.mode === 'git' && session.branch) {
       document.getElementById('branchContext').style.display = '';
       document.getElementById('branchName').textContent = session.branch;
+      // Base branch picker: show in git mode when on a feature branch
+      if (session.base_ref) {
+        currentBaseBranch = session.base_branch_name || '';
+        document.getElementById('baseBranchLabel').textContent = currentBaseBranch || 'base';
+        document.getElementById('baseBranchArrow').style.display = '';
+        fetchBranches();
+      }
     } else if (session.mode !== 'git' && session.files && session.files.length === 1) {
       document.getElementById('branchContext').style.display = '';
       document.querySelector('.branch-icon').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>';
@@ -438,6 +547,9 @@
       scopeToggle.style.display = '';
       const scopes = session.available_scopes || ['all', 'staged', 'unstaged'];
       scopeToggle.querySelectorAll('.toggle-btn').forEach(function(b) {
+        // Clear previous disabled state before re-evaluating
+        b.disabled = false;
+        b.classList.remove('disabled');
         if (b.dataset.scope !== 'all' && scopes.indexOf(b.dataset.scope) === -1) {
           b.disabled = true;
           b.classList.add('disabled');
@@ -446,6 +558,11 @@
       if (scopes.indexOf(diffScope) === -1) {
         diffScope = 'all';
         setCookie('crit-diff-scope', 'all');
+        // Re-fetch session with corrected scope — the initial fetch used the
+        // stale cookie value and may have returned an empty file list.
+        const corrected = await fetchWhenReady('/api/session?scope=all').then(r => r.json());
+        session = corrected;
+        reviewComments = corrected.review_comments || [];
       }
       scopeToggle.querySelectorAll('.toggle-btn').forEach(function(b) {
         b.classList.toggle('active', b.dataset.scope === diffScope);
@@ -460,9 +577,11 @@
       }
     }
 
-    // Hide file-mode-only shortcuts in git mode
+    // Hide mode-specific shortcuts
     if (session.mode === 'git') {
       document.querySelectorAll('.shortcut-filemode-only').forEach(function(el) { el.style.display = 'none'; });
+    } else {
+      document.querySelectorAll('.shortcut-git-only').forEach(function(el) { el.style.display = 'none'; });
     }
 
     updateHeaderRound();
@@ -1508,6 +1627,55 @@
       file.collapsed = !section.open;
     });
 
+    // Lazy file: load content on first expand
+    if (file.lazy) {
+      section.addEventListener('toggle', function onLazyExpand() {
+        if (!section.open || !file.lazy) return;
+        if (file._lazyLoading) return;
+        file._lazyLoading = true;
+        section.removeEventListener('toggle', onLazyExpand);
+        section.classList.add('file-section-loading');
+
+        loadSingleFile({
+          path: file.path,
+          status: file.status,
+          file_type: file.fileType,
+          additions: file.additions,
+          deletions: file.deletions,
+        }, diffScope).then(function(loaded) {
+          // Copy loaded data into the existing file object
+          file.content = loaded.content;
+          file.previousContent = loaded.previousContent;
+          file.comments = loaded.comments;
+          file.diffHunks = loaded.diffHunks;
+          file.lineBlocks = loaded.lineBlocks;
+          file.previousLineBlocks = loaded.previousLineBlocks;
+          file.tocItems = loaded.tocItems;
+          file.diffTooLarge = loaded.diffTooLarge;
+          file.diffLoaded = loaded.diffLoaded;
+          file.lazy = false;
+          file._lazyLoading = false;
+          if (loaded.highlightCache) file.highlightCache = loaded.highlightCache;
+          if (loaded.lang) file.lang = loaded.lang;
+
+          // Re-render this file section in place
+          section.classList.remove('file-section-loading');
+          var newSection = renderFileSection(file);
+          newSection.open = section.open;
+          section.replaceWith(newSection);
+
+          // Update UI state
+          renderFileTree();
+          updateCommentCount();
+          rebuildNavList();
+        }).catch(function() {
+          file._lazyLoading = false;
+          section.classList.remove('file-section-loading');
+          section.addEventListener('toggle', onLazyExpand);
+        });
+      });
+    }
+
     const dirParts = file.path.split('/');
     const fileName = dirParts.pop();
     const dirPath = dirParts.length > 0 ? dirParts.join('/') + '/' : '';
@@ -2397,9 +2565,7 @@
 
   // Strip HTML tags and decode entities to get visible text for word-diff comparison.
   function htmlToText(html) {
-    const tmp = document.createElement('div');
-    tmp.innerHTML = html;
-    return tmp.textContent || '';
+    return html.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
   }
 
   // Apply word-level diffs to a pair of old/new blocks if they are sufficiently similar.
@@ -3919,6 +4085,7 @@
         const updated = await res.json();
         const idx = file.comments.findIndex(c => c.id === formObj.editingId);
         if (idx >= 0) file.comments[idx] = updated;
+        userActedThisRound = true;
       } else {
         const payload = {
           body: body.trim()
@@ -3941,6 +4108,7 @@
         const newComment = await res.json();
         file.comments.push(newComment);
         created = newComment;
+        userActedThisRound = true;
       }
     } catch (err) {
       console.error('Error saving comment:', err);
@@ -4203,12 +4371,6 @@
         : 'Lines ' + comment.start_line + '-' + comment.end_line;
       headerLeft.appendChild(lineRef);
     }
-    if (opts.showCarriedForward && comment.carried_forward) {
-      const label = document.createElement('span');
-      label.className = 'carried-forward-label';
-      label.textContent = 'Unresolved';
-      headerLeft.appendChild(label);
-    }
     const time = document.createElement('span');
     time.className = 'comment-time';
     time.textContent = formatTime(comment.created_at);
@@ -4292,22 +4454,12 @@
     deleteBtn.addEventListener('click', () => deleteComment(comment.id, filePath));
 
     const resolveBtn = document.createElement('button');
+    resolveBtn.className = 'resolve-btn';
     resolveBtn.title = 'Resolve';
-    resolveBtn.innerHTML = ICON_RESOLVE;
-    resolveBtn.addEventListener('click', async function() {
-      try {
-        var res = await fetch('/api/comment/' + comment.id + '/resolve?path=' + enc(filePath), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolved: true }),
-        });
-        if (!res.ok) throw new Error('Server returned ' + res.status);
-      } catch (err) {
-        console.error('Error resolving:', err);
-        showMiniToast('Failed to resolve comment');
-        return;
-      }
-      refreshFileComments(filePath);
+    resolveBtn.setAttribute('aria-label', 'Resolve thread');
+    resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
+    resolveBtn.addEventListener('click', function() {
+      toggleResolveStatus(comment.id, 'file', 'resolve', filePath, resolveBtn);
     });
 
     parts.actions.appendChild(resolveBtn);
@@ -4433,7 +4585,7 @@
       // Use quote_offset when available to disambiguate duplicate substrings
       if (comment.quote_offset != null) {
         var candidateIdx = comment.quote_offset;
-        if (normalizedFull.substr(candidateIdx, normalizedQuote.length) === normalizedQuote) {
+        if (normalizedFull.slice(candidateIdx, candidateIdx + normalizedQuote.length) === normalizedQuote) {
           quoteIdx = candidateIdx;
         }
       }
@@ -4565,12 +4717,42 @@
       await fetch('/api/comment/' + id + '?path=' + enc(filePath), { method: 'DELETE' });
       file.comments = file.comments.filter(c => c.id !== id);
       pendingAgentRequests.delete(id);
+      userActedThisRound = true;
     } catch (err) {
       console.error('Error deleting comment:', err);
     }
+    if (navCommentId === id) navCommentId = null;
     renderFileByPath(filePath);
     updateTreeCommentBadges();
     updateCommentCount();
+  }
+
+  // Shared resolve/unresolve handler for both file-level and review-level comments.
+  // `type` is 'file' or 'review'; `action` is 'resolve' or 'unresolve'.
+  async function toggleResolveStatus(commentId, type, action, filePath, buttonElement) {
+    const resolved = action === 'resolve';
+    const url = type === 'file'
+      ? '/api/comment/' + commentId + '/resolve?path=' + enc(filePath)
+      : '/api/review-comment/' + commentId + '/resolve';
+    try {
+      var res = await fetch(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resolved: resolved }),
+      });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+    } catch (err) {
+      console.error('Error ' + action + ':', err);
+      showMiniToast('Failed to ' + action + ' comment');
+      return;
+    }
+    userActedThisRound = true;
+    if (type === 'file') {
+      refreshFileComments(filePath);
+    } else {
+      await refreshReviewComments();
+      renderCommentsPanel();
+    }
   }
 
   // Re-fetch comments for a file from the API and re-render
@@ -4605,6 +4787,7 @@
       if (!res.ok) throw new Error('Server returned ' + res.status);
       const newComment = await res.json();
       reviewComments.push(newComment);
+      userActedThisRound = true;
     } catch (err) {
       console.error('Error adding review comment:', err);
       showMiniToast('Failed to add comment');
@@ -4629,6 +4812,7 @@
       const updated = await res.json();
       const idx = reviewComments.findIndex(function(c) { return c.id === id; });
       if (idx >= 0) reviewComments[idx] = updated;
+      userActedThisRound = true;
     } catch (err) {
       console.error('Error updating review comment:', err);
       showMiniToast('Failed to update comment');
@@ -4644,11 +4828,13 @@
       const res = await fetch('/api/review-comment/' + id, { method: 'DELETE' });
       if (!res.ok) throw new Error('Server returned ' + res.status);
       reviewComments = reviewComments.filter(function(c) { return c.id !== id; });
+      userActedThisRound = true;
     } catch (err) {
       console.error('Error deleting review comment:', err);
       showMiniToast('Failed to delete comment');
       return;
     }
+    if (navCommentId === id) navCommentId = null;
     updateCommentCount();
   }
 
@@ -4837,7 +5023,9 @@
       } catch (err) {
         console.error('Error editing reply:', err);
         showMiniToast('Failed to edit reply');
+        return;
       }
+      userActedThisRound = true;
       refreshFileComments(filePath);
     });
   }
@@ -4847,6 +5035,7 @@
       await fetch('/api/comment/' + commentId + '/replies/' + replyId + '?path=' + enc(filePath), {
         method: 'DELETE'
       });
+      userActedThisRound = true;
     } catch (err) {
       console.error('Error deleting reply:', err);
     }
@@ -4933,6 +5122,7 @@
           body: JSON.stringify(payload),
         });
         if (!res.ok) throw new Error('Server returned ' + res.status);
+        userActedThisRound = true;
 
         // In live threads, also send the reply to the agent
         var file = getFileByPath(filePath);
@@ -4986,28 +5176,13 @@
       showReplyInput: true,
     });
 
-    const badge = document.createElement('span');
-    badge.className = 'resolved-badge';
-    badge.textContent = 'Resolved';
-
     const unresolveBtn = document.createElement('button');
+    unresolveBtn.className = 'resolve-btn resolve-btn--active';
     unresolveBtn.title = 'Unresolve';
     unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
-    unresolveBtn.innerHTML = ICON_UNRESOLVE;
-    unresolveBtn.addEventListener('click', async function() {
-      try {
-        var res = await fetch('/api/comment/' + comment.id + '/resolve?path=' + enc(filePath), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolved: false }),
-        });
-        if (!res.ok) throw new Error('Server returned ' + res.status);
-      } catch (err) {
-        console.error('Error unresolving:', err);
-        showMiniToast('Failed to unresolve comment');
-        return;
-      }
-      refreshFileComments(filePath);
+    unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
+    unresolveBtn.addEventListener('click', function() {
+      toggleResolveStatus(comment.id, 'file', 'unresolve', filePath, unresolveBtn);
     });
 
     const deleteBtn = document.createElement('button');
@@ -5016,7 +5191,6 @@
     deleteBtn.innerHTML = ICON_DELETE;
     deleteBtn.addEventListener('click', function() { deleteComment(comment.id, filePath); });
 
-    parts.actions.appendChild(badge);
     parts.actions.appendChild(unresolveBtn);
     parts.actions.appendChild(deleteBtn);
 
@@ -5035,20 +5209,22 @@
       if (c.resolved) resolved++; else unresolved++;
     }
     const total = unresolved + resolved;
+    const navGroup = document.getElementById('commentNavGroup');
     const el = document.getElementById('commentCount');
     const numEl = document.getElementById('commentCountNumber');
     if (total === 0) {
-      el.style.display = '';
+      if (navGroup) navGroup.style.display = '';
+      if (navGroup) navGroup.classList.remove('has-comments');
       el.classList.add('comment-count-resolved');
       el.title = 'Toggle comments panel';
       numEl.textContent = '';
     } else if (unresolved > 0) {
-      el.style.display = '';
+      if (navGroup) { navGroup.style.display = ''; navGroup.classList.add('has-comments'); }
       el.classList.remove('comment-count-resolved');
       el.title = unresolved + ' unresolved comment' + (unresolved === 1 ? '' : 's') + ' — toggle panel';
       numEl.textContent = unresolved;
     } else {
-      el.style.display = '';
+      if (navGroup) { navGroup.style.display = ''; navGroup.classList.add('has-comments'); }
       el.classList.add('comment-count-resolved');
       el.title = total + ' resolved comment' + (total === 1 ? '' : 's') + ' — toggle panel';
       numEl.textContent = total;
@@ -5105,58 +5281,28 @@
       showReplyInput: false,
     });
 
-    if (isResolved) {
-      const badge = document.createElement('span');
-      badge.className = 'resolved-badge';
-      badge.textContent = 'Resolved';
-      parts.actions.appendChild(badge);
-    }
-
     if (isGeneral) {
       // General comments: resolve/unresolve, edit, and delete
       if (isResolved) {
         const unresolveBtn = document.createElement('button');
+        unresolveBtn.className = 'resolve-btn resolve-btn--active';
         unresolveBtn.title = 'Unresolve';
         unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
-        unresolveBtn.innerHTML = ICON_UNRESOLVE;
-        unresolveBtn.addEventListener('click', async function(e) {
+        unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
+        unresolveBtn.addEventListener('click', function(e) {
           e.stopPropagation();
-          try {
-            var res = await fetch('/api/review-comment/' + comment.id + '/resolve', {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ resolved: false }),
-            });
-            if (!res.ok) throw new Error('Server returned ' + res.status);
-          } catch (err) {
-            console.error('Error unresolving:', err);
-            showMiniToast('Failed to unresolve comment');
-            return;
-          }
-          await refreshReviewComments();
-          renderCommentsPanel();
+          toggleResolveStatus(comment.id, 'review', 'unresolve', null, unresolveBtn);
         });
         parts.actions.appendChild(unresolveBtn);
       } else {
         const resolveBtn = document.createElement('button');
+        resolveBtn.className = 'resolve-btn';
         resolveBtn.title = 'Resolve';
-        resolveBtn.innerHTML = ICON_RESOLVE;
-        resolveBtn.addEventListener('click', async function(e) {
+        resolveBtn.setAttribute('aria-label', 'Resolve thread');
+        resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
+        resolveBtn.addEventListener('click', function(e) {
           e.stopPropagation();
-          try {
-            var res = await fetch('/api/review-comment/' + comment.id + '/resolve', {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ resolved: true }),
-            });
-            if (!res.ok) throw new Error('Server returned ' + res.status);
-          } catch (err) {
-            console.error('Error resolving:', err);
-            showMiniToast('Failed to resolve comment');
-            return;
-          }
-          await refreshReviewComments();
-          renderCommentsPanel();
+          toggleResolveStatus(comment.id, 'review', 'resolve', null, resolveBtn);
         });
         parts.actions.appendChild(resolveBtn);
       }
@@ -5447,6 +5593,7 @@
 
   function setUIState(state) {
     uiState = state;
+    if (state === 'reviewing') waitingHasComments = false;
     const finishBtn = document.getElementById('finishBtn');
     const waitingOverlay = document.getElementById('waitingOverlay');
 
@@ -5479,13 +5626,12 @@
   document.getElementById('panelAddCommentBtn').addEventListener('click', openReviewCommentForm);
 
   // ===== Finish Review =====
-  document.getElementById('finishBtn').addEventListener('click', async function() {
-    if (uiState !== 'reviewing') return;
-
+  async function doFinishReview() {
     try {
       const resp = await fetch('/api/finish', { method: 'POST' });
       const data = await resp.json();
       const hasComments = !!data.prompt;
+      waitingHasComments = hasComments;
       const prompt = data.prompt || 'I reviewed the changes, no feedback, good to go!';
 
       document.getElementById('waitingPrompt').textContent = prompt;
@@ -5509,6 +5655,88 @@
     } catch (_) {}
 
     setUIState('waiting');
+  }
+
+  async function resolveAllAndFinish() {
+    // Resolve all unresolved file comments
+    for (var fi = 0; fi < files.length; fi++) {
+      var fileComments = files[fi].comments || [];
+      for (var ci = 0; ci < fileComments.length; ci++) {
+        if (!fileComments[ci].resolved) {
+          try {
+            await fetch('/api/comment/' + fileComments[ci].id + '/resolve?path=' + enc(files[fi].path), {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ resolved: true }),
+            });
+          } catch (_) {}
+        }
+      }
+    }
+    // Resolve all unresolved review comments
+    for (var ri = 0; ri < reviewComments.length; ri++) {
+      if (!reviewComments[ri].resolved) {
+        try {
+          await fetch('/api/review-comment/' + reviewComments[ri].id + '/resolve', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolved: true }),
+          });
+        } catch (_) {}
+      }
+    }
+    await doFinishReview();
+  }
+
+  function showNoChangesConfirm() {
+    document.getElementById('noChangesOverlay').classList.add('active');
+  }
+
+  function hideNoChangesConfirm() {
+    document.getElementById('noChangesOverlay').classList.remove('active');
+  }
+
+  document.getElementById('noChangesResolveAll').addEventListener('click', async function() {
+    hideNoChangesConfirm();
+    await resolveAllAndFinish();
+  });
+
+  document.getElementById('noChangesSendAnyway').addEventListener('click', async function() {
+    hideNoChangesConfirm();
+    await doFinishReview();
+  });
+
+  document.getElementById('noChangesGoBack').addEventListener('click', function() {
+    hideNoChangesConfirm();
+  });
+
+  document.getElementById('finishBtn').addEventListener('click', async function() {
+    if (uiState !== 'reviewing') return;
+
+    // Check if user took no action but there are unresolved comments.
+    // Only warn when ALL unresolved comments are carried-forward (from a previous round)
+    // and the user hasn't added, edited, resolved, or replied to anything this round.
+    var unresolvedCount = 0;
+    var hasNewComments = false;
+    for (var fi = 0; fi < files.length; fi++) {
+      if (!files[fi].comments) continue;
+      for (var ci = 0; ci < files[fi].comments.length; ci++) {
+        var c = files[fi].comments[ci];
+        if (!c.resolved) unresolvedCount++;
+        if (!c.carried_forward) hasNewComments = true;
+      }
+    }
+    for (var ri = 0; ri < reviewComments.length; ri++) {
+      if (!reviewComments[ri].resolved) unresolvedCount++;
+      if (!reviewComments[ri].carried_forward) hasNewComments = true;
+    }
+
+    if (!userActedThisRound && !hasNewComments && unresolvedCount > 0) {
+      showNoChangesConfirm();
+      return;
+    }
+
+    await doFinishReview();
   });
 
   document.getElementById('backToEditing').addEventListener('click', function() {
@@ -5535,6 +5763,9 @@
 
     source.addEventListener('file-changed', async function() {
       try {
+        // Reset action tracking for new round
+        userActedThisRound = false;
+
         // Capture per-file user state before rebuilding
         const prevState = {};
         for (let pi = 0; pi < files.length; pi++) {
@@ -5562,7 +5793,8 @@
           const prev = prevState[files[fi].path];
           if (prev) {
             files[fi].viewMode = prev.viewMode;
-            files[fi].collapsed = prev.collapsed;
+            // Lazy files must stay collapsed — they have no content to render
+            if (!files[fi].lazy) files[fi].collapsed = prev.collapsed;
             if (prev.diffLoaded) files[fi].diffLoaded = prev.diffLoaded;
             if (prev.viewed) files[fi].viewed = true;
           }
@@ -5580,6 +5812,7 @@
         diffActive = false;
         reviewCommentFormActive = false;
         reviewCommentEditingId = null;
+        navCommentId = null;
 
         saveViewedState();
         updateHeaderRound();
@@ -5608,7 +5841,9 @@
           const clipEl = document.getElementById('waitingClipboard');
           if (promptEl) promptEl.style.display = 'none';
           if (clipEl) clipEl.style.display = 'none';
-          document.getElementById('waitingMessage').textContent = 'Waiting for your agent to finish...';
+          if (waitingHasComments) {
+            document.getElementById('waitingMessage').textContent = 'Waiting for your agent to finish...';
+          }
         }
       } catch (_) {}
     });
@@ -5616,6 +5851,13 @@
     source.addEventListener('comments-changed', async function() {
       try {
         await Promise.all(files.map(async function(f) {
+          // Lazy files: fetch only comments (not full diff)
+          if (f.lazy) {
+            return fetch('/api/file/comments?path=' + enc(f.path))
+              .then(function(r) { return r.ok ? r.json() : []; })
+              .then(function(comments) { f.comments = Array.isArray(comments) ? comments : []; })
+              .catch(function() {});
+          }
           var fetches = [
             fetch('/api/file/comments?path=' + enc(f.path))
               .then(function(r) { return r.ok ? r.json() : []; })
@@ -5688,12 +5930,28 @@
       }
     });
 
+    source.addEventListener('base-changed', function() {
+      reloadForScope();
+      fetchCommits();
+    });
+
     source.addEventListener('server-shutdown', function() {
       source.close();
       showDisconnected();
     });
 
-    source.onerror = function() {};
+    var sseErrorCount = 0;
+    source.addEventListener('message', function() { sseErrorCount = 0; });
+    source.addEventListener('file-changed', function() { sseErrorCount = 0; });
+    source.addEventListener('comments-changed', function() { sseErrorCount = 0; });
+    source.addEventListener('base-changed', function() { sseErrorCount = 0; });
+
+    source.onerror = function() {
+      sseErrorCount++;
+      if (sseErrorCount >= 3) {
+        showMiniToast('Connection lost \u2014 retrying\u2026');
+      }
+    };
   }
 
   function showDisconnected() {
@@ -6014,9 +6272,17 @@
   }
 
   // ===== Mermaid =====
+  function getMermaidTheme() {
+    var dataTheme = document.documentElement.getAttribute('data-theme');
+    if (dataTheme === 'light') return 'default';
+    if (dataTheme === 'dark') return 'dark';
+    // System theme: check prefers-color-scheme
+    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'default' : 'dark';
+  }
+
   function renderMermaidBlocks() {
     if (typeof mermaid === 'undefined') return;
-    mermaid.initialize({ startOnLoad: false, theme: 'dark' });
+    mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
     const codes = document.querySelectorAll('code.language-mermaid');
     codes.forEach(function(code) {
       const pre = code.parentElement;
@@ -6045,6 +6311,12 @@
       const forTheme = btn.getAttribute('data-for-theme');
       btn.classList.toggle('active', forTheme === choice);
     });
+
+    // Re-initialize mermaid diagrams with updated theme
+    if (typeof mermaid !== 'undefined') {
+      mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
+      try { mermaid.run(); } catch (_) {}
+    }
 
     const indicator = document.querySelector('.theme-pill-indicator');
     if (indicator) {
@@ -6250,7 +6522,7 @@
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape' && commitDropdownEl.classList.contains('open')) {
       commitDropdownEl.classList.remove('open');
-      e.stopPropagation();
+      e.stopImmediatePropagation();
     }
   });
 
@@ -6275,6 +6547,7 @@
     if (!btn || btn.disabled || btn.classList.contains('active')) return;
     let scope = btn.dataset.scope;
     diffScope = scope;
+    navCommentId = null;
     setCookie('crit-diff-scope', scope);
     if (scope !== 'all' && scope !== 'branch') {
       diffCommit = '';
@@ -6288,35 +6561,214 @@
     await reloadForScope();
   });
 
+  var reloadInFlight = null;
   async function reloadForScope() {
-    document.getElementById('filesContainer').innerHTML =
-      '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">Loading...</div>';
+    if (reloadInFlight) return reloadInFlight;
+    reloadInFlight = (async function() {
+      try {
+        document.getElementById('filesContainer').innerHTML =
+          '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">Loading...</div>';
 
-    let sessionUrl = '/api/session?scope=' + enc(diffScope);
-    if (diffCommit) sessionUrl += '&commit=' + enc(diffCommit);
-    const sessionRes = await fetch(sessionUrl).then(function(r) { return r.json(); });
-    session = sessionRes;
-    reviewComments = sessionRes.review_comments || [];
+        let sessionUrl = '/api/session?scope=' + enc(diffScope);
+        if (diffCommit) sessionUrl += '&commit=' + enc(diffCommit);
+        const sessionRes = await fetch(sessionUrl).then(function(r) { return r.json(); });
+        session = sessionRes;
+        reviewComments = sessionRes.review_comments || [];
 
-    if (!session.files || session.files.length === 0) {
-      document.getElementById('filesContainer').innerHTML =
-        '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">No ' + diffScope + ' changes</div>';
-      files = [];
-      renderFileTree();
-      updateCommentCount();
-      updateViewedCount();
+        // Update base branch label if it changed
+        if (session.base_branch_name) {
+          currentBaseBranch = session.base_branch_name;
+          document.getElementById('baseBranchLabel').textContent = currentBaseBranch;
+        }
+
+        if (!session.files || session.files.length === 0) {
+          document.getElementById('filesContainer').innerHTML =
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">No ' + diffScope + ' changes</div>';
+          files = [];
+          renderFileTree();
+          updateCommentCount();
+          updateViewedCount();
+          return;
+        }
+
+        files = await loadAllFileData(session.files, diffScope);
+        files.sort(fileSortComparator);
+        restoreViewedState();
+        renderFileTree();
+        renderAllFiles();
+        buildToc();
+        updateCommentCount();
+        updateViewedCount();
+      } finally {
+        reloadInFlight = null;
+      }
+    })();
+    return reloadInFlight;
+  }
+
+  // ===== Base Branch Picker =====
+  const baseBranchPickerEl = document.getElementById('baseBranchPicker');
+  var baseBranchBtnEl = document.getElementById('baseBranchBtn');
+  let baseBranches = [];
+  let currentBaseBranch = ''; // display name of the current base branch
+  const branchPicker = { highlightedIdx: -1 }; // keyboard-highlighted item index
+
+  async function fetchBranches() {
+    try {
+      const res = await fetch('/api/branches');
+      if (!res.ok) return;
+      baseBranches = await res.json();
+      if (!baseBranches || baseBranches.length < 2) {
+        baseBranchPickerEl.classList.remove('open');
+        baseBranchPickerEl.style.display = 'none';
+        document.getElementById('baseBranchArrow').style.display = 'none';
+        return;
+      }
+      baseBranchPickerEl.style.display = '';
+      renderBaseBranchList();
+    } catch (e) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchPickerEl.style.display = 'none';
+      document.getElementById('baseBranchArrow').style.display = 'none';
+    }
+  }
+
+  function getVisibleItems() {
+    return Array.from(document.getElementById('baseBranchList').querySelectorAll('.base-branch-item'));
+  }
+
+  function updateHighlight() {
+    var items = getVisibleItems();
+    items.forEach(function(el, i) {
+      el.classList.toggle('highlighted', i === branchPicker.highlightedIdx);
+    });
+    if (branchPicker.highlightedIdx >= 0 && branchPicker.highlightedIdx < items.length) {
+      items[branchPicker.highlightedIdx].scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function renderBaseBranchList(filter) {
+    var list = document.getElementById('baseBranchList');
+    var filtered = baseBranches;
+    if (filter) {
+      var lower = filter.toLowerCase();
+      filtered = baseBranches.filter(function(b) { return b.toLowerCase().indexOf(lower) !== -1; });
+    }
+    list.innerHTML = filtered.map(function(b) {
+      var active = b === currentBaseBranch ? ' active' : '';
+      return '<div class="base-branch-item' + active + '" data-branch="' + escapeHtml(b) + '">' + escapeHtml(b) + '</div>';
+    }).join('');
+    if (filtered.length === 0) {
+      list.innerHTML = '<div style="padding: 8px 10px; font-size: 12px; color: var(--fg-muted);">No matching branches</div>';
+    }
+    branchPicker.highlightedIdx = -1;
+  }
+
+  async function selectBaseBranch(branch) {
+    if (branch === currentBaseBranch) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
       return;
     }
-
-    files = await loadAllFileData(session.files, diffScope);
-    files.sort(fileSortComparator);
-    restoreViewedState();
-    renderFileTree();
-    renderAllFiles();
-    buildToc();
-    updateCommentCount();
-    updateViewedCount();
+    baseBranchPickerEl.classList.remove('open');
+    baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    var previousBranch = currentBaseBranch;
+    var previousLabel = document.getElementById('baseBranchLabel').textContent;
+    document.getElementById('baseBranchLabel').textContent = branch;
+    currentBaseBranch = branch;
+    try {
+      var res = await fetch('/api/base-branch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ branch: branch }),
+      });
+      if (!res.ok) {
+        var errText = await res.text();
+        console.error('Failed to change base branch:', errText);
+        currentBaseBranch = previousBranch;
+        document.getElementById('baseBranchLabel').textContent = previousLabel;
+        return;
+      }
+      // Reload immediately for responsiveness; SSE 'base-changed' will also
+      // call reloadForScope() but the dedup guard collapses double-calls.
+      await reloadForScope();
+      fetchCommits();
+    } catch (err) {
+      console.error('Error changing base branch:', err);
+      currentBaseBranch = previousBranch;
+      document.getElementById('baseBranchLabel').textContent = previousLabel;
+    }
   }
+
+  // Toggle dropdown
+  document.getElementById('baseBranchBtn').addEventListener('click', function() {
+    baseBranchPickerEl.classList.toggle('open');
+    var isOpen = baseBranchPickerEl.classList.contains('open');
+    baseBranchBtnEl.setAttribute('aria-expanded', String(isOpen));
+    if (isOpen) {
+      var search = document.getElementById('baseBranchSearch');
+      search.value = '';
+      branchPicker.highlightedIdx = -1;
+      renderBaseBranchList();
+      search.focus();
+    }
+  });
+
+  // Filter on typing
+  document.getElementById('baseBranchSearch').addEventListener('input', function(e) {
+    renderBaseBranchList(e.target.value);
+  });
+
+  // Keyboard navigation in search input
+  document.getElementById('baseBranchSearch').addEventListener('keydown', function(e) {
+    e.stopPropagation();
+    var items = getVisibleItems();
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      branchPicker.highlightedIdx = Math.min(branchPicker.highlightedIdx + 1, items.length - 1);
+      updateHighlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (branchPicker.highlightedIdx > 0) {
+        branchPicker.highlightedIdx--;
+        updateHighlight();
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (branchPicker.highlightedIdx >= 0 && branchPicker.highlightedIdx < items.length) {
+        var branch = items[branchPicker.highlightedIdx].dataset.branch;
+        if (branch) selectBaseBranch(branch);
+      }
+    } else if (e.key === 'Escape') {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  // Close on outside click
+  document.addEventListener('click', function(e) {
+    if (!baseBranchPickerEl.contains(e.target)) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  // Close on Escape (only when open)
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && baseBranchPickerEl.classList.contains('open')) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+      e.stopImmediatePropagation();
+    }
+  });
+
+  // Item selection via click
+  document.getElementById('baseBranchList').addEventListener('click', function(e) {
+    var item = e.target.closest('.base-branch-item');
+    if (!item) return;
+    var branch = item.dataset.branch;
+    if (branch) selectBaseBranch(branch);
+  });
 
   // ===== TOC Toggle =====
   document.getElementById('tocToggle').addEventListener('click', function() {
@@ -6330,6 +6782,67 @@
     document.getElementById('toc').classList.add('toc-hidden');
     setCookie('crit-toc', 'closed');
   });
+
+  // ===== Comment Navigation =====
+  var navCommentId = null;
+  var navHighlightTimer;
+
+  function navigateToComment(direction) {
+    var panel = document.getElementById('commentsPanel');
+    var container = document.getElementById('filesContainer');
+    var cards = Array.from(container.querySelectorAll('.comment-card')).filter(function(card) {
+      return !panel || !panel.contains(card);
+    });
+    if (cards.length === 0) return;
+
+    var header = document.querySelector('.header');
+    var headerHeight = header ? header.offsetHeight : 52;
+
+    // Find current position by stored comment ID (immune to smooth-scroll race conditions)
+    var idx = -1;
+    if (navCommentId) {
+      for (var i = 0; i < cards.length; i++) {
+        if (cards[i].dataset.commentId === navCommentId) { idx = i; break; }
+      }
+    }
+
+    var targetIdx;
+    if (direction === 1) {
+      if (idx < 0) {
+        // First use: pick first card below the header area by viewport position
+        targetIdx = -1;
+        for (var j = 0; j < cards.length; j++) {
+          if (cards[j].getBoundingClientRect().top > headerHeight + 8) { targetIdx = j; break; }
+        }
+        if (targetIdx < 0) targetIdx = 0;
+      } else {
+        targetIdx = idx >= cards.length - 1 ? 0 : idx + 1;
+      }
+    } else {
+      targetIdx = idx <= 0 ? cards.length - 1 : idx - 1;
+    }
+
+    var target = cards[targetIdx];
+    navCommentId = target.dataset.commentId;
+
+    if (navHighlightTimer) {
+      clearTimeout(navHighlightTimer);
+      document.querySelectorAll('.comment-nav-highlight').forEach(function(el) {
+        el.classList.remove('comment-nav-highlight');
+      });
+    }
+
+    var rect = target.getBoundingClientRect();
+    var fileSection = target.closest('.file-section');
+    var fileHeader = fileSection ? fileSection.querySelector('.file-header') : null;
+    var fileHeaderHeight = fileHeader ? fileHeader.offsetHeight : 0;
+    window.scrollTo({ top: rect.top + window.scrollY - headerHeight - fileHeaderHeight - 16, behavior: 'smooth' });
+    target.classList.add('comment-nav-highlight');
+    navHighlightTimer = setTimeout(function() { target.classList.remove('comment-nav-highlight'); navHighlightTimer = null; }, 1000);
+  }
+
+  document.getElementById('commentNavPrev').addEventListener('click', function() { navigateToComment(-1); });
+  document.getElementById('commentNavNext').addEventListener('click', function() { navigateToComment(1); });
 
   // ===== Comments Panel Toggle =====
   document.getElementById('commentCount').addEventListener('click', function() {
@@ -6362,6 +6875,10 @@
     if (e.target === this) toggleShortcutsOverlay();
   });
 
+  document.getElementById('noChangesOverlay').addEventListener('click', function(e) {
+    if (e.target === this) hideNoChangesConfirm();
+  });
+
   document.addEventListener('keydown', function(e) {
     const tag = document.activeElement.tagName;
     if (tag === 'TEXTAREA' || tag === 'INPUT' || document.activeElement.isContentEditable) {
@@ -6372,6 +6889,14 @@
           const form = activeForms.find(function(f) { return f.formKey === ta.dataset.formKey; });
           if (form) cancelComment(form);
         }
+      }
+      return;
+    }
+
+    if (document.getElementById('noChangesOverlay').classList.contains('active')) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideNoChangesConfirm();
       }
       return;
     }
@@ -6492,6 +7017,16 @@
         tocBtn.click();
         break;
       }
+      case ']': {
+        e.preventDefault();
+        navigateToComment(1);
+        break;
+      }
+      case '[': {
+        e.preventDefault();
+        navigateToComment(-1);
+        break;
+      }
       case 'n': {
         if (changeGroups.length === 0) break;
         e.preventDefault();
@@ -6502,6 +7037,17 @@
         if (changeGroups.length === 0) break;
         e.preventDefault();
         navigateToChange(-1);
+        break;
+      }
+      case '!': case '@': case '#': case '$': {
+        if (session.mode !== 'git') break;
+        const scopeMap = { '!': 'all', '@': 'branch', '#': 'staged', '$': 'unstaged' };
+        const scope = scopeMap[e.key];
+        const btn = document.querySelector('#scopeToggle .toggle-btn[data-scope="' + scope + '"]');
+        if (btn && !btn.disabled && !btn.classList.contains('active')) {
+          e.preventDefault();
+          btn.click();
+        }
         break;
       }
       case '?': {
@@ -6534,7 +7080,7 @@
   document.addEventListener('mouseup', function(e) {
     // Don't interfere with gutter interactions (drag-to-select, + button clicks).
     if (dragState || diffDragState) return;
-    if (e.target.closest('.line-comment-gutter') || e.target.closest('.diff-gutter-btn')) return;
+    if (e.target.closest('.line-comment-gutter') || e.target.closest('.diff-comment-btn')) return;
 
     // Small delay to let the browser finalize the selection
     requestAnimationFrame(function() {
@@ -6656,7 +7202,8 @@
   });
 
   // ===== Start =====
-  init();
-  connectSSE();
+  init().then(connectSSE).catch(function(err) {
+    console.error('Init failed:', err.message);
+  });
 
 })();
