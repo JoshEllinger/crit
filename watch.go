@@ -20,7 +20,7 @@ func (s *Session) RefreshDiffs() {
 	}
 	snapshots := make([]fileSnapshot, 0, len(s.Files))
 	for _, f := range s.Files {
-		if f.Status == "deleted" {
+		if f.Status == "deleted" || f.Lazy {
 			continue
 		}
 		snapshots = append(snapshots, fileSnapshot{
@@ -82,7 +82,16 @@ func (s *Session) RefreshFileList() {
 		existing[f.Path] = f
 	}
 	repoRoot := s.RepoRoot
+	baseRef := s.BaseRef
 	s.mu.RUnlock()
+
+	// Fetch numstats if we might need them for lazy files
+	var numstats map[string]NumstatEntry
+	if len(changes) > lazyFileThreshold {
+		if baseRef != "" {
+			numstats, _ = DiffNumstatDir(baseRef, repoRoot)
+		}
+	}
 
 	// Build new file list, doing I/O (os.ReadFile, sha256) without holding the lock.
 	// Status updates for existing entries are deferred to the write-lock section
@@ -93,7 +102,7 @@ func (s *Session) RefreshFileList() {
 	}
 	var newFiles []*FileEntry
 	var updates []existingUpdate
-	for _, fc := range changes {
+	for i, fc := range changes {
 		if f, ok := existing[fc.Path]; ok {
 			updates = append(updates, existingUpdate{f, fc.Status})
 			newFiles = append(newFiles, f)
@@ -106,12 +115,21 @@ func (s *Session) RefreshFileList() {
 				FileType: detectFileType(fc.Path),
 				Comments: []Comment{},
 			}
-			if fc.Status != "deleted" {
+
+			// Apply lazy threshold for newly discovered files
+			if len(changes) > lazyFileThreshold && i >= lazyFileThreshold {
+				fe.Lazy = true
+				if ns, ok := numstats[fc.Path]; ok {
+					fe.LazyAdditions = ns.Additions
+					fe.LazyDeletions = ns.Deletions
+				}
+			} else if fc.Status != "deleted" {
 				if data, err := os.ReadFile(absPath); err == nil {
 					fe.Content = string(data)
 					fe.FileHash = fileHash(data)
 				}
 			}
+
 			newFiles = append(newFiles, fe)
 		}
 	}
@@ -130,6 +148,7 @@ func (s *Session) Watch(stop <-chan struct{}) {
 	if s.Mode == "git" {
 		s.watchGit(stop)
 	} else {
+		// Both "files" and "plan" modes use file mtime polling.
 		s.watchFileMtimes(stop)
 	}
 }
@@ -280,7 +299,7 @@ func (s *Session) carryForwardAllComments() {
 // Must be called with s.mu held for writing.
 func (s *Session) rereadFileContents(snapshotMarkdown bool) {
 	for _, f := range s.Files {
-		if f.Status == "deleted" {
+		if f.Status == "deleted" || f.Lazy {
 			continue
 		}
 		data, err := os.ReadFile(f.AbsPath)
@@ -320,6 +339,7 @@ func (s *Session) handleRoundCompleteGit() {
 	s.mu.Lock()
 	s.rereadFileContents(false)
 	s.carryForwardAllComments()
+	s.ReviewRound++
 	s.mu.Unlock()
 
 	// Refresh diffs for all files
@@ -347,6 +367,7 @@ func (s *Session) handleRoundCompleteFiles() {
 	// (snapshot markdown PreviousContent in case watcher hasn't polled yet)
 	s.mu.Lock()
 	s.rereadFileContents(true)
+	s.ReviewRound++
 	s.mu.Unlock()
 
 	s.finishRoundComplete(edits)

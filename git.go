@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -59,19 +60,37 @@ var (
 	defaultBranchOnce     sync.Once
 	defaultBranchResult   string
 	defaultBranchOverride string
+	defaultBranchMu       sync.RWMutex // protects defaultBranchOverride
 )
 
 // DefaultBranch returns the name of the default branch (main or master).
 // The result is cached after the first call since it doesn't change during a session.
 // If defaultBranchOverride is set, it is returned immediately without caching.
 func DefaultBranch() string {
-	if defaultBranchOverride != "" {
-		return defaultBranchOverride
+	defaultBranchMu.RLock()
+	override := defaultBranchOverride
+	defaultBranchMu.RUnlock()
+	if override != "" {
+		return override
 	}
 	defaultBranchOnce.Do(func() {
 		defaultBranchResult = detectDefaultBranch()
 	})
 	return defaultBranchResult
+}
+
+// setDefaultBranchOverride safely updates the default branch override.
+func setDefaultBranchOverride(branch string) {
+	defaultBranchMu.Lock()
+	defaultBranchOverride = branch
+	defaultBranchMu.Unlock()
+}
+
+// getDefaultBranchOverride safely reads the default branch override.
+func getDefaultBranchOverride() string {
+	defaultBranchMu.RLock()
+	defer defaultBranchMu.RUnlock()
+	return defaultBranchOverride
 }
 
 func detectDefaultBranch() string {
@@ -96,6 +115,28 @@ func detectDefaultBranch() string {
 		return "master"
 	}
 	return "main"
+}
+
+// RemoteBranches returns the names of all remote branches (without the "origin/" prefix).
+// The result excludes HEAD. If dir is non-empty, git runs in that directory.
+func RemoteBranches(dir string) ([]string, error) {
+	cmd := exec.Command("git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/")
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("for-each-ref failed: %w", err)
+	}
+	var branches []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name := strings.TrimPrefix(line, "origin/")
+		if name == "" || name == "HEAD" {
+			continue
+		}
+		branches = append(branches, name)
+	}
+	return branches, nil
 }
 
 // CurrentBranch returns the name of the current branch.
@@ -539,6 +580,45 @@ func parseNameStatus(output string) []FileChange {
 	return changes
 }
 
+// fileStatusInRepo returns the git status of a single file relative to baseRef
+// by running `git diff --name-status <baseRef> -- <path>` from the repo root.
+// This mirrors the same diff approach that ChangedFiles uses (merge-base diff),
+// so files committed on a branch are correctly reported as added/modified.
+// Falls back to checking whether the file is tracked when baseRef is empty.
+func fileStatusInRepo(path, repoRoot, baseRef string) string {
+	if baseRef == "" {
+		// No base ref — check if the file is tracked at all.
+		cmd := exec.Command("git", "ls-files", "--error-unmatch", "--", path)
+		cmd.Dir = repoRoot
+		if err := cmd.Run(); err != nil {
+			return "untracked"
+		}
+		return "modified"
+	}
+	cmd := exec.Command("git", "diff", "--name-status", baseRef, "--", path)
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
+	if err != nil {
+		return "untracked"
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		// File exists but is unchanged relative to baseRef.
+		// Check if it's tracked; if not, it's untracked.
+		chk := exec.Command("git", "ls-files", "--error-unmatch", "--", path)
+		chk.Dir = repoRoot
+		if err := chk.Run(); err != nil {
+			return "untracked"
+		}
+		return "modified"
+	}
+	changes := parseNameStatus(line)
+	if len(changes) > 0 {
+		return changes[0].Status
+	}
+	return "modified"
+}
+
 // dedup removes duplicate paths, keeping the first occurrence.
 func dedup(changes []FileChange) []FileChange {
 	seen := map[string]bool{}
@@ -581,6 +661,28 @@ func fileDiffUnified(path, baseRef, dir string) ([]DiffHunk, error) {
 	return ParseUnifiedDiff(string(out)), nil
 }
 
+// fileDiffUnifiedCtx is like fileDiffUnified but accepts a context for timeout control.
+func fileDiffUnifiedCtx(ctx context.Context, path, baseRef, dir string) ([]DiffHunk, error) {
+	var cmd *exec.Cmd
+	if baseRef == "" {
+		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", "HEAD", "--", path)
+	} else {
+		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", baseRef, "--", path)
+	}
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// git diff exits 1 when there are differences
+		} else {
+			return nil, fmt.Errorf("git diff failed: %w", err)
+		}
+	}
+	return ParseUnifiedDiff(string(out)), nil
+}
+
 // FileDiffUnifiedNewFile returns parsed diff hunks showing the entire file as added.
 // Used for untracked files that don't have a git diff.
 func FileDiffUnifiedNewFile(content string) []DiffHunk {
@@ -608,6 +710,48 @@ func FileDiffUnifiedNewFile(content string) []DiffHunk {
 		})
 	}
 	return []DiffHunk{hunk}
+}
+
+// NumstatEntry holds per-file addition/deletion counts from git diff --numstat.
+type NumstatEntry struct {
+	Additions int
+	Deletions int
+}
+
+// DiffNumstatDir runs git diff --numstat against the given base ref and returns per-file stats.
+// If dir is non-empty, git runs in that directory.
+func DiffNumstatDir(baseRef, dir string) (map[string]NumstatEntry, error) {
+	cmd := exec.Command("git", "diff", "--numstat", baseRef)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// git diff exits 1 when there are differences — normal
+		} else {
+			return nil, fmt.Errorf("git diff --numstat failed: %w", err)
+		}
+	}
+
+	stats := make(map[string]NumstatEntry)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		path := parts[2]
+		adds, err1 := strconv.Atoi(parts[0])
+		dels, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil {
+			adds, dels = 0, 0
+		}
+		stats[path] = NumstatEntry{Additions: adds, Deletions: dels}
+	}
+	return stats, nil
 }
 
 var hunkHeaderRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$`)

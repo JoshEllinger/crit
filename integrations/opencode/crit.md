@@ -61,6 +61,8 @@ The file contains structured JSON with comments per file:
 
 Identify all comments where `"resolved": false` or where the `resolved` field is missing (missing means unresolved). If a comment has a `"quote"` field, it contains the specific text the reviewer selected — focus your changes on the quoted text rather than the entire line range.
 
+Before acting on a comment, check its `replies` array — if you have already replied, the reviewer may be following up conversationally rather than requesting a new code change.
+
 ## Step 4: Address each review comment
 
 For each unresolved comment:
@@ -68,14 +70,14 @@ For each unresolved comment:
 1. Understand what the comment asks for.
 2. If a comment contains a suggestion block, apply that specific change.
 3. Revise the referenced file to address the feedback - this could be the plan file or any code file from the git diff.
-4. Reply to the comment with what you did: `crit comment --reply-to <id> --resolve --author 'OpenCode' '<what you did>'` (works for both file comment IDs like `c1` and review comment IDs like `r0`)
+4. Reply to the comment with what you did: `crit comment --reply-to <id> --author 'OpenCode' '<what you did>'` (works for both file comment IDs like `c1` and review comment IDs like `r0`)
 
-When addressing multiple comments, use `--json` to resolve them all in one call:
+When addressing multiple comments, use `--json` to reply to them all in one call:
 
 ```bash
 echo '[
-  {"reply_to": "c1", "body": "Fixed", "resolve": true},
-  {"reply_to": "c2", "body": "Refactored as suggested", "resolve": true}
+  {"reply_to": "c1", "body": "Fixed"},
+  {"reply_to": "c2", "body": "Refactored as suggested"}
 ]' | crit comment --json --author 'OpenCode'
 ```
 

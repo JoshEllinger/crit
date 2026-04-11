@@ -1,0 +1,20 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - gocyclo
+    - ineffassign
+    - misspell
+    - staticcheck
+  exclusions:
+    rules:
+      - linters: [staticcheck]
+        text: "QF"
+      - linters: [gocyclo]
+        text: "runComment|mergeExternalCritJSON|bulkAddCommentsToCritJSON|runPush"
+
+formatters:
+  enable:
+    - gofmt

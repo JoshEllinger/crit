@@ -204,7 +204,7 @@ test.describe('Comments Panel — Git Mode', () => {
 
   // --- Resolved / carried-forward comment tests ---
 
-  test('resolved carried-forward comment shows Resolved badge, not Unresolved', async ({ page, request }) => {
+  test('resolved carried-forward comment shows resolved card state', async ({ page, request }) => {
     const mdPath = await getMdPath(request);
     await addComment(request, mdPath, 1, 'Will be resolved');
 
@@ -236,27 +236,7 @@ test.describe('Comments Panel — Git Mode', () => {
 
     const card = panelCards(page).first();
     await expect(card).toBeVisible();
-    await expect(card.locator('.resolved-badge')).toContainText('Resolved');
-  });
-
-  test('unresolved carried-forward comment shows Unresolved badge', async ({ page, request }) => {
-    const mdPath = await getMdPath(request);
-    await addComment(request, mdPath, 1, 'Still unresolved');
-
-    // Finish + round-complete to carry forward
-    await request.post('/api/finish');
-    const round = (await request.get('/api/session').then(r => r.json())).review_round;
-    await request.post('/api/round-complete');
-    await waitForRound(request, round);
-
-    await loadPage(page);
-    await page.keyboard.press('Shift+C');
-
-    const card = panelCards(page).first();
-    await expect(card).toBeVisible();
-    await expect(card.locator('.carried-forward-label')).toContainText('Unresolved');
-    // Should NOT have a resolved badge
-    await expect(card.locator('.resolved-badge')).toHaveCount(0);
+    await expect(card).toHaveClass(/resolved-card/);
   });
 
   test('clicking resolved comment in panel scrolls to inline resolved comment', async ({ page, request }) => {
@@ -342,6 +322,6 @@ test.describe('Comments Panel — Git Mode', () => {
     const card = panelCards(page).first();
     await expect(card).toBeVisible();
     await expect(card.locator('.carried-forward-label')).toHaveCount(0);
-    await expect(card.locator('.resolved-badge')).toHaveCount(0);
+    await expect(card.locator('.resolve-btn--active')).toHaveCount(0);
   });
 });

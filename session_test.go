@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -458,8 +459,11 @@ func TestSession_SignalRoundComplete(t *testing.T) {
 	if s.GetLastRoundEdits() != 2 {
 		t.Errorf("last round edits = %d, want 2", s.GetLastRoundEdits())
 	}
-	if s.GetReviewRound() != 2 {
-		t.Errorf("review round = %d, want 2", s.GetReviewRound())
+	// ReviewRound is NOT incremented by SignalRoundComplete — it is deferred
+	// to the watcher's handleRoundComplete* handler to prevent a race where
+	// GetSessionInfo could observe the new round before carry-forward completes.
+	if s.GetReviewRound() != 1 {
+		t.Errorf("review round = %d, want 1 (deferred to watcher)", s.GetReviewRound())
 	}
 	if len(s.GetComments("plan.md")) != 0 {
 		t.Error("plan.md comments should be cleared")
@@ -840,6 +844,184 @@ func TestNewSessionFromGit_BaseBranchParam(t *testing.T) {
 	// BaseRef should be non-empty (a merge-base commit SHA was computed)
 	if session.BaseRef == "" {
 		t.Error("session.BaseRef should be set when diffing against a custom base branch")
+	}
+}
+
+// TestChangeBaseBranch verifies that changing the base branch updates the session's
+// BaseRef, BaseBranchName, and file list to reflect the new diff base.
+func TestChangeBaseBranch(t *testing.T) {
+	dir := initTestRepo(t)
+
+	defaultBranchOnce = sync.Once{}
+	defaultBranchOverride = ""
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer func() {
+		os.Chdir(origDir)
+		defaultBranchOverride = ""
+		defaultBranchOnce = sync.Once{}
+	}()
+
+	// main has: main.go
+	// Create "production" branch off main with extra files
+	runGit(t, dir, "checkout", "-b", "production")
+	writeFile(t, filepath.Join(dir, "prod.go"), "package main\n")
+	runGit(t, dir, "add", "prod.go")
+	runGit(t, dir, "commit", "-m", "production commit")
+
+	// Create feature branch off production
+	runGit(t, dir, "checkout", "-b", "feature")
+	writeFile(t, filepath.Join(dir, "feature.go"), "package main\n")
+	runGit(t, dir, "add", "feature.go")
+	runGit(t, dir, "commit", "-m", "feature commit")
+
+	// Create session with default base (main)
+	session, err := NewSessionFromGit(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// With main as base, both prod.go and feature.go should appear
+	hasProd := false
+	hasFeature := false
+	for _, f := range session.Files {
+		if f.Path == "prod.go" {
+			hasProd = true
+		}
+		if f.Path == "feature.go" {
+			hasFeature = true
+		}
+	}
+	if !hasProd {
+		t.Error("expected prod.go in file list when diffing against main")
+	}
+	if !hasFeature {
+		t.Error("expected feature.go in file list when diffing against main")
+	}
+	session.mu.RLock()
+	baseName := session.BaseBranchName
+	session.mu.RUnlock()
+	if baseName != "main" {
+		t.Errorf("BaseBranchName = %q, want %q", baseName, "main")
+	}
+
+	// Now change base to "production"
+	err = session.ChangeBaseBranch("production")
+	if err != nil {
+		t.Fatalf("ChangeBaseBranch: %v", err)
+	}
+
+	// With production as base, only feature.go should appear (not prod.go)
+	hasProd = false
+	hasFeature = false
+	session.mu.RLock()
+	for _, f := range session.Files {
+		if f.Path == "prod.go" {
+			hasProd = true
+		}
+		if f.Path == "feature.go" {
+			hasFeature = true
+		}
+	}
+	baseName = session.BaseBranchName
+	baseRef := session.BaseRef
+	session.mu.RUnlock()
+	if hasProd {
+		t.Error("prod.go should NOT appear when diffing against production")
+	}
+	if !hasFeature {
+		t.Error("expected feature.go in file list when diffing against production")
+	}
+	if baseName != "production" {
+		t.Errorf("BaseBranchName = %q, want %q", baseName, "production")
+	}
+	if baseRef == "" {
+		t.Error("BaseRef should be set after changing base branch")
+	}
+}
+
+// TestChangeBaseBranch_CommentsPreserved verifies that comments on files that still
+// appear after changing the base branch are preserved through the transition, and
+// that rollback works when the new branch is invalid.
+func TestChangeBaseBranch_CommentsPreserved(t *testing.T) {
+	dir := initTestRepo(t)
+
+	defaultBranchOnce = sync.Once{}
+	defaultBranchOverride = ""
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer func() {
+		os.Chdir(origDir)
+		defaultBranchOverride = ""
+		defaultBranchOnce = sync.Once{}
+	}()
+
+	// main has: README.md (initial commit)
+	// Create "production" branch with prod.go
+	runGit(t, dir, "checkout", "-b", "production")
+	writeFile(t, filepath.Join(dir, "prod.go"), "package main\n")
+	runGit(t, dir, "add", "prod.go")
+	runGit(t, dir, "commit", "-m", "production commit")
+
+	// Create feature branch with feature.go
+	runGit(t, dir, "checkout", "-b", "feature")
+	writeFile(t, filepath.Join(dir, "feature.go"), "package main\nfunc Feature() {}\n")
+	runGit(t, dir, "add", "feature.go")
+	runGit(t, dir, "commit", "-m", "feature commit")
+
+	// Create session (base=main, so both prod.go and feature.go appear)
+	session, err := NewSessionFromGit(nil)
+	if err != nil {
+		t.Fatalf("NewSessionFromGit: %v", err)
+	}
+
+	// Add a comment on feature.go (should survive base branch change)
+	_, ok := session.AddComment("feature.go", 1, 1, "", "keep this comment", "", "")
+	if !ok {
+		t.Fatal("AddComment on feature.go failed")
+	}
+	// Add a comment on prod.go (should be lost when switching base to production)
+	_, ok = session.AddComment("prod.go", 1, 1, "", "will disappear", "", "")
+	if !ok {
+		t.Fatal("AddComment on prod.go failed")
+	}
+
+	// Switch base to production — feature.go remains, prod.go drops out
+	if err := session.ChangeBaseBranch("production"); err != nil {
+		t.Fatalf("ChangeBaseBranch(production): %v", err)
+	}
+
+	// feature.go should still have its comment
+	featureComments := session.GetComments("feature.go")
+	if len(featureComments) != 1 {
+		t.Fatalf("expected 1 comment on feature.go, got %d", len(featureComments))
+	}
+	if featureComments[0].Body != "keep this comment" {
+		t.Errorf("comment body = %q, want %q", featureComments[0].Body, "keep this comment")
+	}
+
+	// prod.go should no longer be in the session
+	if session.FileByPath("prod.go") != nil {
+		t.Error("prod.go should not appear when base is production")
+	}
+
+	// Rollback: changing to a non-existent branch should fail and preserve state
+	session.mu.RLock()
+	baseBefore := session.BaseBranchName
+	session.mu.RUnlock()
+
+	err = session.ChangeBaseBranch("nonexistent-branch")
+	if err == nil {
+		t.Fatal("expected error for nonexistent branch")
+	}
+
+	session.mu.RLock()
+	baseAfter := session.BaseBranchName
+	session.mu.RUnlock()
+	if baseAfter != baseBefore {
+		t.Errorf("BaseBranchName changed to %q after failed switch, want %q", baseAfter, baseBefore)
 	}
 }
 
@@ -2292,5 +2474,212 @@ func TestDeleteReviewCommentReply_NotFound(t *testing.T) {
 	c := s.AddReviewComment("needs work", "reviewer")
 	if s.DeleteReviewCommentReply(c.ID, "nonexistent") {
 		t.Error("expected DeleteReviewCommentReply to return false for nonexistent reply")
+	}
+}
+
+func TestEnsureLoaded(t *testing.T) {
+	dir := initTestRepo(t)
+
+	writeFile(t, filepath.Join(dir, "lazy.go"), "package main\n\nfunc lazy() {}\n")
+	runGit(t, dir, "add", "lazy.go")
+	runGit(t, dir, "commit", "-m", "add lazy.go")
+	runGit(t, dir, "checkout", "-b", "feature-lazy")
+	writeFile(t, filepath.Join(dir, "lazy.go"), "package main\n\nfunc lazy() {\n\tfmt.Println(\"loaded\")\n}\n")
+	runGit(t, dir, "add", "lazy.go")
+	runGit(t, dir, "commit", "-m", "modify lazy.go")
+
+	base := strings.TrimSpace(runGit(t, dir, "merge-base", "main", "HEAD"))
+
+	fe := &FileEntry{
+		Path:    "lazy.go",
+		AbsPath: filepath.Join(dir, "lazy.go"),
+		Status:  "modified",
+		Lazy:    true,
+	}
+
+	if fe.Content != "" {
+		t.Fatal("expected empty content before ensureLoaded")
+	}
+	if len(fe.DiffHunks) != 0 {
+		t.Fatal("expected no diff hunks before ensureLoaded")
+	}
+
+	err := fe.ensureLoaded(dir, base)
+	if err != nil {
+		t.Fatalf("ensureLoaded failed: %v", err)
+	}
+
+	if fe.Content == "" {
+		t.Fatal("expected non-empty content after ensureLoaded")
+	}
+	if !strings.Contains(fe.Content, "loaded") {
+		t.Fatalf("content should contain 'loaded', got: %s", fe.Content)
+	}
+	if len(fe.DiffHunks) == 0 {
+		t.Fatal("expected diff hunks after ensureLoaded")
+	}
+	if fe.Lazy {
+		t.Fatal("expected Lazy=false after ensureLoaded")
+	}
+
+	// Second call is a no-op (sync.Once)
+	err = fe.ensureLoaded(dir, base)
+	if err != nil {
+		t.Fatalf("second ensureLoaded should not fail: %v", err)
+	}
+}
+
+func TestEnsureLoadedNotLazy(t *testing.T) {
+	fe := &FileEntry{
+		Path:    "eager.go",
+		Content: "already loaded",
+		Lazy:    false,
+	}
+	err := fe.ensureLoaded("/tmp", "abc123")
+	if err != nil {
+		t.Fatalf("ensureLoaded on non-lazy file should be no-op, got: %v", err)
+	}
+	if fe.Content != "already loaded" {
+		t.Fatal("content should be unchanged for non-lazy file")
+	}
+}
+
+func TestNewSessionFromGitLazyThreshold(t *testing.T) {
+	dir := initTestRepo(t)
+	defaultBranchOverride = ""
+	defer func() { defaultBranchOverride = "" }()
+
+	runGit(t, dir, "checkout", "-b", "feature-many-files")
+	for i := 0; i < 120; i++ {
+		name := fmt.Sprintf("file%03d.go", i)
+		writeFile(t, filepath.Join(dir, name), fmt.Sprintf("package main\n// file %d\n", i))
+	}
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "add 120 files")
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	s, err := NewSessionFromGit(nil)
+	if err != nil {
+		t.Fatalf("NewSessionFromGit failed: %v", err)
+	}
+
+	if len(s.Files) != 120 {
+		t.Fatalf("expected 120 files, got %d", len(s.Files))
+	}
+
+	eagerCount, lazyCount := 0, 0
+	for _, f := range s.Files {
+		if f.Lazy {
+			lazyCount++
+			if f.Content != "" {
+				t.Errorf("lazy file %s should not have content loaded", f.Path)
+			}
+		} else {
+			eagerCount++
+			if f.Content == "" && f.Status != "deleted" {
+				t.Errorf("eager file %s should have content", f.Path)
+			}
+		}
+	}
+
+	if eagerCount != 100 {
+		t.Errorf("expected 100 eager files, got %d", eagerCount)
+	}
+	if lazyCount != 20 {
+		t.Errorf("expected 20 lazy files, got %d", lazyCount)
+	}
+}
+
+func TestNewSessionFromGitUnderThreshold(t *testing.T) {
+	dir := initTestRepo(t)
+	defaultBranchOverride = ""
+	defer func() { defaultBranchOverride = "" }()
+
+	runGit(t, dir, "checkout", "-b", "feature-few-files")
+	for i := 0; i < 5; i++ {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("small%d.go", i)), "package main\n")
+	}
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "add 5 files")
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	s, err := NewSessionFromGit(nil)
+	if err != nil {
+		t.Fatalf("NewSessionFromGit failed: %v", err)
+	}
+
+	for _, f := range s.Files {
+		if f.Lazy {
+			t.Errorf("file %s should not be lazy when under threshold", f.Path)
+		}
+		if f.Content == "" && f.Status != "deleted" {
+			t.Errorf("file %s should have content loaded", f.Path)
+		}
+	}
+}
+
+func TestGetFileSnapshotLazy(t *testing.T) {
+	dir := initTestRepo(t)
+
+	runGit(t, dir, "checkout", "-b", "feature-snap")
+	writeFile(t, filepath.Join(dir, "snap.go"), "package main\nfunc snap() {}\n")
+	runGit(t, dir, "add", "snap.go")
+	runGit(t, dir, "commit", "-m", "add snap.go")
+
+	base := strings.TrimSpace(runGit(t, dir, "merge-base", "main", "HEAD"))
+
+	s := &Session{
+		Mode:     "git",
+		BaseRef:  base,
+		RepoRoot: dir,
+		Files: []*FileEntry{
+			{
+				Path:          "snap.go",
+				AbsPath:       filepath.Join(dir, "snap.go"),
+				Status:        "added",
+				FileType:      "code",
+				Lazy:          true,
+				LazyAdditions: 2,
+				Comments:      []Comment{},
+			},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// GetFileSnapshot should trigger ensureLoaded
+	snapshot, ok := s.GetFileSnapshot("snap.go")
+	if !ok {
+		t.Fatal("expected file to be found")
+	}
+	content, _ := snapshot["content"].(string)
+	if content == "" {
+		t.Fatal("expected content to be loaded on demand")
+	}
+	if !strings.Contains(content, "func snap") {
+		t.Fatalf("unexpected content: %s", content)
+	}
+
+	// GetFileDiffSnapshot should also work for the now-loaded file
+	diffSnap, ok := s.GetFileDiffSnapshot("snap.go")
+	if !ok {
+		t.Fatal("expected diff snapshot to be found")
+	}
+	hunks, _ := diffSnap["hunks"].([]DiffHunk)
+	if len(hunks) == 0 {
+		t.Fatal("expected diff hunks after lazy load")
+	}
+
+	// GetSessionInfo should show Lazy=false now (file was loaded)
+	info := s.GetSessionInfo()
+	for _, fi := range info.Files {
+		if fi.Path == "snap.go" && fi.Lazy {
+			t.Error("expected Lazy=false in session info after file was loaded")
+		}
 	}
 }

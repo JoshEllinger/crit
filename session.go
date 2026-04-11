@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// lazyFileThreshold is the maximum number of files to eagerly load
+// content and diffs for. Files beyond this threshold are loaded on demand
+// when the user expands them in the UI. Only applies when >threshold files.
+const lazyFileThreshold = 100
 
 // fileHash returns a stable hash string for file content.
 func fileHash(data []byte) string {
@@ -70,6 +76,53 @@ type FileEntry struct {
 	// Multi-round (markdown files only)
 	PreviousContent  string    `json:"-"`
 	PreviousComments []Comment `json:"-"`
+
+	// Lazy loading: when true, Content and DiffHunks are not yet populated.
+	// Call ensureLoaded() before accessing them. Only used when >100 files.
+	Lazy     bool      `json:"-"`
+	loadOnce sync.Once // guards one-time loading of content + diffs
+	loadErr  error     // error from loading, if any
+
+	// Stats for lazy files (populated from git diff --numstat)
+	LazyAdditions int `json:"-"`
+	LazyDeletions int `json:"-"`
+}
+
+// ensureLoaded loads content and diff hunks for a lazy file on first access.
+// For non-lazy files, this is an immediate no-op.
+func (fe *FileEntry) ensureLoaded(repoRoot, baseRef string) error {
+	if !fe.Lazy {
+		return nil
+	}
+	fe.loadOnce.Do(func() {
+		if fe.Status != "deleted" {
+			data, err := os.ReadFile(fe.AbsPath)
+			if err != nil {
+				fe.loadErr = fmt.Errorf("reading %s: %w", fe.Path, err)
+				return
+			}
+			fe.Content = string(data)
+			fe.FileHash = fileHash(data)
+		}
+
+		if fe.Status != "deleted" {
+			if fe.Status == "added" || fe.Status == "untracked" {
+				fe.DiffHunks = FileDiffUnifiedNewFile(fe.Content)
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				hunks, err := fileDiffUnifiedCtx(ctx, fe.Path, baseRef, repoRoot)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: git diff failed for %s: %v\n", fe.Path, err)
+				} else {
+					fe.DiffHunks = hunks
+				}
+			}
+		}
+
+		fe.Lazy = false
+	})
+	return fe.loadErr
 }
 
 // Session is the top-level state manager for a multi-file review.
@@ -79,8 +132,10 @@ type Session struct {
 	CLIArgs        []string // original file arguments passed on the command line (empty for git mode)
 	Branch         string
 	BaseRef        string
+	BaseBranchName string // display name of the base branch (e.g. "production", "master")
 	RepoRoot       string
 	OutputDir      string // custom output directory for .crit.json (empty = RepoRoot)
+	PlanDir        string // managed storage dir for plan mode (empty for git/files)
 	ReviewRound    int
 	IgnorePatterns []string
 
@@ -104,6 +159,7 @@ type Session struct {
 	lastCritJSONMtime   time.Time // mtime after our last WriteFiles(); used to detect external changes
 	awaitingFirstReview bool      // true until first review-cycle completes
 	browserClients      int32     // number of connected SSE browser clients (atomic)
+
 }
 
 // isSessionFile checks whether an absolute path belongs to a file in this session.
@@ -127,6 +183,7 @@ type CritJSON struct {
 	ShareURL       string                  `json:"share_url,omitempty"`
 	DeleteToken    string                  `json:"delete_token,omitempty"`
 	ShareScope     string                  `json:"share_scope,omitempty"`
+	LastShareHash  string                  `json:"last_share_hash,omitempty"`
 	ReviewComments []Comment               `json:"review_comments,omitempty"`
 	Files          map[string]CritJSONFile `json:"files"`
 }
@@ -136,6 +193,75 @@ type CritJSONFile struct {
 	Status   string    `json:"status"`
 	FileHash string    `json:"file_hash"`
 	Comments []Comment `json:"comments"`
+}
+
+// detectGitChanges resolves the base ref and returns the list of changed files.
+func detectGitChanges(root string, ignorePatterns []string) (branch, baseRef, resolvedBase string, changes []FileChange, err error) {
+	branch = CurrentBranch()
+	resolvedBase = DefaultBranch()
+	if branch != resolvedBase {
+		baseRef, _ = MergeBase(resolvedBase)
+	}
+
+	if baseRef != "" {
+		changes, err = changedFilesFromBaseInDir(baseRef, root)
+	} else {
+		changes, err = changedFilesOnDefaultInDir(root)
+	}
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("detecting changes: %w", err)
+	}
+	changes = filterIgnored(changes, ignorePatterns)
+
+	if len(changes) == 0 {
+		return "", "", "", nil, fmt.Errorf("no changed files detected (after applying ignore patterns)")
+	}
+	return branch, baseRef, resolvedBase, changes, nil
+}
+
+// populateLazyFile fills stats for a file that will be loaded on demand.
+func populateLazyFile(fe *FileEntry, fc FileChange, numstats map[string]NumstatEntry) {
+	fe.Lazy = true
+	fe.Comments = []Comment{}
+	if ns, ok := numstats[fc.Path]; ok {
+		fe.LazyAdditions = ns.Additions
+		fe.LazyDeletions = ns.Deletions
+	} else if fc.Status == "untracked" || fc.Status == "added" {
+		if data, err := os.ReadFile(fe.AbsPath); err == nil {
+			fe.LazyAdditions = strings.Count(string(data), "\n")
+			if len(data) > 0 && data[len(data)-1] != '\n' {
+				fe.LazyAdditions++
+			}
+		}
+	}
+}
+
+// populateEagerFile reads content and computes diffs for a file loaded at startup.
+func populateEagerFile(fe *FileEntry, fc FileChange, baseRef, root string) bool {
+	if fc.Status != "deleted" {
+		data, err := os.ReadFile(fe.AbsPath)
+		if err != nil {
+			return false
+		}
+		fe.Content = string(data)
+		fe.FileHash = fileHash(data)
+	}
+
+	if fc.Status != "deleted" {
+		if fc.Status == "added" || fc.Status == "untracked" {
+			fe.DiffHunks = FileDiffUnifiedNewFile(fe.Content)
+		} else {
+			hunks, err := fileDiffUnified(fc.Path, baseRef, root)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: git diff failed for %s: %v\n", fc.Path, err)
+			} else {
+				fe.DiffHunks = hunks
+			}
+		}
+	}
+
+	fe.Comments = []Comment{}
+	return true
 }
 
 // NewSessionFromGit creates a session by auto-detecting changed files via git.
@@ -149,37 +275,16 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 		return nil, fmt.Errorf("not a git repository: %w", err)
 	}
 
-	// Compute baseRef FIRST so we use the same value for both file detection and diffs.
-	// Previously these were computed independently which could lead to inconsistencies.
-	branch := CurrentBranch()
-	resolvedBase := DefaultBranch()
-	baseRef := ""
-	if branch != resolvedBase {
-		baseRef, _ = MergeBase(resolvedBase)
-	}
-
-	var changes []FileChange
-	if baseRef != "" {
-		// Feature branch with valid merge base: diff against it
-		changes, err = changedFilesFromBaseInDir(baseRef, root)
-	} else {
-		// Default branch or merge-base unavailable: diff against HEAD
-		changes, err = changedFilesOnDefaultInDir(root)
-	}
+	branch, baseRef, resolvedBase, changes, err := detectGitChanges(root, ignorePatterns)
 	if err != nil {
-		return nil, fmt.Errorf("detecting changes: %w", err)
-	}
-	// Apply ignore patterns
-	changes = filterIgnored(changes, ignorePatterns)
-
-	if len(changes) == 0 {
-		return nil, fmt.Errorf("no changed files detected (after applying ignore patterns)")
+		return nil, err
 	}
 
 	s := &Session{
 		Mode:                "git",
 		Branch:              branch,
 		BaseRef:             baseRef,
+		BaseBranchName:      resolvedBase,
 		RepoRoot:            root,
 		ReviewRound:         1,
 		nextID:              1,
@@ -189,41 +294,25 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 		awaitingFirstReview: true,
 	}
 
-	for _, fc := range changes {
+	var numstats map[string]NumstatEntry
+	if len(changes) > lazyFileThreshold && baseRef != "" {
+		numstats, _ = DiffNumstatDir(baseRef, root)
+	}
+
+	for i, fc := range changes {
 		absPath := filepath.Join(root, fc.Path)
 		fe := &FileEntry{
-			Path:    fc.Path,
-			AbsPath: absPath,
-			Status:  fc.Status,
-		}
-		fe.FileType = detectFileType(fc.Path)
-
-		// Read content (skip for deleted files)
-		if fc.Status != "deleted" {
-			data, err := os.ReadFile(absPath)
-			if err != nil {
-				continue // skip files that can't be read
-			}
-			fe.Content = string(data)
-			fe.FileHash = fileHash(data)
+			Path:     fc.Path,
+			AbsPath:  absPath,
+			Status:   fc.Status,
+			FileType: detectFileType(fc.Path),
 		}
 
-		// Load diff hunks for all files in git mode.
-		// Run git diff from the repo root to ensure path consistency.
-		if fc.Status != "deleted" {
-			if fc.Status == "added" || fc.Status == "untracked" {
-				fe.DiffHunks = FileDiffUnifiedNewFile(fe.Content)
-			} else {
-				hunks, err := fileDiffUnified(fc.Path, baseRef, root)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: git diff failed for %s: %v\n", fc.Path, err)
-				} else {
-					fe.DiffHunks = hunks
-				}
-			}
+		if len(changes) > lazyFileThreshold && i >= lazyFileThreshold {
+			populateLazyFile(fe, fc, numstats)
+		} else if !populateEagerFile(fe, fc, baseRef, root) {
+			continue
 		}
-
-		fe.Comments = []Comment{}
 		s.Files = append(s.Files, fe)
 	}
 
@@ -231,16 +320,8 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 	return s, nil
 }
 
-// NewSessionFromFiles creates a session from explicitly provided file or directory paths.
-// When a directory is passed, all files within it are included recursively.
-// The base branch is read from DefaultBranch(), which respects defaultBranchOverride
-// set by resolveServerConfig(). See NewSessionFromGit for rationale.
-func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, error) {
-	if len(paths) == 0 {
-		return nil, fmt.Errorf("no files provided")
-	}
-
-	// Expand directories into individual file paths
+// expandAndDedupPaths expands directory paths into files and deduplicates the result.
+func expandAndDedupPaths(paths []string, ignorePatterns []string) ([]string, error) {
 	var expandedPaths []string
 	for _, p := range paths {
 		absPath, err := filepath.Abs(p)
@@ -258,12 +339,10 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 			}
 			expandedPaths = append(expandedPaths, dirFiles...)
 		} else {
-			// Explicit files are never filtered by ignore patterns
 			expandedPaths = append(expandedPaths, absPath)
 		}
 	}
 
-	// Deduplicate paths
 	seen := make(map[string]bool, len(expandedPaths))
 	unique := expandedPaths[:0]
 	for _, p := range expandedPaths {
@@ -272,34 +351,51 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 			unique = append(unique, p)
 		}
 	}
-	expandedPaths = unique
+	return unique, nil
+}
 
+// resolveGitContext returns git repo state for file-mode sessions.
+func resolveGitContext() (root, branch, baseRef, baseBranchName string) {
+	if !IsGitRepo() {
+		return "", "", "", ""
+	}
+	root, _ = RepoRoot()
+	branch = CurrentBranch()
+	resolvedBase := DefaultBranch()
+	baseBranchName = resolvedBase
+	if branch != resolvedBase {
+		baseRef, _ = MergeBase(resolvedBase)
+	}
+	return root, branch, baseRef, baseBranchName
+}
+
+// NewSessionFromFiles creates a session from explicitly provided file or directory paths.
+// When a directory is passed, all files within it are included recursively.
+// The base branch is read from DefaultBranch(), which respects defaultBranchOverride
+// set by resolveServerConfig(). See NewSessionFromGit for rationale.
+func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, error) {
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no files provided")
+	}
+
+	expandedPaths, err := expandAndDedupPaths(paths, ignorePatterns)
+	if err != nil {
+		return nil, err
+	}
 	if len(expandedPaths) == 0 {
 		return nil, fmt.Errorf("no files found")
 	}
 
-	// Determine output dir and repo root
-	outputDir := filepath.Dir(expandedPaths[0])
-
-	root := ""
-	branch := ""
-	baseRef := ""
-	if IsGitRepo() {
-		root, _ = RepoRoot()
-		branch = CurrentBranch()
-		resolvedBase := DefaultBranch()
-		if branch != resolvedBase {
-			baseRef, _ = MergeBase(resolvedBase)
-		}
-	}
+	root, branch, baseRef, baseBranchName := resolveGitContext()
 	if root == "" {
-		root = outputDir
+		root = filepath.Dir(expandedPaths[0])
 	}
 
 	s := &Session{
 		Mode:                "files",
 		Branch:              branch,
 		BaseRef:             baseRef,
+		BaseBranchName:      baseBranchName,
 		RepoRoot:            root,
 		ReviewRound:         1,
 		nextID:              1,
@@ -332,11 +428,10 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 			Comments: []Comment{},
 		}
 
-		// Load diff hunks in a git repo
 		if IsGitRepo() {
-			hunks, err := fileDiffUnified(relPath, baseRef, root)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: git diff failed for %s: %v\n", relPath, err)
+			hunks, diffErr := fileDiffUnified(relPath, baseRef, root)
+			if diffErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: git diff failed for %s: %v\n", relPath, diffErr)
 			} else {
 				fe.DiffHunks = hunks
 			}
@@ -700,7 +795,7 @@ func (s *Session) RefreshFileContent() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, f := range s.Files {
-		if f.AbsPath == "" {
+		if f.AbsPath == "" || f.Lazy {
 			continue
 		}
 		data, err := os.ReadFile(f.AbsPath)
@@ -937,16 +1032,9 @@ func (s *Session) EnsureFileEntry(path string) bool {
 		return false
 	}
 
-	// Determine the file's git status
-	status := "untracked"
-	if changes, err := ChangedFiles(); err == nil {
-		for _, fc := range changes {
-			if fc.Path == path {
-				status = fc.Status
-				break
-			}
-		}
-	}
+	// Determine the file's git status via a single-file diff against baseRef
+	// (avoids running full ChangedFiles which diffs ALL files).
+	status := fileStatusInRepo(path, repoRoot, baseRef)
 
 	fe := &FileEntry{
 		Path:     path,
@@ -1063,7 +1151,12 @@ func (s *Session) SetAwaitingFirstReview(v bool) {
 	s.awaitingFirstReview = v
 }
 
-// SignalRoundComplete transitions to a new review round.
+// SignalRoundComplete prepares the session for a new round by clearing current
+// comments and sending a signal to the watcher goroutine. The ReviewRound counter
+// is NOT incremented here — it is deferred to the watcher's handleRoundComplete*
+// handler, which increments it only after comments have been carried forward from
+// .crit.json. This prevents a TOCTOU race where GetSessionInfo could observe the
+// new round number before carry-forward is complete, returning empty comments.
 func (s *Session) SignalRoundComplete() {
 	s.mu.Lock()
 	if s.writeTimer != nil {
@@ -1073,8 +1166,8 @@ func (s *Session) SignalRoundComplete() {
 	s.pendingWrite = false
 	s.lastRoundEdits = s.pendingEdits
 	s.pendingEdits = 0
-	s.ReviewRound++
-	// Clear comments on all files, reset session-global ID counter
+	// Clear comments on all files, reset session-global ID counter.
+	// ReviewRound is incremented later by the watcher after carry-forward.
 	for _, f := range s.Files {
 		f.Comments = []Comment{}
 	}
@@ -1121,9 +1214,104 @@ func (s *Session) ClearAllComments() {
 	os.Remove(critPath) //nolint:errcheck
 }
 
-// RoundCompleteChan returns the channel signaled on round completion.
-func (s *Session) RoundCompleteChan() <-chan struct{} {
-	return s.roundComplete
+// ChangeBaseBranch changes the diff base to the given branch, recomputes merge-base,
+// rebuilds the file list with new diffs, and notifies connected browsers via SSE.
+// Comments are preserved for files that still appear in the new diff.
+func (s *Session) ChangeBaseBranch(branch string) error {
+	s.mu.RLock()
+	mode := s.Mode
+	s.mu.RUnlock()
+	if mode != "git" {
+		return fmt.Errorf("base branch can only be changed in git mode")
+	}
+
+	// Compute merge-base with the new branch (try both local and remote ref)
+	mb, err := MergeBase(branch)
+	if err != nil {
+		mb, err = MergeBase("origin/" + branch)
+		if err != nil {
+			return fmt.Errorf("cannot compute merge-base with %s: %w", branch, err)
+		}
+	}
+
+	// Save old state for rollback
+	oldOverride := getDefaultBranchOverride()
+
+	// Update the global override so ChangedFiles() uses the new base
+	setDefaultBranchOverride(branch)
+
+	s.mu.Lock()
+	oldBaseRef := s.BaseRef
+	oldBaseBranchName := s.BaseBranchName
+	s.BaseRef = mb
+	s.BaseBranchName = branch
+	repoRoot := s.RepoRoot
+	currentBranch := s.Branch
+	ignorePatterns := s.IgnorePatterns
+
+	// Preserve existing comments keyed by file path
+	commentsByPath := make(map[string][]Comment, len(s.Files))
+	for _, f := range s.Files {
+		if len(f.Comments) > 0 {
+			commentsByPath[f.Path] = f.Comments
+		}
+	}
+	s.mu.Unlock()
+
+	// Re-detect changed files with new base
+	var changes []FileChange
+	if currentBranch != branch {
+		changes, err = changedFilesFromBaseInDir(mb, repoRoot)
+	} else {
+		changes, err = changedFilesOnDefaultInDir(repoRoot)
+	}
+	if err != nil {
+		// Rollback all state
+		setDefaultBranchOverride(oldOverride)
+		s.mu.Lock()
+		s.BaseRef = oldBaseRef
+		s.BaseBranchName = oldBaseBranchName
+		s.mu.Unlock()
+		return fmt.Errorf("detecting changes: %w", err)
+	}
+	changes = filterIgnored(changes, ignorePatterns)
+
+	// Build new file entries, preserving comments
+	var newFiles []*FileEntry
+	for _, fc := range changes {
+		absPath := filepath.Join(repoRoot, fc.Path)
+		fe := &FileEntry{
+			Path:     fc.Path,
+			AbsPath:  absPath,
+			Status:   fc.Status,
+			FileType: detectFileType(fc.Path),
+			Comments: commentsByPath[fc.Path],
+		}
+		if fe.Comments == nil {
+			fe.Comments = []Comment{}
+		}
+		if fc.Status != "deleted" {
+			if data, readErr := os.ReadFile(absPath); readErr == nil {
+				fe.Content = string(data)
+				fe.FileHash = fileHash(data)
+			}
+		}
+		if fc.Status != "added" && fc.Status != "untracked" {
+			if hunks, diffErr := fileDiffUnified(fc.Path, mb, repoRoot); diffErr == nil {
+				fe.DiffHunks = hunks
+			}
+		} else {
+			fe.DiffHunks = FileDiffUnifiedNewFile(fe.Content)
+		}
+		newFiles = append(newFiles, fe)
+	}
+
+	s.mu.Lock()
+	s.Files = newFiles
+	s.mu.Unlock()
+
+	s.notify(SSEEvent{Type: "base-changed"})
+	return nil
 }
 
 // scheduleWrite debounces writes to disk.
@@ -1177,54 +1365,57 @@ type writeFileSnapshot struct {
 	comments []Comment
 }
 
-// WriteFiles writes the .crit.json file to disk.
-//
-// The implementation snapshots all needed session state under RLock, then
-// releases the lock before doing any disk I/O (ReadFile, Stat, WriteFile).
-// This prevents a slow filesystem from blocking comment operations.
-//
-// Concurrency note: the debounce timer in scheduleWrite ensures that only one
-// WriteFiles call is in-flight at a time for a given generation. Between the
-// snapshot and the final WriteFile, no concurrent WriteFiles should be running
-// because scheduleWrite cancels the previous timer before arming a new one.
-func (s *Session) WriteFiles() {
-	critPath := s.critJSONPath()
-
-	// --- Phase 1: check for external deletion (needs brief lock) ---
+// handleExternalDeletion checks if .crit.json was deleted externally and clears
+// in-memory comments if so. Returns true if the file was deleted.
+func (s *Session) handleExternalDeletion(critPath string) bool {
 	s.mu.RLock()
 	lastMtime := s.lastCritJSONMtime
 	s.mu.RUnlock()
 
-	if !lastMtime.IsZero() {
-		if _, statErr := os.Stat(critPath); os.IsNotExist(statErr) {
-			s.mu.Lock()
-			s.lastCritJSONMtime = time.Time{}
-			anyComments := false
-			for _, f := range s.Files {
-				if len(f.Comments) > 0 {
-					f.Comments = []Comment{}
-					anyComments = true
-				}
-			}
-			s.nextID = 1
-			s.mu.Unlock()
-			if anyComments {
-				s.notify(SSEEvent{Type: "comments-changed"})
-			}
-			return
-		}
+	if lastMtime.IsZero() {
+		return false
+	}
+	if _, statErr := os.Stat(critPath); !os.IsNotExist(statErr) {
+		return false
 	}
 
-	// --- Phase 2: snapshot session state under RLock ---
-	snap := s.snapshotForWrite(critPath)
+	s.clearAllCommentData()
+	return true
+}
 
-	// --- Phase 3: all disk I/O happens here, no lock held ---
+// clearAllCommentData resets all in-memory comment state (file comments,
+// review comments, and ID counters) and notifies if any comments existed.
+// Caller must NOT hold s.mu.
+func (s *Session) clearAllCommentData() {
+	s.mu.Lock()
+	s.lastCritJSONMtime = time.Time{}
+	anyComments := false
+	for _, f := range s.Files {
+		if len(f.Comments) > 0 {
+			f.Comments = []Comment{}
+			anyComments = true
+		}
+	}
+	if len(s.reviewComments) > 0 {
+		anyComments = true
+	}
+	s.reviewComments = nil
+	s.nextID = 1
+	s.reviewNextID = 0
+	s.mu.Unlock()
+	if anyComments {
+		s.notify(SSEEvent{Type: "comments-changed"})
+	}
+}
 
-	// Start from existing .crit.json to preserve comments for files not in this session
-	// (e.g. comments added via `crit comment` on files outside the current diff).
+// buildCritJSON loads existing .crit.json from disk, applies the snapshot metadata,
+// and merges per-file comments.
+func buildCritJSON(snap writeFilesSnapshot) CritJSON {
 	cj := CritJSON{Files: make(map[string]CritJSONFile)}
 	if data, err := os.ReadFile(snap.critPath); err == nil {
-		_ = json.Unmarshal(data, &cj)
+		if unmarshalErr := json.Unmarshal(data, &cj); unmarshalErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: corrupt .crit.json, starting fresh: %v\n", unmarshalErr)
+		}
 		if cj.Files == nil {
 			cj.Files = make(map[string]CritJSONFile)
 		}
@@ -1238,42 +1429,69 @@ func (s *Session) WriteFiles() {
 	cj.ShareScope = snap.shareScope
 	cj.ReviewComments = snap.reviewComments
 
-	// Overlay session files: merge with disk comments, remove entries with no comments.
 	for _, fs := range snap.files {
-		diskFile, hasDisk := cj.Files[fs.path]
+		mergeFileSnapshotIntoCritJSON(&cj, fs)
+	}
+	return cj
+}
 
-		// Build set of in-memory comment IDs
-		memIDs := make(map[string]struct{}, len(fs.comments))
-		for _, c := range fs.comments {
-			memIDs[c.ID] = struct{}{}
-		}
+// mergeFileSnapshotIntoCritJSON merges a single file's comments from the snapshot
+// with any disk-only comments, and updates the CritJSON.
+func mergeFileSnapshotIntoCritJSON(cj *CritJSON, fs writeFileSnapshot) {
+	diskFile, hasDisk := cj.Files[fs.path]
 
-		// Start with in-memory comments (already a copy from the snapshot)
-		merged := fs.comments
+	memIDs := make(map[string]struct{}, len(fs.comments))
+	for _, c := range fs.comments {
+		memIDs[c.ID] = struct{}{}
+	}
 
-		// Merge in any disk-only comments (added externally via crit comment, crit pull, etc.)
-		if hasDisk {
-			for _, dc := range diskFile.Comments {
-				if _, exists := memIDs[dc.ID]; !exists {
-					merged = append(merged, dc)
-				}
+	merged := fs.comments
+	if hasDisk {
+		for _, dc := range diskFile.Comments {
+			if _, exists := memIDs[dc.ID]; !exists {
+				merged = append(merged, dc)
 			}
-		}
-
-		if len(merged) == 0 {
-			delete(cj.Files, fs.path)
-			continue
-		}
-
-		cj.Files[fs.path] = CritJSONFile{
-			Status:   fs.status,
-			FileHash: fs.fileHash,
-			Comments: merged,
 		}
 	}
 
-	// Only remove if nothing meaningful remains
-	if len(cj.Files) == 0 && len(cj.ReviewComments) == 0 && cj.ShareURL == "" && cj.DeleteToken == "" && cj.ShareScope == "" {
+	if len(merged) == 0 {
+		delete(cj.Files, fs.path)
+		return
+	}
+
+	cj.Files[fs.path] = CritJSONFile{
+		Status:   fs.status,
+		FileHash: fs.fileHash,
+		Comments: merged,
+	}
+}
+
+func critJSONIsEmpty(cj CritJSON) bool {
+	return len(cj.Files) == 0 && len(cj.ReviewComments) == 0 &&
+		cj.ShareURL == "" && cj.DeleteToken == "" && cj.ShareScope == ""
+}
+
+// WriteFiles writes the .crit.json file to disk.
+//
+// The implementation snapshots all needed session state under RLock, then
+// releases the lock before doing any disk I/O (ReadFile, Stat, WriteFile).
+// This prevents a slow filesystem from blocking comment operations.
+//
+// Concurrency note: the debounce timer in scheduleWrite ensures that only one
+// WriteFiles call is in-flight at a time for a given generation. Between the
+// snapshot and the final WriteFile, no concurrent WriteFiles should be running
+// because scheduleWrite cancels the previous timer before arming a new one.
+func (s *Session) WriteFiles() {
+	critPath := s.critJSONPath()
+
+	if s.handleExternalDeletion(critPath) {
+		return
+	}
+
+	snap := s.snapshotForWrite(critPath)
+	cj := buildCritJSON(snap)
+
+	if critJSONIsEmpty(cj) {
 		os.Remove(snap.critPath)
 		s.mu.Lock()
 		s.lastCritJSONMtime = time.Time{}
@@ -1291,7 +1509,6 @@ func (s *Session) WriteFiles() {
 		fmt.Fprintf(os.Stderr, "Error writing .crit.json: %v\n", err)
 		return
 	}
-	// Record mtime so mergeExternalCritJSON can distinguish our writes from external ones.
 	if info, err := os.Stat(snap.critPath); err == nil {
 		s.mu.Lock()
 		s.lastCritJSONMtime = info.ModTime()
@@ -1334,9 +1551,156 @@ func (s *Session) snapshotForWrite(critPath string) writeFilesSnapshot {
 	return snap
 }
 
-// mergeExternalCritJSON checks if .crit.json was modified externally (not by us)
-// and merges any new comments into the in-memory session.
-// Returns true if changes were detected and merged.
+// handleCritJSONDeleted clears all in-memory comment state when .crit.json
+// has been deleted. Returns true unconditionally to signal the deletion.
+func (s *Session) handleCritJSONDeleted() bool {
+	s.clearAllCommentData()
+	return true
+}
+
+func (s *Session) mergeFileCommentsFromDisk(f *FileEntry, diskFile CritJSONFile) bool {
+	changed := false
+
+	memIDs := make(map[string]struct{}, len(f.Comments))
+	for _, c := range f.Comments {
+		memIDs[c.ID] = struct{}{}
+	}
+
+	for _, dc := range diskFile.Comments {
+		if _, exists := memIDs[dc.ID]; !exists {
+			f.Comments = append(f.Comments, dc)
+			id := 0
+			fmt.Sscanf(dc.ID, "c%d", &id)
+			if id >= s.nextID {
+				s.nextID = id + 1
+			}
+			changed = true
+		} else {
+			changed = s.mergeCommentRepliesAndState(f.Comments, dc) || changed
+		}
+	}
+
+	// Remove comments deleted on disk.
+	if len(diskFile.Comments) != len(f.Comments) {
+		changed = filterDeletedComments(f, diskFile.Comments) || changed
+	}
+
+	return changed
+}
+
+func (s *Session) mergeCommentRepliesAndState(comments []Comment, dc Comment) bool {
+	changed := false
+	for i, mc := range comments {
+		if mc.ID != dc.ID {
+			continue
+		}
+		memReplyIDs := make(map[string]struct{}, len(mc.Replies))
+		for _, r := range mc.Replies {
+			memReplyIDs[r.ID] = struct{}{}
+		}
+		for _, dr := range dc.Replies {
+			if _, exists := memReplyIDs[dr.ID]; !exists {
+				comments[i].Replies = append(comments[i].Replies, dr)
+				changed = true
+			}
+		}
+		if dc.Resolved != mc.Resolved {
+			comments[i].Resolved = dc.Resolved
+			changed = true
+		}
+		break
+	}
+	return changed
+}
+
+func filterDeletedComments(f *FileEntry, diskComments []Comment) bool {
+	diskIDs := make(map[string]struct{}, len(diskComments))
+	for _, dc := range diskComments {
+		diskIDs[dc.ID] = struct{}{}
+	}
+	filtered := f.Comments[:0]
+	for _, c := range f.Comments {
+		if _, exists := diskIDs[c.ID]; exists {
+			filtered = append(filtered, c)
+		}
+	}
+	if len(filtered) != len(f.Comments) {
+		f.Comments = filtered
+		return true
+	}
+	return false
+}
+
+func (s *Session) mergeReviewCommentsFromDisk(diskComments []Comment) bool {
+	changed := false
+
+	memReviewIDs := make(map[string]struct{}, len(s.reviewComments))
+	for _, c := range s.reviewComments {
+		memReviewIDs[c.ID] = struct{}{}
+	}
+	for _, dc := range diskComments {
+		if _, exists := memReviewIDs[dc.ID]; !exists {
+			s.reviewComments = append(s.reviewComments, dc)
+			id := 0
+			fmt.Sscanf(dc.ID, "r%d", &id)
+			if id >= s.reviewNextID {
+				s.reviewNextID = id + 1
+			}
+			changed = true
+		} else {
+			changed = s.mergeReviewCommentRepliesAndState(dc) || changed
+		}
+	}
+
+	// Remove review comments deleted on disk.
+	changed = s.filterDeletedReviewComments(diskComments) || changed
+
+	return changed
+}
+
+func (s *Session) mergeReviewCommentRepliesAndState(dc Comment) bool {
+	changed := false
+	for i, mc := range s.reviewComments {
+		if mc.ID != dc.ID {
+			continue
+		}
+		if dc.Resolved != mc.Resolved {
+			s.reviewComments[i].Resolved = dc.Resolved
+			changed = true
+		}
+		memRIDs := make(map[string]struct{}, len(mc.Replies))
+		for _, r := range mc.Replies {
+			memRIDs[r.ID] = struct{}{}
+		}
+		for _, dr := range dc.Replies {
+			if _, exists := memRIDs[dr.ID]; !exists {
+				s.reviewComments[i].Replies = append(s.reviewComments[i].Replies, dr)
+				changed = true
+			}
+		}
+		break
+	}
+	return changed
+}
+
+func (s *Session) filterDeletedReviewComments(diskComments []Comment) bool {
+	diskRIDs := make(map[string]struct{}, len(diskComments))
+	for _, dc := range diskComments {
+		diskRIDs[dc.ID] = struct{}{}
+	}
+	filtered := s.reviewComments[:0]
+	for _, c := range s.reviewComments {
+		if _, exists := diskRIDs[c.ID]; exists {
+			filtered = append(filtered, c)
+		}
+	}
+	if len(filtered) != len(s.reviewComments) {
+		s.reviewComments = filtered
+		return true
+	}
+	return false
+}
+
 func (s *Session) mergeExternalCritJSON() bool {
 	critPath := s.critJSONPath()
 
@@ -1347,33 +1711,16 @@ func (s *Session) mergeExternalCritJSON() bool {
 	s.mu.RUnlock()
 
 	if err != nil {
-		// File doesn't exist. If we previously tracked it, it was externally deleted.
 		if !lastMtime.IsZero() {
-			s.mu.Lock()
-			s.lastCritJSONMtime = time.Time{}
-			anyComments := false
-			for _, f := range s.Files {
-				if len(f.Comments) > 0 {
-					f.Comments = []Comment{}
-					anyComments = true
-				}
-			}
-			s.nextID = 1
-			s.mu.Unlock()
-			if anyComments {
-				s.notify(SSEEvent{Type: "comments-changed"})
-			}
+			return s.handleCritJSONDeleted()
 		}
-		return !lastMtime.IsZero()
+		return false
 	}
 
-	// If mtime matches our last write, this is our own change — skip.
 	if !lastMtime.IsZero() && info.ModTime().Equal(lastMtime) {
 		return false
 	}
 
-	// If a debounced write is pending, skip the merge to avoid re-adding
-	// comments that the user just deleted (race between delete + debounce).
 	s.mu.RLock()
 	pending := s.pendingWrite
 	s.mu.RUnlock()
@@ -1397,135 +1744,17 @@ func (s *Session) mergeExternalCritJSON() bool {
 
 	for _, f := range s.Files {
 		diskFile, hasDisk := cj.Files[f.Path]
-
 		if !hasDisk {
-			// File not in .crit.json — if we have comments, they were cleared externally.
 			if len(f.Comments) > 0 {
 				f.Comments = []Comment{}
 				changed = true
 			}
 			continue
 		}
-
-		// Build set of in-memory comment IDs.
-		memIDs := make(map[string]struct{}, len(f.Comments))
-		for _, c := range f.Comments {
-			memIDs[c.ID] = struct{}{}
-		}
-
-		// Merge in new comments from disk.
-		for _, dc := range diskFile.Comments {
-			if _, exists := memIDs[dc.ID]; !exists {
-				f.Comments = append(f.Comments, dc)
-				id := 0
-				fmt.Sscanf(dc.ID, "c%d", &id)
-				if id >= s.nextID {
-					s.nextID = id + 1
-				}
-				changed = true
-			} else {
-				// Comment exists in memory — merge replies and resolved state from disk.
-				for i, mc := range f.Comments {
-					if mc.ID != dc.ID {
-						continue
-					}
-					// Merge new replies from disk
-					memReplyIDs := make(map[string]struct{}, len(mc.Replies))
-					for _, r := range mc.Replies {
-						memReplyIDs[r.ID] = struct{}{}
-					}
-					for _, dr := range dc.Replies {
-						if _, exists := memReplyIDs[dr.ID]; !exists {
-							f.Comments[i].Replies = append(f.Comments[i].Replies, dr)
-							changed = true
-						}
-					}
-					// Sync resolved state bidirectionally from disk
-					if dc.Resolved != mc.Resolved {
-						f.Comments[i].Resolved = dc.Resolved
-						changed = true
-					}
-					break
-				}
-			}
-		}
-
-		// Check for comments removed on disk (e.g. crit comment --clear).
-		// After the merge above, len(f.Comments) >= len(diskFile.Comments), so != means memory has disk-absent IDs.
-		if len(diskFile.Comments) != len(f.Comments) {
-			diskIDs := make(map[string]struct{}, len(diskFile.Comments))
-			for _, dc := range diskFile.Comments {
-				diskIDs[dc.ID] = struct{}{}
-			}
-			filtered := f.Comments[:0]
-			for _, c := range f.Comments {
-				if _, exists := diskIDs[c.ID]; exists {
-					filtered = append(filtered, c)
-				}
-			}
-			if len(filtered) != len(f.Comments) {
-				f.Comments = filtered
-				changed = true
-			}
-		}
+		changed = s.mergeFileCommentsFromDisk(f, diskFile) || changed
 	}
 
-	// Merge review-level comments from disk
-	memReviewIDs := make(map[string]struct{}, len(s.reviewComments))
-	for _, c := range s.reviewComments {
-		memReviewIDs[c.ID] = struct{}{}
-	}
-	for _, dc := range cj.ReviewComments {
-		if _, exists := memReviewIDs[dc.ID]; !exists {
-			s.reviewComments = append(s.reviewComments, dc)
-			id := 0
-			fmt.Sscanf(dc.ID, "r%d", &id)
-			if id >= s.reviewNextID {
-				s.reviewNextID = id + 1
-			}
-			changed = true
-		} else {
-			// Merge resolved state and replies from disk
-			for i, mc := range s.reviewComments {
-				if mc.ID != dc.ID {
-					continue
-				}
-				if dc.Resolved != mc.Resolved {
-					s.reviewComments[i].Resolved = dc.Resolved
-					changed = true
-				}
-				memRIDs := make(map[string]struct{}, len(mc.Replies))
-				for _, r := range mc.Replies {
-					memRIDs[r.ID] = struct{}{}
-				}
-				for _, dr := range dc.Replies {
-					if _, exists := memRIDs[dr.ID]; !exists {
-						s.reviewComments[i].Replies = append(s.reviewComments[i].Replies, dr)
-						changed = true
-					}
-				}
-				break
-			}
-		}
-	}
-	// Remove review comments deleted on disk (always run filter — length check is unreliable
-	// when adds and deletes happen in the same external edit)
-	{
-		diskRIDs := make(map[string]struct{}, len(cj.ReviewComments))
-		for _, dc := range cj.ReviewComments {
-			diskRIDs[dc.ID] = struct{}{}
-		}
-		filtered := s.reviewComments[:0]
-		for _, c := range s.reviewComments {
-			if _, exists := diskRIDs[c.ID]; exists {
-				filtered = append(filtered, c)
-			}
-		}
-		if len(filtered) != len(s.reviewComments) {
-			s.reviewComments = filtered
-			changed = true
-		}
-	}
+	changed = s.mergeReviewCommentsFromDisk(cj.ReviewComments) || changed
 	s.mu.Unlock()
 
 	if changed {
@@ -1666,11 +1895,22 @@ func (s *Session) Shutdown() {
 // GetFileSnapshot returns a JSON-ready map for the /api/file endpoint.
 func (s *Session) GetFileSnapshot(path string) (map[string]any, bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	f := s.fileByPathLocked(path)
 	if f == nil {
+		s.mu.RUnlock()
 		return nil, false
 	}
+	repoRoot := s.RepoRoot
+	baseRef := s.BaseRef
+	s.mu.RUnlock()
+
+	// Load content on demand for lazy files
+	if err := f.ensureLoaded(repoRoot, baseRef); err != nil {
+		return nil, false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return map[string]any{
 		"path":      f.Path,
 		"status":    f.Status,
@@ -1719,7 +1959,16 @@ func (s *Session) GetFileDiffSnapshot(path string) (map[string]any, bool) {
 		s.mu.RUnlock()
 		return nil, false
 	}
+	repoRoot := s.RepoRoot
+	baseRef := s.BaseRef
+	s.mu.RUnlock()
 
+	// Load content + diffs on demand for lazy files
+	if err := f.ensureLoaded(repoRoot, baseRef); err != nil {
+		return nil, false
+	}
+
+	s.mu.RLock()
 	if f.FileType == "code" || s.Mode == "git" {
 		hunks := f.DiffHunks
 		s.mu.RUnlock()
@@ -1750,6 +1999,7 @@ type SessionInfo struct {
 	Mode            string            `json:"mode"` // "files" or "git"
 	Branch          string            `json:"branch"`
 	BaseRef         string            `json:"base_ref"`
+	BaseBranchName  string            `json:"base_branch_name,omitempty"`
 	ReviewRound     int               `json:"review_round"`
 	AvailableScopes []string          `json:"available_scopes"`
 	Files           []SessionFileInfo `json:"files"`
@@ -1764,6 +2014,7 @@ type SessionFileInfo struct {
 	CommentCount int    `json:"comment_count"`
 	Additions    int    `json:"additions"`
 	Deletions    int    `json:"deletions"`
+	Lazy         bool   `json:"lazy,omitempty"`
 }
 
 // GetSessionInfo returns a snapshot of session metadata.
@@ -1775,13 +2026,15 @@ func (s *Session) GetSessionInfo() SessionInfo {
 	copy(reviewComments, s.reviewComments)
 
 	info := SessionInfo{
-		Mode:            s.Mode,
-		Branch:          s.Branch,
-		BaseRef:         s.BaseRef,
-		ReviewRound:     s.ReviewRound,
-		AvailableScopes: availableScopes(s.BaseRef),
-		ReviewComments:  reviewComments,
+		Mode:           s.Mode,
+		Branch:         s.Branch,
+		BaseRef:        s.BaseRef,
+		BaseBranchName: s.BaseBranchName,
+		ReviewRound:    s.ReviewRound,
+		ReviewComments: reviewComments,
 	}
+
+	info.AvailableScopes = cachedAvailableScopes(info.BaseRef)
 
 	for _, f := range s.Files {
 		fi := SessionFileInfo{
@@ -1789,21 +2042,63 @@ func (s *Session) GetSessionInfo() SessionInfo {
 			Status:       f.Status,
 			FileType:     f.FileType,
 			CommentCount: len(f.Comments),
+			Lazy:         f.Lazy,
 		}
-		// Count additions/deletions from diff hunks
-		for _, h := range f.DiffHunks {
-			for _, l := range h.Lines {
-				switch l.Type {
-				case "add":
-					fi.Additions++
-				case "del":
-					fi.Deletions++
+		if f.Lazy {
+			// Use pre-computed stats from git diff --numstat
+			fi.Additions = f.LazyAdditions
+			fi.Deletions = f.LazyDeletions
+		} else {
+			// Count additions/deletions from diff hunks
+			for _, h := range f.DiffHunks {
+				for _, l := range h.Lines {
+					switch l.Type {
+					case "add":
+						fi.Additions++
+					case "del":
+						fi.Deletions++
+					}
 				}
 			}
 		}
 		info.Files = append(info.Files, fi)
 	}
 	return info
+}
+
+// scopeCache caches the result of availableScopes to avoid running multiple
+// git commands on every /api/session request. The cache has a short TTL (2s)
+// so scope changes are picked up quickly.
+var (
+	scopeCacheMu      sync.Mutex
+	scopeCacheBaseRef string
+	scopeCacheResult  []string
+	scopeCacheExpiry  time.Time
+)
+
+const scopeCacheTTL = 2 * time.Second
+
+// cachedAvailableScopes returns availableScopes results, using a 2-second cache
+// to avoid running git commands on every /api/session poll.
+func cachedAvailableScopes(baseRef string) []string {
+	scopeCacheMu.Lock()
+	defer scopeCacheMu.Unlock()
+
+	now := time.Now()
+	if now.Before(scopeCacheExpiry) && scopeCacheBaseRef == baseRef {
+		result := make([]string, len(scopeCacheResult))
+		copy(result, scopeCacheResult)
+		return result
+	}
+
+	scopes := availableScopes(baseRef)
+	scopeCacheBaseRef = baseRef
+	scopeCacheResult = scopes
+	scopeCacheExpiry = now.Add(scopeCacheTTL)
+
+	result := make([]string, len(scopes))
+	copy(result, scopes)
+	return result
 }
 
 // availableScopes returns the list of scopes that have files.
@@ -1841,154 +2136,213 @@ func (s *Session) GetCommits() []CommitInfo {
 	return commits
 }
 
+// scopedSessionSnapshot holds session state read under lock for scoped queries.
+type scopedSessionSnapshot struct {
+	baseRef        string
+	baseBranchName string
+	repoRoot       string
+	mode           string
+	branch         string
+	reviewRound    int
+	ignorePatterns []string
+	commentCounts  map[string]int
+	lazyFiles      map[string]*FileEntry
+	reviewComments []Comment
+}
+
+func (s *Session) snapshotForScoped() scopedSessionSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	commentCounts := make(map[string]int, len(s.Files))
+	lazyFiles := make(map[string]*FileEntry, len(s.Files))
+	for _, f := range s.Files {
+		commentCounts[f.Path] = len(f.Comments)
+		if f.Lazy {
+			lazyFiles[f.Path] = f
+		}
+	}
+	rc := make([]Comment, len(s.reviewComments))
+	copy(rc, s.reviewComments)
+
+	return scopedSessionSnapshot{
+		baseRef:        s.BaseRef,
+		baseBranchName: s.BaseBranchName,
+		repoRoot:       s.RepoRoot,
+		mode:           s.Mode,
+		branch:         s.Branch,
+		reviewRound:    s.ReviewRound,
+		ignorePatterns: s.IgnorePatterns,
+		commentCounts:  commentCounts,
+		lazyFiles:      lazyFiles,
+		reviewComments: rc,
+	}
+}
+
+func scopedHunks(fc FileChange, scope, commit, baseRef, repoRoot string) []DiffHunk {
+	if commit != "" {
+		h, err := FileDiffForCommit(fc.Path, commit, repoRoot)
+		if err == nil {
+			return h
+		}
+		return nil
+	}
+	if fc.Status == "added" || fc.Status == "untracked" {
+		absPath := filepath.Join(repoRoot, fc.Path)
+		if data, err := os.ReadFile(absPath); err == nil {
+			return FileDiffUnifiedNewFile(string(data))
+		}
+		return nil
+	}
+	h, err := FileDiffScoped(fc.Path, scope, baseRef, repoRoot)
+	if err == nil {
+		return h
+	}
+	return nil
+}
+
+func countHunkStats(hunks []DiffHunk) (additions, deletions int) {
+	for _, h := range hunks {
+		for _, l := range h.Lines {
+			switch l.Type {
+			case "add":
+				additions++
+			case "del":
+				deletions++
+			}
+		}
+	}
+	return additions, deletions
+}
+
 // GetSessionInfoScoped returns session metadata filtered to a specific diff scope.
 // When scope is "" or in file mode (scopes only apply to git), delegates to GetSessionInfo.
 // All other scopes (including "all") run fresh git queries to pick up files added after startup.
 // When commit is non-empty, files and diffs are scoped to that single commit.
 func (s *Session) GetSessionInfoScoped(scope, commit string) SessionInfo {
-	if commit == "" && (scope == "" || s.Mode == "files") {
+	if commit == "" && (scope == "" || scope == "all" || s.Mode == "files" || s.Mode == "plan") {
 		return s.GetSessionInfo()
 	}
 
-	// Read session fields under lock, then release before shelling out to git.
-	s.mu.RLock()
-	baseRef := s.BaseRef
-	repoRoot := s.RepoRoot
-	mode := s.Mode
-	branch := s.Branch
-	reviewRound := s.ReviewRound
-	ignorePatterns := s.IgnorePatterns
-	// Build a map of comment counts (comments are scope-independent)
-	commentCounts := make(map[string]int, len(s.Files))
-	for _, f := range s.Files {
-		commentCounts[f.Path] = len(f.Comments)
-	}
-	reviewComments := make([]Comment, len(s.reviewComments))
-	copy(reviewComments, s.reviewComments)
-	s.mu.RUnlock()
+	snap := s.snapshotForScoped()
 
 	info := SessionInfo{
-		Mode:            mode,
-		Branch:          branch,
-		BaseRef:         baseRef,
-		ReviewRound:     reviewRound,
-		AvailableScopes: availableScopes(baseRef),
-		ReviewComments:  reviewComments,
+		Mode:            snap.mode,
+		Branch:          snap.branch,
+		BaseRef:         snap.baseRef,
+		BaseBranchName:  snap.baseBranchName,
+		ReviewRound:     snap.reviewRound,
+		AvailableScopes: availableScopes(snap.baseRef),
+		ReviewComments:  snap.reviewComments,
 	}
 
 	var changes []FileChange
 	var err error
 	if commit != "" {
-		changes, err = ChangedFilesForCommit(commit, repoRoot)
+		changes, err = ChangedFilesForCommit(commit, snap.repoRoot)
 	} else {
-		changes, err = ChangedFilesScoped(scope, baseRef)
+		changes, err = ChangedFilesScoped(scope, snap.baseRef)
 	}
 	if err != nil || len(changes) == 0 {
 		return info
 	}
 
-	// Apply the same ignore patterns used during session creation so that
-	// files like .crit/sessions/*.json don't leak into scoped views.
-	changes = filterIgnored(changes, ignorePatterns)
+	changes = filterIgnored(changes, snap.ignorePatterns)
 
 	for _, fc := range changes {
 		fi := SessionFileInfo{
 			Path:         fc.Path,
 			Status:       fc.Status,
 			FileType:     detectFileType(fc.Path),
-			CommentCount: commentCounts[fc.Path],
+			CommentCount: snap.commentCounts[fc.Path],
 		}
 
-		// Compute diff stats for the scoped view
-		var hunks []DiffHunk
-		if commit != "" {
-			h, diffErr := FileDiffForCommit(fc.Path, commit, repoRoot)
-			if diffErr == nil {
-				hunks = h
-			}
-		} else if fc.Status == "added" || fc.Status == "untracked" {
-			absPath := filepath.Join(repoRoot, fc.Path)
-			if data, readErr := os.ReadFile(absPath); readErr == nil {
-				hunks = FileDiffUnifiedNewFile(string(data))
-			}
-		} else {
-			h, diffErr := FileDiffScoped(fc.Path, scope, baseRef, repoRoot)
-			if diffErr == nil {
-				hunks = h
-			}
-		}
-		for _, h := range hunks {
-			for _, l := range h.Lines {
-				switch l.Type {
-				case "add":
-					fi.Additions++
-				case "del":
-					fi.Deletions++
-				}
-			}
+		if lf, ok := snap.lazyFiles[fc.Path]; ok {
+			fi.Lazy = true
+			fi.Additions = lf.LazyAdditions
+			fi.Deletions = lf.LazyDeletions
+			info.Files = append(info.Files, fi)
+			continue
 		}
 
+		hunks := scopedHunks(fc, scope, commit, snap.baseRef, snap.repoRoot)
+		fi.Additions, fi.Deletions = countHunkStats(hunks)
 		info.Files = append(info.Files, fi)
 	}
 
 	return info
 }
 
-// GetFileDiffSnapshotScoped returns diff data for a file filtered by scope.
-// When scope is "" or in file mode (scopes only apply to git), delegates to GetFileDiffSnapshot.
-// When commit is non-empty, returns the diff for that single commit.
-func (s *Session) GetFileDiffSnapshotScoped(path, scope, commit string) (map[string]any, bool) {
-	if commit == "" && (scope == "" || s.Mode == "files") {
-		return s.GetFileDiffSnapshot(path)
-	}
-
+// loadScopedFileState reads file state from the session or disk for scoped diff queries.
+func (s *Session) loadScopedFileState(path, scope string) (status, content, baseRef, repoRoot string) {
 	s.mu.RLock()
 	f := s.fileByPathLocked(path)
-	var baseRef, repoRoot, status, content string
-	if f != nil {
-		baseRef = s.BaseRef
-		status = f.Status
-		content = f.Content
-	} else {
-		baseRef = s.BaseRef
-	}
+	baseRef = s.BaseRef
 	repoRoot = s.RepoRoot
+	if f != nil {
+		status = f.Status
+	}
 	s.mu.RUnlock()
 
-	// If the file is not in the session (e.g. created after startup), read it
-	// from disk and determine its status so we can generate the correct diff.
-	if f == nil && repoRoot != "" {
-		absPath := filepath.Join(repoRoot, path)
-		if data, err := os.ReadFile(absPath); err == nil {
-			content = string(data)
-			// Determine file status from git for the requested scope
-			if changes, err := ChangedFilesScoped(scope, baseRef); err == nil {
-				for _, fc := range changes {
-					if fc.Path == path {
-						status = fc.Status
-						break
-					}
+	if f != nil {
+		if err := f.ensureLoaded(repoRoot, baseRef); err == nil {
+			s.mu.RLock()
+			content = f.Content
+			s.mu.RUnlock()
+		}
+		return status, content, baseRef, repoRoot
+	}
+
+	if repoRoot == "" {
+		return status, content, baseRef, repoRoot
+	}
+	absPath := filepath.Join(repoRoot, path)
+	if data, err := os.ReadFile(absPath); err == nil {
+		content = string(data)
+		if changes, err := ChangedFilesScoped(scope, baseRef); err == nil {
+			for _, fc := range changes {
+				if fc.Path == path {
+					status = fc.Status
+					break
 				}
 			}
 		}
 	}
+	return status, content, baseRef, repoRoot
+}
 
-	var hunks []DiffHunk
+func computeScopedDiffHunks(path, scope, commit, status, content, baseRef, repoRoot string) []DiffHunk {
 	if commit != "" {
 		h, err := FileDiffForCommit(path, commit, repoRoot)
 		if err == nil {
-			hunks = h
+			return h
 		}
-	} else if status == "untracked" && (scope == "unstaged" || scope == "all" || scope == "") {
-		hunks = FileDiffUnifiedNewFile(content)
-	} else if status == "added" && scope != "unstaged" {
-		hunks = FileDiffUnifiedNewFile(content)
-	} else {
-		h, err := FileDiffScoped(path, scope, baseRef, repoRoot)
-		if err == nil {
-			hunks = h
-		}
+		return nil
 	}
+	if status == "untracked" && (scope == "unstaged" || scope == "all" || scope == "") {
+		return FileDiffUnifiedNewFile(content)
+	}
+	if status == "added" && scope != "unstaged" {
+		return FileDiffUnifiedNewFile(content)
+	}
+	h, err := FileDiffScoped(path, scope, baseRef, repoRoot)
+	if err == nil {
+		return h
+	}
+	return nil
+}
+
+// GetFileDiffSnapshotScoped returns diff data for a file filtered by scope.
+// When scope is "" or in file mode (scopes only apply to git), delegates to GetFileDiffSnapshot.
+// When commit is non-empty, returns the diff for that single commit.
+func (s *Session) GetFileDiffSnapshotScoped(path, scope, commit string) (map[string]any, bool) {
+	if commit == "" && (scope == "" || scope == "all" || s.Mode == "files" || s.Mode == "plan") {
+		return s.GetFileDiffSnapshot(path)
+	}
+
+	status, content, baseRef, repoRoot := s.loadScopedFileState(path, scope)
+
+	hunks := computeScopedDiffHunks(path, scope, commit, status, content, baseRef, repoRoot)
 	if hunks == nil {
 		hunks = []DiffHunk{}
 	}
