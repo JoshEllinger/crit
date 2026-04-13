@@ -249,8 +249,8 @@ func TestMergeGHComments_PreservesExistingComments(t *testing.T) {
 	if cf.Comments[1].Author != "reviewer" {
 		t.Errorf("new comment author = %q", cf.Comments[1].Author)
 	}
-	if cf.Comments[1].ID != "c2" {
-		t.Errorf("new comment ID = %q, want c2", cf.Comments[1].ID)
+	if !strings.HasPrefix(cf.Comments[1].ID, "c_") || len(cf.Comments[1].ID) != 8 {
+		t.Errorf("new comment ID = %q, want c_ prefix + 6 hex chars", cf.Comments[1].ID)
 	}
 }
 
@@ -646,7 +646,7 @@ func TestAddCommentToCritJSON_CreatesNewFile(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
 
-	err := addCommentToCritJSON("main.go", 10, 15, "Fix this bug", "", "")
+	err := addCommentToCritJSON("main.go", 10, 15, "Fix this bug", "", dir)
 	if err != nil {
 		t.Fatalf("addCommentToCritJSON: %v", err)
 	}
@@ -667,8 +667,8 @@ func TestAddCommentToCritJSON_CreatesNewFile(t *testing.T) {
 	if len(cf.Comments) != 1 {
 		t.Fatalf("expected 1 comment, got %d", len(cf.Comments))
 	}
-	if cf.Comments[0].ID != "c1" {
-		t.Errorf("ID = %q, want c1", cf.Comments[0].ID)
+	if !strings.HasPrefix(cf.Comments[0].ID, "c_") || len(cf.Comments[0].ID) != 8 {
+		t.Errorf("ID = %q, want c_ prefix + 6 hex chars", cf.Comments[0].ID)
 	}
 	if cf.Comments[0].StartLine != 10 || cf.Comments[0].EndLine != 15 {
 		t.Errorf("lines = %d-%d, want 10-15", cf.Comments[0].StartLine, cf.Comments[0].EndLine)
@@ -687,10 +687,10 @@ func TestAddCommentToCritJSON_AppendsToExisting(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
 
-	if err := addCommentToCritJSON("main.go", 1, 1, "First", "", ""); err != nil {
+	if err := addCommentToCritJSON("main.go", 1, 1, "First", "", dir); err != nil {
 		t.Fatalf("first add: %v", err)
 	}
-	if err := addCommentToCritJSON("main.go", 20, 20, "Second", "", ""); err != nil {
+	if err := addCommentToCritJSON("main.go", 20, 20, "Second", "", dir); err != nil {
 		t.Fatalf("second add: %v", err)
 	}
 
@@ -702,8 +702,8 @@ func TestAddCommentToCritJSON_AppendsToExisting(t *testing.T) {
 	if len(cf.Comments) != 2 {
 		t.Fatalf("expected 2 comments, got %d", len(cf.Comments))
 	}
-	if cf.Comments[0].ID != "c1" || cf.Comments[1].ID != "c2" {
-		t.Errorf("IDs = %q, %q — want c1, c2", cf.Comments[0].ID, cf.Comments[1].ID)
+	if cf.Comments[0].ID == cf.Comments[1].ID {
+		t.Errorf("comment IDs should be unique, both = %q", cf.Comments[0].ID)
 	}
 }
 
@@ -716,8 +716,8 @@ func TestAddCommentToCritJSON_MultipleFiles(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
 
-	addCommentToCritJSON("main.go", 1, 1, "Comment on main", "", "")
-	addCommentToCritJSON("auth.go", 5, 10, "Comment on auth", "", "")
+	addCommentToCritJSON("main.go", 1, 1, "Comment on main", "", dir)
+	addCommentToCritJSON("auth.go", 5, 10, "Comment on auth", "", dir)
 
 	data, _ := os.ReadFile(dir + "/.crit.json")
 	var cj CritJSON
@@ -740,7 +740,7 @@ func TestAddCommentToCritJSON_FileMode_NoGitRepo(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
 
-	err := addCommentToCritJSON("main.go", 5, 5, "File mode comment", "", "")
+	err := addCommentToCritJSON("main.go", 5, 5, "File mode comment", "", dir)
 	if err != nil {
 		t.Fatalf("addCommentToCritJSON: %v", err)
 	}
@@ -773,7 +773,7 @@ func TestAddCommentToCritJSON_FileMode_PathRelativeToCWD(t *testing.T) {
 	defer os.Chdir(origDir)
 
 	// Path should be stored as given (relative to CWD), not resolved to anything else
-	addCommentToCritJSON("src/auth.go", 10, 10, "comment", "", "")
+	addCommentToCritJSON("src/auth.go", 10, 10, "comment", "", dir)
 
 	data, _ := os.ReadFile(dir + "/.crit.json")
 	var cj CritJSON
@@ -864,7 +864,7 @@ func TestAddCommentToCritJSON_RespectsBaseBranchConfig(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
 
-	if err := addCommentToCritJSON("feature.go", 1, 1, "test comment", "", ""); err != nil {
+	if err := addCommentToCritJSON("feature.go", 1, 1, "test comment", "", dir); err != nil {
 		t.Fatalf("addCommentToCritJSON: %v", err)
 	}
 
@@ -1028,7 +1028,7 @@ func TestResolveCritDir_FileArgsInGitRepo(t *testing.T) {
 
 	// Register a session with file args pointing to the subdirectory file
 	resolved, _ := filepath.EvalSymlinks(dir)
-	key := sessionKey(resolved, []string{"docs/plans/plan.md"})
+	key := sessionKey(resolved, "", []string{"docs/plans/plan.md"})
 	err = writeSessionFile(key, sessionEntry{
 		PID:       os.Getpid(),
 		Port:      port,
@@ -1225,9 +1225,10 @@ func TestBulkAddCommentsToCritJSON_MixedCommentsAndReplies(t *testing.T) {
 		t.Errorf("expected author TestBot, got %q", cf.Comments[0].Author)
 	}
 
-	// Now add a reply to c1
+	// Now add a reply to the first comment (use its actual random ID)
+	firstCommentID := cf.Comments[0].ID
 	replyEntries := []BulkCommentEntry{
-		{ReplyTo: "c1", Body: "Done — added godoc comment", Resolve: true},
+		{ReplyTo: firstCommentID, Body: "Done — added godoc comment", Resolve: true},
 	}
 	err = bulkAddCommentsToCritJSON(replyEntries, "TestBot", dir)
 	if err != nil {
@@ -1740,14 +1741,17 @@ func TestAppendReviewComment(t *testing.T) {
 	if cj.ReviewComments[0].Scope != "review" {
 		t.Errorf("scope = %q, want review", cj.ReviewComments[0].Scope)
 	}
-	if cj.ReviewComments[0].ID != "r0" {
-		t.Errorf("ID = %q, want r0", cj.ReviewComments[0].ID)
+	if !strings.HasPrefix(cj.ReviewComments[0].ID, "r_") || len(cj.ReviewComments[0].ID) != 8 {
+		t.Errorf("ID = %q, want r_ prefix + 6 hex chars", cj.ReviewComments[0].ID)
 	}
 
 	// Add another
 	appendReviewComment(cj, "second note", "reviewer")
-	if cj.ReviewComments[1].ID != "r1" {
-		t.Errorf("second ID = %q, want r1", cj.ReviewComments[1].ID)
+	if !strings.HasPrefix(cj.ReviewComments[1].ID, "r_") || len(cj.ReviewComments[1].ID) != 8 {
+		t.Errorf("second ID = %q, want r_ prefix + 6 hex chars", cj.ReviewComments[1].ID)
+	}
+	if cj.ReviewComments[0].ID == cj.ReviewComments[1].ID {
+		t.Errorf("review comment IDs should be unique, both = %q", cj.ReviewComments[0].ID)
 	}
 }
 
@@ -1792,7 +1796,7 @@ func TestAddCommentToCritJSON_RoundTrip(t *testing.T) {
 	defer os.Chdir(origDir)
 
 	// Add a comment via the CLI function
-	err := addCommentToCritJSON("README.md", 1, 1, "fix typo", "reviewer", "")
+	err := addCommentToCritJSON("README.md", 1, 1, "fix typo", "reviewer", dir)
 	if err != nil {
 		t.Fatalf("addCommentToCritJSON: %v", err)
 	}
@@ -1822,7 +1826,7 @@ func TestAddCommentToCritJSON_RoundTrip(t *testing.T) {
 	}
 
 	// Add a second comment to same file
-	err = addCommentToCritJSON("README.md", 3, 5, "refactor this section", "agent", "")
+	err = addCommentToCritJSON("README.md", 3, 5, "refactor this section", "agent", dir)
 	if err != nil {
 		t.Fatalf("second addCommentToCritJSON: %v", err)
 	}
@@ -1841,7 +1845,7 @@ func TestAddReplyToCritJSON_RoundTrip(t *testing.T) {
 	defer os.Chdir(origDir)
 
 	// Add a comment first
-	err := addCommentToCritJSON("README.md", 1, 1, "fix this", "reviewer", "")
+	err := addCommentToCritJSON("README.md", 1, 1, "fix this", "reviewer", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1854,7 +1858,7 @@ func TestAddReplyToCritJSON_RoundTrip(t *testing.T) {
 	commentID := cj.Files["README.md"].Comments[0].ID
 
 	// Add a reply
-	err = addReplyToCritJSON(commentID, "done, fixed", "agent", false, "", "")
+	err = addReplyToCritJSON(commentID, "done, fixed", "agent", false, dir, "")
 	if err != nil {
 		t.Fatalf("addReplyToCritJSON: %v", err)
 	}
@@ -1875,7 +1879,7 @@ func TestAddReplyToCritJSON_WithResolve_ViaFile(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
 
-	addCommentToCritJSON("README.md", 1, 1, "fix this", "reviewer", "")
+	addCommentToCritJSON("README.md", 1, 1, "fix this", "reviewer", dir)
 
 	critPath := filepath.Join(dir, ".crit.json")
 	data, _ := os.ReadFile(critPath)
@@ -1883,7 +1887,7 @@ func TestAddReplyToCritJSON_WithResolve_ViaFile(t *testing.T) {
 	json.Unmarshal(data, &cj)
 	commentID := cj.Files["README.md"].Comments[0].ID
 
-	err := addReplyToCritJSON(commentID, "done", "agent", true, "", "")
+	err := addReplyToCritJSON(commentID, "done", "agent", true, dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1895,30 +1899,24 @@ func TestAddReplyToCritJSON_WithResolve_ViaFile(t *testing.T) {
 	}
 }
 
-func TestNextCommentID_Gaps(t *testing.T) {
-	files := map[string]CritJSONFile{
-		"main.go": {
-			Comments: []Comment{
-				{ID: "c1"}, {ID: "c5"}, {ID: "c3"},
-			},
-		},
-		"server.go": {
-			Comments: []Comment{
-				{ID: "c2"}, {ID: "c10"},
-			},
-		},
-	}
-	next := nextCommentID(files)
-	if next != 11 {
-		t.Errorf("nextCommentID = %d, want 11", next)
+func TestRandomCommentID_Format(t *testing.T) {
+	id := randomCommentID()
+	if !strings.HasPrefix(id, "c_") || len(id) != 8 {
+		t.Errorf("randomCommentID() = %q, want c_ prefix + 6 hex chars", id)
 	}
 }
 
-func TestNextCommentID_Empty(t *testing.T) {
-	files := map[string]CritJSONFile{}
-	next := nextCommentID(files)
-	if next != 1 {
-		t.Errorf("nextCommentID = %d, want 1", next)
+func TestRandomReviewCommentID_Format(t *testing.T) {
+	id := randomReviewCommentID()
+	if !strings.HasPrefix(id, "r_") || len(id) != 8 {
+		t.Errorf("randomReviewCommentID() = %q, want r_ prefix + 6 hex chars", id)
+	}
+}
+
+func TestRandomReplyID_Format(t *testing.T) {
+	id := randomReplyID()
+	if !strings.HasPrefix(id, "rp_") || len(id) != 9 {
+		t.Errorf("randomReplyID() = %q, want rp_ prefix + 6 hex chars", id)
 	}
 }
 
@@ -1982,7 +1980,7 @@ func TestAddReviewCommentToCritJSON_RoundTrip(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
 
-	err := addReviewCommentToCritJSON("overall the code is good", "reviewer", "")
+	err := addReviewCommentToCritJSON("overall the code is good", "reviewer", dir)
 	if err != nil {
 		t.Fatalf("addReviewCommentToCritJSON: %v", err)
 	}
@@ -2009,14 +2007,14 @@ func TestClearCritJSON(t *testing.T) {
 	defer os.Chdir(origDir)
 
 	// Create a .crit.json
-	addCommentToCritJSON("README.md", 1, 1, "test", "author", "")
+	addCommentToCritJSON("README.md", 1, 1, "test", "author", dir)
 
 	critPath := filepath.Join(dir, ".crit.json")
 	if _, err := os.Stat(critPath); err != nil {
 		t.Fatal("expected .crit.json to exist")
 	}
 
-	err := clearCritJSON("")
+	err := clearCritJSON(dir)
 	if err != nil {
 		t.Fatalf("clearCritJSON: %v", err)
 	}
@@ -2024,4 +2022,187 @@ func TestClearCritJSON(t *testing.T) {
 	if _, err := os.Stat(critPath); !os.IsNotExist(err) {
 		t.Error("expected .crit.json to be deleted")
 	}
+}
+
+// TestAddReplyToCritJSON_RandomIDs exercises the reply threading workflow
+// end-to-end with the new random hex ID format (c_XXXXXX, r_XXXXXX, rp_XXXXXX).
+func TestAddReplyToCritJSON_RandomIDs(t *testing.T) {
+	dir := t.TempDir()
+
+	// Build a .crit.json with random-format IDs across multiple files
+	cj := CritJSON{
+		Branch:      "feature",
+		ReviewRound: 1,
+		ReviewComments: []Comment{
+			{ID: "r_aabb01", Body: "general architecture note", Scope: "review",
+				CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
+		},
+		Files: map[string]CritJSONFile{
+			"src/main.go": {
+				Status: "modified",
+				Comments: []Comment{
+					{ID: "c_a3f8b2", StartLine: 10, EndLine: 12, Body: "Extract this",
+						CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
+				},
+			},
+			"src/util.go": {
+				Status: "modified",
+				Comments: []Comment{
+					{ID: "c_d4e5f6", StartLine: 5, EndLine: 5, Body: "Rename this",
+						CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+
+	t.Run("reply to file comment by random ID", func(t *testing.T) {
+		err := addReplyToCritJSON("c_a3f8b2", "Done, extracted", "agent", false, dir, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		data, _ := os.ReadFile(filepath.Join(dir, ".crit.json"))
+		var result CritJSON
+		json.Unmarshal(data, &result)
+
+		replies := result.Files["src/main.go"].Comments[0].Replies
+		if len(replies) != 1 {
+			t.Fatalf("expected 1 reply, got %d", len(replies))
+		}
+		if replies[0].Body != "Done, extracted" {
+			t.Errorf("reply body = %q", replies[0].Body)
+		}
+		if !strings.HasPrefix(replies[0].ID, "rp_") || len(replies[0].ID) != 9 {
+			t.Errorf("reply ID = %q, want rp_ prefix + 6 hex chars", replies[0].ID)
+		}
+	})
+
+	t.Run("reply to review comment by random ID", func(t *testing.T) {
+		err := addReplyToCritJSON("r_aabb01", "Acknowledged", "agent", false, dir, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		data, _ := os.ReadFile(filepath.Join(dir, ".crit.json"))
+		var result CritJSON
+		json.Unmarshal(data, &result)
+
+		replies := result.ReviewComments[0].Replies
+		if len(replies) != 1 {
+			t.Fatalf("expected 1 reply, got %d", len(replies))
+		}
+		if replies[0].Body != "Acknowledged" {
+			t.Errorf("reply body = %q", replies[0].Body)
+		}
+		if !strings.HasPrefix(replies[0].ID, "rp_") {
+			t.Errorf("reply ID = %q, want rp_ prefix", replies[0].ID)
+		}
+	})
+
+	t.Run("review comment reply does not need path disambiguation", func(t *testing.T) {
+		// Review comments are global — no filterPath needed
+		err := addReplyToCritJSON("r_aabb01", "No path needed", "agent", true, dir, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		data, _ := os.ReadFile(filepath.Join(dir, ".crit.json"))
+		var result CritJSON
+		json.Unmarshal(data, &result)
+
+		if !result.ReviewComments[0].Resolved {
+			t.Error("review comment should be resolved")
+		}
+		// Should have 2 replies now (from previous subtest + this one)
+		if len(result.ReviewComments[0].Replies) != 2 {
+			t.Fatalf("expected 2 replies, got %d", len(result.ReviewComments[0].Replies))
+		}
+	})
+}
+
+// TestAppendReply_AmbiguousID verifies the --path disambiguation error when
+// the same comment ID appears in multiple files.
+func TestAppendReply_AmbiguousID(t *testing.T) {
+	duplicateID := "c_abcdef"
+	cj := &CritJSON{
+		Files: map[string]CritJSONFile{
+			"a.go": {
+				Status: "modified",
+				Comments: []Comment{
+					{ID: duplicateID, StartLine: 1, EndLine: 1, Body: "fix"},
+				},
+			},
+			"b.go": {
+				Status: "modified",
+				Comments: []Comment{
+					{ID: duplicateID, StartLine: 5, EndLine: 5, Body: "fix"},
+				},
+			},
+		},
+	}
+
+	t.Run("error without filterPath", func(t *testing.T) {
+		err := appendReply(cj, duplicateID, "done", "agent", false, "")
+		if err == nil {
+			t.Fatal("expected disambiguation error")
+		}
+		if !strings.Contains(err.Error(), "use --path <file> to disambiguate") {
+			t.Errorf("error = %q, want disambiguation message", err.Error())
+		}
+		if !strings.Contains(err.Error(), duplicateID) {
+			t.Errorf("error should mention comment ID %q: %s", duplicateID, err.Error())
+		}
+	})
+
+	t.Run("success with filterPath", func(t *testing.T) {
+		// Reset: clear any replies added by the ambiguous attempt
+		cjClean := &CritJSON{
+			Files: map[string]CritJSONFile{
+				"a.go": {
+					Status: "modified",
+					Comments: []Comment{
+						{ID: duplicateID, StartLine: 1, EndLine: 1, Body: "fix"},
+					},
+				},
+				"b.go": {
+					Status: "modified",
+					Comments: []Comment{
+						{ID: duplicateID, StartLine: 5, EndLine: 5, Body: "fix"},
+					},
+				},
+			},
+		}
+
+		err := appendReply(cjClean, duplicateID, "done", "agent", false, "a.go")
+		if err != nil {
+			t.Fatalf("appendReply with filterPath: %v", err)
+		}
+		if len(cjClean.Files["a.go"].Comments[0].Replies) != 1 {
+			t.Fatalf("expected 1 reply on a.go, got %d", len(cjClean.Files["a.go"].Comments[0].Replies))
+		}
+		if len(cjClean.Files["b.go"].Comments[0].Replies) != 0 {
+			t.Error("b.go should have no replies when filterPath=a.go")
+		}
+	})
+
+	t.Run("filterPath with wrong file", func(t *testing.T) {
+		cjClean := &CritJSON{
+			Files: map[string]CritJSONFile{
+				"a.go": {
+					Status:   "modified",
+					Comments: []Comment{{ID: duplicateID, StartLine: 1, EndLine: 1, Body: "fix"}},
+				},
+			},
+		}
+
+		err := appendReply(cjClean, duplicateID, "done", "agent", false, "nonexistent.go")
+		if err == nil {
+			t.Fatal("expected not-found error with wrong filterPath")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("error = %q, want 'not found'", err.Error())
+		}
+	})
 }
