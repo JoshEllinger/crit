@@ -266,6 +266,8 @@ func carryForwardComment(old Comment, newID string, now string) Comment {
 		EndLine:        old.EndLine,
 		Side:           old.Side,
 		Body:           old.Body,
+		Quote:          old.Quote,
+		QuoteOffset:    old.QuoteOffset,
 		Author:         old.Author,
 		Scope:          old.Scope,
 		CreatedAt:      old.CreatedAt,
@@ -288,8 +290,10 @@ func (s *Session) carryForwardAllComments() {
 		}
 		for _, c := range f.PreviousComments {
 			carried := carryForwardComment(c, randomCommentID(), now)
-
 			f.Comments = append(f.Comments, carried)
+			// Track the old ID as deleted so mergeFileSnapshotIntoCritJSON
+			// won't re-add the original from disk alongside the carried-forward copy.
+			s.trackDeletedComment(f.Path, c.ID)
 		}
 	}
 }
@@ -471,6 +475,10 @@ func (s *Session) carryForwardComments() {
 		f.Comments = nil // Clear before carry-forward to prevent duplicates
 		now := time.Now().UTC().Format(time.RFC3339)
 		for _, c := range prevComments {
+			// Track the old ID as deleted so mergeFileSnapshotIntoCritJSON
+			// won't re-add the original from disk alongside the carried-forward copy.
+			s.trackDeletedComment(f.Path, c.ID)
+
 			// File-level comments have no line references — carry forward as-is.
 			if c.Scope == "file" {
 				carried := carryForwardComment(c, randomCommentID(), now)
