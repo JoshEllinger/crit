@@ -13,10 +13,10 @@ Works with Claude Code, Cursor, GitHub Copilot, Aider, Cline, Windsurf and any o
 
 ## Why Crit
 
-- **Browser UI, not terminal.** A persistent tab with rendered markdown and visual diffs. No tmux, no TUI.
-- **Single binary, zero dependencies.** `brew install` and you're done. No Docker, no MCP.
-- **Round-to-round diffs.** See exactly what your agent changed between iterations. Previous comments show as resolved or still open.
-- **Works with any agent.** Not locked to one editor or AI provider.
+- **Browser UI, not terminal.** A persistent tab with rendered markdown and visual diffs.
+- **Single binary, zero dependencies.** `brew install` and you're done.
+- **Round-to-round diffs.** See exactly what your agent changed between iterations. See previous comments to make sure they're addressed.
+- **Works with any agent.** Not locked to one AI provider.
 
 ![Crit review UI](images/demo-overview.png)
 
@@ -30,13 +30,13 @@ Also available via [Go, Nix, or binary download](#other-install-methods).
 
 ## Agent Integrations
 
-Crit ships with plugins and configuration files for popular AI coding tools. Each one teaches your agent to write a plan, launch `crit` for review, and wait for your feedback before implementing.
+Crit ships with plugins and configuration files for popular AI coding tools.
 
 See [`integrations/`](integrations/) for all install methods and details.
 
 ### Plugin install (Claude Code)
 
-For the full experience — installs globally with a `/crit` command plus a `crit` skill that auto-activates when your agent works with `.crit.json`, `crit comment`, `crit pull/push`, etc:
+For the full experience - installs globally with a `/crit` command plus a `crit` skill that auto-activates when your agent works with `.crit.json`, `crit comment`, `crit pull/push`, etc:
 
 ```
 /plugin marketplace add tomasz-tomczyk/crit
@@ -101,7 +101,7 @@ Select lines and use "Insert suggestion" to pre-fill the comment with the origin
 
 ### Finish review: agent notified automatically
 
-When you click "Finish Review", Crit writes `.crit.json` and notifies your agent If your agent was listening, it picks up the prompt automatically — no copy-paste needed.
+When you click "Finish Review", Crit writes `.crit.json` and notifies your agent If your agent was listening, it picks up the prompt automatically - no copy-paste needed.
 
 ### Programmatic comments
 
@@ -144,7 +144,7 @@ crit auth whoami                   # show current user info
 crit auth logout                   # log out and revoke token
 ```
 
-`crit auth login` uses the OAuth Device Flow — it opens your browser, you confirm, and the CLI receives a token automatically. The token is stored in your global config (`~/.crit.config.json`).
+`crit auth login` uses the OAuth Device Flow - it opens your browser, you confirm, and the CLI receives a token automatically. The token is stored in your global config (`~/.crit.config.json`).
 
 ### GitHub PR Sync
 
@@ -170,7 +170,7 @@ crit push 42                       # explicit PR number
 
 Click "Send now" on any comment during a review to get an AI agent response in real-time. This feature only appears when `agent_cmd` is configured.
 The agent reads the comment context, addresses it (editing code if needed), and replies
-inline — all while you continue reviewing.
+inline - all while you continue reviewing.
 
 Configure in `~/.crit.config.json` (global config only):
 
@@ -186,7 +186,7 @@ Agents need tool permissions to edit files on your behalf. How you grant them de
 
 | Mode             | Command                                                   | What the agent can do                                                                       |
 | ---------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Full access      | `claude --dangerously-skip-permissions -p`                | Read, write, and run any tool. Simplest option — recommended for trusted repos.             |
+| Full access      | `claude --dangerously-skip-permissions -p`                | Read, write, and run any tool. Simplest option - recommended for trusted repos.             |
 | Selective access | `claude --allowedTools Edit,Read,Bash,Write,Glob,Grep -p` | Only the listed tools are permitted. Good middle ground.                                    |
 | No permissions   | `claude -p`                                               | The agent can respond to comments but **cannot edit files**. Useful for Q&A-only workflows. |
 
@@ -201,9 +201,9 @@ Agents need tool permissions to edit files on your behalf. How you grant them de
 
 After the first agent interaction, the comment becomes a **live thread**:
 
-- Further replies you post in the thread are automatically sent to the agent — no need to click "Send to agent" again.
+- Further replies you post in the thread are automatically sent to the agent - no need to click "Send to agent" again.
 - The agent sees the **full conversation history**, so it can build on previous context.
-- Live threads show a ⚡ **live** badge and green glow — the agent will respond immediately to further replies.
+- Live threads show a ⚡ **live** badge and green glow - the agent will respond immediately to further replies.
 
 #### Supported agents
 
