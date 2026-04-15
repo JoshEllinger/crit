@@ -27,11 +27,13 @@ var browserClient = &http.Client{Timeout: 2 * time.Second}
 
 // sessionEntry tracks a running daemon process in ~/.crit/sessions/.
 type sessionEntry struct {
-	PID       int      `json:"pid"`
-	Port      int      `json:"port"`
-	CWD       string   `json:"cwd"`
-	Args      []string `json:"args,omitempty"`
-	StartedAt string   `json:"started_at"`
+	PID        int      `json:"pid"`
+	Port       int      `json:"port"`
+	CWD        string   `json:"cwd"`
+	Args       []string `json:"args,omitempty"`
+	Branch     string   `json:"branch"`
+	ReviewPath string   `json:"review_path"`
+	StartedAt  string   `json:"started_at"`
 }
 
 // resolvedCWD returns the current working directory with symlinks resolved.
@@ -48,14 +50,16 @@ func resolvedCWD() (string, error) {
 	return resolved, nil
 }
 
-// sessionKey returns a deterministic hash for cwd + args, used as the session filename.
-// Format: sha256(cwd + "\0" + arg1 + "\0" + arg2 + ...)[:12]
-func sessionKey(cwd string, args []string) string {
+// sessionKey returns a deterministic hash for cwd + branch + args, used as the session filename.
+// Format: sha256(cwd + "\0" + branch + "\0" + arg1 + "\0" + arg2 + ...)[:12]
+func sessionKey(cwd string, branch string, args []string) string {
 	sorted := make([]string, len(args))
 	copy(sorted, args)
 	sort.Strings(sorted)
 	h := sha256.New()
 	h.Write([]byte(cwd))
+	h.Write([]byte{0})
+	h.Write([]byte(branch))
 	for _, a := range sorted {
 		h.Write([]byte{0})
 		h.Write([]byte(a))
@@ -81,23 +85,32 @@ func sessionFilePath(key string) (string, error) {
 	return filepath.Join(dir, key+".json"), nil
 }
 
-// writeSessionFile writes a session entry to ~/.crit/sessions/<key>.json.
-// Uses atomic temp file + fsync + rename to prevent corruption.
-func writeSessionFile(key string, entry sessionEntry) error {
-	dir, err := sessionsDir()
+// reviewsDir returns the path to ~/.crit/reviews/.
+func reviewsDir() (string, error) {
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return err
+		return "", fmt.Errorf("finding home directory: %w", err)
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating sessions directory: %w", err)
-	}
-	data, err := json.MarshalIndent(entry, "", "  ")
+	return filepath.Join(home, ".crit", "reviews"), nil
+}
+
+// reviewFilePath returns the full path for a review data file.
+func reviewFilePath(key string) (string, error) {
+	dir, err := reviewsDir()
 	if err != nil {
-		return err
+		return "", err
+	}
+	return filepath.Join(dir, key+".json"), nil
+}
+
+// atomicWriteFile writes data to the target path atomically using temp file + fsync + rename.
+func atomicWriteFile(target string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("creating directory %s: %w", dir, err)
 	}
 
-	target := filepath.Join(dir, key+".json")
-	tmp, err := os.CreateTemp(dir, key+"*.tmp")
+	tmp, err := os.CreateTemp(dir, filepath.Base(target)+"*.tmp")
 	if err != nil {
 		return err
 	}
@@ -117,7 +130,24 @@ func writeSessionFile(key string, entry sessionEntry) error {
 		os.Remove(tmpName)
 		return err
 	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
 	return os.Rename(tmpName, target)
+}
+
+// writeSessionFile writes a session entry to ~/.crit/sessions/<key>.json.
+func writeSessionFile(key string, entry sessionEntry) error {
+	path, err := sessionFilePath(key)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(path, data, 0600)
 }
 
 // readSessionFile reads a session entry from ~/.crit/sessions/<key>.json.
@@ -205,6 +235,23 @@ func listSessionsForCWD(cwd string) ([]sessionEntry, []string) {
 	return alive, keys
 }
 
+// findSessionForCWDBranch scans all alive sessions for the given cwd and branch.
+// Returns the session, its key, and the number of branch matches found.
+// The session and key are only valid when matchCount == 1.
+func findSessionForCWDBranch(cwd, branch string) (entry sessionEntry, key string, matchCount int) {
+	sessions, keys := listSessionsForCWD(cwd)
+	var matched []int
+	for i, s := range sessions {
+		if s.Branch == branch {
+			matched = append(matched, i)
+		}
+	}
+	if len(matched) == 1 {
+		return sessions[matched[0]], keys[matched[0]], 1
+	}
+	return sessionEntry{}, "", len(matched)
+}
+
 // isDaemonAlive checks if the daemon process is running AND responding to HTTP.
 // After PID recycling, a different process could listen on the same port,
 // so we validate that the response body contains {"status":"ok"}.
@@ -269,7 +316,7 @@ func acquireSessionLock(key string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating sessions directory: %w", err)
 	}
 	lockPath := filepath.Join(dir, key+".lock")

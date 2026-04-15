@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,10 +19,29 @@ import (
 // when the user expands them in the UI. Only applies when >threshold files.
 const lazyFileThreshold = 100
 
-// fileHash returns a stable hash string for file content.
+// fileHash returns a stable, prefixed hash string for file content tracking.
+// It delegates to computeFileHash and adds a "sha256:" prefix to distinguish
+// the hash algorithm used.
 func fileHash(data []byte) string {
-	return fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+	return "sha256:" + computeFileHash(data)
 }
+
+// randomID generates a random ID with the given prefix using crypto/rand.
+// Format: prefix + 6 hex characters (3 random bytes).
+func randomID(prefix string) string {
+	var b [3]byte
+	_, _ = rand.Read(b[:])
+	return prefix + hex.EncodeToString(b[:])
+}
+
+// randomCommentID returns a random file/line comment ID (e.g. "c_a3f8b2").
+func randomCommentID() string { return randomID("c_") }
+
+// randomReviewCommentID returns a random review-level comment ID (e.g. "r_b4c9e1").
+func randomReviewCommentID() string { return randomID("r_") }
+
+// randomReplyID returns a random reply ID (e.g. "rp_d7e2a0").
+func randomReplyID() string { return randomID("rp_") }
 
 // Reply represents a single reply in a comment thread.
 type Reply struct {
@@ -135,15 +154,19 @@ type Session struct {
 	BaseBranchName string // display name of the base branch (e.g. "production", "master")
 	RepoRoot       string
 	OutputDir      string // custom output directory for .crit.json (empty = RepoRoot)
+	ReviewFilePath string // centralized review file path (~/.crit/reviews/<key>.json)
 	PlanDir        string // managed storage dir for plan mode (empty for git/files)
 	ReviewRound    int
 	IgnorePatterns []string
 
 	reviewComments []Comment
-	reviewNextID   int
+
+	// deletedCommentIDs tracks IDs of file comments deleted in-memory but not
+	// yet written to disk. Keyed by file path -> set of comment IDs. This
+	// prevents mergeFileSnapshotIntoCritJSON from re-adding them from disk.
+	deletedCommentIDs map[string]map[string]struct{}
 
 	mu                  sync.RWMutex
-	nextID              int // session-global comment ID counter (c1, c2, c3... across ALL files)
 	subscribers         map[chan SSEEvent]struct{}
 	subMu               sync.Mutex
 	writeTimer          *time.Timer
@@ -287,7 +310,6 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 		BaseBranchName:      resolvedBase,
 		RepoRoot:            root,
 		ReviewRound:         1,
-		nextID:              1,
 		IgnorePatterns:      ignorePatterns,
 		subscribers:         make(map[chan SSEEvent]struct{}),
 		roundComplete:       make(chan struct{}, 1),
@@ -316,7 +338,6 @@ func NewSessionFromGit(ignorePatterns []string) (*Session, error) {
 		s.Files = append(s.Files, fe)
 	}
 
-	s.loadCritJSON()
 	return s, nil
 }
 
@@ -398,7 +419,6 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 		BaseBranchName:      baseBranchName,
 		RepoRoot:            root,
 		ReviewRound:         1,
-		nextID:              1,
 		IgnorePatterns:      ignorePatterns,
 		subscribers:         make(map[chan SSEEvent]struct{}),
 		roundComplete:       make(chan struct{}, 1),
@@ -440,7 +460,6 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 		s.Files = append(s.Files, fe)
 	}
 
-	s.loadCritJSON()
 	return s, nil
 }
 
@@ -540,7 +559,7 @@ func (s *Session) AddComment(filePath string, startLine, endLine int, side, body
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	c := Comment{
-		ID:          fmt.Sprintf("c%d", s.nextID),
+		ID:          randomCommentID(),
 		StartLine:   startLine,
 		EndLine:     endLine,
 		Side:        side,
@@ -552,7 +571,6 @@ func (s *Session) AddComment(filePath string, startLine, endLine int, side, body
 		UpdatedAt:   now,
 		ReviewRound: s.ReviewRound,
 	}
-	s.nextID++
 	f.Comments = append(f.Comments, c)
 	s.scheduleWrite()
 	return c, true
@@ -568,7 +586,7 @@ func (s *Session) AddFileComment(filePath, body, author string) (Comment, bool) 
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	c := Comment{
-		ID:          fmt.Sprintf("c%d", s.nextID),
+		ID:          randomCommentID(),
 		Body:        body,
 		Author:      author,
 		Scope:       "file",
@@ -576,7 +594,6 @@ func (s *Session) AddFileComment(filePath, body, author string) (Comment, bool) 
 		UpdatedAt:   now,
 		ReviewRound: s.ReviewRound,
 	}
-	s.nextID++
 	f.Comments = append(f.Comments, c)
 	s.scheduleWrite()
 	return c, true
@@ -588,7 +605,7 @@ func (s *Session) AddReviewComment(body, author string) Comment {
 	defer s.mu.Unlock()
 	now := time.Now().UTC().Format(time.RFC3339)
 	c := Comment{
-		ID:          fmt.Sprintf("r%d", s.reviewNextID),
+		ID:          randomReviewCommentID(),
 		Body:        body,
 		Author:      author,
 		Scope:       "review",
@@ -596,7 +613,6 @@ func (s *Session) AddReviewComment(body, author string) Comment {
 		UpdatedAt:   now,
 		ReviewRound: s.ReviewRound,
 	}
-	s.reviewNextID++
 	s.reviewComments = append(s.reviewComments, c)
 	s.scheduleWrite()
 	return c
@@ -663,7 +679,7 @@ func (s *Session) AddReviewCommentReply(commentID, body, author string) (Reply, 
 		if c.ID == commentID {
 			now := time.Now().UTC().Format(time.RFC3339)
 			r := Reply{
-				ID:        nextReplyID(commentID, c.Replies),
+				ID:        randomReplyID(),
 				Body:      body,
 				Author:    author,
 				CreatedAt: now,
@@ -767,6 +783,7 @@ func (s *Session) DeleteComment(filePath, id string) bool {
 	for i, c := range f.Comments {
 		if c.ID == id {
 			f.Comments = append(f.Comments[:i], f.Comments[i+1:]...)
+			s.trackDeletedComment(filePath, id)
 			s.scheduleWrite()
 			return true
 		}
@@ -774,20 +791,16 @@ func (s *Session) DeleteComment(filePath, id string) bool {
 	return false
 }
 
-// nextReplyID generates the next reply ID for a comment, e.g. "c1-r1", "c1-r2".
-// It finds the max existing reply number with the prefix and increments.
-func nextReplyID(commentID string, existing []Reply) string {
-	prefix := commentID + "-r"
-	max := 0
-	for _, r := range existing {
-		if strings.HasPrefix(r.ID, prefix) {
-			numStr := r.ID[len(prefix):]
-			if n, err := strconv.Atoi(numStr); err == nil && n > max {
-				max = n
-			}
-		}
+// trackDeletedComment records a file comment ID as deleted so the merge logic
+// does not re-add it from disk. Caller must hold s.mu.
+func (s *Session) trackDeletedComment(filePath, id string) {
+	if s.deletedCommentIDs == nil {
+		s.deletedCommentIDs = make(map[string]map[string]struct{})
 	}
-	return fmt.Sprintf("%s-r%d", commentID, max+1)
+	if s.deletedCommentIDs[filePath] == nil {
+		s.deletedCommentIDs[filePath] = make(map[string]struct{})
+	}
+	s.deletedCommentIDs[filePath][id] = struct{}{}
 }
 
 // RefreshFileContent re-reads all file content from disk.
@@ -822,7 +835,7 @@ func (s *Session) AddReply(filePath, commentID, body, author string) (Reply, boo
 		if c.ID == commentID {
 			now := time.Now().UTC().Format(time.RFC3339)
 			r := Reply{
-				ID:        nextReplyID(commentID, c.Replies),
+				ID:        randomReplyID(),
 				Body:      body,
 				Author:    author,
 				CreatedAt: now,
@@ -1166,12 +1179,11 @@ func (s *Session) SignalRoundComplete() {
 	s.pendingWrite = false
 	s.lastRoundEdits = s.pendingEdits
 	s.pendingEdits = 0
-	// Clear comments on all files, reset session-global ID counter.
+	// Clear comments on all files.
 	// ReviewRound is incremented later by the watcher after carry-forward.
 	for _, f := range s.Files {
 		f.Comments = []Comment{}
 	}
-	s.nextID = 1
 	s.mu.Unlock()
 	select {
 	case s.roundComplete <- struct{}{}:
@@ -1181,8 +1193,8 @@ func (s *Session) SignalRoundComplete() {
 
 // ClearAllComments removes all comments from all files and resets comment IDs and review round.
 // Used by the E2E test cleanup endpoint to return the server to a clean initial state.
-// It also removes .crit.json from s.Files and deletes it from disk so it does not appear
-// as an untracked git file in subsequent requests.
+// It also removes .crit.json from s.Files and deletes the review file from disk
+// (centralized storage under ~/.crit/reviews/ or legacy repo-local .crit.json).
 func (s *Session) ClearAllComments() {
 	s.mu.Lock()
 	// Cancel any pending debounced write so it cannot recreate .crit.json after we delete it.
@@ -1202,15 +1214,13 @@ func (s *Session) ClearAllComments() {
 		filtered = append(filtered, f)
 	}
 	s.Files = filtered
-	s.nextID = 1
 	s.reviewComments = nil
-	s.reviewNextID = 0
 	s.ReviewRound = 1
 	s.lastCritJSONMtime = time.Time{}
 	s.pendingWrite = false
 	critPath := s.critJSONPath()
 	s.mu.Unlock()
-	// Delete .crit.json from disk so it is no longer listed as an untracked git file.
+	// Delete the review file from disk (centralized or legacy path).
 	os.Remove(critPath) //nolint:errcheck
 }
 
@@ -1334,11 +1344,14 @@ func (s *Session) scheduleWrite() {
 
 // critJSONPath returns the path to the .crit.json file.
 func (s *Session) critJSONPath() string {
-	dir := s.RepoRoot
 	if s.OutputDir != "" {
-		dir = s.OutputDir
+		return filepath.Join(s.OutputDir, ".crit.json")
 	}
-	return filepath.Join(dir, ".crit.json")
+	if s.ReviewFilePath != "" {
+		return s.ReviewFilePath
+	}
+	// Fallback for tests and backwards compat
+	return filepath.Join(s.RepoRoot, ".crit.json")
 }
 
 // writeFilesSnapshot holds all session state needed to write .crit.json,
@@ -1359,10 +1372,11 @@ type writeFilesSnapshot struct {
 }
 
 type writeFileSnapshot struct {
-	path     string
-	status   string
-	fileHash string
-	comments []Comment
+	path       string
+	status     string
+	fileHash   string
+	comments   []Comment
+	deletedIDs map[string]struct{} // comment IDs deleted in-memory, skip during merge
 }
 
 // handleExternalDeletion checks if .crit.json was deleted externally and clears
@@ -1400,8 +1414,7 @@ func (s *Session) clearAllCommentData() {
 		anyComments = true
 	}
 	s.reviewComments = nil
-	s.nextID = 1
-	s.reviewNextID = 0
+	s.deletedCommentIDs = nil
 	s.mu.Unlock()
 	if anyComments {
 		s.notify(SSEEvent{Type: "comments-changed"})
@@ -1448,9 +1461,14 @@ func mergeFileSnapshotIntoCritJSON(cj *CritJSON, fs writeFileSnapshot) {
 	merged := fs.comments
 	if hasDisk {
 		for _, dc := range diskFile.Comments {
-			if _, exists := memIDs[dc.ID]; !exists {
-				merged = append(merged, dc)
+			if _, exists := memIDs[dc.ID]; exists {
+				continue
 			}
+			// Skip comments that were explicitly deleted in-memory
+			if _, deleted := fs.deletedIDs[dc.ID]; deleted {
+				continue
+			}
+			merged = append(merged, dc)
 		}
 	}
 
@@ -1496,6 +1514,7 @@ func (s *Session) WriteFiles() {
 		s.mu.Lock()
 		s.lastCritJSONMtime = time.Time{}
 		s.pendingWrite = false
+		s.deletedCommentIDs = nil
 		s.mu.Unlock()
 		return
 	}
@@ -1505,7 +1524,7 @@ func (s *Session) WriteFiles() {
 		fmt.Fprintf(os.Stderr, "Error marshaling .crit.json: %v\n", err)
 		return
 	}
-	if err := os.WriteFile(snap.critPath, data, 0644); err != nil {
+	if err := atomicWriteFile(snap.critPath, data, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing .crit.json: %v\n", err)
 		return
 	}
@@ -1513,6 +1532,7 @@ func (s *Session) WriteFiles() {
 		s.mu.Lock()
 		s.lastCritJSONMtime = info.ModTime()
 		s.pendingWrite = false
+		s.deletedCommentIDs = nil // written to disk, no longer needed
 		s.mu.Unlock()
 	}
 }
@@ -1541,11 +1561,19 @@ func (s *Session) snapshotForWrite(critPath string) writeFilesSnapshot {
 	for i, f := range s.Files {
 		comments := make([]Comment, len(f.Comments))
 		copy(comments, f.Comments)
+		var deleted map[string]struct{}
+		if ids := s.deletedCommentIDs[f.Path]; len(ids) > 0 {
+			deleted = make(map[string]struct{}, len(ids))
+			for k, v := range ids {
+				deleted[k] = v
+			}
+		}
 		snap.files[i] = writeFileSnapshot{
-			path:     f.Path,
-			status:   f.Status,
-			fileHash: f.FileHash,
-			comments: comments,
+			path:       f.Path,
+			status:     f.Status,
+			fileHash:   f.FileHash,
+			comments:   comments,
+			deletedIDs: deleted,
 		}
 	}
 	return snap
@@ -1569,11 +1597,6 @@ func (s *Session) mergeFileCommentsFromDisk(f *FileEntry, diskFile CritJSONFile)
 	for _, dc := range diskFile.Comments {
 		if _, exists := memIDs[dc.ID]; !exists {
 			f.Comments = append(f.Comments, dc)
-			id := 0
-			fmt.Sscanf(dc.ID, "c%d", &id)
-			if id >= s.nextID {
-				s.nextID = id + 1
-			}
 			changed = true
 		} else {
 			changed = s.mergeCommentRepliesAndState(f.Comments, dc) || changed
@@ -1641,11 +1664,6 @@ func (s *Session) mergeReviewCommentsFromDisk(diskComments []Comment) bool {
 	for _, dc := range diskComments {
 		if _, exists := memReviewIDs[dc.ID]; !exists {
 			s.reviewComments = append(s.reviewComments, dc)
-			id := 0
-			fmt.Sscanf(dc.ID, "r%d", &id)
-			if id >= s.reviewNextID {
-				s.reviewNextID = id + 1
-			}
 			changed = true
 		} else {
 			changed = s.mergeReviewCommentRepliesAndState(dc) || changed
@@ -1739,6 +1757,8 @@ func (s *Session) mergeExternalCritJSON() bool {
 
 	s.mu.Lock()
 	s.lastCritJSONMtime = info.ModTime()
+	// Disk is authoritative for external edits — clear deleted tracking
+	s.deletedCommentIDs = nil
 
 	changed := false
 
@@ -1798,7 +1818,6 @@ func (s *Session) loadCritJSON() {
 	}
 
 	// Restore comments for files that match by path.
-	// Scan ALL files' comments to find the global max ID for session-level nextID.
 	for _, f := range s.Files {
 		if cf, ok := cj.Files[f.Path]; ok {
 			f.Comments = cf.Comments
@@ -1806,24 +1825,12 @@ func (s *Session) loadCritJSON() {
 				if f.Comments[i].Scope == "" {
 					f.Comments[i].Scope = "line"
 				}
-				id := 0
-				_, _ = fmt.Sscanf(f.Comments[i].ID, "c%d", &id)
-				if id >= s.nextID {
-					s.nextID = id + 1
-				}
 			}
 		}
 	}
 
-	// Restore review-level comments and rebuild reviewNextID.
+	// Restore review-level comments.
 	s.reviewComments = cj.ReviewComments
-	for _, c := range s.reviewComments {
-		id := 0
-		_, _ = fmt.Sscanf(c.ID, "r%d", &id)
-		if id >= s.reviewNextID {
-			s.reviewNextID = id + 1
-		}
-	}
 
 	// Record the mtime so the first ticker tick doesn't re-process our own file.
 	if info, err := os.Stat(s.critJSONPath()); err == nil {
@@ -2004,6 +2011,7 @@ type SessionInfo struct {
 	AvailableScopes []string          `json:"available_scopes"`
 	Files           []SessionFileInfo `json:"files"`
 	ReviewComments  []Comment         `json:"review_comments"`
+	Cwd             string            `json:"cwd,omitempty"`
 }
 
 // SessionFileInfo is a summary of a file for the session API response.
@@ -2032,6 +2040,7 @@ func (s *Session) GetSessionInfo() SessionInfo {
 		BaseBranchName: s.BaseBranchName,
 		ReviewRound:    s.ReviewRound,
 		ReviewComments: reviewComments,
+		Cwd:            s.RepoRoot,
 	}
 
 	info.AvailableScopes = cachedAvailableScopes(info.BaseRef)

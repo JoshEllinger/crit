@@ -26,12 +26,12 @@ func TestComputeFileHash(t *testing.T) {
 func TestCheckInstalledIntegrations_StaleFile(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write a file at the claude-code command destination with different content
-	ccDest := filepath.Join(dir, ".claude", "commands")
+	// Write a file at the claude-code skill destination with different content
+	ccDest := filepath.Join(dir, ".claude", "skills", "crit")
 	if err := os.MkdirAll(ccDest, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(ccDest, "crit.md"), []byte("old content"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(ccDest, "SKILL.md"), []byte("old content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,21 +57,21 @@ func TestCheckInstalledIntegrations_UpToDate(t *testing.T) {
 
 	// Read the actual embedded content and write it to the destination
 	// so it matches the precomputed hash
-	embedded, err := integrationsFS.ReadFile("integrations/claude-code/commands/crit.md")
+	embedded, err := integrationsFS.ReadFile("integrations/claude-code/skills/crit/SKILL.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ccDest := filepath.Join(dir, ".claude", "commands")
+	ccDest := filepath.Join(dir, ".claude", "skills", "crit")
 	if err := os.MkdirAll(ccDest, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(ccDest, "crit.md"), embedded, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(ccDest, "SKILL.md"), embedded, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	stale := checkInstalledIntegrations(dir, dir)
 	for _, s := range stale {
-		if s.agent == "claude-code" && s.dest == filepath.Join(ccDest, "crit.md") {
+		if s.agent == "claude-code" && s.dest == filepath.Join(ccDest, "SKILL.md") {
 			t.Error("file matches embedded content, should not be stale")
 		}
 	}
@@ -90,11 +90,11 @@ func TestCheckInstalledIntegrations_HomeDirStale(t *testing.T) {
 	homeDir := t.TempDir()
 
 	// Write stale file only in homeDir
-	ccDest := filepath.Join(homeDir, ".claude", "commands")
+	ccDest := filepath.Join(homeDir, ".claude", "skills", "crit")
 	if err := os.MkdirAll(ccDest, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(ccDest, "crit.md"), []byte("old version"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(ccDest, "SKILL.md"), []byte("old version"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -102,7 +102,7 @@ func TestCheckInstalledIntegrations_HomeDirStale(t *testing.T) {
 	if len(stale) == 0 {
 		t.Fatal("expected stale file in home dir, got none")
 	}
-	if stale[0].dest != filepath.Join(ccDest, "crit.md") {
+	if stale[0].dest != filepath.Join(ccDest, "SKILL.md") {
 		t.Errorf("expected home dir path, got %s", stale[0].dest)
 	}
 }
@@ -113,11 +113,11 @@ func TestCheckInstalledIntegrations_MarketplaceStale(t *testing.T) {
 
 	// Write stale file at marketplace source path
 	mpPath := filepath.Join(homeDir, ".claude", "plugins", "marketplaces", "crit",
-		"integrations", "claude-code", "commands")
+		"integrations", "claude-code", "skills", "crit")
 	if err := os.MkdirAll(mpPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(mpPath, "crit.md"), []byte("old marketplace"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(mpPath, "SKILL.md"), []byte("old marketplace"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,11 +146,11 @@ func TestCheckInstalledIntegrations_CacheStale(t *testing.T) {
 
 	// Write stale file at cache path with hash-named dir
 	cachePath := filepath.Join(homeDir, ".claude", "plugins", "cache", "crit", "crit",
-		"abc123def456", "commands")
+		"abc123def456", "skills", "crit")
 	if err := os.MkdirAll(cachePath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cachePath, "crit.md"), []byte("cached old"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cachePath, "SKILL.md"), []byte("cached old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -210,21 +210,21 @@ func TestCheckInstalledIntegrations_CacheSkipsOldVersions(t *testing.T) {
 	// Create two version dirs: 1.0.0 (stale) and 1.0.1 (current)
 	for _, ver := range []string{"1.0.0", "1.0.1"} {
 		cachePath := filepath.Join(homeDir, ".claude", "plugins", "cache", "crit", "crit",
-			ver, "commands")
+			ver, "skills", "crit")
 		if err := os.MkdirAll(cachePath, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if ver == "1.0.0" {
 			// Stale content in old version
-			os.WriteFile(filepath.Join(cachePath, "crit.md"), []byte("old stale"), 0o644)
+			os.WriteFile(filepath.Join(cachePath, "SKILL.md"), []byte("old stale"), 0o644)
 		} else {
 			// Current content — use the real source file to get the correct hash
-			src := filepath.Join("integrations", "claude-code", "commands", "crit.md")
+			src := filepath.Join("integrations", "claude-code", "skills", "crit", "SKILL.md")
 			data, err := os.ReadFile(src)
 			if err != nil {
 				t.Fatal(err)
 			}
-			os.WriteFile(filepath.Join(cachePath, "crit.md"), data, 0o644)
+			os.WriteFile(filepath.Join(cachePath, "SKILL.md"), data, 0o644)
 		}
 	}
 
@@ -245,11 +245,99 @@ func TestPrintStaleWarnings_NoStale(t *testing.T) {
 
 func TestPrintStaleWarnings_WithStale(t *testing.T) {
 	stale := []staleFile{
-		{agent: "claude-code", file: "crit.md", dest: "/tmp/test/.claude/commands/crit.md", location: locationProject},
+		{agent: "claude-code", file: "SKILL.md", dest: "/tmp/test/.claude/skills/crit/SKILL.md", location: locationProject},
 	}
 	count := printStaleWarnings(stale)
 	if count == 0 {
 		t.Error("expected at least 1 warning")
+	}
+}
+
+func TestDetectInstalledIntegrations(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(projectDir, 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	// No integrations installed — should return empty
+	result := detectInstalledIntegrations(projectDir, homeDir)
+	if len(result) != 0 {
+		t.Errorf("expected 0 integrations, got %d", len(result))
+	}
+
+	// Install a current integration file
+	sourceFiles := integrationMap["claude-code"]
+	if len(sourceFiles) == 0 {
+		t.Fatal("no claude-code integration files defined")
+	}
+	sourceContent, err := integrationsFS.ReadFile(sourceFiles[0].source)
+	if err != nil {
+		t.Fatalf("reading embedded source: %v", err)
+	}
+	dest := filepath.Join(projectDir, sourceFiles[0].dest)
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(dest, sourceContent, 0o644)
+
+	result = detectInstalledIntegrations(projectDir, homeDir)
+	if len(result) == 0 {
+		t.Fatal("expected at least 1 integration, got 0")
+	}
+	found := false
+	for _, r := range result {
+		if r.Agent == "claude-code" && r.Status == "current" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected claude-code with status current, got %+v", result)
+	}
+
+	// Write a stale file
+	os.WriteFile(dest, []byte("stale content"), 0o644)
+	result = detectInstalledIntegrations(projectDir, homeDir)
+	found = false
+	for _, r := range result {
+		if r.Agent == "claude-code" && r.Status == "stale" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected claude-code with status stale, got %+v", result)
+	}
+}
+
+func TestDetectInstalledIntegrations_DedupsPerAgent(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(projectDir, 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	// Install same integration in both project and home — should only appear once
+	sourceFiles := integrationMap["claude-code"]
+	if len(sourceFiles) == 0 {
+		t.Fatal("no claude-code integration files defined")
+	}
+	sourceContent, err := integrationsFS.ReadFile(sourceFiles[0].source)
+	if err != nil {
+		t.Fatalf("reading embedded source: %v", err)
+	}
+	for _, dir := range []string{projectDir, homeDir} {
+		dest := filepath.Join(dir, sourceFiles[0].dest)
+		os.MkdirAll(filepath.Dir(dest), 0o755)
+		os.WriteFile(dest, sourceContent, 0o644)
+	}
+
+	result := detectInstalledIntegrations(projectDir, homeDir)
+	count := 0
+	for _, r := range result {
+		if r.Agent == "claude-code" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 claude-code entry (deduped), got %d", count)
 	}
 }
 

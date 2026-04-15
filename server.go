@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"rsc.io/qr"
 )
 
+// Server handles HTTP requests for the crit review UI.
 type Server struct {
 	session           *Session
 	mux               *http.ServeMux
@@ -34,12 +36,18 @@ type Server struct {
 	latestVersion     string
 	versionMu         sync.RWMutex
 	staleIntegrations []staleFile
+	githubAPIURL      string // override for testing; defaults to "https://api.github.com"
 	port              int
 	status            *Status
 	ready             atomic.Bool
 	initErr           atomic.Pointer[error]
+	projectDir        string
+	homeDir           string
+	cfg               Config
+	reviewPath        string
 }
 
+// NewServer creates a Server with the given session and configuration.
 func NewServer(session *Session, frontendFS embed.FS, shareURL string, authToken string, author string, currentVersion string, port int, agentCmd string) (*Server, error) {
 	assets, err := fs.Sub(frontendFS, "frontend")
 	if err != nil {
@@ -149,6 +157,41 @@ func (s *Server) SetInitErr(err error) {
 	s.initErr.Store(&e)
 }
 
+// CheckForUpdates fetches the latest release tag from GitHub and stores
+// it so the frontend can display an update notification. Safe to call
+// from a goroutine — the result is written under versionMu.
+func (s *Server) CheckForUpdates() {
+	if s.currentVersion == "" || s.currentVersion == "dev" {
+		return
+	}
+	base := s.githubAPIURL
+	if base == "" {
+		base = "https://api.github.com"
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(base + "/repos/tomasz-tomczyk/crit/releases/latest")
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return
+	}
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.Unmarshal(body, &release); err != nil || release.TagName == "" {
+		return
+	}
+	s.versionMu.Lock()
+	s.latestVersion = release.TagName
+	s.versionMu.Unlock()
+}
+
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -166,7 +209,27 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"author":            s.author,
 		"agent_cmd_enabled": s.agentCmd != "",
 		"agent_name":        agentName(s.agentCmd),
+		"agent_cmd":         s.agentCmd,
+
+		// Auth status
+		"auth_logged_in":  s.authToken != "",
+		"auth_user_name":  s.cfg.AuthUserName,
+		"auth_user_email": s.cfg.AuthUserEmail,
+
+		// Review file path
+		"review_path": s.reviewPath,
+
+		// Config pass-throughs for frontend suppression
+		"no_integration_check": s.cfg.NoIntegrationCheck,
+		"no_update_check":      s.cfg.NoUpdateCheck,
+
+		// Available integrations (always included)
+		"integrations_available": availableIntegrations(),
 	}
+
+	// Integration detection
+	s.addIntegrationStatus(resp)
+
 	if len(s.staleIntegrations) > 0 {
 		type staleInfo struct {
 			Agent    string `json:"agent"`
@@ -204,6 +267,18 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		resp["pr_created_at"] = prInfo.CreatedAt
 	}
 	writeJSON(w, resp)
+}
+
+// addIntegrationStatus populates integration detection fields in the config response.
+func (s *Server) addIntegrationStatus(resp map[string]interface{}) {
+	if s.cfg.NoIntegrationCheck {
+		resp["integrations"] = []integrationStatus{}
+		resp["any_integration_installed"] = false
+		return
+	}
+	integrations := detectInstalledIntegrations(s.projectDir, s.homeDir)
+	resp["integrations"] = integrations
+	resp["any_integration_installed"] = len(integrations) > 0
 }
 
 // handleSession returns session metadata: mode, branch, file list with stats.
@@ -1243,8 +1318,7 @@ func buildAgentPrompt(c Comment, filePath string) string {
 	}
 	b.WriteString("Address this comment. If it requires a code change, make the edit.\n\n" +
 		"IMPORTANT: Do NOT run `crit comment` or `crit` commands. " +
-		"Just print your response to stdout — it will be posted as a reply automatically.\n" +
-		"If the comment is fully addressed, start your response with RESOLVED: (e.g., \"RESOLVED: Fixed the typo on line 5.\").\n")
+		"Just print your response to stdout — it will be posted as a reply automatically.\n")
 	return b.String()
 }
 
@@ -1292,15 +1366,6 @@ func (s *Server) runAgentCmd(prompt string, commentID string, filePath string) {
 		return
 	}
 
-	// Check for RESOLVED: anywhere in response (agent may add preamble)
-	resolved := false
-	upper := strings.ToUpper(response)
-	if idx := strings.Index(upper, "RESOLVED:"); idx >= 0 {
-		resolved = true
-		// Keep text after RESOLVED: as the reply, discard preamble
-		response = strings.TrimSpace(response[idx+len("RESOLVED:"):])
-	}
-
 	author := agentName(s.agentCmd)
 	log.Printf("agent-request %s: completed, posting reply (%d bytes)\nResponse: %s\nStderr: %s", commentID, len(response), response, stderr.String())
 	// Try original path first, then search all files (path may have changed during agent run)
@@ -1316,12 +1381,6 @@ func (s *Server) runAgentCmd(prompt string, commentID string, filePath string) {
 	if !ok {
 		log.Printf("agent-request %s: failed to add reply (comment not found in file %q)", commentID, filePath)
 	} else {
-		if resolved {
-			// AddReply resets Resolved to false, so we re-set it here.
-			// Both operations use scheduleWrite with a 200ms debounce,
-			// so the final resolved=true state will be persisted.
-			s.session.SetCommentResolved(filePath, commentID, true)
-		}
 		// Re-read content (and file list/diffs in git mode) so next fetch returns updated data
 		s.session.RefreshFileContent()
 		if s.session.Mode == "git" {

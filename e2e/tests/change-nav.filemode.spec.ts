@@ -3,11 +3,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { clearAllComments, loadPage, mdSection } from './helpers';
 
-// Get the fixture directory path from .crit.json location
+// Get the fixture directory from the session API.
 async function getFixtureDir(request: APIRequestContext): Promise<string> {
-  const finishRes = await request.post('/api/finish');
-  const finishData = await finishRes.json();
-  return path.dirname(finishData.review_file);
+  const res = await request.get('/api/session');
+  const data = await res.json();
+  return data.cwd;
 }
 
 // Perform a round-complete cycle: finish, modify file, trigger round-complete, wait for UI refresh
@@ -356,12 +356,13 @@ test.describe('Change Navigation — File Mode', () => {
 
     // Open shortcuts overlay
     await page.keyboard.press('?');
-    const overlay = page.locator('#shortcutsOverlay');
+    const overlay = page.locator('.settings-overlay');
     await expect(overlay).toHaveClass(/active/);
+    const pane = page.locator('.settings-pane[data-pane="shortcuts"]');
 
     // Should list n and N shortcuts
-    await expect(overlay.locator('text=Next change')).toBeVisible();
-    await expect(overlay.locator('text=Previous change')).toBeVisible();
+    await expect(pane.locator('text=Next change')).toBeVisible();
+    await expect(pane.locator('text=Previous change')).toBeVisible();
   });
 
   test('changed blocks have colored left border (box-shadow)', async ({ page, request }) => {

@@ -266,6 +266,8 @@ func carryForwardComment(old Comment, newID string, now string) Comment {
 		EndLine:        old.EndLine,
 		Side:           old.Side,
 		Body:           old.Body,
+		Quote:          old.Quote,
+		QuoteOffset:    old.QuoteOffset,
 		Author:         old.Author,
 		Scope:          old.Scope,
 		CreatedAt:      old.CreatedAt,
@@ -287,9 +289,11 @@ func (s *Session) carryForwardAllComments() {
 			continue
 		}
 		for _, c := range f.PreviousComments {
-			carried := carryForwardComment(c, fmt.Sprintf("c%d", s.nextID), now)
-			s.nextID++
+			carried := carryForwardComment(c, randomCommentID(), now)
 			f.Comments = append(f.Comments, carried)
+			// Track the old ID as deleted so mergeFileSnapshotIntoCritJSON
+			// won't re-add the original from disk alongside the carried-forward copy.
+			s.trackDeletedComment(f.Path, c.ID)
 		}
 	}
 }
@@ -425,14 +429,6 @@ func (s *Session) loadResolvedComments() {
 	// Restore review-level comments so they survive round-complete.
 	// Always overwrite (even when disk has 0) to clear stale in-memory state.
 	s.reviewComments = cj.ReviewComments
-	s.reviewNextID = 0
-	for _, c := range s.reviewComments {
-		id := 0
-		fmt.Sscanf(c.ID, "r%d", &id)
-		if id >= s.reviewNextID {
-			s.reviewNextID = id + 1
-		}
-	}
 	// Record the current mtime so mergeExternalCritJSON does not re-process
 	// this same file. Without this, the file watcher could detect the
 	// externally-written .crit.json (e.g. from a test or crit comment) as a
@@ -476,12 +472,17 @@ func (s *Session) carryForwardComments() {
 		}
 
 		s.mu.Lock()
+		f.Comments = nil // Clear before carry-forward to prevent duplicates
 		now := time.Now().UTC().Format(time.RFC3339)
 		for _, c := range prevComments {
+			// Track the old ID as deleted so mergeFileSnapshotIntoCritJSON
+			// won't re-add the original from disk alongside the carried-forward copy.
+			s.trackDeletedComment(f.Path, c.ID)
+
 			// File-level comments have no line references — carry forward as-is.
 			if c.Scope == "file" {
-				carried := carryForwardComment(c, fmt.Sprintf("c%d", s.nextID), now)
-				s.nextID++
+				carried := carryForwardComment(c, randomCommentID(), now)
+
 				f.Comments = append(f.Comments, carried)
 				continue
 			}
@@ -505,10 +506,10 @@ func (s *Session) carryForwardComments() {
 			if newEnd < newStart {
 				newEnd = newStart
 			}
-			carried := carryForwardComment(c, fmt.Sprintf("c%d", s.nextID), now)
+			carried := carryForwardComment(c, randomCommentID(), now)
 			carried.StartLine = newStart
 			carried.EndLine = newEnd
-			s.nextID++
+
 			f.Comments = append(f.Comments, carried)
 		}
 		s.mu.Unlock()

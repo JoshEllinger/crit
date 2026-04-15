@@ -20,8 +20,21 @@ type Config struct {
 	BaseBranch         string   `json:"base_branch,omitempty"`
 	IgnorePatterns     []string `json:"ignore_patterns,omitempty"`
 	NoIntegrationCheck bool     `json:"no_integration_check,omitempty"`
+	NoUpdateCheck      bool     `json:"no_update_check,omitempty"`
 	AgentCmd           string   `json:"agent_cmd,omitempty"`
 	AuthToken          string   `json:"auth_token,omitempty"`
+	AuthUserName       string   `json:"auth_user_name,omitempty"`
+	AuthUserEmail      string   `json:"auth_user_email,omitempty"`
+	CleanupOnApprove   *bool    `json:"cleanup_on_approve,omitempty"`
+}
+
+// CleanupOnApproveEnabled returns whether review files should be cleaned up
+// when a review is approved. Defaults to true if not explicitly set.
+func (c Config) CleanupOnApproveEnabled() bool {
+	if c.CleanupOnApprove != nil {
+		return *c.CleanupOnApprove
+	}
+	return true
 }
 
 // String returns a human-readable JSON representation of the resolved config.
@@ -52,12 +65,14 @@ func defaultConfig() generatedConfig {
 			".crit.json",
 			".crit/",
 		},
-		AgentCmd:  "",
-		AuthToken: "",
+		AgentCmd:         "",
+		CleanupOnApprove: true,
 	}
 }
 
 // generatedConfig is like Config but without omitempty, so all keys appear in output.
+// auth_token is intentionally excluded — it is global-only and should not appear
+// in project config files where it could be accidentally committed.
 type generatedConfig struct {
 	Port               int      `json:"port"`
 	NoOpen             bool     `json:"no_open"`
@@ -68,8 +83,9 @@ type generatedConfig struct {
 	BaseBranch         string   `json:"base_branch"`
 	IgnorePatterns     []string `json:"ignore_patterns"`
 	NoIntegrationCheck bool     `json:"no_integration_check"`
+	NoUpdateCheck      bool     `json:"no_update_check"`
 	AgentCmd           string   `json:"agent_cmd"`
-	AuthToken          string   `json:"auth_token"`
+	CleanupOnApprove   bool     `json:"cleanup_on_approve"`
 }
 
 func (c generatedConfig) String() string {
@@ -88,6 +104,8 @@ type configPresence struct {
 	NoOpen             bool
 	Quiet              bool
 	NoIntegrationCheck bool
+	NoUpdateCheck      bool
+	CleanupOnApprove   bool
 }
 
 // loadConfigFile reads and parses a single JSON config file.
@@ -113,6 +131,8 @@ func loadConfigFile(path string) (Config, configPresence, error) {
 	_, presence.NoOpen = raw["no_open"]
 	_, presence.Quiet = raw["quiet"]
 	_, presence.NoIntegrationCheck = raw["no_integration_check"]
+	_, presence.NoUpdateCheck = raw["no_update_check"]
+	_, presence.CleanupOnApprove = raw["cleanup_on_approve"]
 
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, presence, fmt.Errorf("parsing %s: %w", path, err)
@@ -149,6 +169,12 @@ func mergeConfigs(global, project Config, projectPresence configPresence) Config
 	}
 	if projectPresence.NoIntegrationCheck {
 		merged.NoIntegrationCheck = project.NoIntegrationCheck
+	}
+	if projectPresence.NoUpdateCheck {
+		merged.NoUpdateCheck = project.NoUpdateCheck
+	}
+	if projectPresence.CleanupOnApprove {
+		merged.CleanupOnApprove = project.CleanupOnApprove
 	}
 	// auth_token is global-only (like agent_cmd) — project config cannot override
 	// Union ignore patterns
@@ -206,6 +232,37 @@ func globalConfigPath() string {
 		return ""
 	}
 	return filepath.Join(home, ".crit.config.json")
+}
+
+// saveGlobalConfig performs a read-modify-write on ~/.crit.config.json.
+// It uses map[string]json.RawMessage to preserve unknown keys.
+// The apply function receives the raw map and should set or delete keys as needed.
+// The file is written with 0600 permissions since it may contain auth_token.
+func saveGlobalConfig(apply func(m map[string]json.RawMessage) error) error {
+	path := globalConfigPath()
+	if path == "" {
+		return fmt.Errorf("cannot determine home directory")
+	}
+
+	raw := make(map[string]json.RawMessage)
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("parsing %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	if err := apply(raw); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o600)
 }
 
 // matchPattern checks if a file path matches an ignore pattern.

@@ -55,7 +55,10 @@ var commandDispatch = map[string]func([]string){
 	"review":    runReview,
 	"plan":      runPlan,
 	"plan-hook": func([]string) { runPlanHook() },
+	"auth":      runAuth,
 	"stop":      runStop,
+	"status":    runStatus,
+	"cleanup":   runCleanup,
 	"_serve":    runServe,
 }
 
@@ -152,18 +155,18 @@ func printQR(url string, showQR bool) {
 	}
 }
 
-func runShareExisting(existingCfg CritJSON, critDir string, files []shareFile, sharePaths []string, authToken string, showQR bool) {
+func runShareExisting(existingCfg CritJSON, critPath string, files []shareFile, sharePaths []string, authToken string, showQR bool) {
 	localIDs := buildLocalIDSet(existingCfg)
 	localFingerprints := buildLocalFingerprints(existingCfg)
 	if webComments, err := fetchNewWebComments(existingCfg.ShareURL, localIDs, localFingerprints, authToken); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not pull remote comments: %v\n", err)
 	} else if len(webComments) > 0 {
-		if err := mergeWebComments(critDir, webComments); err != nil {
+		if err := mergeWebComments(critPath, webComments); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not merge remote comments: %v\n", err)
 		}
 	}
 
-	allComments, _ := loadAllCommentsForShare(critDir, sharePaths)
+	allComments, _ := loadCommentsForUpsert(critPath, sharePaths)
 
 	result, err := upsertShareToWeb(existingCfg, files, allComments, authToken)
 	if err != nil {
@@ -171,7 +174,7 @@ func runShareExisting(existingCfg CritJSON, critDir string, files []shareFile, s
 		os.Exit(1)
 	}
 
-	if err := updateShareState(critDir, computeShareHash(files, allComments), result.ReviewRound); err != nil {
+	if err := updateShareState(critPath, computeShareHash(files, allComments), result.ReviewRound); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save share state: %v\n", err)
 	}
 	if result.Changed {
@@ -183,8 +186,8 @@ func runShareExisting(existingCfg CritJSON, critDir string, files []shareFile, s
 	printQR(result.URL, showQR)
 }
 
-func runShareNew(critDir string, files []shareFile, filePaths []string, svcURL, authToken string, showQR bool) {
-	comments, reviewRound := loadCommentsForShare(critDir, filePaths)
+func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL, authToken string, showQR bool) {
+	comments, reviewRound := loadCommentsForShare(critPath, filePaths)
 
 	url, deleteToken, err := shareFilesToWeb(files, comments, svcURL, reviewRound, authToken)
 	if err != nil {
@@ -192,15 +195,19 @@ func runShareNew(critDir string, files []shareFile, filePaths []string, svcURL, 
 		os.Exit(1)
 	}
 
-	if err := persistShareState(critDir, url, deleteToken, shareScope(filePaths)); err != nil {
+	if err := persistShareState(critPath, url, deleteToken, shareScope(filePaths)); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save share state to .crit.json: %v\n", err)
 	}
 
-	initialComments, _ := loadAllCommentsForShare(critDir, filePaths)
-	_ = updateShareState(critDir, computeShareHash(files, initialComments), reviewRound)
+	initialComments, _ := loadCommentsForUpsert(critPath, filePaths)
+	_ = updateShareState(critPath, computeShareHash(files, initialComments), reviewRound)
 
 	fmt.Println(url)
 	printQR(url, showQR)
+
+	if authToken == "" {
+		showLoginHint()
+	}
 }
 
 func runShare(args []string) {
@@ -211,12 +218,12 @@ func runShare(args []string) {
 	}
 
 	cfg := loadShareConfig()
-	sf.svcURL = resolveShareURL(sf.svcURL, cfg)
+	sf.svcURL = resolveShareURL(sf.svcURL, cfg, defaultShareURL)
 	authToken := resolveAuthToken(cfg)
 
 	files := loadShareFiles(sf.files)
 
-	critDir, err := resolveCritDir(sf.outputDir)
+	critPath, err := resolveReviewPath(sf.outputDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -227,12 +234,12 @@ func runShare(args []string) {
 		sharePaths[i] = f.Path
 	}
 
-	if existingCfg, ok := loadExistingShareCfg(critDir, sharePaths); ok {
-		runShareExisting(existingCfg, critDir, files, sharePaths, authToken, sf.showQR)
+	if existingCfg, ok := loadExistingShareCfg(critPath, sharePaths); ok {
+		runShareExisting(existingCfg, critPath, files, sharePaths, authToken, sf.showQR)
 		return
 	}
 
-	runShareNew(critDir, files, sharePaths, sf.svcURL, authToken, sf.showQR)
+	runShareNew(critPath, files, sharePaths, sf.svcURL, authToken, sf.showQR)
 }
 
 func parseFetchOutputDir(args []string) string {
@@ -258,25 +265,6 @@ func parseFetchOutputDir(args []string) string {
 	return outputDir
 }
 
-func loadCritJSONForFetch(critDir string) CritJSON {
-	critPath := filepath.Join(critDir, ".crit.json")
-	data, err := os.ReadFile(critPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error: no .crit.json found. Run `crit share` first.")
-		os.Exit(1)
-	}
-	var cj CritJSON
-	if err := json.Unmarshal(data, &cj); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid .crit.json: %v\n", err)
-		os.Exit(1)
-	}
-	if cj.ShareURL == "" {
-		fmt.Fprintln(os.Stderr, "Error: no share URL in .crit.json. Run `crit share` first.")
-		os.Exit(1)
-	}
-	return cj
-}
-
 func printFetchedComments(webComments []webComment) {
 	fmt.Printf("Fetched %d new comment(s) into .crit.json\n", len(webComments))
 	for _, wc := range webComments {
@@ -296,13 +284,26 @@ func printFetchedComments(webComments []webComment) {
 func runFetch(args []string) {
 	outputDir := parseFetchOutputDir(args)
 
-	critDir, err := resolveCritDir(outputDir)
+	critPath, err := resolveReviewPath(outputDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	cj := loadCritJSONForFetch(critDir)
+	data, readErr := os.ReadFile(critPath)
+	if readErr != nil {
+		fmt.Fprintln(os.Stderr, "Error: no review file found. Run `crit share` first.")
+		os.Exit(1)
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid review file: %v\n", err)
+		os.Exit(1)
+	}
+	if cj.ShareURL == "" {
+		fmt.Fprintln(os.Stderr, "Error: no share URL in review file. Run `crit share` first.")
+		os.Exit(1)
+	}
 
 	authToken := resolveAuthToken(loadShareConfig())
 	localIDs := buildLocalIDSet(cj)
@@ -319,8 +320,8 @@ func runFetch(args []string) {
 		return
 	}
 
-	if err := mergeWebComments(critDir, webComments); err != nil {
-		fmt.Fprintf(os.Stderr, "Error merging comments: %v\n", err)
+	if err := mergeWebComments(critPath, webComments); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving review file: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -354,27 +355,26 @@ func runUnpublish(args []string) {
 	}
 
 	unpubCfg := loadShareConfig()
-	unpubSvcURL = resolveShareURL(unpubSvcURL, unpubCfg)
+	unpubSvcURL = resolveShareURL(unpubSvcURL, unpubCfg, defaultShareURL)
 	unpubAuthToken := resolveAuthToken(unpubCfg)
 
-	critDir, err := resolveCritDir(unpubOutputDir)
+	critPath, err := resolveReviewPath(unpubOutputDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	critPath := filepath.Join(critDir, ".crit.json")
 	data, err := os.ReadFile(critPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error: no .crit.json found. Nothing to unpublish.")
+		fmt.Fprintln(os.Stderr, "Error: no review file found. Nothing to unpublish.")
 		os.Exit(1)
 	}
 	var cj CritJSON
 	if err := json.Unmarshal(data, &cj); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid .crit.json: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: invalid review file: %v\n", err)
 		os.Exit(1)
 	}
 	if cj.DeleteToken == "" {
-		fmt.Fprintln(os.Stderr, "No shared review found in .crit.json — nothing to unpublish.")
+		fmt.Fprintln(os.Stderr, "No shared review found — nothing to unpublish.")
 		return
 	}
 
@@ -383,8 +383,9 @@ func runUnpublish(args []string) {
 		os.Exit(1)
 	}
 
-	if err := clearShareState(critDir); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not clear share state from .crit.json: %v\n", err)
+	// Clear share state from the review file
+	if err := clearShareState(critPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not clear share state: %v\n", err)
 	}
 
 	fmt.Println("Review unpublished.")
@@ -477,27 +478,6 @@ func parsePullFlags(args []string) pullFlags {
 	return f
 }
 
-func loadOrCreateCritJSON(critDir string) CritJSON {
-	var cj CritJSON
-	if data, err := os.ReadFile(filepath.Join(critDir, ".crit.json")); err == nil {
-		if err := json.Unmarshal(data, &cj); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: existing .crit.json is invalid, starting fresh: %v\n", err)
-		}
-	}
-	if cj.Files == nil {
-		cj.Files = make(map[string]CritJSONFile)
-		cj.Branch = CurrentBranch()
-		cfg := LoadConfig(critDir)
-		base := cfg.BaseBranch
-		if base == "" {
-			base = DefaultBranch()
-		}
-		cj.BaseRef, _ = MergeBase(base)
-		cj.ReviewRound = 1
-	}
-	return cj
-}
-
 func runPull(args []string) {
 	if err := requireGH(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -518,12 +498,28 @@ func runPull(args []string) {
 		os.Exit(1)
 	}
 
-	critDir, err := resolveCritDir(f.outputDir)
+	critPath, err := resolveReviewPath(f.outputDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	cj := loadOrCreateCritJSON(critDir)
+	var cj CritJSON
+	if data, readErr := os.ReadFile(critPath); readErr == nil {
+		if jsonErr := json.Unmarshal(data, &cj); jsonErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: existing review file is invalid, starting fresh: %v\n", jsonErr)
+		}
+	}
+	if cj.Files == nil {
+		cj.Files = make(map[string]CritJSONFile)
+		cj.Branch = CurrentBranch()
+		cfg := LoadConfig("")
+		base := cfg.BaseBranch
+		if base == "" {
+			base = DefaultBranch()
+		}
+		cj.BaseRef, _ = MergeBase(base)
+		cj.ReviewRound = 1
+	}
 
 	added := mergeGHComments(&cj, ghComments)
 
@@ -532,12 +528,12 @@ func runPull(args []string) {
 		return
 	}
 
-	if err := writeCritJSON(cj, f.outputDir); err != nil {
+	if err := saveCritJSON(critPath, cj); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Pulled %d comments from PR #%d into .crit.json\n", added, prNumber)
+	fmt.Printf("Pulled %d comments from PR #%d into %s\n", added, prNumber, critPath)
 	fmt.Println("Run 'crit' to view them in the browser.")
 }
 
@@ -660,19 +656,19 @@ func runPush(args []string) {
 		os.Exit(1)
 	}
 
-	critDir, err := resolveCritDir(f.outputDir)
+	critPath, err := resolveReviewPath(f.outputDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	data, err := os.ReadFile(filepath.Join(critDir, ".crit.json"))
+	data, err := os.ReadFile(critPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: no .crit.json found. Run a crit review first.\n")
+		fmt.Fprintf(os.Stderr, "Error: no review file found. Run a crit review first.\n")
 		os.Exit(1)
 	}
 	var cj CritJSON
 	if err := json.Unmarshal(data, &cj); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid .crit.json: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: invalid review file: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -703,7 +699,6 @@ func runPush(args []string) {
 
 	replyIDs := postPushReplies(prNumber, allReplies)
 
-	critPath := filepath.Join(critDir, ".crit.json")
 	if err := updateCritJSONWithGitHubIDs(critPath, commentIDs, replyIDs); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to update .crit.json with GitHub IDs: %v\n", err)
 	}
@@ -871,7 +866,7 @@ func printCommentUsage() {
 	fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' src/auth.go 'Restructure this file'")
 	fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' main.go:42 'Fix this bug'")
 	fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' src/auth.go:10-25 'This block needs refactoring'")
-	fmt.Fprintln(os.Stderr, "  crit comment --reply-to c1 --resolve --author 'Claude' 'Split into two functions'")
+	fmt.Fprintln(os.Stderr, "  crit comment --reply-to c_a3f8b2 --resolve --author 'Claude' 'Split into two functions'")
 	fmt.Fprintln(os.Stderr, "  crit comment --output /tmp/reviews main.go:42 'Fix this bug'")
 	fmt.Fprintln(os.Stderr, "  echo '[{\"file\":\"main.go\",\"line\":42,\"body\":\"Fix this\"}]' | crit comment --json --author 'Claude'")
 	fmt.Fprintln(os.Stderr, "")
@@ -1009,11 +1004,10 @@ func fileExistsOnDiskOrSession(path string, outputDir string) bool {
 		}
 	}
 	// Check if it exists in .crit.json
-	root, err := resolveCritDir(outputDir)
+	critPath, err := resolveReviewPath(outputDir)
 	if err != nil {
 		return false
 	}
-	critPath := filepath.Join(root, ".crit.json")
 	cj, err := loadCritJSON(critPath)
 	if err != nil {
 		return false
@@ -1142,6 +1136,14 @@ func killDaemonOnApproval(approved bool, pid int) {
 	}
 }
 
+// cleanupOnApproval deletes the review file when the review is approved
+// and cleanup is enabled.
+func cleanupOnApproval(approved bool, reviewPath string, cleanupEnabled bool) {
+	if approved && cleanupEnabled && reviewPath != "" {
+		os.Remove(reviewPath)
+	}
+}
+
 func runPlan(args []string) {
 	pc := resolvePlanConfig(args)
 	content := readPlanContent(pc)
@@ -1173,6 +1175,7 @@ func runPlan(args []string) {
 
 	approved := runReviewClient(entry)
 	killDaemonOnApproval(approved, entry.PID)
+	cleanupOnApproval(approved, entry.ReviewPath, LoadConfig(cwd).CleanupOnApproveEnabled())
 }
 
 type planHookEvent struct {
@@ -1282,13 +1285,44 @@ func runPlanHook() {
 
 	approved, prompt := runReviewClientRaw(entry)
 	killDaemonOnApproval(approved, entry.PID)
+	cleanupOnApproval(approved, entry.ReviewPath, LoadConfig(cwd).CleanupOnApproveEnabled())
 	emitHookDecision(approved, prompt)
+}
+
+// waitForDaemonReady polls the daemon's /api/session endpoint until it stops
+// returning 503 Service Unavailable (session not yet initialized). Returns the
+// last response status code and body, or an error if the daemon is unreachable
+// or the 5-minute deadline expires.
+func waitForDaemonReady(client *http.Client, port int) (statusCode int, body []byte, err error) {
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		resp, reqErr := client.Get(fmt.Sprintf("http://localhost:%d/api/session", port))
+		if reqErr != nil {
+			return 0, nil, fmt.Errorf("could not reach daemon on port %d: %w", port, reqErr)
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			return resp.StatusCode, respBody, nil
+		}
+		if time.Now().After(deadline) {
+			return 0, nil, fmt.Errorf("daemon did not become ready within 5 minutes")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // runReviewClientRaw is like runReviewClient but returns (approved, prompt)
 // without writing to stdout — used by runPlanHook to construct hookSpecificOutput.
 func runReviewClientRaw(entry sessionEntry) (approved bool, prompt string) {
 	client := &http.Client{Timeout: 24 * time.Hour}
+
+	// Wait for the server to finish initializing before calling review-cycle.
+	if _, _, err := waitForDaemonReady(client, entry.Port); err != nil {
+		fmt.Fprintf(os.Stderr, "crit plan-hook: %v\n", err)
+		return true, ""
+	}
+
 	resp, err := client.Post(
 		fmt.Sprintf("http://localhost:%d/api/review-cycle", entry.Port),
 		"application/json",
@@ -1331,7 +1365,11 @@ func runReview(args []string) {
 	}
 
 	cwd, _ := resolvedCWD()
-	key := sessionKey(cwd, sc.files)
+	branch := ""
+	if IsGitRepo() {
+		branch = CurrentBranch()
+	}
+	key := sessionKey(cwd, branch, sc.files)
 
 	// Check for running daemon with the same session key
 	entry, alive := findAliveSession(key)
@@ -1361,6 +1399,7 @@ func runReview(args []string) {
 
 	approved := runReviewClient(entry)
 	killDaemonOnApproval(approved, entry.PID)
+	cleanupOnApproval(approved, entry.ReviewPath, LoadConfig(cwd).CleanupOnApproveEnabled())
 }
 
 // runReviewClient connects to a running daemon/server, blocks until the user
@@ -1370,37 +1409,21 @@ func runReviewClient(entry sessionEntry) (approved bool) {
 	client := &http.Client{Timeout: 24 * time.Hour}
 
 	// Wait for the server to finish initializing before calling review-cycle.
-	// The daemon signals readiness as soon as the port is bound, but session
-	// creation (git operations) may still be in progress.
-	initDeadline := time.Now().Add(5 * time.Minute)
-	for {
-		resp, err := client.Get(fmt.Sprintf("http://localhost:%d/api/session", entry.Port))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: could not reach crit daemon on port %d: %v\n", entry.Port, err)
-			os.Exit(1)
+	statusCode, body, err := waitForDaemonReady(client, entry.Port)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if statusCode == http.StatusInternalServerError {
+		var status struct {
+			Message string `json:"message"`
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusServiceUnavailable {
-			if time.Now().After(initDeadline) {
-				fmt.Fprintf(os.Stderr, "Error: server did not finish initializing within 5 minutes\n")
-				os.Exit(1)
-			}
-			time.Sleep(500 * time.Millisecond)
-			continue
+		if json.Unmarshal(body, &status) == nil && status.Message != "" {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", status.Message)
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", body)
 		}
-		if resp.StatusCode == http.StatusInternalServerError {
-			var status struct {
-				Message string `json:"message"`
-			}
-			if json.Unmarshal(body, &status) == nil && status.Message != "" {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", status.Message)
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", body)
-			}
-			os.Exit(1)
-		}
-		break
+		os.Exit(1)
 	}
 
 	resp, err := client.Post(
@@ -1419,7 +1442,7 @@ func runReviewClient(entry sessionEntry) (approved bool) {
 		os.Exit(1)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
 		os.Exit(1)
@@ -1457,8 +1480,45 @@ func runStop(args []string) {
 		return
 	}
 
-	key := sessionKey(cwd, fileArgs)
-	if err := stopDaemon(key); err != nil {
+	branch := ""
+	if IsGitRepo() {
+		branch = CurrentBranch()
+	}
+
+	// If file args were given, use the exact key (user knows which session).
+	if len(fileArgs) > 0 {
+		key := sessionKey(cwd, branch, fileArgs)
+		if err := stopDaemon(key); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Daemon stopped.")
+		return
+	}
+
+	// No file args: try exact key first (git-mode session with no args).
+	key := sessionKey(cwd, branch, nil)
+	if entry, _ := readSessionFile(key); entry.PID > 0 {
+		if err := stopDaemon(key); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Daemon stopped.")
+		return
+	}
+
+	// Exact key not found — fall back to scanning by cwd + branch.
+	_, foundKey, matchCount := findSessionForCWDBranch(cwd, branch)
+	if matchCount > 1 {
+		fmt.Fprintf(os.Stderr, "Error: multiple daemons running on branch %q. Use 'crit stop --all' or specify file args.\n", branch)
+		os.Exit(1)
+	}
+	if matchCount == 0 {
+		fmt.Fprintln(os.Stderr, "Error: no running daemon found for current directory and branch.")
+		os.Exit(1)
+	}
+
+	if err := stopDaemon(foundKey); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -1492,9 +1552,12 @@ type serverConfig struct {
 	ignorePatterns     []string
 	files              []string // explicit file arguments (empty = git mode)
 	noIntegrationCheck bool
+	noUpdateCheck      bool
 	agentCmd           string
 	planDir            string // managed storage directory for plan mode
 	planName           string // display name for plan content
+	reviewPath         string // centralized review file path (~/.crit/reviews/<key>.json)
+	cfg                Config // full resolved config for the settings panel
 }
 
 // serverFlagSet holds the parsed flag values before config resolution.
@@ -1560,22 +1623,12 @@ func resolvePort(flagPort, cfgPort int) int {
 	return cfgPort
 }
 
-func resolveShareURLFromEnv(flagURL, cfgURL string) string {
-	if flagURL != "" {
-		return flagURL
-	}
-	if envShare, ok := os.LookupEnv("CRIT_SHARE_URL"); ok {
-		return envShare
-	}
-	return cfgURL
-}
-
 func applyConfigDefaults(sf *serverFlagSet, cfg Config) {
 	sf.port = resolvePort(sf.port, cfg.Port)
 	if !sf.noOpen && cfg.NoOpen {
 		sf.noOpen = true
 	}
-	sf.shareURL = resolveShareURLFromEnv(sf.shareURL, cfg.ShareURL)
+	sf.shareURL = resolveShareURL(sf.shareURL, cfg, "")
 	if !sf.quiet && cfg.Quiet {
 		sf.quiet = true
 	}
@@ -1627,21 +1680,36 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 		author:             cfg.Author,
 		ignorePatterns:     ignorePatterns,
 		noIntegrationCheck: cfg.NoIntegrationCheck,
+		noUpdateCheck:      cfg.NoUpdateCheck,
 		agentCmd:           cfg.AgentCmd,
 		files:              sf.fileArgs,
 		planDir:            sf.planDir,
 		planName:           sf.planName,
+		cfg:                cfg,
 	}, nil
 }
 
 func createSession(sc *serverConfig) (*Session, error) {
+	var session *Session
+	var err error
 	if len(sc.files) == 0 {
 		if !IsGitRepo() {
 			return nil, fmt.Errorf("not in a git repository and no files specified")
 		}
-		return NewSessionFromGit(sc.ignorePatterns)
+		session, err = NewSessionFromGit(sc.ignorePatterns)
+	} else {
+		session, err = NewSessionFromFiles(sc.files, sc.ignorePatterns)
 	}
-	return NewSessionFromFiles(sc.files, sc.ignorePatterns)
+	if err != nil {
+		return nil, err
+	}
+	// Set ReviewFilePath before loadCritJSON so it reads from the centralized
+	// review file, not the legacy repo-root .crit.json.
+	if sc.reviewPath != "" {
+		session.ReviewFilePath = sc.reviewPath
+		session.loadCritJSON()
+	}
+	return session, nil
 }
 
 func applySessionOverrides(session *Session, sc *serverConfig) {
@@ -1680,7 +1748,11 @@ func serveSessionKey(sc *serverConfig) string {
 	if sc.planDir != "" {
 		return planSessionKey(cwd, sc.planName)
 	}
-	return sessionKey(cwd, sc.files)
+	branch := ""
+	if IsGitRepo() {
+		branch = CurrentBranch()
+	}
+	return sessionKey(cwd, branch, sc.files)
 }
 
 func checkStaleIntegrations(sc *serverConfig, srv *Server, cwd string) {
@@ -1739,14 +1811,33 @@ func runServe(args []string) {
 		daemonFatal(pipe, "Error creating server: %v", err)
 	}
 
+	// Set config-dependent fields for the settings panel
+	srv.cfg = sc.cfg
 	cwd, _ := resolvedCWD()
+	srv.projectDir = cwd
+	if home, err := os.UserHomeDir(); err == nil {
+		srv.homeDir = home
+	}
 	key := serveSessionKey(sc)
+	branch := ""
+	if IsGitRepo() {
+		branch = CurrentBranch()
+	}
+	if sc.outputDir != "" {
+		abs, _ := filepath.Abs(sc.outputDir)
+		sc.reviewPath = filepath.Join(abs, ".crit.json")
+	} else {
+		sc.reviewPath, _ = reviewFilePath(key)
+	}
+	srv.reviewPath = sc.reviewPath
 	if err := writeSessionFile(key, sessionEntry{
-		PID:       os.Getpid(),
-		Port:      addr.Port,
-		CWD:       cwd,
-		Args:      sc.files,
-		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		PID:        os.Getpid(),
+		Port:       addr.Port,
+		CWD:        cwd,
+		Args:       sc.files,
+		Branch:     branch,
+		ReviewPath: sc.reviewPath,
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
 	}); err != nil {
 		daemonFatal(pipe, "Error writing session file: %v", err)
 	}
@@ -1823,6 +1914,9 @@ func runServe(args []string) {
 
 	checkStaleIntegrations(sc, srv, cwd)
 
+	if !sc.noUpdateCheck && os.Getenv("CRIT_NO_UPDATE_CHECK") == "" {
+		go srv.CheckForUpdates()
+	}
 	srv.SetSession(session)
 
 	if session.Mode == "git" {
@@ -1843,9 +1937,322 @@ func runServe(args []string) {
 	session.Shutdown()
 	session.WriteFiles()
 
+	if session.ReviewFilePath != "" {
+		fmt.Fprintf(os.Stderr, "Review file: %s\n", session.ReviewFilePath)
+	}
+
 	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutCtx)
+}
+
+func runStatus(args []string) {
+	jsonOutput := false
+	for _, arg := range args {
+		if arg == "--json" {
+			jsonOutput = true
+		}
+	}
+
+	cwd, err := resolvedCWD()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	branch := ""
+	if IsGitRepo() {
+		branch = CurrentBranch()
+	}
+
+	sessions, keys := listSessionsForCWD(cwd)
+	var matchedSession *sessionEntry
+	for i, s := range sessions {
+		if s.Branch == branch || (branch == "" && len(sessions) == 1) {
+			matchedSession = &sessions[i]
+			_ = keys[i]
+			break
+		}
+	}
+
+	var revPath string
+	if matchedSession != nil && matchedSession.ReviewPath != "" {
+		revPath = matchedSession.ReviewPath
+	} else {
+		key := sessionKey(cwd, branch, nil)
+		revPath, _ = reviewFilePath(key)
+	}
+
+	revExists := false
+	if _, statErr := os.Stat(revPath); statErr == nil {
+		revExists = true
+	}
+
+	if jsonOutput {
+		printStatusJSON(branch, revPath, revExists, matchedSession)
+		return
+	}
+
+	printStatusHuman(branch, revPath, revExists, matchedSession)
+}
+
+func printStatusJSON(branch, revPath string, revExists bool, session *sessionEntry) {
+	result := map[string]interface{}{
+		"branch":             branch,
+		"review_file":        revPath,
+		"review_file_exists": revExists,
+	}
+	daemon := map[string]interface{}{"running": false}
+	if session != nil {
+		daemon["running"] = true
+		daemon["pid"] = session.PID
+		daemon["port"] = session.Port
+	}
+	result["daemon"] = daemon
+
+	if revExists {
+		addReviewStats(result, revPath)
+	}
+
+	data, _ := json.MarshalIndent(result, "", "  ")
+	fmt.Println(string(data))
+}
+
+func addReviewStats(result map[string]interface{}, revPath string) {
+	data, err := os.ReadFile(revPath)
+	if err != nil {
+		return
+	}
+	var cj CritJSON
+	if json.Unmarshal(data, &cj) != nil {
+		return
+	}
+	result["round"] = cj.ReviewRound
+	unresolved, resolved := countComments(cj)
+	result["comments"] = map[string]int{
+		"unresolved": unresolved,
+		"resolved":   resolved,
+	}
+}
+
+func printStatusHuman(branch, revPath string, revExists bool, session *sessionEntry) {
+	if branch != "" {
+		fmt.Printf("Branch:      %s\n", branch)
+	}
+	fmt.Printf("Review file: %s\n", revPath)
+	if session != nil {
+		fmt.Printf("Daemon:      running (PID %d, port %d)\n", session.PID, session.Port)
+	} else {
+		fmt.Println("Daemon:      not running")
+	}
+	if !revExists {
+		return
+	}
+	data, err := os.ReadFile(revPath)
+	if err != nil {
+		return
+	}
+	var cj CritJSON
+	if json.Unmarshal(data, &cj) != nil {
+		return
+	}
+	fmt.Printf("Round:       %d\n", cj.ReviewRound)
+	unresolved, resolved := countComments(cj)
+	fmt.Printf("Comments:    %d unresolved, %d resolved\n", unresolved, resolved)
+}
+
+func countComments(cj CritJSON) (unresolved, resolved int) {
+	for _, f := range cj.Files {
+		for _, c := range f.Comments {
+			if c.Resolved {
+				resolved++
+			} else {
+				unresolved++
+			}
+		}
+	}
+	for _, c := range cj.ReviewComments {
+		if c.Resolved {
+			resolved++
+		} else {
+			unresolved++
+		}
+	}
+	return
+}
+
+func runCleanup(args []string) {
+	days := 7
+	force := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--days":
+			if i+1 < len(args) {
+				i++
+				d, err := strconv.Atoi(args[i])
+				if err != nil || d < 0 {
+					fmt.Fprintf(os.Stderr, "Error: invalid --days value\n")
+					os.Exit(1)
+				}
+				days = d
+			}
+		case "--force":
+			force = true
+		default:
+			fmt.Fprintf(os.Stderr, "Usage: crit cleanup [--days N] [--force]\n")
+			os.Exit(1)
+		}
+	}
+
+	revDir, err := reviewsDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	stale := findStaleReviews(revDir, days)
+	if len(stale) == 0 {
+		fmt.Println("No stale review files found.")
+		return
+	}
+
+	fmt.Printf("Found %d stale review file%s:\n", len(stale), plural(len(stale)))
+	for _, s := range stale {
+		ageDays := int(s.age.Hours() / 24)
+		branchInfo := ""
+		if s.branch != "" {
+			branchInfo = s.branch + ", "
+		}
+		fmt.Printf("  %s  (%s%d days old, %d comment%s)\n", s.path, branchInfo, ageDays, s.comments, plural(s.comments))
+	}
+
+	if !force {
+		fmt.Print("Delete all? [y/N] ")
+		var answer string
+		fmt.Scanln(&answer)
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Println("Aborted.")
+			return
+		}
+	}
+
+	deleted := deleteStaleReviews(stale)
+	fmt.Printf("Deleted %d review file%s.\n", deleted, plural(deleted))
+}
+
+type staleReview struct {
+	key      string
+	path     string
+	branch   string
+	age      time.Duration
+	comments int
+}
+
+func findStaleReviews(revDir string, days int) []staleReview {
+	entries, err := os.ReadDir(revDir)
+	if err != nil {
+		return nil
+	}
+
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	activeSessions := buildActiveSessionSet()
+
+	var stale []staleReview
+	for _, de := range entries {
+		if !strings.HasSuffix(de.Name(), ".json") {
+			continue
+		}
+		key := strings.TrimSuffix(de.Name(), ".json")
+		if activeSessions[key] {
+			continue
+		}
+		if sr, ok := checkStaleReview(revDir, de, key, cutoff); ok {
+			stale = append(stale, sr)
+		}
+	}
+	return stale
+}
+
+func buildActiveSessionSet() map[string]bool {
+	sessDir, _ := sessionsDir()
+	active := make(map[string]bool)
+	sessEntries, err := os.ReadDir(sessDir)
+	if err != nil {
+		return active
+	}
+	for _, se := range sessEntries {
+		if !strings.HasSuffix(se.Name(), ".json") {
+			continue
+		}
+		key := strings.TrimSuffix(se.Name(), ".json")
+		data, err := os.ReadFile(filepath.Join(sessDir, se.Name()))
+		if err != nil {
+			continue
+		}
+		var entry sessionEntry
+		if json.Unmarshal(data, &entry) == nil && isDaemonAlive(entry) {
+			active[key] = true
+		}
+	}
+	return active
+}
+
+func checkStaleReview(revDir string, de os.DirEntry, key string, cutoff time.Time) (staleReview, bool) {
+	path := filepath.Join(revDir, de.Name())
+	info, err := de.Info()
+	if err != nil {
+		return staleReview{}, false
+	}
+
+	var updatedAt time.Time
+	var branch string
+	var commentCount int
+	if data, readErr := os.ReadFile(path); readErr == nil {
+		var cj CritJSON
+		if json.Unmarshal(data, &cj) == nil {
+			branch = cj.Branch
+			if t, parseErr := time.Parse(time.RFC3339, cj.UpdatedAt); parseErr == nil {
+				updatedAt = t
+			}
+			for _, f := range cj.Files {
+				commentCount += len(f.Comments)
+			}
+			commentCount += len(cj.ReviewComments)
+		}
+	}
+	if updatedAt.IsZero() {
+		updatedAt = info.ModTime()
+	}
+
+	if !updatedAt.Before(cutoff) {
+		return staleReview{}, false
+	}
+	return staleReview{
+		key:      key,
+		path:     path,
+		branch:   branch,
+		age:      time.Since(updatedAt),
+		comments: commentCount,
+	}, true
+}
+
+func deleteStaleReviews(stale []staleReview) int {
+	sessDir, _ := sessionsDir()
+	deleted := 0
+	for _, s := range stale {
+		if err := os.Remove(s.path); err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting %s: %v\n", s.path, err)
+			continue
+		}
+		deleted++
+		if sessDir != "" {
+			os.Remove(filepath.Join(sessDir, s.key+".json"))
+			os.Remove(filepath.Join(sessDir, s.key+".lock"))
+			os.Remove(filepath.Join(sessDir, s.key+".log"))
+		}
+	}
+	return deleted
 }
 
 func printHelp() {
@@ -1867,7 +2274,12 @@ Usage:
   crit push [--dry-run] [--event <type>] [-m <msg>] [-o <dir>] [pr-number]  Post .crit.json comments to a GitHub PR
   crit plan --name <slug> <file>             Review a plan file (manages versioned copies)
   crit plan --name <slug>                    Read plan from stdin
+  crit auth login                            Log in to crit-web via browser
+  crit auth logout                           Log out and revoke token
+  crit auth whoami                           Show current user info
   crit install <agent> [--global]            Install integration files for an AI coding tool (--global: user-wide)
+  crit status [--json]                        Print session info (review file, daemon, comments)
+  crit cleanup [--days N] [--force]           Delete stale review files (default: 7 days)
   crit check                                 Check if installed integrations are up to date
   crit config [--generate]                    Show resolved configuration
   crit help                                  Show this help message
@@ -1890,6 +2302,7 @@ Environment:
   CRIT_SHARE_URL              Override the share service URL
   CRIT_PORT                   Override the default port
   CRIT_NO_UPDATE_CHECK        Disable update check on startup
+  CRIT_AUTH_TOKEN              Override the auth token (skip login)
   CRIT_NO_INTEGRATION_CHECK   Disable integration staleness check
 
 Configuration:
@@ -1977,12 +2390,12 @@ type integration struct {
 
 var integrationMap = map[string][]integration{
 	"claude-code": {
-		{source: "integrations/claude-code/commands/crit.md", dest: ".claude/commands/crit.md", hint: "Run /crit in Claude Code to start a review loop"},
-		{source: "integrations/claude-code/skills/crit-cli/SKILL.md", dest: ".claude/skills/crit-cli/SKILL.md", hint: "The crit skill is available to Claude Code agents when needed"},
+		{source: "integrations/claude-code/skills/crit/SKILL.md", dest: ".claude/skills/crit/SKILL.md", hint: "Run /crit in Claude Code to start a review loop"},
+		{source: "integrations/claude-code/skills/crit-cli/SKILL.md", dest: ".claude/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Claude Code agents when needed"},
 	},
 	"cursor": {
-		{source: "integrations/cursor/commands/crit.md", dest: ".cursor/commands/crit.md", hint: "Run /crit in Cursor to start a review loop"},
-		{source: "integrations/cursor/skills/crit-cli/SKILL.md", dest: ".cursor/skills/crit-cli/SKILL.md", hint: "The crit skill is available to Cursor agents when needed"},
+		{source: "integrations/cursor/skills/crit/SKILL.md", dest: ".cursor/skills/crit/SKILL.md", hint: "Run /crit in Cursor to start a review loop"},
+		{source: "integrations/cursor/skills/crit-cli/SKILL.md", dest: ".cursor/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Cursor agents when needed"},
 	},
 	"opencode": {
 		{source: "integrations/opencode/crit.md", dest: ".opencode/commands/crit.md", hint: "Run /crit in OpenCode to start a review loop"},
@@ -1992,8 +2405,8 @@ var integrationMap = map[string][]integration{
 		{source: "integrations/windsurf/crit.md", dest: ".windsurf/rules/crit.md", hint: "Windsurf will suggest Crit when writing plans"},
 	},
 	"github-copilot": {
-		{source: "integrations/github-copilot/commands/crit.prompt.md", dest: ".github/prompts/crit.prompt.md", hint: "Run /crit in GitHub Copilot to start a review loop"},
-		{source: "integrations/github-copilot/skills/crit-cli/SKILL.md", dest: ".github/skills/crit-cli/SKILL.md", hint: "The crit skill is available to GitHub Copilot agents when needed"},
+		{source: "integrations/github-copilot/skills/crit/SKILL.md", dest: ".github/skills/crit/SKILL.md", hint: "Run /crit in GitHub Copilot to start a review loop"},
+		{source: "integrations/github-copilot/skills/crit-cli/SKILL.md", dest: ".github/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to GitHub Copilot agents when needed"},
 	},
 	"cline": {
 		{source: "integrations/cline/crit.md", dest: ".clinerules/crit.md", hint: "Cline will suggest Crit when writing plans"},

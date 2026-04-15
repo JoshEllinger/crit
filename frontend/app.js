@@ -16,23 +16,23 @@
 
   // ===== File Reference Inline Rule =====
   commentMd.inline.ruler.push('file_ref', function(state, silent) {
-    var start = state.pos;
-    var max = state.posMax;
+    const start = state.pos;
+    const max = state.posMax;
     if (state.src.charCodeAt(start) !== 0x40 /* @ */) return false;
     if (start > 0 && !/\s/.test(state.src[start - 1])) return false;
-    var end = start + 1;
+    let end = start + 1;
     while (end < max && /[a-zA-Z0-9._\-\/]/.test(state.src[end])) end++;
-    var path = state.src.substring(start + 1, end);
+    const path = state.src.substring(start + 1, end);
     if (path.length === 0 || (path.indexOf('.') === -1 && path.indexOf('/') === -1)) return false;
     if (!silent) {
-      var token = state.push('file_ref', '', 0);
+      const token = state.push('file_ref', '', 0);
       token.content = path;
     }
     state.pos = end;
     return true;
   });
   commentMd.renderer.rules.file_ref = function(tokens, idx) {
-    var path = tokens[idx].content;
+    const path = tokens[idx].content;
     return '<span class="file-ref">' + escapeHtml(path) + '</span>';
   };
 
@@ -129,10 +129,14 @@
   let waitingHasComments = false;
   let pendingUpdates = [];
   let pendingUpdatesVersion = '';
-  let updateModalEl = null;
+
   let reviewComments = []; // review-level (general) comments
   let reviewCommentFormActive = false; // is the review comment form open?
   let reviewCommentEditingId = null; // id of review comment being edited, or null
+
+  let settingsPanelOpen = false;
+  let settingsPanelTab = 'settings';
+  let cachedConfig = null; // populated on first panel open
 
   let diffMode = getCookie('crit-diff-mode') || 'split'; // 'split' or 'unified'
   let diffScope = getCookie('crit-diff-scope') || 'all'; // 'all', 'branch', 'staged', or 'unstaged'
@@ -237,9 +241,9 @@
     }
 
     // Split into eager and lazy batches
-    var eager = [];
-    var lazy = [];
-    for (var i = 0; i < fileInfos.length; i++) {
+    const eager = [];
+    const lazy = [];
+    for (let i = 0; i < fileInfos.length; i++) {
       if (fileInfos[i].lazy) {
         lazy.push(fileInfos[i]);
       } else {
@@ -248,10 +252,10 @@
     }
 
     // Load eager files fully
-    var eagerFiles = await Promise.all(eager.map(function(fi) { return loadSingleFile(fi, scope); }));
+    const eagerFiles = await Promise.all(eager.map(function(fi) { return loadSingleFile(fi, scope); }));
 
     // Create lightweight placeholders for lazy files
-    var lazyFiles = lazy.map(function(fi) {
+    const lazyFiles = lazy.map(function(fi) {
       return {
         path: fi.path,
         status: fi.status,
@@ -278,7 +282,7 @@
 
   // Load a single file's content, comments, and diff from the API.
   async function loadSingleFile(fi, scope) {
-    var diffUrl = '/api/file/diff?path=' + enc(fi.path);
+    let diffUrl = '/api/file/diff?path=' + enc(fi.path);
     if (scope && scope !== 'all') {
       diffUrl += '&scope=' + enc(scope);
     }
@@ -310,8 +314,8 @@
     };
 
     // Mark large diffs for deferred rendering
-    var diffLineCount = 0;
-    for (var h = 0; h < f.diffHunks.length; h++) {
+    let diffLineCount = 0;
+    for (let h = 0; h < f.diffHunks.length; h++) {
       diffLineCount += (f.diffHunks[h].Lines || []).length;
     }
     f.diffTooLarge = diffLineCount > 1000;
@@ -393,15 +397,15 @@
   }
 
   async function fetchWhenReady(url) {
-    var start = Date.now();
-    var maxWait = 5 * 60 * 1000; // 5 minutes
+    const start = Date.now();
+    const maxWait = 5 * 60 * 1000; // 5 minutes
     while (true) {
-      var r;
+      let r;
       try {
         r = await fetch(url);
       } catch (_) {
         // Network error — server may have shut down during init
-        var el = document.getElementById('filesContainer');
+        const el = document.getElementById('filesContainer');
         if (el) {
           el.innerHTML =
             '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
@@ -413,8 +417,8 @@
         if (Date.now() - start > maxWait) {
           throw new Error('Server did not finish initializing within 5 minutes');
         }
-        var elapsed = Math.round((Date.now() - start) / 1000);
-        var loadingEl = document.getElementById('filesContainer');
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        const loadingEl = document.getElementById('filesContainer');
         if (loadingEl) {
           loadingEl.innerHTML =
             '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
@@ -424,9 +428,9 @@
         continue;
       }
       if (r.status === 500) {
-        var body = {};
+        let body = {};
         try { body = await r.json(); } catch (_) {}
-        var msg = body.message || 'Server initialization failed';
+        const msg = body.message || 'Server initialization failed';
         document.getElementById('filesContainer').innerHTML =
           '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
           msg + '</div>';
@@ -442,6 +446,7 @@
   // ===== Init =====
   async function init() {
     initTheme();
+    initWidth();
 
     // Measure actual header height and set CSS variable for sticky offsets
     function updateHeaderHeight() {
@@ -475,10 +480,13 @@
     agentEnabled = configRes.agent_cmd_enabled || false;
     agentName = configRes.agent_name || 'agent';
 
-    if (shareURL && session.mode !== 'git') {
+    if (shareURL) {
       const shareBtn = document.getElementById('shareBtn');
       shareBtn.style.display = '';
-      if (hostedURL) {
+      if (session.mode === 'git') {
+        shareBtn.disabled = true;
+        shareBtn.title = 'Sharing is not available in git mode';
+      } else if (hostedURL) {
         setShareButtonState('shared');
       }
     }
@@ -527,7 +535,7 @@
     // PR overview panel toggle
     if (configRes.pr_url && configRes.pr_number) {
       prData = configRes;
-      var prToggle = document.getElementById('prToggle');
+      const prToggle = document.getElementById('prToggle');
       prToggle.style.display = '';
       document.getElementById('prToggleNumber').textContent = '#' + configRes.pr_number;
       if (configRes.pr_is_draft) prToggle.classList.add('pr-toggle-draft');
@@ -575,13 +583,6 @@
         commitDropdownEl.style.display = 'none';
         diffCommit = '';
       }
-    }
-
-    // Hide mode-specific shortcuts
-    if (session.mode === 'git') {
-      document.querySelectorAll('.shortcut-filemode-only').forEach(function(el) { el.style.display = 'none'; });
-    } else {
-      document.querySelectorAll('.shortcut-git-only').forEach(function(el) { el.style.display = 'none'; });
     }
 
     updateHeaderRound();
@@ -787,9 +788,7 @@
         html: '<pre><code class="language-mermaid">' + escapeHtml(token.content) + '</code></pre>',
         isEmpty: false, cssClass: 'mermaid-block'
       });
-      coveredUpTo = blockEnd;
-      coveredUpTo = addGapLineBlocks(blocks, sourceLines, coveredUpTo, blockEnd);
-      return coveredUpTo;
+      return addGapLineBlocks(blocks, sourceLines, blockEnd, blockEnd);
     }
 
     let highlighted = '';
@@ -1025,7 +1024,7 @@
 
       // Lists: split into per-item blocks
       if (token.type === 'bullet_list_open' || token.type === 'ordered_list_open') {
-        var listResult = handleListToken(tokens, i, token, md, blocks, sourceLines, coveredUpTo, blockEnd);
+        const listResult = handleListToken(tokens, i, token, md, blocks, sourceLines, coveredUpTo, blockEnd);
         i = listResult.nextIndex;
         coveredUpTo = listResult.coveredUpTo;
         continue;
@@ -1033,7 +1032,7 @@
 
       // Tables: split into per-row blocks
       if (token.type === 'table_open') {
-        var tableResult = handleTableToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockEnd);
+        const tableResult = handleTableToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockEnd);
         i = tableResult.nextIndex;
         coveredUpTo = tableResult.coveredUpTo;
         continue;
@@ -1041,7 +1040,7 @@
 
       // Blockquotes: split into child blocks
       if (token.type === 'blockquote_open') {
-        var bqResult = handleBlockquoteToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockStart, blockEnd);
+        const bqResult = handleBlockquoteToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockStart, blockEnd);
         i = bqResult.nextIndex;
         coveredUpTo = bqResult.coveredUpTo;
         continue;
@@ -1621,7 +1620,6 @@
         file.collapsed = true;
       }
       // Expanding: let native <details> handle it
-      header.blur(); // prevent <summary> from trapping keyboard focus
     });
     section.addEventListener('toggle', function() {
       file.collapsed = !section.open;
@@ -1660,7 +1658,7 @@
 
           // Re-render this file section in place
           section.classList.remove('file-section-loading');
-          var newSection = renderFileSection(file);
+          const newSection = renderFileSection(file);
           newSection.open = section.open;
           section.replaceWith(newSection);
 
@@ -1670,6 +1668,8 @@
           rebuildNavList();
         }).catch(function() {
           file._lazyLoading = false;
+          // Guard against stale DOM node: only re-attach if still in the document
+          if (!section.isConnected) return;
           section.classList.remove('file-section-loading');
           section.addEventListener('toggle', onLazyExpand);
         });
@@ -1964,6 +1964,13 @@
     return container;
   }
 
+  function buildContentClasses(block) {
+    let classes = 'line-content';
+    if (block.isEmpty) classes += ' empty-line';
+    if (block.cssClass) classes += ' ' + block.cssClass;
+    return classes;
+  }
+
   // Render a single block for the unified diff view.
   // When commentable=true, includes gutter, keyboard nav, comments. Otherwise read-only.
   function renderUnifiedBlock(block, diffClass, file, commentable, blockIndex, commentsMap, commentRangeSet) {
@@ -2019,10 +2026,7 @@
     lineBlockEl.insertBefore(gutter, lineBlockEl.firstChild);
 
     const contentEl = document.createElement('div');
-    let contentClasses = 'line-content';
-    if (block.isEmpty) contentClasses += ' empty-line';
-    if (block.cssClass) contentClasses += ' ' + block.cssClass;
-    contentEl.className = contentClasses;
+    contentEl.className = buildContentClasses(block);
     let html = block.wordDiffHtml || block.html;
     html = processTaskLists(html);
     html = rewriteImageSrcs(html);
@@ -2254,10 +2258,7 @@
 
       // Content
       const content = document.createElement('div');
-      let contentClasses = 'line-content';
-      if (block.isEmpty) contentClasses += ' empty-line';
-      if (block.cssClass) contentClasses += ' ' + block.cssClass;
-      content.className = contentClasses;
+      content.className = buildContentClasses(block);
       let html = block.html;
       html = processTaskLists(html);
       html = rewriteImageSrcs(html);
@@ -3163,35 +3164,44 @@
   }
 
   // ===== Comment Helpers =====
-  function buildCommentsMap(comments) {
-    const map = {};
+
+  // Single-pass builder that produces all three comment index structures:
+  //   commentsMap: { end_line → [comment] }          (document view)
+  //   diffCommentsMap: { "end_line:side" → [comment] } (diff view)
+  //   commentedRangeSet: Set<"line:side">              (highlight ranges)
+  function buildCommentIndices(comments) {
+    const commentsMap = {};
+    const diffCommentsMap = {};
+    const rangeSet = new Set();
     for (const c of comments) {
-      const key = c.end_line;
-      if (!map[key]) map[key] = [];
-      map[key].push(c);
+      // commentsMap — keyed by end_line only
+      const lineKey = c.end_line;
+      if (!commentsMap[lineKey]) commentsMap[lineKey] = [];
+      commentsMap[lineKey].push(c);
+      // diffCommentsMap — keyed by "end_line:side"
+      const sideKey = c.end_line + ':' + (c.side || '');
+      if (!diffCommentsMap[sideKey]) diffCommentsMap[sideKey] = [];
+      diffCommentsMap[sideKey].push(c);
+      // commentedRangeSet — only unresolved, non-file-scope comments
+      if (!c.resolved && c.scope !== 'file') {
+        const side = c.side || '';
+        for (let ln = c.start_line; ln <= c.end_line; ln++) rangeSet.add(ln + ':' + side);
+      }
     }
-    return map;
+    return { commentsMap: commentsMap, diffCommentsMap: diffCommentsMap, rangeSet: rangeSet };
+  }
+
+  // Convenience wrappers that maintain the existing call-site API
+  function buildCommentsMap(comments) {
+    return buildCommentIndices(comments).commentsMap;
   }
 
   function buildDiffCommentsMap(comments) {
-    // Key by "line:side" to distinguish old-side vs new-side comments on the same line number
-    const map = {};
-    for (const c of comments) {
-      const key = c.end_line + ':' + (c.side || '');
-      if (!map[key]) map[key] = [];
-      map[key].push(c);
-    }
-    return map;
+    return buildCommentIndices(comments).diffCommentsMap;
   }
 
   function buildCommentedRangeSet(comments) {
-    const set = new Set();
-    for (const c of comments) {
-      if (c.resolved || c.scope === 'file') continue;
-      const side = c.side || '';
-      for (let ln = c.start_line; ln <= c.end_line; ln++) set.add(ln + ':' + side);
-    }
-    return set;
+    return buildCommentIndices(comments).rangeSet;
   }
 
   // For unified diff: build a Set of visual indices that should have has-comment.
@@ -3872,8 +3882,8 @@
 
     function highlightItem() {
       if (!dropdown) return;
-      var items = dropdown.children;
-      for (var i = 0; i < items.length; i++) {
+      const items = dropdown.children;
+      for (let i = 0; i < items.length; i++) {
         items[i].classList.toggle('active', i === activeIndex);
       }
       if (activeIndex >= 0 && items[activeIndex]) {
@@ -3882,13 +3892,13 @@
     }
 
     function selectItem(filePath) {
-      var val = textarea.value;
-      var cursor = textarea.selectionStart;
-      var before = val.substring(0, triggerStart);
-      var after = val.substring(cursor);
-      var insertion = '@' + filePath + ' ';
+      const val = textarea.value;
+      const cursor = textarea.selectionStart;
+      const before = val.substring(0, triggerStart);
+      const after = val.substring(cursor);
+      const insertion = '@' + filePath + ' ';
       textarea.value = before + insertion + after;
-      var newCursor = before.length + insertion.length;
+      const newCursor = before.length + insertion.length;
       textarea.selectionStart = textarea.selectionEnd = newCursor;
       textarea.focus();
       hideDropdown();
@@ -3928,19 +3938,28 @@
 
     attachFilePicker(textarea);
 
+    const doSubmit = opts.onSubmit
+      ? function() { opts.onSubmit(textarea.value); }
+      : function() { submitComment(textarea.value, formObj); };
+    const doCancel = opts.onCancel
+      ? function() { opts.onCancel(); }
+      : function() { cancelComment(formObj); };
+
     textarea.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         e.stopPropagation();
-        submitComment(textarea.value, formObj);
+        doSubmit();
       } else if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
-        cancelComment(formObj);
+        doCancel();
       }
     });
 
-    textarea.addEventListener('input', function() { debouncedSaveDraft(textarea.value, formObj); });
+    if (!opts.onSubmit) {
+      textarea.addEventListener('input', function() { debouncedSaveDraft(textarea.value, formObj); });
+    }
 
     const actions = document.createElement('div');
     actions.className = 'comment-form-actions';
@@ -3948,12 +3967,12 @@
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn btn-sm';
     cancelBtn.textContent = 'Cancel';
-    cancelBtn.addEventListener('click', function() { cancelComment(formObj); });
+    cancelBtn.addEventListener('click', doCancel);
 
     const submitBtn = document.createElement('button');
     submitBtn.className = 'btn btn-sm btn-primary';
     submitBtn.textContent = opts.submitText;
-    submitBtn.addEventListener('click', function() { submitComment(textarea.value, formObj); });
+    submitBtn.addEventListener('click', doSubmit);
 
     actions.appendChild(cancelBtn);
     actions.appendChild(submitBtn);
@@ -4320,14 +4339,14 @@
     wrapper.className = opts.wrapperClass || 'comment-block';
 
     const card = document.createElement('div');
-    var cardClass = 'comment-card';
+    let cardClass = 'comment-card';
     if (opts.cardClassExtra) cardClass += ' ' + opts.cardClassExtra;
     card.className = cardClass;
     card.dataset.commentId = comment.id;
 
     // Collapse state — live threads never auto-collapse
-    var liveOrPending = isLiveThread(comment) || pendingAgentRequests.has(comment.id);
-    var isCollapsed = liveOrPending ? false
+    const liveOrPending = isLiveThread(comment) || pendingAgentRequests.has(comment.id);
+    const isCollapsed = liveOrPending ? false
       : opts.collapseDefault
         ? (commentCollapseOverrides[comment.id] !== undefined ? commentCollapseOverrides[comment.id] : true)
         : (commentCollapseOverrides[comment.id] === true);
@@ -4358,7 +4377,7 @@
     }
     if (comment.review_round >= 1) {
       const roundBadge = document.createElement('span');
-      var rc = comment.review_round === session.review_round ? ' round-current' : comment.review_round === session.review_round - 1 ? ' round-latest' : '';
+      const rc = comment.review_round === session.review_round ? ' round-current' : comment.review_round === session.review_round - 1 ? ' round-latest' : '';
       roundBadge.className = 'comment-round-badge' + rc;
       roundBadge.textContent = 'R' + comment.review_round;
       headerLeft.appendChild(roundBadge);
@@ -4433,7 +4452,7 @@
       return createInlineEditor(comment, filePath);
     }
 
-    var parts = buildCommentCard(comment, filePath, {
+    const parts = buildCommentCard(comment, filePath, {
       wrapperClass: 'comment-block',
       cardClassExtra: comment.carried_forward ? 'carried-forward' : '',
       collapseDefault: false,
@@ -4459,7 +4478,7 @@
     resolveBtn.setAttribute('aria-label', 'Resolve thread');
     resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
     resolveBtn.addEventListener('click', function() {
-      toggleResolveStatus(comment.id, 'file', 'resolve', filePath, resolveBtn);
+      toggleResolveStatus(comment.id, 'file', 'resolve', filePath);
     });
 
     parts.actions.appendChild(resolveBtn);
@@ -4497,11 +4516,11 @@
 
       const replyActions = document.createElement('div');
       replyActions.className = 'reply-actions';
-      var replyEditBtn = document.createElement('button');
+      const replyEditBtn = document.createElement('button');
       replyEditBtn.title = 'Edit';
       replyEditBtn.innerHTML = ICON_EDIT;
       replyEditBtn.addEventListener('click', function(e) { e.stopPropagation(); editReply(comment.id, reply.id, filePath); });
-      var replyDeleteBtn = document.createElement('button');
+      const replyDeleteBtn = document.createElement('button');
       replyDeleteBtn.className = 'delete-btn';
       replyDeleteBtn.title = 'Delete';
       replyDeleteBtn.innerHTML = ICON_DELETE;
@@ -4554,7 +4573,7 @@
         // Diff view: diff lines with data-diff-line-num
         // Filter by side to avoid matching the wrong line in unified diff
         // (deleted and added lines can share the same line number)
-        var commentSide = comment.side || '';
+        const commentSide = comment.side || '';
         sectionEl.querySelectorAll('[data-diff-file-path="' + CSS.escape(file.path) + '"][data-diff-line-num="' + ln + '"]').forEach(function(el) {
           if (el.dataset.diffSide !== commentSide) return;
           const content = el.querySelector('.diff-content');
@@ -4584,7 +4603,7 @@
       let quoteIdx = -1;
       // Use quote_offset when available to disambiguate duplicate substrings
       if (comment.quote_offset != null) {
-        var candidateIdx = comment.quote_offset;
+        const candidateIdx = comment.quote_offset;
         if (normalizedFull.slice(candidateIdx, candidateIdx + normalizedQuote.length) === normalizedQuote) {
           quoteIdx = candidateIdx;
         }
@@ -4680,7 +4699,7 @@
         : 'Lines ' + comment.start_line + '-' + comment.end_line;
       headerText = 'Editing comment on ' + lineRef;
     }
-    var formEl = createCommentFormUI({
+    const formEl = createCommentFormUI({
       formObj: formObj,
       headerText: headerText,
       submitText: 'Update Comment',
@@ -4690,7 +4709,7 @@
 
     // Keep replies visible below the edit form, inside the form's card
     if (comment.replies && comment.replies.length > 0) {
-      var formCard = formEl.querySelector('.comment-form');
+      const formCard = formEl.querySelector('.comment-form');
       if (formCard) {
         formCard.appendChild(renderReplyList(comment, filePath));
       }
@@ -4729,13 +4748,13 @@
 
   // Shared resolve/unresolve handler for both file-level and review-level comments.
   // `type` is 'file' or 'review'; `action` is 'resolve' or 'unresolve'.
-  async function toggleResolveStatus(commentId, type, action, filePath, buttonElement) {
+  async function toggleResolveStatus(commentId, type, action, filePath) {
     const resolved = action === 'resolve';
     const url = type === 'file'
       ? '/api/comment/' + commentId + '/resolve?path=' + enc(filePath)
       : '/api/review-comment/' + commentId + '/resolve';
     try {
-      var res = await fetch(url, {
+      const res = await fetch(url, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resolved: resolved }),
@@ -4880,94 +4899,31 @@
   }
 
   function createReviewCommentFormUI() {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'comment-form-wrapper';
-
-    const form = document.createElement('div');
-    form.className = 'comment-form';
-
-    const textarea = document.createElement('textarea');
-    textarea.placeholder = 'Leave a comment... (Ctrl+Enter to submit, Escape to cancel)';
-
-    textarea.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        e.stopPropagation();
-        addReviewComment(textarea.value);
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        cancelReviewCommentForm();
-      }
+    const formObj = { scope: 'review', filePath: '', startLine: 0, endLine: 0, formKey: 'review:new' };
+    return createCommentFormUI({
+      formObj: formObj,
+      headerText: 'Comment',
+      submitText: 'Submit',
+      initialBody: '',
+      autoFocus: false,
+      onSubmit: function(body) { addReviewComment(body); },
+      onCancel: function() { cancelReviewCommentForm(); },
     });
-
-    const actions = document.createElement('div');
-    actions.className = 'comment-form-actions';
-
-    const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'btn btn-sm';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.addEventListener('click', function() { cancelReviewCommentForm(); });
-
-    const submitBtn = document.createElement('button');
-    submitBtn.className = 'btn btn-sm btn-primary';
-    submitBtn.textContent = 'Submit';
-    submitBtn.addEventListener('click', function() { addReviewComment(textarea.value); });
-
-    actions.appendChild(cancelBtn);
-    actions.appendChild(submitBtn);
-
-    form.appendChild(textarea);
-    form.appendChild(actions);
-    wrapper.appendChild(form);
-
-    return wrapper;
   }
 
   function createReviewCommentEditor(comment) {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'comment-form-wrapper panel-comment-block';
-
-    const form = document.createElement('div');
-    form.className = 'comment-form';
-
-    const textarea = document.createElement('textarea');
-    textarea.placeholder = 'Edit comment...';
-    textarea.value = comment.body;
-
-    textarea.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        e.stopPropagation();
-        updateReviewComment(comment.id, textarea.value);
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        cancelReviewCommentForm();
-      }
+    const formObj = { scope: 'review', filePath: '', startLine: 0, endLine: 0, editingId: comment.id, formKey: 'review:' + comment.id };
+    const el = createCommentFormUI({
+      formObj: formObj,
+      headerText: 'Editing comment',
+      submitText: 'Save',
+      initialBody: comment.body,
+      autoFocus: true,
+      onSubmit: function(body) { updateReviewComment(comment.id, body); },
+      onCancel: function() { cancelReviewCommentForm(); },
     });
-
-    const actions = document.createElement('div');
-    actions.className = 'comment-form-actions';
-
-    const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'btn btn-sm';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.addEventListener('click', function() { cancelReviewCommentForm(); });
-
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'btn btn-sm btn-primary';
-    saveBtn.textContent = 'Save';
-    saveBtn.addEventListener('click', function() { updateReviewComment(comment.id, textarea.value); });
-
-    actions.appendChild(cancelBtn);
-    actions.appendChild(saveBtn);
-
-    form.appendChild(textarea);
-    form.appendChild(actions);
-    wrapper.appendChild(form);
-
-    return wrapper;
+    el.classList.add('panel-comment-block');
+    return el;
   }
 
   async function refreshReviewComments() {
@@ -5047,7 +5003,7 @@
     form.className = 'reply-form';
 
     // Check if this comment is pending agent response
-    var isPending = pendingAgentRequests.has(commentId);
+    const isPending = pendingAgentRequests.has(commentId);
 
     const input = document.createElement('input');
     input.type = 'text';
@@ -5110,13 +5066,13 @@
     });
 
     submitBtn.addEventListener('click', async function() {
-      var body = textarea.value.trim();
+      const body = textarea.value.trim();
       if (!body) return;
       submitBtn.disabled = true;
       try {
-        var payload = { body: body };
+        const payload = { body: body };
         if (configAuthor) payload.author = configAuthor;
-        var res = await fetch('/api/comment/' + commentId + '/replies?path=' + enc(filePath), {
+        const res = await fetch('/api/comment/' + commentId + '/replies?path=' + enc(filePath), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -5125,8 +5081,8 @@
         userActedThisRound = true;
 
         // In live threads, also send the reply to the agent
-        var file = getFileByPath(filePath);
-        var comment = file && file.comments ? file.comments.find(function(c) { return c.id === commentId; }) : null;
+        const file = getFileByPath(filePath);
+        const comment = file && file.comments ? file.comments.find(function(c) { return c.id === commentId; }) : null;
         if (comment && (isLiveThread(comment) || pendingAgentRequests.has(commentId))) {
           pendingAgentRequests.add(commentId);
           fetch('/api/agent/request', {
@@ -5167,7 +5123,7 @@
   }
 
   function createResolvedElement(comment, filePath) {
-    var parts = buildCommentCard(comment, filePath, {
+    const parts = buildCommentCard(comment, filePath, {
       wrapperClass: 'comment-block',
       cardClassExtra: 'resolved-card',
       collapseDefault: true,
@@ -5182,7 +5138,7 @@
     unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
     unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
     unresolveBtn.addEventListener('click', function() {
-      toggleResolveStatus(comment.id, 'file', 'unresolve', filePath, unresolveBtn);
+      toggleResolveStatus(comment.id, 'file', 'unresolve', filePath);
     });
 
     const deleteBtn = document.createElement('button');
@@ -5243,7 +5199,7 @@
     const commentsOpen = commentsPanel && !commentsPanel.classList.contains('comments-panel-hidden');
     const prOpen = prPanel && !prPanel.classList.contains('pr-panel-hidden');
     const tocBaseRight = 16;
-    var panelWidth = 0;
+    let panelWidth = 0;
     if (commentsOpen && commentsPanel) panelWidth = commentsPanel.offsetWidth;
     if (prOpen && prPanel) panelWidth = prPanel.offsetWidth;
     toc.style.right = panelWidth > 0 ? (panelWidth + tocBaseRight) + 'px' : '';
@@ -5266,12 +5222,12 @@
     const isGeneral = !filePath;
     const isResolved = comment.resolved;
 
-    var cardClassExtra = [
+    const cardClassExtra = [
       isResolved ? 'resolved-card' : '',
       comment.carried_forward ? 'carried-forward' : '',
     ].filter(Boolean).join(' ');
 
-    var parts = buildCommentCard(comment, filePath || '', {
+    const parts = buildCommentCard(comment, filePath || '', {
       wrapperClass: 'comment-block panel-comment-block',
       cardClassExtra: cardClassExtra,
       collapseDefault: isResolved,
@@ -5291,7 +5247,7 @@
         unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
         unresolveBtn.addEventListener('click', function(e) {
           e.stopPropagation();
-          toggleResolveStatus(comment.id, 'review', 'unresolve', null, unresolveBtn);
+          toggleResolveStatus(comment.id, 'review', 'unresolve', null);
         });
         parts.actions.appendChild(unresolveBtn);
       } else {
@@ -5302,7 +5258,7 @@
         resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
         resolveBtn.addEventListener('click', function(e) {
           e.stopPropagation();
-          toggleResolveStatus(comment.id, 'review', 'resolve', null, resolveBtn);
+          toggleResolveStatus(comment.id, 'review', 'resolve', null);
         });
         parts.actions.appendChild(resolveBtn);
       }
@@ -5448,8 +5404,8 @@
 
   // ===== PR Overview Panel =====
   function togglePRPanel() {
-    var panel = document.getElementById('prPanel');
-    var isHidden = panel.classList.contains('pr-panel-hidden');
+    const panel = document.getElementById('prPanel');
+    const isHidden = panel.classList.contains('pr-panel-hidden');
     panel.classList.toggle('pr-panel-hidden');
     // Close comments panel if opening PR panel
     if (isHidden) {
@@ -5460,19 +5416,19 @@
   }
 
   function renderPRPanel() {
-    var panel = document.getElementById('prPanel');
+    const panel = document.getElementById('prPanel');
     if (panel.classList.contains('pr-panel-hidden')) return;
-    var pr = prData;
+    const pr = prData;
     if (!pr) return;
 
-    var body = document.getElementById('prPanelBody');
+    const body = document.getElementById('prPanelBody');
     body.innerHTML = '';
 
     // PR title row with close button
-    var linkSection = document.createElement('div');
+    const linkSection = document.createElement('div');
     linkSection.className = 'pr-panel-link-section';
 
-    var prLink = document.createElement('a');
+    const prLink = document.createElement('a');
     prLink.className = 'pr-panel-pr-link';
     prLink.href = pr.pr_url;
     prLink.target = '_blank';
@@ -5481,7 +5437,7 @@
       '<span class="pr-panel-pr-title-text">' + escapeHtml(pr.pr_title || 'Pull Request') + ' <span class="pr-panel-pr-number">#' + pr.pr_number + '</span></span>';
     linkSection.appendChild(prLink);
 
-    var closeBtn = document.createElement('button');
+    const closeBtn = document.createElement('button');
     closeBtn.className = 'pr-panel-close';
     closeBtn.title = 'Close';
     closeBtn.setAttribute('aria-label', 'Close PR panel');
@@ -5495,23 +5451,23 @@
     body.appendChild(linkSection);
 
     // State badge + meta
-    var metaSection = document.createElement('div');
+    const metaSection = document.createElement('div');
     metaSection.className = 'pr-panel-meta';
 
-    var stateLabel = (pr.pr_state || 'OPEN').toUpperCase();
-    var stateClass = 'pr-panel-state';
+    const stateLabel = (pr.pr_state || 'OPEN').toUpperCase();
+    let stateClass = 'pr-panel-state';
     if (stateLabel === 'MERGED') stateClass += ' pr-panel-state-merged';
     else if (stateLabel === 'CLOSED') stateClass += ' pr-panel-state-closed';
     else stateClass += ' pr-panel-state-open';
     if (pr.pr_is_draft) stateClass += ' pr-panel-state-draft';
 
-    var stateBadge = document.createElement('span');
+    const stateBadge = document.createElement('span');
     stateBadge.className = stateClass;
     stateBadge.textContent = pr.pr_is_draft ? 'Draft' : stateLabel.charAt(0) + stateLabel.slice(1).toLowerCase();
     metaSection.appendChild(stateBadge);
 
     if (pr.pr_author) {
-      var authorEl = document.createElement('span');
+      const authorEl = document.createElement('span');
       authorEl.className = 'pr-panel-author';
       authorEl.textContent = pr.pr_author;
       metaSection.appendChild(authorEl);
@@ -5521,7 +5477,7 @@
 
     // Branch info
     if (pr.pr_head_ref && pr.pr_base_ref) {
-      var branchInfo = document.createElement('div');
+      const branchInfo = document.createElement('div');
       branchInfo.className = 'pr-panel-branches';
       branchInfo.innerHTML =
         '<span class="pr-panel-branch">' + escapeHtml(pr.pr_head_ref) + '</span>' +
@@ -5531,11 +5487,11 @@
     }
 
     // Stats
-    var statsSection = document.createElement('div');
+    const statsSection = document.createElement('div');
     statsSection.className = 'pr-panel-stats';
 
     if (pr.pr_changed_files !== undefined) {
-      var filesStat = document.createElement('span');
+      const filesStat = document.createElement('span');
       filesStat.className = 'pr-panel-stat';
       filesStat.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
         pr.pr_changed_files + ' file' + (pr.pr_changed_files !== 1 ? 's' : '');
@@ -5543,7 +5499,7 @@
     }
 
     if (pr.pr_additions !== undefined || pr.pr_deletions !== undefined) {
-      var diffStat = document.createElement('span');
+      const diffStat = document.createElement('span');
       diffStat.className = 'pr-panel-stat';
       diffStat.innerHTML =
         '<span class="pr-panel-additions">+' + (pr.pr_additions || 0) + '</span>' +
@@ -5555,15 +5511,15 @@
 
     // Description (PR body)
     if (pr.pr_body && pr.pr_body.trim()) {
-      var descSection = document.createElement('div');
+      const descSection = document.createElement('div');
       descSection.className = 'pr-panel-description';
 
-      var descTitle = document.createElement('div');
+      const descTitle = document.createElement('div');
       descTitle.className = 'pr-panel-section-title';
       descTitle.textContent = 'Description';
       descSection.appendChild(descTitle);
 
-      var descBody = document.createElement('div');
+      const descBody = document.createElement('div');
       descBody.className = 'pr-panel-description-body';
       descBody.innerHTML = commentMd.render(pr.pr_body);
       descSection.appendChild(descBody);
@@ -5659,9 +5615,9 @@
 
   async function resolveAllAndFinish() {
     // Resolve all unresolved file comments
-    for (var fi = 0; fi < files.length; fi++) {
-      var fileComments = files[fi].comments || [];
-      for (var ci = 0; ci < fileComments.length; ci++) {
+    for (let fi = 0; fi < files.length; fi++) {
+      const fileComments = files[fi].comments || [];
+      for (let ci = 0; ci < fileComments.length; ci++) {
         if (!fileComments[ci].resolved) {
           try {
             await fetch('/api/comment/' + fileComments[ci].id + '/resolve?path=' + enc(files[fi].path), {
@@ -5674,7 +5630,7 @@
       }
     }
     // Resolve all unresolved review comments
-    for (var ri = 0; ri < reviewComments.length; ri++) {
+    for (let ri = 0; ri < reviewComments.length; ri++) {
       if (!reviewComments[ri].resolved) {
         try {
           await fetch('/api/review-comment/' + reviewComments[ri].id + '/resolve', {
@@ -5716,17 +5672,17 @@
     // Check if user took no action but there are unresolved comments.
     // Only warn when ALL unresolved comments are carried-forward (from a previous round)
     // and the user hasn't added, edited, resolved, or replied to anything this round.
-    var unresolvedCount = 0;
-    var hasNewComments = false;
-    for (var fi = 0; fi < files.length; fi++) {
+    let unresolvedCount = 0;
+    let hasNewComments = false;
+    for (let fi = 0; fi < files.length; fi++) {
       if (!files[fi].comments) continue;
-      for (var ci = 0; ci < files[fi].comments.length; ci++) {
-        var c = files[fi].comments[ci];
+      for (let ci = 0; ci < files[fi].comments.length; ci++) {
+        const c = files[fi].comments[ci];
         if (!c.resolved) unresolvedCount++;
         if (!c.carried_forward) hasNewComments = true;
       }
     }
-    for (var ri = 0; ri < reviewComments.length; ri++) {
+    for (let ri = 0; ri < reviewComments.length; ri++) {
       if (!reviewComments[ri].resolved) unresolvedCount++;
       if (!reviewComments[ri].carried_forward) hasNewComments = true;
     }
@@ -5749,10 +5705,15 @@
       await navigator.clipboard.writeText(prompt);
       const el = document.getElementById('waitingClipboard');
       el.textContent = '\u2713 Copied';
+      el.setAttribute('aria-label', 'Copied');
+      announceCopy();
       el.classList.remove('clipboard-confirm');
       void el.offsetWidth;
       el.classList.add('clipboard-confirm');
-      setTimeout(function() { el.textContent = 'Copy prompt'; }, 2000);
+      setTimeout(function() {
+        el.textContent = 'Copy prompt';
+        el.setAttribute('aria-label', 'Copy prompt');
+      }, 2000);
     } catch (_) {}
   });
 
@@ -5850,46 +5811,13 @@
 
     source.addEventListener('comments-changed', async function() {
       try {
+        // Only re-fetch comments data, not file content or diffs (those only
+        // change on file-changed events). This reduces O(3N) to O(N) requests.
         await Promise.all(files.map(async function(f) {
-          // Lazy files: fetch only comments (not full diff)
-          if (f.lazy) {
-            return fetch('/api/file/comments?path=' + enc(f.path))
-              .then(function(r) { return r.ok ? r.json() : []; })
-              .then(function(comments) { f.comments = Array.isArray(comments) ? comments : []; })
-              .catch(function() {});
-          }
-          var fetches = [
-            fetch('/api/file/comments?path=' + enc(f.path))
-              .then(function(r) { return r.ok ? r.json() : []; })
-              .catch(function() { return []; }),
-            fetch('/api/file?path=' + enc(f.path))
-              .then(function(r) { return r.ok ? r.json() : null; })
-              .catch(function() { return null; }),
-            fetch('/api/file/diff?path=' + enc(f.path)
-              + (diffScope && diffScope !== 'all' ? '&scope=' + enc(diffScope) : '')
-              + (diffCommit ? '&commit=' + enc(diffCommit) : ''))
-              .then(function(r) { return r.ok ? r.json() : null; })
-              .catch(function() { return null; }),
-          ];
-          const [commentsRes, fileRes, diffRes] = await Promise.all(fetches);
-          f.comments = Array.isArray(commentsRes) ? commentsRes : [];
-          if (fileRes && fileRes.content !== undefined && fileRes.content !== f.content) {
-            f.content = fileRes.content;
-            // Rebuild parsed blocks from new content
-            if (f.fileType === 'markdown') {
-              var parsed = parseMarkdown(f.content);
-              f.lineBlocks = parsed.blocks;
-              f.tocItems = parsed.tocItems;
-            } else if (f.fileType === 'code' && session.mode !== 'git') {
-              f.lineBlocks = buildCodeLineBlocks(f);
-            }
-            if (f.fileType === 'code') {
-              f.highlightCache = preHighlightFile(f);
-            }
-          }
-          if (diffRes && Array.isArray(diffRes.hunks)) {
-            f.diffHunks = diffRes.hunks;
-          }
+          return fetch('/api/file/comments?path=' + enc(f.path))
+            .then(function(r) { return r.ok ? r.json() : []; })
+            .then(function(comments) { f.comments = Array.isArray(comments) ? comments : []; })
+            .catch(function() {});
         }));
         // Also refresh review-level comments
         try {
@@ -5897,12 +5825,12 @@
           if (rcRes.ok) reviewComments = await rcRes.json();
         } catch (_) {}
         // Save form drafts and focused element before re-render
-        var focusedFormKey = null;
-        var focusedSelStart = 0;
-        var focusedSelEnd = 0;
-        var activeEl = document.activeElement;
+        let focusedFormKey = null;
+        let focusedSelStart = 0;
+        let focusedSelEnd = 0;
+        const activeEl = document.activeElement;
         if (activeEl && activeEl.tagName === 'TEXTAREA') {
-          var formEl = activeEl.closest('.comment-form');
+          const formEl = activeEl.closest('.comment-form');
           if (formEl) {
             focusedFormKey = formEl.dataset.formKey;
             focusedSelStart = activeEl.selectionStart;
@@ -5918,7 +5846,7 @@
         updateTreeCommentBadges();
         // Restore focus
         if (focusedFormKey) {
-          var ta = document.querySelector('.comment-form[data-form-key="' + focusedFormKey + '"] textarea');
+          const ta = document.querySelector('.comment-form[data-form-key="' + focusedFormKey + '"] textarea');
           if (ta) {
             ta.focus();
             ta.selectionStart = focusedSelStart;
@@ -5940,7 +5868,7 @@
       showDisconnected();
     });
 
-    var sseErrorCount = 0;
+    let sseErrorCount = 0;
     source.addEventListener('message', function() { sseErrorCount = 0; });
     source.addEventListener('file-changed', function() { sseErrorCount = 0; });
     source.addEventListener('comments-changed', function() { sseErrorCount = 0; });
@@ -5995,13 +5923,16 @@
 
     const overlay = document.createElement('div');
     overlay.className = 'share-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'Share review');
     overlay.innerHTML =
       '<div class="share-dialog">' +
         '<h3><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.25 5.5l-5.5 5.5-3.5-3.5"/></svg>Review shared</h3>' +
         '<div class="share-dialog-qr" id="modalQR"></div>' +
         '<div class="share-dialog-url">' +
           '<span>' + escapeHtml(hostedURL) + '</span>' +
-          '<button class="copy-icon-btn" id="modalCopyBtn" title="Copy link">' +
+          '<button class="copy-icon-btn" id="modalCopyBtn" title="Copy link" aria-label="Copy link">' +
             ICON_CLIPBOARD +
           '</button>' +
         '</div>' +
@@ -6038,8 +5969,13 @@
     overlay.querySelector('#modalCopyBtn').addEventListener('click', function() {
       navigator.clipboard.writeText(hostedURL).catch(function() {});
       this.innerHTML = ICON_CHECK_SMALL;
+      this.setAttribute('aria-label', 'Copied');
+      announceCopy();
       const copyBtn = this;
-      setTimeout(function() { copyBtn.innerHTML = ICON_CLIPBOARD; }, 2000);
+      setTimeout(function() {
+        copyBtn.innerHTML = ICON_CLIPBOARD;
+        copyBtn.setAttribute('aria-label', 'Copy link');
+      }, 2000);
     });
 
     if (deleteToken) {
@@ -6086,7 +6022,7 @@
         '<span>Unpublish failed: ' + escapeHtml(err.message) + '</span>' +
         '<div class="toast-actions">' +
           '<button class="toast-btn toast-btn-filled" id="shareUnpublishRetryBtn">Retry</button>' +
-          '<button class="toast-btn toast-btn-ghost" onclick="dismissToast(\'share\')">Dismiss</button>' +
+          '<button class="toast-btn toast-btn-ghost" data-dismiss-toast="share">Dismiss</button>' +
         '</div>');
       el.querySelector('#shareUnpublishRetryBtn').addEventListener('click', function() {
         dismissToast('share');
@@ -6126,7 +6062,7 @@
         '<span>Share failed: ' + escapeHtml(err.message) + '</span>' +
         '<div class="toast-actions">' +
           '<button class="toast-btn toast-btn-filled" id="shareRetryBtn">Retry</button>' +
-          '<button class="toast-btn toast-btn-ghost" onclick="dismissToast(\'share\')">Dismiss</button>' +
+          '<button class="toast-btn toast-btn-ghost" data-dismiss-toast="share">Dismiss</button>' +
         '</div>');
       el.querySelector('#shareRetryBtn').addEventListener('click', function() {
         dismissToast('share');
@@ -6134,6 +6070,12 @@
       });
     }
   });
+
+  // Announce copy action to screen readers via live region
+  function announceCopy() {
+    const el = document.getElementById('copyStatus');
+    if (el) { el.textContent = ''; el.textContent = 'Copied to clipboard'; }
+  }
 
   // ===== Toast System =====
   function showToast(id, type, content, opts) {
@@ -6150,25 +6092,28 @@
     return el;
   }
 
-  // Global for onclick handlers in toast HTML
-  window.dismissToast = function(id) {
+  function dismissToast(id) {
     const el = document.getElementById('toast-' + id);
     if (!el) return;
     el.classList.add('toast-out');
     el.addEventListener('animationend', function() { el.remove(); }, { once: true });
-  };
+  }
+
+  // Event delegation for toast dismiss buttons (replaces inline onclick)
+  document.getElementById('toastContainer').addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-dismiss-toast]');
+    if (btn) dismissToast(btn.dataset.dismissToast);
+  });
 
   // ===== Table of Contents =====
   function buildToc() {
     const tocEl = document.getElementById('toc');
     const listEl = tocEl.querySelector('.toc-list');
     const toggleBtn = document.getElementById('tocToggle');
-    const tocShortcut = document.querySelector('.shortcut-toc-only');
     listEl.innerHTML = '';
 
     function hideToc() {
       toggleBtn.style.display = 'none';
-      if (tocShortcut) tocShortcut.style.display = 'none';
     }
 
     // TOC only for single-file markdown reviews
@@ -6192,7 +6137,6 @@
       return;
     }
     toggleBtn.style.display = '';
-    if (tocShortcut) tocShortcut.style.display = '';
 
     // Restore TOC open/closed state from cookie
     if (getCookie('crit-toc') === 'open') {
@@ -6273,7 +6217,7 @@
 
   // ===== Mermaid =====
   function getMermaidTheme() {
-    var dataTheme = document.documentElement.getAttribute('data-theme');
+    const dataTheme = document.documentElement.getAttribute('data-theme');
     if (dataTheme === 'light') return 'default';
     if (dataTheme === 'dark') return 'dark';
     // System theme: check prefers-color-scheme
@@ -6307,134 +6251,29 @@
     else if (choice === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
     else document.documentElement.removeAttribute('data-theme');
 
-    document.querySelectorAll('.theme-pill-btn').forEach(function(btn) {
-      const forTheme = btn.getAttribute('data-for-theme');
-      btn.classList.toggle('active', forTheme === choice);
-    });
-
     // Re-initialize mermaid diagrams with updated theme
     if (typeof mermaid !== 'undefined') {
       mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
       try { mermaid.run(); } catch (_) {}
     }
-
-    const indicator = document.querySelector('.theme-pill-indicator');
-    if (indicator) {
-      if (choice === 'system') indicator.style.left = '0%';
-      else if (choice === 'light') indicator.style.left = '33.333%';
-      else indicator.style.left = '66.666%';
-    }
   };
 
-  document.querySelectorAll('.theme-pill-btn').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      applyTheme(btn.getAttribute('data-for-theme'));
-    });
-  });
-
-  // ===== Update Modal =====
-  let updateEscapeHandler = null;
-
-  function closeUpdateModal() {
-    if (updateModalEl) {
-      updateModalEl.remove();
-      updateModalEl = null;
-    }
-    if (updateEscapeHandler) {
-      document.removeEventListener('keydown', updateEscapeHandler);
-      updateEscapeHandler = null;
-    }
+  // ===== Width =====
+  function initWidth() {
+    const saved = getCookie('crit-width') || 'default';
+    applyWidth(saved);
   }
 
-  function showUpdateModal() {
-    closeUpdateModal();
-
-    var overlay = document.createElement('div');
-    overlay.className = 'update-overlay';
-
-    let itemsHtml = '';
-    pendingUpdates.forEach(function(u) {
-      const lines = u.hint.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
-      let cmdsHtml = '';
-      lines.forEach(function(line) {
-        // Separate label prefix from command — look for ":" delimiter
-        let prefix = '';
-        let cmd = line;
-        const colonIdx = line.indexOf(':');
-        if (colonIdx > 0 && colonIdx < line.length - 1 && !/^https?:/.test(line)) {
-          prefix = line.substring(0, colonIdx).trim();
-          cmd = line.substring(colonIdx + 1).trim();
-        }
-        if (prefix) {
-          cmdsHtml += '<div class="update-item-prefix">' + escapeHtml(prefix) + '</div>';
-        }
-        cmdsHtml += '<div class="update-item-cmd">'
-          + '<code>' + escapeHtml(cmd) + '</code>'
-          + '<button class="update-item-copy" title="Copy command" aria-label="Copy command" data-cmd="' + escapeHtml(cmd).replace(/"/g, '&quot;') + '">'
-          + ICON_CLIPBOARD
-          + '</button>'
-          + '</div>';
-      });
-      let labelHtml = escapeHtml(u.label);
-      if (u.labelUrl) {
-        labelHtml += '. <a class="update-item-release-link" href="' + escapeHtml(u.labelUrl) + '" target="_blank" rel="noopener">See release notes</a>';
-      }
-      itemsHtml += '<div class="update-item">'
-        + '<div class="update-item-label">' + labelHtml + '</div>'
-        + cmdsHtml
-        + '</div>';
-    });
-
-    overlay.innerHTML =
-      '<div class="update-dialog" role="dialog" aria-modal="true" aria-label="Updates available">' +
-        '<h3>' +
-          '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0l-3-3m3 3l3-3"/><path d="M2.5 11v1.75c0 .69.56 1.25 1.25 1.25h8.5c.69 0 1.25-.56 1.25-1.25V11"/></svg>' +
-          'Updates Available' +
-        '</h3>' +
-        '<div class="update-items">' + itemsHtml + '</div>' +
-        '<div class="update-dialog-actions">' +
-          '<button class="btn btn-sm" id="updateDismissBtn">Don\u2019t remind me</button>' +
-          '<button class="btn btn-sm" id="updateCloseBtn">Close</button>' +
-        '</div>' +
-      '</div>';
-
-    document.body.appendChild(overlay);
-    updateModalEl = overlay;
-    overlay.querySelector('#updateCloseBtn').focus();
-
-    // Copy buttons
-    overlay.querySelectorAll('.update-item-copy').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        var cmd = this.getAttribute('data-cmd');
-        navigator.clipboard.writeText(cmd).catch(function() {});
-        this.innerHTML = ICON_CHECK_SMALL;
-        var self = this;
-        setTimeout(function() { self.innerHTML = ICON_CLIPBOARD; }, 2000);
-      });
-    });
-
-    // Close on overlay background click
-    overlay.addEventListener('click', function(e) {
-      if (e.target === overlay) closeUpdateModal();
-    });
-    updateEscapeHandler = function(e) {
-      if (e.key === 'Escape') closeUpdateModal();
-    };
-    document.addEventListener('keydown', updateEscapeHandler);
-    overlay.querySelector('#updateCloseBtn').addEventListener('click', closeUpdateModal);
-    overlay.querySelector('#updateDismissBtn').addEventListener('click', function() {
-      setCookie('crit-updates-dismissed', pendingUpdatesVersion);
-      document.getElementById('updateBtn').style.display = 'none';
-      closeUpdateModal();
-    });
+  function applyWidth(choice) {
+    setCookie('crit-width', choice);
+    if (choice === 'compact') document.documentElement.setAttribute('data-width', 'compact');
+    else if (choice === 'wide') document.documentElement.setAttribute('data-width', 'wide');
+    else document.documentElement.setAttribute('data-width', 'default');
   }
 
+  // ===== Update Button =====
   document.getElementById('updateBtn').addEventListener('click', function() {
-    if (updateModalEl) {
-      closeUpdateModal();
-    } else {
-      showUpdateModal();
-    }
+    openSettingsPanel('settings');
   });
 
   // ===== Diff Mode Toggle (Split / Unified) =====
@@ -6496,8 +6335,8 @@
     }
 
     list.innerHTML = commitList.map(function(c) {
-      var active = c.sha === diffCommit ? ' active' : '';
-      var time = c.date ? '<span class="commit-picker-item-time">' + relativeTime(c.date) + '</span>' : '';
+      const active = c.sha === diffCommit ? ' active' : '';
+      const time = c.date ? '<span class="commit-picker-item-time">' + relativeTime(c.date) + '</span>' : '';
       return '<div class="commit-picker-item' + active + '" data-commit="' + c.sha + '">'
         + '<span class="commit-picker-item-sha">' + escapeHtml(c.short_sha) + '</span>'
         + '<span class="commit-picker-item-msg">' + escapeHtml(c.message.length > 40 ? c.message.slice(0, 40) + '\u2026' : c.message) + '</span>'
@@ -6561,7 +6400,7 @@
     await reloadForScope();
   });
 
-  var reloadInFlight = null;
+  let reloadInFlight = null;
   async function reloadForScope() {
     if (reloadInFlight) return reloadInFlight;
     reloadInFlight = (async function() {
@@ -6608,7 +6447,7 @@
 
   // ===== Base Branch Picker =====
   const baseBranchPickerEl = document.getElementById('baseBranchPicker');
-  var baseBranchBtnEl = document.getElementById('baseBranchBtn');
+  const baseBranchBtnEl = document.getElementById('baseBranchBtn');
   let baseBranches = [];
   let currentBaseBranch = ''; // display name of the current base branch
   const branchPicker = { highlightedIdx: -1 }; // keyboard-highlighted item index
@@ -6638,7 +6477,7 @@
   }
 
   function updateHighlight() {
-    var items = getVisibleItems();
+    const items = getVisibleItems();
     items.forEach(function(el, i) {
       el.classList.toggle('highlighted', i === branchPicker.highlightedIdx);
     });
@@ -6648,14 +6487,14 @@
   }
 
   function renderBaseBranchList(filter) {
-    var list = document.getElementById('baseBranchList');
-    var filtered = baseBranches;
+    const list = document.getElementById('baseBranchList');
+    let filtered = baseBranches;
     if (filter) {
-      var lower = filter.toLowerCase();
+      const lower = filter.toLowerCase();
       filtered = baseBranches.filter(function(b) { return b.toLowerCase().indexOf(lower) !== -1; });
     }
     list.innerHTML = filtered.map(function(b) {
-      var active = b === currentBaseBranch ? ' active' : '';
+      const active = b === currentBaseBranch ? ' active' : '';
       return '<div class="base-branch-item' + active + '" data-branch="' + escapeHtml(b) + '">' + escapeHtml(b) + '</div>';
     }).join('');
     if (filtered.length === 0) {
@@ -6672,18 +6511,18 @@
     }
     baseBranchPickerEl.classList.remove('open');
     baseBranchBtnEl.setAttribute('aria-expanded', 'false');
-    var previousBranch = currentBaseBranch;
-    var previousLabel = document.getElementById('baseBranchLabel').textContent;
+    const previousBranch = currentBaseBranch;
+    const previousLabel = document.getElementById('baseBranchLabel').textContent;
     document.getElementById('baseBranchLabel').textContent = branch;
     currentBaseBranch = branch;
     try {
-      var res = await fetch('/api/base-branch', {
+      const res = await fetch('/api/base-branch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ branch: branch }),
       });
       if (!res.ok) {
-        var errText = await res.text();
+        const errText = await res.text();
         console.error('Failed to change base branch:', errText);
         currentBaseBranch = previousBranch;
         document.getElementById('baseBranchLabel').textContent = previousLabel;
@@ -6703,10 +6542,10 @@
   // Toggle dropdown
   document.getElementById('baseBranchBtn').addEventListener('click', function() {
     baseBranchPickerEl.classList.toggle('open');
-    var isOpen = baseBranchPickerEl.classList.contains('open');
+    const isOpen = baseBranchPickerEl.classList.contains('open');
     baseBranchBtnEl.setAttribute('aria-expanded', String(isOpen));
     if (isOpen) {
-      var search = document.getElementById('baseBranchSearch');
+      const search = document.getElementById('baseBranchSearch');
       search.value = '';
       branchPicker.highlightedIdx = -1;
       renderBaseBranchList();
@@ -6722,7 +6561,7 @@
   // Keyboard navigation in search input
   document.getElementById('baseBranchSearch').addEventListener('keydown', function(e) {
     e.stopPropagation();
-    var items = getVisibleItems();
+    const items = getVisibleItems();
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       branchPicker.highlightedIdx = Math.min(branchPicker.highlightedIdx + 1, items.length - 1);
@@ -6736,7 +6575,7 @@
     } else if (e.key === 'Enter') {
       e.preventDefault();
       if (branchPicker.highlightedIdx >= 0 && branchPicker.highlightedIdx < items.length) {
-        var branch = items[branchPicker.highlightedIdx].dataset.branch;
+        const branch = items[branchPicker.highlightedIdx].dataset.branch;
         if (branch) selectBaseBranch(branch);
       }
     } else if (e.key === 'Escape') {
@@ -6764,9 +6603,9 @@
 
   // Item selection via click
   document.getElementById('baseBranchList').addEventListener('click', function(e) {
-    var item = e.target.closest('.base-branch-item');
+    const item = e.target.closest('.base-branch-item');
     if (!item) return;
-    var branch = item.dataset.branch;
+    const branch = item.dataset.branch;
     if (branch) selectBaseBranch(branch);
   });
 
@@ -6784,34 +6623,34 @@
   });
 
   // ===== Comment Navigation =====
-  var navCommentId = null;
-  var navHighlightTimer;
+  let navCommentId = null;
+  let navHighlightTimer;
 
   function navigateToComment(direction) {
-    var panel = document.getElementById('commentsPanel');
-    var container = document.getElementById('filesContainer');
-    var cards = Array.from(container.querySelectorAll('.comment-card')).filter(function(card) {
+    const panel = document.getElementById('commentsPanel');
+    const container = document.getElementById('filesContainer');
+    const cards = Array.from(container.querySelectorAll('.comment-card')).filter(function(card) {
       return !panel || !panel.contains(card);
     });
     if (cards.length === 0) return;
 
-    var header = document.querySelector('.header');
-    var headerHeight = header ? header.offsetHeight : 52;
+    const header = document.querySelector('.header');
+    const headerHeight = header ? header.offsetHeight : 52;
 
     // Find current position by stored comment ID (immune to smooth-scroll race conditions)
-    var idx = -1;
+    let idx = -1;
     if (navCommentId) {
-      for (var i = 0; i < cards.length; i++) {
+      for (let i = 0; i < cards.length; i++) {
         if (cards[i].dataset.commentId === navCommentId) { idx = i; break; }
       }
     }
 
-    var targetIdx;
+    let targetIdx;
     if (direction === 1) {
       if (idx < 0) {
         // First use: pick first card below the header area by viewport position
         targetIdx = -1;
-        for (var j = 0; j < cards.length; j++) {
+        for (let j = 0; j < cards.length; j++) {
           if (cards[j].getBoundingClientRect().top > headerHeight + 8) { targetIdx = j; break; }
         }
         if (targetIdx < 0) targetIdx = 0;
@@ -6822,7 +6661,7 @@
       targetIdx = idx <= 0 ? cards.length - 1 : idx - 1;
     }
 
-    var target = cards[targetIdx];
+    const target = cards[targetIdx];
     navCommentId = target.dataset.commentId;
 
     if (navHighlightTimer) {
@@ -6832,10 +6671,10 @@
       });
     }
 
-    var rect = target.getBoundingClientRect();
-    var fileSection = target.closest('.file-section');
-    var fileHeader = fileSection ? fileSection.querySelector('.file-header') : null;
-    var fileHeaderHeight = fileHeader ? fileHeader.offsetHeight : 0;
+    const rect = target.getBoundingClientRect();
+    const fileSection = target.closest('.file-section');
+    const fileHeader = fileSection ? fileSection.querySelector('.file-header') : null;
+    const fileHeaderHeight = fileHeader ? fileHeader.offsetHeight : 0;
     window.scrollTo({ top: rect.top + window.scrollY - headerHeight - fileHeaderHeight - 16, behavior: 'smooth' });
     target.classList.add('comment-nav-highlight');
     navHighlightTimer = setTimeout(function() { target.classList.remove('comment-nav-highlight'); navHighlightTimer = null; }, 1000);
@@ -6865,14 +6704,426 @@
     renderCommentsPanel();
   });
 
-  // ===== Keyboard Shortcuts =====
-  function toggleShortcutsOverlay() {
-    document.getElementById('shortcutsOverlay').classList.toggle('active');
+  // ===== Settings Panel =====
+  function openSettingsPanel(tab) {
+    settingsPanelTab = tab || 'settings';
+    settingsPanelOpen = true;
+    const overlay = document.getElementById('settingsOverlay');
+    overlay.classList.add('active');
+    // Ensure the sliding underline element exists
+    if (!overlay.querySelector('.settings-tab-underline')) {
+      const underline = document.createElement('div');
+      underline.className = 'settings-tab-underline';
+      overlay.querySelector('.settings-tabs').appendChild(underline);
+    }
+    switchSettingsTab(settingsPanelTab);
+    // Fetch config if not cached
+    if (!cachedConfig) {
+      fetch('/api/config').then(function(r) { return r.json(); }).then(function(cfg) {
+        cachedConfig = cfg;
+        renderSettingsPane(cfg);
+        renderAboutPane(cfg);
+      });
+    }
+    renderShortcutsPane();
+    // Trap focus inside the settings dialog
+    trapFocusIn(overlay);
   }
 
-  document.getElementById('shortcutsToggle').addEventListener('click', toggleShortcutsOverlay);
-  document.getElementById('shortcutsOverlay').addEventListener('click', function(e) {
-    if (e.target === this) toggleShortcutsOverlay();
+  let focusTrapCleanup = null;
+
+  function trapFocusIn(container) {
+    releaseFocusTrap();
+    function handler(e) {
+      if (e.key !== 'Tab') return;
+      const focusable = container.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+      } else {
+        if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    }
+    container.addEventListener('keydown', handler);
+    focusTrapCleanup = function() { container.removeEventListener('keydown', handler); };
+    // Focus the first focusable element
+    const firstFocusable = container.querySelector('button:not([disabled]), [href], input:not([disabled])');
+    if (firstFocusable) requestAnimationFrame(function() { firstFocusable.focus(); });
+  }
+
+  function releaseFocusTrap() {
+    if (focusTrapCleanup) { focusTrapCleanup(); focusTrapCleanup = null; }
+  }
+
+  function closeSettingsPanel() {
+    settingsPanelOpen = false;
+    releaseFocusTrap();
+    document.getElementById('settingsOverlay').classList.remove('active');
+  }
+
+  function switchSettingsTab(tab) {
+    settingsPanelTab = tab;
+    let activeBtn = null;
+    document.querySelectorAll('.settings-tab[role="tab"]').forEach(function(t) {
+      const isActive = t.dataset.tab === tab;
+      t.classList.toggle('active', isActive);
+      t.setAttribute('aria-selected', String(isActive));
+      if (isActive) activeBtn = t;
+    });
+    document.querySelectorAll('.settings-pane').forEach(function(p) {
+      p.classList.toggle('active', p.dataset.pane === tab);
+    });
+    // Position the sliding underline
+    const underline = document.querySelector('.settings-tab-underline');
+    if (underline && activeBtn) {
+      const tabsRect = activeBtn.parentElement.getBoundingClientRect();
+      const btnRect = activeBtn.getBoundingClientRect();
+      underline.style.left = (btnRect.left - tabsRect.left) + 'px';
+      underline.style.width = btnRect.width + 'px';
+    }
+  }
+
+  function updatePillIndicator(indicatorId, values, current) {
+    const indicator = document.getElementById(indicatorId);
+    if (!indicator) return;
+    const idx = values.indexOf(current);
+    if (idx >= 0) {
+      indicator.style.left = (idx * (100 / values.length)) + '%';
+      indicator.style.width = (100 / values.length) + '%';
+    }
+  }
+
+  function renderSettingsPane(cfg) {
+    const pane = document.getElementById('settingsPane');
+    const currentTheme = getCookie('crit-theme') || 'system';
+    const currentWidth = getCookie('crit-width') || 'default';
+
+    let html = '';
+
+    // Display section
+    html += '<div class="settings-section-label">Display</div>';
+    html += '<div class="settings-display-group">';
+
+    // Theme row
+    html += '<div class="settings-display-row">';
+    html += '<span class="settings-display-label">Theme</span>';
+    html += '<div class="settings-pill settings-pill--theme" id="settingsThemePill" role="group" aria-label="Theme">';
+    html += '<div class="settings-pill-indicator" id="settingsThemeIndicator"></div>';
+    const themeIcons = {
+      system: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M2 4.25A2.25 2.25 0 0 1 4.25 2h7.5A2.25 2.25 0 0 1 14 4.25v5.5A2.25 2.25 0 0 1 11.75 12h-1.312c.1.128.21.248.328.36a.75.75 0 0 1 .234.545v.345a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1-.75-.75v-.345a.75.75 0 0 1 .234-.545c.118-.111.228-.232.328-.36H4.25A2.25 2.25 0 0 1 2 9.75v-5.5Zm2.25-.75a.75.75 0 0 0-.75.75v4.5c0 .414.336.75.75.75h7.5a.75.75 0 0 0 .75-.75v-4.5a.75.75 0 0 0-.75-.75h-7.5Z" clip-rule="evenodd"/></svg>',
+      light: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 1ZM10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0ZM12.95 4.11a.75.75 0 1 0-1.06-1.06l-1.062 1.06a.75.75 0 0 0 1.061 1.062l1.06-1.061ZM15 8a.75.75 0 0 1-.75.75h-1.5a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 15 8ZM11.89 12.95a.75.75 0 0 0 1.06-1.06l-1.06-1.062a.75.75 0 0 0-1.062 1.061l1.061 1.06ZM8 12a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 12ZM5.172 11.89a.75.75 0 0 0-1.061-1.062L3.05 11.89a.75.75 0 1 0 1.06 1.06l1.06-1.06ZM4 8a.75.75 0 0 1-.75.75h-1.5a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 4 8ZM4.11 5.172A.75.75 0 0 0 5.173 4.11L4.11 3.05a.75.75 0 1 0-1.06 1.06l1.06 1.06Z"/></svg>',
+      dark: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M14.438 10.148c.19-.425-.321-.787-.748-.601A5.5 5.5 0 0 1 6.453 2.31c.186-.427-.176-.938-.6-.748a6.501 6.501 0 1 0 8.585 8.586Z"/></svg>'
+    };
+    ['system', 'light', 'dark'].forEach(function(theme) {
+      const active = theme === currentTheme ? ' active' : '';
+      html += '<button class="settings-pill-btn' + active + '" data-settings-theme="' + theme + '" title="' + theme.charAt(0).toUpperCase() + theme.slice(1) + ' theme">' + themeIcons[theme] + '</button>';
+    });
+    html += '</div></div>';
+
+    // Width row
+    html += '<div class="settings-display-row">';
+    html += '<span class="settings-display-label">Content Width <span style="font-weight:400;color:var(--fg-muted)">(file mode)</span></span>';
+    html += '<div class="settings-pill settings-pill--width" id="settingsWidthPill" role="group" aria-label="Content width">';
+    html += '<div class="settings-pill-indicator" id="settingsWidthIndicator"></div>';
+    ['compact', 'default', 'wide'].forEach(function(w) {
+      const active = w === currentWidth ? ' active' : '';
+      html += '<button class="settings-pill-btn' + active + '" data-settings-width="' + w + '">' + w.charAt(0).toUpperCase() + w.slice(1) + '</button>';
+    });
+    html += '</div></div>';
+    html += '</div>'; // close settings-display-group
+
+    // Configuration section
+    html += '<div class="settings-section-label">Configuration</div>';
+    html += '<div class="config-cards">';
+
+    // Update card (shown only when an update is available)
+    if (cfg.latest_version && cfg.version && cfg.latest_version !== cfg.version && !cfg.no_update_check) {
+      const upgradeCmd = 'brew update && brew upgrade crit';
+      const releaseUrl = 'https://github.com/tomasz-tomczyk/crit/releases/tag/v' + escapeHtml(cfg.latest_version);
+      html += '<div class="config-card config-card--orange"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--yellow)">&#11014;</span>';
+      html += '<span class="config-card-title">Update available</span>';
+      html += '<span class="config-card-value">v' + escapeHtml(cfg.latest_version) + '</span>';
+      html += '</div>';
+      html += '<div class="config-card-cmd"><span>$ ' + escapeHtml(upgradeCmd) + '</span><button class="config-card-copy" data-copy="' + escapeHtml(upgradeCmd) + '">Copy</button></div>';
+      html += '<div class="config-card-body"><a class="about-link" href="' + releaseUrl + '" target="_blank" rel="noopener">Release notes</a></div>';
+      html += '</div>';
+    }
+
+    // Account card (only show if sharing is enabled)
+    if (cfg.share_url) {
+      if (cfg.auth_logged_in) {
+        const display = cfg.auth_user_email || cfg.auth_user_name || 'Logged in';
+        html += '<div class="config-card config-card--green"><div class="config-card-header">';
+        html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+        html += '<span class="config-card-title">Account</span>';
+        html += '<span class="config-card-value">' + escapeHtml(display) + '</span>';
+        html += '</div></div>';
+      } else {
+        html += '<div class="config-card config-card--red config-card--unconfigured"><div class="config-card-header">';
+        html += '<span class="config-card-icon" style="color:var(--red)">&#9675;</span>';
+        html += '<span class="config-card-title">Account</span>';
+        html += '</div>';
+        html += '<div class="config-card-body">Not logged in. Sign in to link reviews to your account and track review history.</div>';
+        html += '<div class="config-card-cmd"><span>$ crit auth login</span><button class="config-card-copy" data-copy="crit auth login">Copy</button></div>';
+        html += '</div>';
+      }
+    }
+
+    // Agent Command card
+    if (cfg.agent_cmd_enabled) {
+      html += '<div class="config-card config-card--green"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+      html += '<span class="config-card-title">Agent Command</span>';
+      html += '</div>';
+      html += '<div class="config-card-cmd-value"><code>' + escapeHtml(cfg.agent_cmd || cfg.agent_name || '') + '</code></div>';
+      html += '</div>';
+    } else {
+      html += '<div class="config-card config-card--orange config-card--unconfigured"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--yellow)">&#9675;</span>';
+      html += '<span class="config-card-title">Agent Command</span>';
+      html += '</div>';
+      html += '<div class="config-card-body">Edit <code>~/.crit.config.json</code> and set <code>agent_cmd</code> to send comments directly to your AI agent. <a href="https://github.com/tomasz-tomczyk/crit#send-to-agent-experimental" target="_blank" rel="noopener" style="color:var(--accent)">Learn more</a></div>';
+      html += '<div class="config-card-snippet">{"agent_cmd": "claude -p"}\n// Also: "opencode ask", "aider --message"</div>';
+      html += '</div>';
+    }
+
+    // Integration card (hidden if no_integration_check)
+    if (!cfg.no_integration_check) {
+      const integrations = cfg.integrations || [];
+      const anyInstalled = cfg.any_integration_installed;
+      if (anyInstalled) {
+        const current = integrations.filter(function(i) { return i.status === 'current'; });
+        const stale = integrations.filter(function(i) { return i.status === 'stale'; });
+        if (stale.length > 0) {
+          const si = stale[0];
+          const name = si.agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+          html += '<div class="config-card config-card--yellow"><div class="config-card-header">';
+          html += '<span class="config-card-icon" style="color:var(--yellow)">&#9888;</span>';
+          html += '<span class="config-card-title">AI Integration</span>';
+          html += '<span class="config-card-value">' + escapeHtml(name) + ' (update available)</span>';
+          html += '</div>';
+          const hintLines = si.hint.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+          hintLines.forEach(function(line) {
+            const parts = line.split('|');
+            let label = '';
+            let cmd = line.replace(/^Run:\s*/i, '');
+            if (parts.length === 2) {
+              label = parts[0];
+              cmd = parts[1];
+            }
+            html += '<div class="config-card-cmd">';
+            if (label) html += '<span class="config-card-cmd-label">' + escapeHtml(label) + '</span>';
+            html += '<span>$ ' + escapeHtml(cmd) + '</span><button class="config-card-copy" data-copy="' + escapeHtml(cmd) + '">Copy</button></div>';
+          });
+          html += '</div>';
+        } else if (current.length > 0) {
+          const name = current[0].agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+          html += '<div class="config-card config-card--green"><div class="config-card-header">';
+          html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+          html += '<span class="config-card-title">AI Integration</span>';
+          html += '<span class="config-card-value">' + escapeHtml(name) + ' (up to date)</span>';
+          html += '</div></div>';
+        }
+      } else {
+        const available = (cfg.integrations_available || []).join(' \u00b7 ');
+        html += '<div class="config-card config-card--blue config-card--unconfigured"><div class="config-card-header">';
+        html += '<span class="config-card-icon" style="color:var(--accent)">&#128161;</span>';
+        html += '<span class="config-card-title">AI Integration</span>';
+        html += '<span class="config-card-badge">Recommended</span>';
+        html += '</div>';
+        html += '<div class="config-card-body">Install a plugin so your AI agent can launch crit, read comments, and iterate.</div>';
+        html += '<div class="config-card-cmd"><span>$ crit install claude-code</span><button class="config-card-copy" data-copy="crit install claude-code">Copy</button></div>';
+        if (available) html += '<div class="config-card-agents">Also: ' + escapeHtml(available) + '</div>';
+        html += '</div>';
+      }
+    }
+
+    // Share card
+    if (cfg.share_url) {
+      let hostname;
+      try { hostname = new URL(cfg.share_url).hostname; } catch (_) { hostname = cfg.share_url; }
+      html += '<div class="config-card config-card--green"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+      html += '<span class="config-card-title">Sharing enabled</span>';
+      html += '<span class="config-card-value">' + escapeHtml(hostname) + '</span>';
+      html += '</div></div>';
+    } else {
+      html += '<div class="config-card config-card--gray config-card--unconfigured"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--fg-muted)">&mdash;</span>';
+      html += '<span class="config-card-title">Share</span>';
+      html += '<span class="config-card-value">Disabled</span>';
+      html += '</div></div>';
+    }
+    html += '</div>'; // close config-cards
+
+    pane.innerHTML = html;
+
+    // Wire up theme pill clicks
+    pane.querySelectorAll('[data-settings-theme]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const theme = btn.dataset.settingsTheme;
+        applyTheme(theme);
+        pane.querySelectorAll('[data-settings-theme]').forEach(function(b) { b.classList.toggle('active', b.dataset.settingsTheme === theme); });
+        updatePillIndicator('settingsThemeIndicator', ['system', 'light', 'dark'], theme);
+      });
+    });
+    updatePillIndicator('settingsThemeIndicator', ['system', 'light', 'dark'], currentTheme);
+
+    // Wire up width pill clicks
+    pane.querySelectorAll('[data-settings-width]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const w = btn.dataset.settingsWidth;
+        applyWidth(w);
+        pane.querySelectorAll('[data-settings-width]').forEach(function(b) { b.classList.toggle('active', b.dataset.settingsWidth === w); });
+        updatePillIndicator('settingsWidthIndicator', ['compact', 'default', 'wide'], w);
+      });
+    });
+    updatePillIndicator('settingsWidthIndicator', ['compact', 'default', 'wide'], currentWidth);
+
+    // Wire up copy buttons
+    pane.querySelectorAll('.config-card-copy').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const text = btn.dataset.copy;
+        navigator.clipboard.writeText(text).then(function() {
+          btn.textContent = '\u2713 Copied';
+          btn.setAttribute('aria-label', 'Copied');
+          announceCopy();
+          btn.classList.add('copied');
+          setTimeout(function() {
+            btn.textContent = 'Copy';
+            btn.setAttribute('aria-label', 'Copy');
+            btn.classList.remove('copied');
+          }, 1500);
+        });
+      });
+    });
+  }
+
+  function renderShortcutsPane() {
+    const pane = document.getElementById('shortcutsPane');
+    let html = '';
+
+    const groups = [
+      { label: 'Navigation', shortcuts: [
+        { key: '<kbd>j</kbd>', action: 'Next block' },
+        { key: '<kbd>k</kbd>', action: 'Previous block' },
+        { key: '<kbd>]</kbd>', action: 'Next comment' },
+        { key: '<kbd>[</kbd>', action: 'Previous comment' },
+        { key: '<kbd>n</kbd>', action: 'Next change', mode: 'file mode' },
+        { key: '<kbd>N</kbd>', action: 'Previous change', mode: 'file mode' },
+      ]},
+      { label: 'Comments', shortcuts: [
+        { key: '<kbd>c</kbd>', action: 'Comment on focused block' },
+        { key: '<kbd>e</kbd>', action: 'Edit comment on focused block' },
+        { key: '<kbd>d</kbd>', action: 'Delete comment on focused block' },
+        { key: '<kbd>G</kbd>', action: 'General comment' },
+        { key: '<kbd>Ctrl</kbd>+<kbd>Enter</kbd>', action: 'Submit comment' },
+      ]},
+      { label: 'Review', shortcuts: [
+        { key: '<kbd>Shift</kbd>+<kbd>F</kbd>', action: 'Finish review' },
+        { key: '<kbd>Shift</kbd>+<kbd>C</kbd>', action: 'Toggle comments panel' },
+        { key: '<kbd>Shift</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>/<kbd>4</kbd>', action: 'Switch scope', mode: 'git mode' },
+      ]},
+      { label: 'View', shortcuts: [
+        { key: '<kbd>t</kbd>', action: 'Toggle table of contents', mode: 'file mode' },
+        { key: '<kbd>Esc</kbd>', action: 'Cancel / clear focus' },
+        { key: '<kbd>?</kbd>', action: 'Toggle this panel' },
+      ]},
+    ];
+
+    groups.forEach(function(group) {
+      html += '<div class="shortcuts-group-label">' + group.label + '</div>';
+      html += '<table class="shortcuts-table">';
+      group.shortcuts.forEach(function(s) {
+        const modeTag = s.mode ? '<span class="shortcut-mode-badge">' + s.mode + '</span>' : '';
+        html += '<tr><td>' + s.key + '</td><td>' + s.action + modeTag + '</td></tr>';
+      });
+      html += '</table>';
+    });
+
+    pane.innerHTML = html;
+  }
+
+  function renderAboutPane(cfg) {
+    const pane = document.getElementById('aboutPane');
+    let html = '';
+
+    // Version header
+    html += '<div class="about-header">';
+    html += '<h2>Crit</h2>';
+    const ver = cfg.version || 'dev';
+    html += '<div class="about-version">' + escapeHtml(ver) + '</div>';
+    if (!cfg.no_update_check) {
+      if (cfg.latest_version && cfg.version && cfg.latest_version !== cfg.version) {
+        html += '<div class="about-badge about-badge--update">Update available: ' + escapeHtml(cfg.latest_version) + '</div>';
+      } else if (cfg.version && cfg.version !== 'dev') {
+        html += '<div class="about-badge about-badge--current">Up to date</div>';
+      }
+    }
+    html += '</div>';
+
+    // Session info
+    html += '<div class="settings-section-label">Current Session</div>';
+    html += '<div class="about-session"><div class="about-session-grid">';
+    html += '<span class="about-session-label">Mode</span><span class="about-session-value">' + (session.mode || 'unknown') + '</span>';
+    if (session.mode === 'git' && session.branch) {
+      html += '<span class="about-session-label">Branch</span><span class="about-session-value">' + escapeHtml(session.branch) + '</span>';
+    }
+    if (session.base_ref) {
+      html += '<span class="about-session-label">Base</span><span class="about-session-value">' + escapeHtml(session.base_branch_name || session.base_ref) + '</span>';
+    }
+    html += '<span class="about-session-label">Round</span><span class="about-session-value">' + (session.review_round || 1) + '</span>';
+    html += '<span class="about-session-label">Files</span><span class="about-session-value">' + (session.files ? session.files.length : 0) + ' changed</span>';
+    if (cfg.review_path) {
+      html += '<span class="about-session-label">Review file</span><span class="about-session-value"><code>' + escapeHtml(cfg.review_path) + '</code></span>';
+    }
+    html += '</div></div>';
+
+    // Links
+    html += '<div class="settings-section-label">Links</div>';
+    html += '<div class="about-links">';
+    html += '<a class="about-link" href="https://crit.md" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1v4M5.5 3h5M3 7h10v6.5a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5V7Z"/></svg>Homepage</a>';
+    html += '<a class="about-link" href="https://github.com/tomasz-tomczyk/crit" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>GitHub</a>';
+    html += '<a class="about-link" href="https://github.com/tomasz-tomczyk/crit/releases" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l6.25 6.25a1.75 1.75 0 0 1 0 2.474l-5.026 5.026a1.75 1.75 0 0 1-2.474 0l-6.25-6.25A1.752 1.752 0 0 1 1 7.775Zm1.5 0c0 .066.026.13.073.177l6.25 6.25a.25.25 0 0 0 .354 0l5.025-5.025a.25.25 0 0 0 0-.354l-6.25-6.25a.25.25 0 0 0-.177-.073H2.75a.25.25 0 0 0-.25.25ZM6 5a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>Changelog</a>';
+    html += '</div>';
+
+    pane.innerHTML = html;
+  }
+
+  // Gear icon opens Settings tab
+  document.getElementById('settingsToggle').addEventListener('click', function() {
+    if (settingsPanelOpen) closeSettingsPanel();
+    else openSettingsPanel('settings');
+  });
+
+  // Close button
+  document.getElementById('settingsClose').addEventListener('click', closeSettingsPanel);
+
+  // Click outside to close
+  document.getElementById('settingsOverlay').addEventListener('click', function(e) {
+    if (e.target === this) closeSettingsPanel();
+  });
+
+  // Tab switching
+  document.querySelectorAll('.settings-tab[data-tab]').forEach(function(tab) {
+    tab.addEventListener('click', function() { switchSettingsTab(tab.dataset.tab); });
+  });
+
+  // Arrow key navigation for ARIA tabs pattern
+  document.querySelector('.settings-tabs[role="tablist"]').addEventListener('keydown', function(e) {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const tabs = Array.from(this.querySelectorAll('.settings-tab[data-tab]'));
+    const current = tabs.findIndex(function(t) { return t.getAttribute('aria-selected') === 'true'; });
+    if (current === -1) return;
+    let next = e.key === 'ArrowRight' ? current + 1 : current - 1;
+    if (next < 0) next = tabs.length - 1;
+    if (next >= tabs.length) next = 0;
+    e.preventDefault();
+    switchSettingsTab(tabs[next].dataset.tab);
+    tabs[next].focus();
   });
 
   document.getElementById('noChangesOverlay').addEventListener('click', function(e) {
@@ -6901,10 +7152,14 @@
       return;
     }
 
-    if (document.getElementById('shortcutsOverlay').classList.contains('active')) {
-      if (e.key === 'Escape' || e.key === '?') {
+    if (settingsPanelOpen) {
+      if (e.key === 'Escape') {
         e.preventDefault();
-        toggleShortcutsOverlay();
+        closeSettingsPanel();
+      } else if (e.key === '?') {
+        e.preventDefault();
+        if (settingsPanelTab === 'shortcuts') closeSettingsPanel();
+        else switchSettingsTab('shortcuts');
       }
       return;
     }
@@ -7052,7 +7307,7 @@
       }
       case '?': {
         e.preventDefault();
-        toggleShortcutsOverlay();
+        openSettingsPanel('shortcuts');
         break;
       }
       case 'Escape': {
@@ -7106,7 +7361,7 @@
           // Try both document view (.line-block) and diff view elements.
           // Also collect content elements in order for offset computation.
           let fullText = '';
-          var contentEls = [];
+          const contentEls = [];
           for (let ln = range.startLine; ln <= range.endLine; ln++) {
             // Document view
             document.querySelectorAll('.line-block[data-file-path]').forEach(function(el) {
@@ -7121,7 +7376,7 @@
               }
             });
             // Diff view — filter by side so unified diff doesn't double-count
-            var selSide = range.side || '';
+            const selSide = range.side || '';
             document.querySelectorAll('[data-diff-file-path][data-diff-line-num="' + ln + '"]').forEach(function(el) {
               if (el.dataset.diffFilePath !== range.filePath) return;
               if (el.dataset.diffSide !== selSide) return;
@@ -7143,18 +7398,18 @@
             // substrings (e.g. "foo foo foo" — selecting the last "foo").
             try {
               // Determine which end of the selection comes first in document order
-              var selRange = selection.getRangeAt(0);
-              var startContainer = selRange.startContainer;
-              var startOff = selRange.startOffset;
+              const selRange = selection.getRangeAt(0);
+              const startContainer = selRange.startContainer;
+              const startOff = selRange.startOffset;
 
               // Walk content elements to find total chars before selection start
-              var charsBefore = 0;
-              var foundEl = false;
-              for (var ci = 0; ci < contentEls.length; ci++) {
+              let charsBefore = 0;
+              let foundEl = false;
+              for (let ci = 0; ci < contentEls.length; ci++) {
                 if (contentEls[ci].contains(startContainer)) {
                   // Walk text nodes in this element up to the start node
-                  var walker = document.createTreeWalker(contentEls[ci], NodeFilter.SHOW_TEXT, null);
-                  var tn;
+                  const walker = document.createTreeWalker(contentEls[ci], NodeFilter.SHOW_TEXT, null);
+                  let tn;
                   while ((tn = walker.nextNode())) {
                     if (tn === startContainer) {
                       charsBefore += startOff;
@@ -7170,13 +7425,13 @@
 
               if (foundEl) {
                 // Build the raw text up to charsBefore, then normalize to get offset
-                var rawAll = '';
-                var rawUpTo = charsBefore;
-                for (var ri = 0; ri < contentEls.length; ri++) {
+                let rawAll = '';
+                const rawUpTo = charsBefore;
+                for (let ri = 0; ri < contentEls.length; ri++) {
                   rawAll += contentEls[ri].textContent;
                   if (contentEls[ri].contains(startContainer)) break;
                 }
-                var textBefore = rawAll.slice(0, rawUpTo);
+                const textBefore = rawAll.slice(0, rawUpTo);
                 quoteOffset = textBefore.replace(/\s+/g, ' ').trimStart().length;
               }
             } catch (_) { /* offset is a nice-to-have */ }

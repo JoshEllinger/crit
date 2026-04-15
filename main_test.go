@@ -1,12 +1,18 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestSubcommandDispatch_Help verifies that help flags are recognized.
@@ -300,9 +306,25 @@ func TestHelperProcess_CommentJSON(t *testing.T) {
 
 // TestRunComment_JSONFlagMixed verifies that --json handles mixed comments and replies.
 func TestRunComment_JSONFlagMixed(t *testing.T) {
+	// Step 1: Create a comment and capture its ID
+	tmp := t.TempDir()
+	err := addCommentToCritJSON("main.go", 1, 1, "comment", "TestBot", tmp)
+	if err != nil {
+		t.Fatalf("setup comment: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, ".crit.json"))
+	if err != nil {
+		t.Fatalf("read .crit.json: %v", err)
+	}
+	var cj CritJSON
+	json.Unmarshal(data, &cj)
+	commentID := cj.Files["main.go"].Comments[0].ID
+
+	// Step 2: Run --json with a new comment + reply to the existing comment
+	input := fmt.Sprintf(`[{"file":"main.go","line":5,"body":"another"},{"reply_to":%q,"body":"reply","resolve":true}]`, commentID)
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess_CommentJSONMix$", "--")
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1")
-	cmd.Stdin = strings.NewReader(`[{"file":"main.go","line":1,"body":"comment"},{"reply_to":"c1","body":"reply","resolve":true}]`)
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "TEST_OUTPUT_DIR="+tmp)
+	cmd.Stdin = strings.NewReader(input)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("process exited with error: %v\noutput: %s", err, out)
@@ -316,56 +338,14 @@ func TestHelperProcess_CommentJSONMix(t *testing.T) {
 	if os.Getenv("GO_TEST_HELPER") != "1" {
 		return
 	}
-	tmp := t.TempDir()
+	tmp := os.Getenv("TEST_OUTPUT_DIR")
+	if tmp == "" {
+		tmp = t.TempDir()
+	}
 	runComment([]string{"--json", "--output", tmp, "--author", "TestBot"})
 }
 
-func TestParsePushEvent_Default(t *testing.T) {
-	event, err := parsePushEvent("")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if event != "COMMENT" {
-		t.Errorf("default event = %q, want COMMENT", event)
-	}
-}
-
-func TestParsePushEvent_Approve(t *testing.T) {
-	event, err := parsePushEvent("approve")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if event != "APPROVE" {
-		t.Errorf("event = %q, want APPROVE", event)
-	}
-}
-
-func TestParsePushEvent_RequestChanges(t *testing.T) {
-	event, err := parsePushEvent("request-changes")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if event != "REQUEST_CHANGES" {
-		t.Errorf("event = %q, want REQUEST_CHANGES", event)
-	}
-}
-
-func TestParsePushEvent_Comment(t *testing.T) {
-	event, err := parsePushEvent("comment")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if event != "COMMENT" {
-		t.Errorf("event = %q, want COMMENT", event)
-	}
-}
-
-func TestParsePushEvent_Invalid(t *testing.T) {
-	_, err := parsePushEvent("reject")
-	if err == nil {
-		t.Error("expected error for invalid event type, got nil")
-	}
-}
+// TestParsePushEvent is in github_test.go with comprehensive cases.
 
 // TestResolveServerConfig_BaseBranch verifies that --base-branch sets defaultBranchOverride
 // and that config file base_branch is used as a fallback when the flag is absent.
@@ -806,5 +786,229 @@ func TestResolvePlanConfig_NameOnly(t *testing.T) {
 	}
 	if !pc.stdinExpected {
 		t.Error("expected stdinExpected=true when no file arg")
+	}
+}
+
+func TestCountComments(t *testing.T) {
+	cj := CritJSON{
+		Files: map[string]CritJSONFile{
+			"a.go": {Comments: []Comment{
+				{ID: "c1", Resolved: false},
+				{ID: "c2", Resolved: true},
+			}},
+			"b.go": {Comments: []Comment{
+				{ID: "c3", Resolved: false},
+			}},
+		},
+		ReviewComments: []Comment{
+			{ID: "r1", Resolved: true},
+		},
+	}
+	unresolved, resolved := countComments(cj)
+	if unresolved != 2 {
+		t.Errorf("unresolved = %d, want 2", unresolved)
+	}
+	if resolved != 2 {
+		t.Errorf("resolved = %d, want 2", resolved)
+	}
+}
+
+func TestFindStaleReviews(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a review file with an old updated_at.
+	oldTime := time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	cj := CritJSON{
+		Branch:      "old-branch",
+		UpdatedAt:   oldTime,
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"main.go": {Comments: []Comment{{ID: "c1"}}},
+		},
+	}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "stale123.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a recent review file.
+	recentCJ := CritJSON{
+		Branch:      "recent-branch",
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		ReviewRound: 1,
+		Files:       map[string]CritJSONFile{},
+	}
+	recentData, _ := json.MarshalIndent(recentCJ, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "recent456.json"), recentData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := findStaleReviews(dir, 7)
+	if len(stale) != 1 {
+		t.Fatalf("expected 1 stale review, got %d", len(stale))
+	}
+	if stale[0].branch != "old-branch" {
+		t.Errorf("branch = %q, want %q", stale[0].branch, "old-branch")
+	}
+	if stale[0].comments != 1 {
+		t.Errorf("comments = %d, want 1", stale[0].comments)
+	}
+}
+
+func TestDeleteStaleReviews(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.json")
+	if err := os.WriteFile(path, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := []staleReview{{key: "test", path: path}}
+	deleted := deleteStaleReviews(stale)
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("stale review file should be deleted")
+	}
+}
+
+func TestCleanupOnApproval_DeletesReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	reviewPath := filepath.Join(dir, "review.json")
+	os.WriteFile(reviewPath, []byte(`{"branch":"main"}`), 0644)
+
+	// approved=true with cleanup enabled should delete the file.
+	cleanupOnApproval(true, reviewPath, true)
+
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Error("expected review file to be deleted after approval")
+	}
+}
+
+func TestCleanupOnApproval_KeepsFileWhenNotApproved(t *testing.T) {
+	dir := t.TempDir()
+	reviewPath := filepath.Join(dir, "review.json")
+	os.WriteFile(reviewPath, []byte(`{"branch":"main"}`), 0644)
+
+	cleanupOnApproval(false, reviewPath, true)
+
+	if _, err := os.Stat(reviewPath); os.IsNotExist(err) {
+		t.Error("expected review file to still exist when not approved")
+	}
+}
+
+func TestCleanupOnApproval_KeepsFileWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	reviewPath := filepath.Join(dir, "review.json")
+	os.WriteFile(reviewPath, []byte(`{"branch":"main"}`), 0644)
+
+	// approved=true but cleanup disabled — file should stay.
+	cleanupOnApproval(true, reviewPath, false)
+
+	if _, err := os.Stat(reviewPath); os.IsNotExist(err) {
+		t.Error("expected review file to still exist when cleanup is disabled")
+	}
+}
+
+// TestRunReviewClientRaw_WaitsForReadiness verifies that runReviewClientRaw
+// polls /api/session until the daemon is ready (non-503) before hitting
+// /api/review-cycle. Regression test for the plan-hook auto-approve bug where
+// review-cycle was called immediately after daemon start, got 503, and
+// allowed through on error.
+func TestRunReviewClientRaw_WaitsForReadiness(t *testing.T) {
+	var sessionCalls atomic.Int32
+	var reviewCycleCalled atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/session":
+			n := sessionCalls.Add(1)
+			if n <= 2 {
+				// First two calls return 503 (still initializing)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				json.NewEncoder(w).Encode(map[string]string{"status": "loading"})
+				return
+			}
+			// Third call: ready
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+		case "/api/review-cycle":
+			reviewCycleCalled.Store(true)
+			// Verify session was polled past the 503 phase
+			if sessionCalls.Load() < 3 {
+				t.Errorf("review-cycle called after only %d session polls, expected >=3", sessionCalls.Load())
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{"approved": true, "prompt": ""})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	// Extract port from test server URL
+	port := 0
+	fmt.Sscanf(ts.URL, "http://127.0.0.1:%d", &port)
+	if port == 0 {
+		fmt.Sscanf(ts.URL, "http://localhost:%d", &port)
+	}
+	if port == 0 {
+		t.Fatalf("could not parse port from test server URL: %s", ts.URL)
+	}
+
+	entry := sessionEntry{Port: port}
+	approved, _ := runReviewClientRaw(entry)
+
+	if !reviewCycleCalled.Load() {
+		t.Error("review-cycle was never called")
+	}
+	if !approved {
+		t.Error("expected approved=true")
+	}
+	if n := sessionCalls.Load(); n < 3 {
+		t.Errorf("expected at least 3 session polls (2x503 + 1x200), got %d", n)
+	}
+}
+
+// TestRunReviewClientRaw_NoReadinessDelay verifies that when the daemon is
+// already ready, runReviewClientRaw proceeds immediately without extra delay.
+func TestRunReviewClientRaw_NoReadinessDelay(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/session":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case "/api/review-cycle":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{"approved": false, "prompt": "fix this"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	port := 0
+	fmt.Sscanf(ts.URL, "http://127.0.0.1:%d", &port)
+	if port == 0 {
+		fmt.Sscanf(ts.URL, "http://localhost:%d", &port)
+	}
+	if port == 0 {
+		t.Fatalf("could not parse port from test server URL: %s", ts.URL)
+	}
+
+	start := time.Now()
+	approved, prompt := runReviewClientRaw(sessionEntry{Port: port})
+	elapsed := time.Since(start)
+
+	if approved {
+		t.Error("expected approved=false")
+	}
+	if prompt != "fix this" {
+		t.Errorf("expected prompt='fix this', got %q", prompt)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("took %v, expected near-instant when daemon is already ready", elapsed)
 	}
 }
