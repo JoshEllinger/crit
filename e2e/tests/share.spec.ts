@@ -5,13 +5,11 @@ import { loadPage } from './helpers';
 // Share Feature — Git Mode (share button disabled in git mode with tooltip)
 // ============================================================
 test.describe('Share — Git Mode', () => {
-  test('share button is disabled in git mode', async ({ page }) => {
+  test('share button is hidden when no share_url is configured', async ({ page }) => {
     await loadPage(page);
 
     const shareBtn = page.locator('#shareBtn');
-    await expect(shareBtn).toBeVisible();
-    await expect(shareBtn).toBeDisabled();
-    await expect(shareBtn).toHaveAttribute('title', /not available in git mode/i);
+    await expect(shareBtn).not.toBeVisible();
   });
 
   test('config API returns empty share_url when not configured', async ({ request }) => {
