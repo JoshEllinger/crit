@@ -105,6 +105,10 @@ type FileEntry struct {
 	// Stats for lazy files (populated from git diff --numstat)
 	LazyAdditions int `json:"-"`
 	LazyDeletions int `json:"-"`
+
+	// Orphaned: file has comments in the review file but is no longer in the session's
+	// file list (e.g., added on branch then deleted). No content or diff available.
+	Orphaned bool `json:"-"`
 }
 
 // ensureLoaded loads content and diff hunks for a lazy file on first access.
@@ -1190,10 +1194,10 @@ func (s *Session) ClearAllComments() {
 		s.writeTimer.Stop()
 	}
 	s.writeGen++
-	// Reset all file state and drop the review file entry from the file list.
+	// Reset all file state, drop the review file entry and orphaned phantom entries.
 	filtered := make([]*FileEntry, 0, len(s.Files))
 	for _, f := range s.Files {
-		if filepath.Base(f.Path) == ".crit.json" {
+		if filepath.Base(f.Path) == ".crit.json" || f.Orphaned {
 			continue
 		}
 		f.Comments = []Comment{}
@@ -1817,12 +1821,62 @@ func (s *Session) loadCritJSON() {
 		}
 	}
 
+	// Detect orphaned paths: files in the review file with comments but not in the session.
+	s.appendOrphanedFiles(cj.Files)
+
 	// Restore review-level comments.
 	s.reviewComments = cj.ReviewComments
 
 	// Record the mtime so the first ticker tick doesn't re-process our own file.
 	if info, err := os.Stat(s.critJSONPath()); err == nil {
 		s.lastCritJSONMtime = info.ModTime()
+	}
+}
+
+// restoreOrphanedComments reads the review file and creates phantom FileEntry
+// objects for any paths that have comments but aren't in s.Files.
+// Safe to call multiple times — existing entries (including previous orphans) are skipped.
+// Must be called with s.mu NOT held (acquires the lock internally).
+func (s *Session) restoreOrphanedComments() {
+	data, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		return
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appendOrphanedFiles(cj.Files)
+}
+
+// appendOrphanedFiles creates phantom FileEntry objects for paths in critFiles
+// that have comments but no matching entry in s.Files. Must be called with
+// s.mu held or during init (before concurrent access).
+func (s *Session) appendOrphanedFiles(critFiles map[string]CritJSONFile) {
+	knownPaths := make(map[string]bool, len(s.Files))
+	for _, f := range s.Files {
+		knownPaths[f.Path] = true
+	}
+	for path, cf := range critFiles {
+		if knownPaths[path] || len(cf.Comments) == 0 {
+			continue
+		}
+		fe := &FileEntry{
+			Path:     path,
+			Status:   "removed",
+			FileType: detectFileType(path),
+			Comments: cf.Comments,
+			Orphaned: true,
+		}
+		for i := range fe.Comments {
+			if fe.Comments[i].Scope == "" {
+				fe.Comments[i].Scope = "line"
+			}
+		}
+		s.Files = append(s.Files, fe)
 	}
 }
 
@@ -2007,6 +2061,7 @@ type SessionFileInfo struct {
 	Additions    int    `json:"additions"`
 	Deletions    int    `json:"deletions"`
 	Lazy         bool   `json:"lazy,omitempty"`
+	Orphaned     bool   `json:"orphaned,omitempty"`
 }
 
 // GetSessionInfo returns a snapshot of session metadata.
@@ -2036,6 +2091,7 @@ func (s *Session) GetSessionInfo() SessionInfo {
 			FileType:     f.FileType,
 			CommentCount: len(f.Comments),
 			Lazy:         f.Lazy,
+			Orphaned:     f.Orphaned,
 		}
 		if f.Lazy {
 			// Use pre-computed stats from git diff --numstat
