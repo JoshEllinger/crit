@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -285,6 +286,7 @@ func carryForwardComment(old Comment, newID string, now string) Comment {
 		Body:           old.Body,
 		Quote:          old.Quote,
 		QuoteOffset:    old.QuoteOffset,
+		Anchor:         old.Anchor,
 		Author:         old.Author,
 		Scope:          old.Scope,
 		CreatedAt:      old.CreatedAt,
@@ -357,8 +359,22 @@ func (s *Session) handleRoundCompleteGit() {
 	// Refresh file list (agent may have created/deleted files)
 	s.RefreshFileList()
 
+	// Snapshot markdown PreviousContent before re-reading, then carry forward
+	// with LCS + anchor verification (same as files mode).
 	s.mu.Lock()
+	for _, f := range s.Files {
+		if f.FileType == "markdown" && f.PreviousContent == "" {
+			f.PreviousContent = f.Content
+		}
+	}
 	s.rereadFileContents(false)
+	s.mu.Unlock()
+
+	// Run LCS-based carry-forward for markdown files (with anchor verification).
+	s.carryForwardComments()
+
+	// Carry forward remaining files (code files, or markdown files without PreviousContent).
+	s.mu.Lock()
 	s.carryForwardAllComments()
 	s.mu.Unlock()
 
@@ -466,6 +482,102 @@ func (s *Session) loadResolvedComments() {
 	}
 }
 
+// findAnchorInLines searches for the anchor text in the given lines (joined with newline).
+// Returns the 1-indexed start line of the best match, or 0 if not found.
+// If multiple matches exist, returns the one closest to preferredStart.
+func findAnchorInLines(lines []string, anchor string, preferredStart int) int {
+	anchorLines := strings.Split(anchor, "\n")
+	anchorLen := len(anchorLines)
+	if anchorLen == 0 || len(lines) < anchorLen {
+		return 0
+	}
+
+	var matches []int
+	for i := 0; i <= len(lines)-anchorLen; i++ {
+		candidate := strings.Join(lines[i:i+anchorLen], "\n")
+		if candidate == anchor {
+			matches = append(matches, i+1) // 1-indexed
+		}
+	}
+
+	if len(matches) == 0 {
+		return 0
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+
+	// Multiple matches: pick closest to the LCS-suggested position.
+	best := matches[0]
+	bestDist := abs(best - preferredStart)
+	for _, m := range matches[1:] {
+		d := abs(m - preferredStart)
+		if d < bestDist {
+			best = m
+			bestDist = d
+		}
+	}
+	return best
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// verifyAndCorrectPosition checks whether the LCS-remapped position still
+// points at the anchor text. If not, it searches the new content for the anchor.
+// Returns the corrected (start, end) and whether the comment has drifted.
+func verifyAndCorrectPosition(newLines []string, anchor string, lcsStart, lcsEnd int) (start, end, drifted int) {
+	anchorLines := strings.Split(anchor, "\n")
+	anchorLen := len(anchorLines)
+
+	// Check if the LCS position still matches.
+	if lcsStart >= 1 && lcsStart+anchorLen-1 <= len(newLines) {
+		candidate := strings.Join(newLines[lcsStart-1:lcsStart+anchorLen-1], "\n")
+		if candidate == anchor {
+			return lcsStart, lcsStart + anchorLen - 1, 0
+		}
+	}
+
+	// LCS position doesn't match — search the entire file.
+	found := findAnchorInLines(newLines, anchor, lcsStart)
+	if found > 0 {
+		return found, found + anchorLen - 1, 0
+	}
+
+	// Anchor not found anywhere — mark drifted, keep LCS position.
+	return lcsStart, lcsEnd, 1
+}
+
+// remapLines translates old start/end line numbers through the LCS line map,
+// falling back to the original positions and clamping to [1, maxLine].
+func remapLines(lineMap map[int]int, oldStart, oldEnd, maxLine int) (int, int) {
+	s := lineMap[oldStart]
+	e := lineMap[oldEnd]
+	if s == 0 {
+		s = oldStart
+	}
+	if e == 0 {
+		e = oldEnd
+	}
+	if s > maxLine {
+		s = maxLine
+	}
+	if e > maxLine {
+		e = maxLine
+	}
+	if s < 1 {
+		s = 1
+	}
+	if e < s {
+		e = s
+	}
+	return s, e
+}
+
 // carryForwardComments maps comments from the previous round
 // to the new document positions for markdown files.
 func (s *Session) carryForwardComments() {
@@ -493,7 +605,8 @@ func (s *Session) carryForwardComments() {
 		entries := ComputeLineDiff(prevContent, currContent)
 		lineMap := MapOldLineToNew(entries)
 
-		newLineCount := len(splitLines(currContent))
+		newLines := splitLines(currContent)
+		newLineCount := len(newLines)
 		if newLineCount == 0 {
 			newLineCount = 1
 		}
@@ -513,29 +626,18 @@ func (s *Session) carryForwardComments() {
 				f.Comments = append(f.Comments, carried)
 				continue
 			}
-			newStart := lineMap[c.StartLine]
-			newEnd := lineMap[c.EndLine]
-			if newStart == 0 {
-				newStart = c.StartLine
-			}
-			if newEnd == 0 {
-				newEnd = c.EndLine
-			}
-			if newStart > newLineCount {
-				newStart = newLineCount
-			}
-			if newEnd > newLineCount {
-				newEnd = newLineCount
-			}
-			if newStart < 1 {
-				newStart = 1
-			}
-			if newEnd < newStart {
-				newEnd = newStart
-			}
+			newStart, newEnd := remapLines(lineMap, c.StartLine, c.EndLine, newLineCount)
 			carried := carryForwardComment(c, randomCommentID(), now)
 			carried.StartLine = newStart
 			carried.EndLine = newEnd
+
+			// Anchor-based verification and correction.
+			if c.Anchor != "" {
+				corrStart, corrEnd, drift := verifyAndCorrectPosition(newLines, c.Anchor, newStart, newEnd)
+				carried.StartLine = corrStart
+				carried.EndLine = corrEnd
+				carried.Drifted = drift != 0
+			}
 
 			f.Comments = append(f.Comments, carried)
 		}

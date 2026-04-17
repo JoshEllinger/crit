@@ -4482,6 +4482,14 @@
       headerLeft.appendChild(badge);
     }
 
+    if (comment.drifted) {
+      wrapper.classList.add('outdated-comment');
+      const driftedBadge = document.createElement('span');
+      driftedBadge.className = 'outdated-badge';
+      driftedBadge.textContent = 'Drifted';
+      headerLeft.appendChild(driftedBadge);
+    }
+
     const actions = document.createElement('div');
     actions.className = 'comment-actions';
 
@@ -4493,6 +4501,78 @@
     bodyEl.innerHTML = commentMd.render(comment.body, filePath ? buildCommentEnv(comment, filePath) : undefined);
 
     card.appendChild(header);
+
+    // Drifted anchor context — show original content that was commented on
+    if (comment.drifted && comment.anchor) {
+      const driftedCtx = document.createElement('div');
+      driftedCtx.className = 'drifted-context';
+
+      const toggle = document.createElement('button');
+      toggle.className = 'drifted-toggle';
+      toggle.type = 'button';
+
+      const chevron = document.createElement('span');
+      chevron.className = 'drifted-chevron';
+      chevron.innerHTML = '<svg viewBox="0 0 10 10" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,1.5 7,5 3.5,8.5"/></svg>';
+
+      const toggleLabel = document.createElement('span');
+      toggleLabel.className = 'drifted-toggle-label';
+      toggleLabel.textContent = 'Referenced content at time of review';
+
+      const anchorLines = comment.anchor.split('\n');
+      const toggleMeta = document.createElement('span');
+      toggleMeta.className = 'drifted-toggle-meta';
+      toggleMeta.textContent = anchorLines.length === 1 ? '1 line' : anchorLines.length + ' lines';
+
+      toggle.appendChild(chevron);
+      toggle.appendChild(toggleLabel);
+      toggle.appendChild(toggleMeta);
+
+      // Panel with CSS grid animation wrapper
+      const panelId = 'drifted-panel-' + comment.id;
+      const wrapper = document.createElement('div');
+      wrapper.className = 'drifted-panel-wrapper';
+      const inner = document.createElement('div');
+      inner.className = 'drifted-panel-inner';
+      const panel = document.createElement('div');
+      panel.className = 'drifted-panel';
+      panel.id = panelId;
+
+      // Render anchor text with line numbers
+      const pre = document.createElement('pre');
+      pre.className = 'drifted-anchor-text';
+      const startLine = comment.start_line || 1;
+      anchorLines.forEach(function(line, i) {
+        const lineEl = document.createElement('span');
+        lineEl.className = 'drifted-line';
+        const numEl = document.createElement('span');
+        numEl.className = 'drifted-line-number';
+        numEl.textContent = String(startLine + i);
+        const contentEl = document.createElement('span');
+        contentEl.className = 'drifted-line-content';
+        contentEl.textContent = line;
+        lineEl.appendChild(numEl);
+        lineEl.appendChild(contentEl);
+        pre.appendChild(lineEl);
+      });
+
+      panel.appendChild(pre);
+      inner.appendChild(panel);
+      wrapper.appendChild(inner);
+
+      toggle.setAttribute('aria-expanded', 'false');
+      toggle.setAttribute('aria-controls', panelId);
+      toggle.addEventListener('click', function() {
+        const isExpanded = driftedCtx.classList.contains('expanded');
+        driftedCtx.classList.toggle('expanded', !isExpanded);
+        toggle.setAttribute('aria-expanded', String(!isExpanded));
+      });
+
+      driftedCtx.appendChild(toggle);
+      driftedCtx.appendChild(wrapper);
+      card.appendChild(driftedCtx);
+    }
+
     card.appendChild(bodyEl);
 
     // Render replies
