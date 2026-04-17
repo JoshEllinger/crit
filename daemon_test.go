@@ -13,47 +13,63 @@ import (
 )
 
 func TestSessionKey_Deterministic(t *testing.T) {
-	k1 := sessionKey("/tmp/repo", []string{"plan.md"})
-	k2 := sessionKey("/tmp/repo", []string{"plan.md"})
+	k1 := sessionKey("/tmp/repo", "main", []string{"plan.md"})
+	k2 := sessionKey("/tmp/repo", "main", []string{"plan.md"})
 	if k1 != k2 {
 		t.Errorf("same inputs produced different keys: %s vs %s", k1, k2)
 	}
 }
 
 func TestSessionKey_DifferentArgs(t *testing.T) {
-	k1 := sessionKey("/tmp/repo", nil)
-	k2 := sessionKey("/tmp/repo", []string{"plan.md"})
+	k1 := sessionKey("/tmp/repo", "main", nil)
+	k2 := sessionKey("/tmp/repo", "main", []string{"plan.md"})
 	if k1 == k2 {
 		t.Errorf("different args produced same key: %s", k1)
 	}
 }
 
 func TestSessionKey_SortedArgs(t *testing.T) {
-	k1 := sessionKey("/tmp/repo", []string{"a.md", "b.md"})
-	k2 := sessionKey("/tmp/repo", []string{"b.md", "a.md"})
+	k1 := sessionKey("/tmp/repo", "main", []string{"a.md", "b.md"})
+	k2 := sessionKey("/tmp/repo", "main", []string{"b.md", "a.md"})
 	if k1 != k2 {
 		t.Errorf("arg order should not matter: %s vs %s", k1, k2)
 	}
 }
 
 func TestSessionKey_DifferentCWD(t *testing.T) {
-	k1 := sessionKey("/tmp/repo1", nil)
-	k2 := sessionKey("/tmp/repo2", nil)
+	k1 := sessionKey("/tmp/repo1", "main", nil)
+	k2 := sessionKey("/tmp/repo2", "main", nil)
 	if k1 == k2 {
 		t.Errorf("different CWDs produced same key: %s", k1)
 	}
 }
 
 func TestSessionKey_NilVsEmpty(t *testing.T) {
-	k1 := sessionKey("/tmp/repo", nil)
-	k2 := sessionKey("/tmp/repo", []string{})
+	k1 := sessionKey("/tmp/repo", "main", nil)
+	k2 := sessionKey("/tmp/repo", "main", []string{})
 	if k1 != k2 {
 		t.Errorf("nil and empty args should produce same key: %s vs %s", k1, k2)
 	}
 }
 
+func TestSessionKey_FileMode_BranchIndependent(t *testing.T) {
+	k1 := sessionKey("/tmp/repo", "main", []string{"plan.md"})
+	k2 := sessionKey("/tmp/repo", "feature-x", []string{"plan.md"})
+	if k1 != k2 {
+		t.Errorf("file-mode key should be branch-independent: %s vs %s", k1, k2)
+	}
+}
+
+func TestSessionKey_GitMode_BranchDependent(t *testing.T) {
+	k1 := sessionKey("/tmp/repo", "main", nil)
+	k2 := sessionKey("/tmp/repo", "feature-x", nil)
+	if k1 == k2 {
+		t.Errorf("git-mode key should differ by branch: %s", k1)
+	}
+}
+
 func TestSessionKey_Length(t *testing.T) {
-	k := sessionKey("/tmp/repo", nil)
+	k := sessionKey("/tmp/repo", "main", nil)
 	if len(k) != 12 {
 		t.Errorf("expected key length 12, got %d: %s", len(k), k)
 	}
@@ -386,5 +402,210 @@ func TestIsDaemonAlive_AcceptsCritResponse(t *testing.T) {
 	entry := sessionEntry{PID: os.Getpid(), Port: port}
 	if !isDaemonAlive(entry) {
 		t.Error("isDaemonAlive should return true for valid crit health response")
+	}
+}
+
+func TestFindSessionForCWDBranch_MatchesByBranch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cwd := "/tmp/myrepo"
+
+	// Create a mock HTTP server that responds to /api/health
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts.Close()
+	port, _ := strconv.Atoi(ts.URL[strings.LastIndex(ts.URL, ":")+1:])
+
+	// Write a session with file args (simulates "crit README.md")
+	writeSessionFile("abc123def456", sessionEntry{
+		PID:        os.Getpid(),
+		Port:       port,
+		CWD:        cwd,
+		Args:       []string{"README.md"},
+		Branch:     "main",
+		ReviewPath: "/tmp/reviews/abc123def456.json",
+	})
+
+	// findSessionForCWDBranch should find it by cwd + branch
+	entry, key, matchCount := findSessionForCWDBranch(cwd, "main")
+	if matchCount != 1 {
+		t.Fatalf("expected matchCount 1, got %d", matchCount)
+	}
+	if key != "abc123def456" {
+		t.Errorf("expected key abc123def456, got %s", key)
+	}
+	if entry.Port != port {
+		t.Errorf("expected port %d, got %d", port, entry.Port)
+	}
+}
+
+func TestFindSessionForCWDBranch_NoBranchMatch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cwd := "/tmp/myrepo"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts.Close()
+	port, _ := strconv.Atoi(ts.URL[strings.LastIndex(ts.URL, ":")+1:])
+
+	writeSessionFile("abc123def456", sessionEntry{
+		PID:    os.Getpid(),
+		Port:   port,
+		CWD:    cwd,
+		Branch: "feature/other",
+	})
+
+	_, _, matchCount := findSessionForCWDBranch(cwd, "main")
+	if matchCount != 0 {
+		t.Errorf("expected matchCount 0, got %d", matchCount)
+	}
+}
+
+func TestFindSessionForCWDBranch_MultipleMatches(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cwd := "/tmp/myrepo"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts.Close()
+	port, _ := strconv.Atoi(ts.URL[strings.LastIndex(ts.URL, ":")+1:])
+
+	// Two sessions on same branch (different file args)
+	writeSessionFile("session1aaaa", sessionEntry{
+		PID:    os.Getpid(),
+		Port:   port,
+		CWD:    cwd,
+		Args:   []string{"README.md"},
+		Branch: "main",
+	})
+	writeSessionFile("session2bbbb", sessionEntry{
+		PID:    os.Getpid(),
+		Port:   port,
+		CWD:    cwd,
+		Branch: "main",
+	})
+
+	// Should return matchCount > 1 when ambiguous
+	_, _, matchCount := findSessionForCWDBranch(cwd, "main")
+	if matchCount != 2 {
+		t.Errorf("expected matchCount 2 for ambiguous case, got %d", matchCount)
+	}
+}
+
+func TestListSessionsForRepoRoot_MatchesSubdirectories(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	repoRoot := "/tmp/myrepo"
+
+	// Create mock HTTP servers for alive sessions
+	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts1.Close()
+	port1, _ := strconv.Atoi(ts1.URL[strings.LastIndex(ts1.URL, ":")+1:])
+
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts2.Close()
+	port2, _ := strconv.Atoi(ts2.URL[strings.LastIndex(ts2.URL, ":")+1:])
+
+	ts3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts3.Close()
+	port3, _ := strconv.Atoi(ts3.URL[strings.LastIndex(ts3.URL, ":")+1:])
+
+	pid := os.Getpid()
+
+	// Session started from repo/api subdirectory
+	writeSessionFile("sub1", sessionEntry{PID: pid, Port: port1, CWD: repoRoot + "/api", Branch: "feat", ReviewPath: "/reviews/sub1.json"})
+	// Session started from repo root
+	writeSessionFile("sub2", sessionEntry{PID: pid, Port: port2, CWD: repoRoot, Branch: "main", ReviewPath: "/reviews/sub2.json"})
+	// Session from a completely different repo
+	writeSessionFile("other", sessionEntry{PID: pid, Port: port3, CWD: "/tmp/other-repo", Branch: "main", ReviewPath: "/reviews/other.json"})
+
+	entries, keys := listSessionsForRepoRoot(repoRoot)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 sessions for repo root, got %d", len(entries))
+	}
+
+	// Verify both repo sessions found, other excluded
+	foundKeys := map[string]bool{}
+	for _, k := range keys {
+		foundKeys[k] = true
+	}
+	if !foundKeys["sub1"] || !foundKeys["sub2"] {
+		t.Errorf("expected keys sub1 and sub2, got %v", keys)
+	}
+	if foundKeys["other"] {
+		t.Error("should not include session from different repo")
+	}
+}
+
+func TestListSessionsForRepoRoot_NoPartialMatch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts.Close()
+	port, _ := strconv.Atoi(ts.URL[strings.LastIndex(ts.URL, ":")+1:])
+
+	// /tmp/myrepo-extended should NOT match /tmp/myrepo
+	writeSessionFile("extended", sessionEntry{PID: os.Getpid(), Port: port, CWD: "/tmp/myrepo-extended", Branch: "main"})
+
+	entries, _ := listSessionsForRepoRoot("/tmp/myrepo")
+	if len(entries) != 0 {
+		t.Errorf("expected 0 sessions (no partial match), got %d", len(entries))
+	}
+}
+
+func TestCleanOrphanedSessions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sessDir := filepath.Join(home, ".crit", "sessions")
+
+	// Create a session file with a dead PID (PID that cannot exist).
+	deadEntry := sessionEntry{PID: 999999999, Port: 12345, CWD: "/tmp/repo"}
+	if err := writeSessionFile("deadpid12345", deadEntry); err != nil {
+		t.Fatalf("writeSessionFile: %v", err)
+	}
+
+	// Create a session file with a live PID (our own process).
+	// isDaemonAlive also checks HTTP, so this will fail the HTTP probe and
+	// be treated as dead. Use an httptest server to keep it alive.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts.Close()
+	port, _ := strconv.Atoi(ts.URL[strings.LastIndex(ts.URL, ":")+1:])
+
+	liveEntry := sessionEntry{PID: os.Getpid(), Port: port, CWD: "/tmp/repo"}
+	if err := writeSessionFile("livepid12345", liveEntry); err != nil {
+		t.Fatalf("writeSessionFile: %v", err)
+	}
+
+	cleanOrphanedSessions()
+
+	// Dead PID session should be removed.
+	if _, err := os.Stat(filepath.Join(sessDir, "deadpid12345.json")); !os.IsNotExist(err) {
+		t.Error("expected dead PID session file to be removed")
+	}
+
+	// Live PID session should still exist.
+	if _, err := os.Stat(filepath.Join(sessDir, "livepid12345.json")); err != nil {
+		t.Error("expected live PID session file to still exist")
 	}
 }

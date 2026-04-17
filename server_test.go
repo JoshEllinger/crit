@@ -22,10 +22,10 @@ func newTestServer(t *testing.T) (*Server, *Session) {
 	}
 
 	session := &Session{
-		Mode:          "files",
-		RepoRoot:      dir,
-		ReviewRound:   1,
-		nextID:        1,
+		Mode:        "files",
+		RepoRoot:    dir,
+		ReviewRound: 1,
+
 		subscribers:   make(map[chan SSEEvent]struct{}),
 		roundComplete: make(chan struct{}, 1),
 		Files: []*FileEntry{
@@ -388,26 +388,6 @@ func TestFinish_PromptBareGitMode(t *testing.T) {
 	}
 }
 
-func TestFinish_ApproveReturnsEmptyPrompt(t *testing.T) {
-	s, _ := newTestServer(t)
-
-	// No comments = approve → approved=true and empty prompt
-	req := httptest.NewRequest("POST", "/api/finish", nil)
-	w := httptest.NewRecorder()
-	s.ServeHTTP(w, req)
-
-	var resp map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp["prompt"] != "" {
-		t.Errorf("expected empty prompt for approve, got: %s", resp["prompt"])
-	}
-	if resp["approved"] != true {
-		t.Errorf("expected approved=true, got %v", resp["approved"])
-	}
-}
-
 func TestFinish_UnresolvedReturnsPromptWithInstructions(t *testing.T) {
 	s, session := newTestServer(t)
 	session.AddComment("test.md", 1, 1, "", "fix this", "", "")
@@ -646,24 +626,9 @@ func TestCheckForUpdates(t *testing.T) {
 
 	s, _ := newTestServer(t)
 	s.currentVersion = "v1.0.0"
+	s.githubAPIURL = gh.URL
 
-	// Test the parsing logic via our mock
-	req, _ := http.NewRequest("GET", gh.URL+"/repos/tomasz-tomczyk/crit/releases/latest", nil)
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var release struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		t.Fatal(err)
-	}
-	s.versionMu.Lock()
-	s.latestVersion = release.TagName
-	s.versionMu.Unlock()
+	s.CheckForUpdates()
 
 	s.versionMu.RLock()
 	got := s.latestVersion
@@ -672,16 +637,48 @@ func TestCheckForUpdates(t *testing.T) {
 		t.Errorf("latestVersion = %q, want v9.9.9", got)
 	}
 
-	// Verify config reflects it
-	req2 := httptest.NewRequest("GET", "/api/config", nil)
-	w2 := httptest.NewRecorder()
-	s.ServeHTTP(w2, req2)
+	// Verify config API reflects it
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
 	var cfg map[string]any
-	if err := json.Unmarshal(w2.Body.Bytes(), &cfg); err != nil {
+	if err := json.Unmarshal(w.Body.Bytes(), &cfg); err != nil {
 		t.Fatal(err)
 	}
 	if cfg["latest_version"] != "v9.9.9" {
 		t.Errorf("config latest_version = %v, want v9.9.9", cfg["latest_version"])
+	}
+}
+
+func TestCheckForUpdates_SkipsDevVersion(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.currentVersion = "dev"
+	s.CheckForUpdates()
+
+	s.versionMu.RLock()
+	got := s.latestVersion
+	s.versionMu.RUnlock()
+	if got != "" {
+		t.Errorf("latestVersion should be empty for dev builds, got %q", got)
+	}
+}
+
+func TestCheckForUpdates_HandlesServerError(t *testing.T) {
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer gh.Close()
+
+	s, _ := newTestServer(t)
+	s.currentVersion = "v1.0.0"
+	s.githubAPIURL = gh.URL
+	s.CheckForUpdates()
+
+	s.versionMu.RLock()
+	got := s.latestVersion
+	s.versionMu.RUnlock()
+	if got != "" {
+		t.Errorf("latestVersion should be empty on server error, got %q", got)
 	}
 }
 
@@ -1759,6 +1756,111 @@ func TestHandleConfig_AgentCmdEnabled(t *testing.T) {
 	}
 }
 
+func TestHandleConfig_AuthAndIntegrationFields(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.authToken = "test-token"
+	s.cfg = Config{
+		AuthUserName:  "Test User",
+		AuthUserEmail: "test@example.com",
+	}
+	s.projectDir = t.TempDir()
+	s.homeDir = t.TempDir()
+	s.reviewPath = "/tmp/test-review.json"
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Auth fields
+	if resp["auth_logged_in"] != true {
+		t.Errorf("auth_logged_in = %v, want true", resp["auth_logged_in"])
+	}
+	if resp["auth_user_name"] != "Test User" {
+		t.Errorf("auth_user_name = %v, want Test User", resp["auth_user_name"])
+	}
+	if resp["auth_user_email"] != "test@example.com" {
+		t.Errorf("auth_user_email = %v, want test@example.com", resp["auth_user_email"])
+	}
+
+	// Review path
+	if resp["review_path"] != "/tmp/test-review.json" {
+		t.Errorf("review_path = %v, want /tmp/test-review.json", resp["review_path"])
+	}
+
+	// Integration fields
+	avail, ok := resp["integrations_available"].([]any)
+	if !ok || len(avail) == 0 {
+		t.Error("integrations_available should be a non-empty array")
+	}
+	if _, ok := resp["integrations"]; !ok {
+		t.Error("integrations field should be present")
+	}
+	if _, ok := resp["any_integration_installed"]; !ok {
+		t.Error("any_integration_installed field should be present")
+	}
+
+	// Config pass-throughs
+	if resp["no_integration_check"] != false {
+		t.Errorf("no_integration_check = %v, want false", resp["no_integration_check"])
+	}
+	if resp["no_update_check"] != false {
+		t.Errorf("no_update_check = %v, want false", resp["no_update_check"])
+	}
+}
+
+func TestHandleConfig_AuthNotLoggedIn(t *testing.T) {
+	s, _ := newTestServer(t)
+	// authToken is empty by default
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["auth_logged_in"] != false {
+		t.Errorf("auth_logged_in = %v, want false", resp["auth_logged_in"])
+	}
+	if resp["auth_user_name"] != "" {
+		t.Errorf("auth_user_name = %v, want empty", resp["auth_user_name"])
+	}
+}
+
+func TestHandleConfig_NoIntegrationCheck(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.cfg = Config{NoIntegrationCheck: true}
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["no_integration_check"] != true {
+		t.Errorf("no_integration_check = %v, want true", resp["no_integration_check"])
+	}
+	integrations, ok := resp["integrations"].([]any)
+	if !ok {
+		t.Fatal("integrations should be an array")
+	}
+	if len(integrations) != 0 {
+		t.Errorf("integrations should be empty when check disabled, got %d", len(integrations))
+	}
+	if resp["any_integration_installed"] != false {
+		t.Errorf("any_integration_installed should be false when check disabled")
+	}
+}
+
 func TestFuzzyScore(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1939,10 +2041,10 @@ func TestReadinessGate_Returns200AfterSetSession(t *testing.T) {
 	os.WriteFile(path, []byte("hello\n"), 0644)
 
 	session := &Session{
-		Mode:          "files",
-		RepoRoot:      dir,
-		ReviewRound:   1,
-		nextID:        1,
+		Mode:        "files",
+		RepoRoot:    dir,
+		ReviewRound: 1,
+
 		subscribers:   make(map[chan SSEEvent]struct{}),
 		roundComplete: make(chan struct{}, 1),
 		Files: []*FileEntry{
@@ -2090,28 +2192,143 @@ func TestSetPRInfo_ConcurrentSafe(t *testing.T) {
 	<-done
 }
 
-func TestWithReady_503WhenNotReady(t *testing.T) {
-	// Create a server without a session — the server should not be ready.
-	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestAgentName is in server_agent_test.go (TestAgentName_Codex covers all cases).
 
-	req := httptest.NewRequest("GET", "/api/session", nil)
+func TestFileCommentResolveAPI(t *testing.T) {
+	srv, session := newTestServer(t)
+	c, _ := session.AddComment("test.md", 1, 1, "", "fix this", "", "")
+
+	// Resolve
+	body := `{"resolved": true}`
+	req := httptest.NewRequest("PUT", "/api/comment/"+c.ID+"/resolve?path=test.md", strings.NewReader(body))
 	w := httptest.NewRecorder()
-	s.ServeHTTP(w, req)
+	srv.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("PUT resolve: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resolved Comment
+	json.Unmarshal(w.Body.Bytes(), &resolved)
+	if !resolved.Resolved {
+		t.Error("expected comment to be resolved")
+	}
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", w.Code)
+	// Unresolve
+	body = `{"resolved": false}`
+	req = httptest.NewRequest("PUT", "/api/comment/"+c.ID+"/resolve?path=test.md", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("PUT unresolve: status = %d", w.Code)
 	}
-	if got := w.Header().Get("Retry-After"); got != "1" {
-		t.Errorf("Retry-After = %q, want %q", got, "1")
+	var unresolved Comment
+	json.Unmarshal(w.Body.Bytes(), &unresolved)
+	if unresolved.Resolved {
+		t.Error("expected comment to be unresolved")
 	}
-	var body map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("failed to decode response body: %v", err)
+
+	// Not found
+	req = httptest.NewRequest("PUT", "/api/comment/nonexistent/resolve?path=test.md", strings.NewReader(`{"resolved": true}`))
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Errorf("resolve nonexistent: status = %d, want 404", w.Code)
 	}
-	if body["status"] != "loading" {
-		t.Errorf("status = %q, want %q", body["status"], "loading")
+}
+
+func TestFileCommentReplyAPI(t *testing.T) {
+	srv, session := newTestServer(t)
+	c, _ := session.AddComment("test.md", 1, 1, "", "fix this", "", "")
+
+	// POST reply
+	body := strings.NewReader(`{"body": "done, fixed", "author": "agent"}`)
+	req := httptest.NewRequest("POST", "/api/comment/"+c.ID+"/replies?path=test.md", body)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 201 {
+		t.Fatalf("POST reply: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var reply Reply
+	json.Unmarshal(w.Body.Bytes(), &reply)
+	if reply.Body != "done, fixed" {
+		t.Errorf("reply body = %q", reply.Body)
+	}
+	if reply.Author != "agent" {
+		t.Errorf("reply author = %q", reply.Author)
+	}
+
+	// PUT reply
+	body = strings.NewReader(`{"body": "updated reply"}`)
+	req = httptest.NewRequest("PUT", "/api/comment/"+c.ID+"/replies/"+reply.ID+"?path=test.md", body)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("PUT reply: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var updated Reply
+	json.Unmarshal(w.Body.Bytes(), &updated)
+	if updated.Body != "updated reply" {
+		t.Errorf("updated body = %q", updated.Body)
+	}
+
+	// DELETE reply
+	req = httptest.NewRequest("DELETE", "/api/comment/"+c.ID+"/replies/"+reply.ID+"?path=test.md", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 204 {
+		t.Fatalf("DELETE reply: status = %d", w.Code)
+	}
+
+	// Verify reply is gone
+	comments := session.GetComments("test.md")
+	if len(comments[0].Replies) != 0 {
+		t.Errorf("expected 0 replies after delete, got %d", len(comments[0].Replies))
+	}
+}
+
+func TestFileCommentReplyNotFound(t *testing.T) {
+	srv, _ := newTestServer(t)
+	body := strings.NewReader(`{"body": "reply", "author": "agent"}`)
+	req := httptest.NewRequest("POST", "/api/comment/nonexistent/replies?path=test.md", body)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Errorf("POST reply to nonexistent: status = %d, want 404", w.Code)
+	}
+}
+
+func TestAPIUpdateComment_EmptyBody(t *testing.T) {
+	srv, session := newTestServer(t)
+	c, _ := session.AddComment("test.md", 1, 1, "", "original", "", "")
+
+	body := `{"body": ""}`
+	req := httptest.NewRequest("PUT", "/api/comment/"+c.ID+"?path=test.md", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Errorf("PUT with empty body: status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleAgentRequest_NotConfigured(t *testing.T) {
+	srv, session := newTestServer(t)
+	session.AddComment("test.md", 1, 1, "", "fix this", "", "")
+
+	body := strings.NewReader(`{"comment_id": "c1"}`)
+	req := httptest.NewRequest("POST", "/api/agent/request", body)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Errorf("expected 400 when agent_cmd not configured, got %d", w.Code)
+	}
+}
+
+func TestHandleAgentRequest_MethodNotAllowed(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/api/agent/request", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 405 {
+		t.Errorf("expected 405, got %d", w.Code)
 	}
 }

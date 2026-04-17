@@ -194,12 +194,13 @@ test.describe('Comments Panel — Git Mode', () => {
     await expect(fileNames).toHaveCount(2);
   });
 
-  test('keyboard shortcut in shortcuts overlay', async ({ page }) => {
+  test('keyboard shortcut in shortcuts panel', async ({ page }) => {
     await loadPage(page);
     await page.keyboard.press('?');
-    const overlay = page.locator('.shortcuts-overlay.active');
-    await expect(overlay).toBeVisible();
-    await expect(overlay).toContainText('Toggle comments panel');
+    const overlay = page.locator('.settings-overlay');
+    await expect(overlay).toHaveClass(/active/);
+    const pane = page.locator('.settings-pane[data-pane="shortcuts"]');
+    await expect(pane).toContainText('Toggle comments panel');
   });
 
   // --- Resolved / carried-forward comment tests ---
@@ -208,12 +209,12 @@ test.describe('Comments Panel — Git Mode', () => {
     const mdPath = await getMdPath(request);
     await addComment(request, mdPath, 1, 'Will be resolved');
 
-    // Finish to write .crit.json
+    // Finish to write the review file
     const finishRes = await request.post('/api/finish');
     const finishData = await finishRes.json();
     const critJsonPath = finishData.review_file;
 
-    // Mark comment as resolved in .crit.json
+    // Mark comment as resolved in the review file
     const critJson = JSON.parse(fs.readFileSync(critJsonPath, 'utf-8'));
     for (const fileKey of Object.keys(critJson.files)) {
       for (const comment of critJson.files[fileKey].comments) {
@@ -261,7 +262,7 @@ test.describe('Comments Panel — Git Mode', () => {
 
     await loadPage(page);
 
-    // After round-complete, .crit.json appears in session, so mdSection helper
+    // After round-complete, the review file appears in session, so mdSection helper
     // can match multiple sections. Use the plan.md section by ID directly.
     const mdSectionById = page.locator('#file-section-plan\\.md');
     const docBtn = mdSectionById.locator('.file-header-toggle .toggle-btn[data-mode="document"]');

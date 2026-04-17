@@ -1,0 +1,56 @@
+{
+  "branch": "",
+  "base_ref": "",
+  "updated_at": "2026-04-17T19:16:36Z",
+  "review_round": 1,
+  "share_url": "https://crit.md/r/test123",
+  "delete_token": "tok_test",
+  "share_scope": "0bbe5bc4573bcf1c",
+  "files": {
+    "plan.md": {
+      "status": "",
+      "file_hash": "",
+      "comments": [
+        {
+          "id": "c1",
+          "start_line": 1,
+          "end_line": 1,
+          "body": "Fix this",
+          "created_at": "",
+          "updated_at": ""
+        },
+        {
+          "id": "c2",
+          "start_line": 2,
+          "end_line": 2,
+          "body": "Done",
+          "created_at": "",
+          "updated_at": "",
+          "resolved": true
+        }
+      ]
+    },
+    "test.md": {
+      "status": "",
+      "file_hash": "",
+      "comments": [
+        {
+          "id": "c1",
+          "start_line": 1,
+          "end_line": 1,
+          "body": "Fix this",
+          "created_at": "",
+          "updated_at": "2026-04-17T19:16:32Z",
+          "replies": [
+            {
+              "id": "rp_afccde",
+              "body": "Done, fixed it",
+              "author": "agent",
+              "created_at": "2026-04-17T19:16:32Z"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

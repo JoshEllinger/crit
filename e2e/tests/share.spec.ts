@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import { loadPage } from './helpers';
 
 // ============================================================
-// Share Feature — Git Mode (share button hidden even with default share_url)
+// Share Feature — Git Mode (share button hidden in git mode)
 // ============================================================
 test.describe('Share — Git Mode', () => {
   test('share button is hidden in git mode', async ({ page }) => {

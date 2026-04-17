@@ -1,3 +1,8 @@
+---
+name: crit
+description: Review code changes or a plan with crit inline comments. Use when asked to review code, a plan, a diff, or when you want structured human feedback on your work.
+---
+
 # Review with Crit
 
 Review and revise code changes or a plan using `crit` for inline comment review.
@@ -32,11 +37,11 @@ This starts the daemon if needed (or connects to an existing one), opens the bro
 
 Tell the user: **"Crit is open in your browser. Leave inline comments, then click Finish Review."**
 
-**Do NOT proceed until `crit` completes.** Do NOT ask the user to type anything. Do NOT read `.crit.json` early. Wait for the foreground command to finish — that is how you know the human is done reviewing.
+**Do NOT proceed until `crit` completes.** Do NOT ask the user to type anything. Do NOT read the review file early. Wait for the foreground command to finish — that is how you know the human is done reviewing.
 
 ## Step 3: Read the review output
 
-Read the `.crit.json` file in the repo root (or working directory).
+When `crit` completes, its stdout output includes the path to the review file. Read that file.
 
 The file contains structured JSON with comments per file:
 
@@ -45,14 +50,14 @@ The file contains structured JSON with comments per file:
   "files": {
     "plan.md": {
       "comments": [
-        { "id": "c1", "start_line": 5, "end_line": 10, "body": "Clarify this step", "quote": "specific words", "resolved": false }
+        { "id": "c_a1b2c3", "start_line": 5, "end_line": 10, "body": "Clarify this step", "quote": "specific words", "anchor": "The sessions table needs a complete rewrite...", "resolved": false }
       ]
     }
   }
 }
 ```
 
-Identify all comments where `"resolved": false` or where the `resolved` field is missing (missing means unresolved). If a comment has a `"quote"` field, it contains the specific text the reviewer selected — focus your changes on the quoted text rather than the entire line range.
+Identify all comments where `"resolved": false` or where the `resolved` field is missing (missing means unresolved). If a comment has a `"quote"` field, it contains the specific text the reviewer selected — focus your changes on the quoted text rather than the entire line range. If a comment has an `"anchor"` field, use it to locate the current position of the content rather than trusting `start_line`/`end_line` which may be stale after edits. If `"drifted": true`, the original content was removed or heavily rewritten — the line numbers are approximate at best.
 
 ## Step 4: Address each review comment
 
@@ -61,15 +66,15 @@ For each unresolved comment:
 1. Understand what the comment asks for (clarification, change, addition, removal)
 2. If a comment contains a suggestion block, apply that specific change
 3. Revise the **referenced file** to address the feedback - this could be the plan file or any code file
-4. Reply to the comment with what you did: `crit comment --reply-to <id> --author 'GitHub Copilot' '<what you did>'`
+4. Reply to the comment with what you did: `crit comment --reply-to <id> --author 'Cursor' '<what you did>'`
 
 When addressing multiple comments, use `--json` to reply to them all in one call:
 
 ```bash
 echo '[
-  {"reply_to": "c1", "body": "Fixed"},
-  {"reply_to": "c2", "body": "Refactored as suggested"}
-]' | crit comment --json --author 'GitHub Copilot'
+  {"reply_to": "c_a1b2c3", "body": "Fixed"},
+  {"reply_to": "c_d4e5f6", "body": "Refactored as suggested"}
+]' | crit comment --json --author 'Cursor'
 ```
 
 Editing the plan file triggers Crit's live reload - the user sees changes in the browser immediately.
@@ -80,10 +85,11 @@ Editing the plan file triggers Crit's live reload - the user sees changes in the
 
 **CRITICAL — you MUST run this step. Do NOT skip it. Do NOT proceed without it.**
 
-Run `crit` in the foreground and block until it exits:
+Run the **exact same `crit` command from Step 2** in the foreground and block until it exits. This is critical — if you launched `crit plan.md` in Step 2, you must run `crit plan.md` again here (not bare `crit`). The daemon is keyed by the arguments, so mismatched args will start a new daemon instead of reconnecting.
 
 ```bash
-crit
+# Must match Step 2 exactly:
+crit <same-args-as-step-2>
 ```
 
 On subsequent calls, `crit` automatically signals round-complete first, then blocks again until the next "Finish Review" click.

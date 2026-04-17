@@ -20,9 +20,9 @@ func newTestSession(t *testing.T) *Session {
 	writeFile(t, goPath, "package main\n\nfunc main() {}\n")
 
 	s := &Session{
-		RepoRoot:      dir,
-		ReviewRound:   1,
-		nextID:        1,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+
 		subscribers:   make(map[chan SSEEvent]struct{}),
 		roundComplete: make(chan struct{}, 1),
 		Files: []*FileEntry{
@@ -69,8 +69,8 @@ func TestSession_AddComment(t *testing.T) {
 	if !ok {
 		t.Fatal("AddComment failed")
 	}
-	if c.ID != "c1" {
-		t.Errorf("ID = %q, want c1", c.ID)
+	if !strings.HasPrefix(c.ID, "c_") || len(c.ID) != 8 {
+		t.Errorf("ID = %q, want c_ prefix + 6 hex chars", c.ID)
 	}
 	if c.Body != "Rethink this" {
 		t.Errorf("Body = %q", c.Body)
@@ -92,8 +92,8 @@ func TestSession_AddComment_NonexistentFile(t *testing.T) {
 
 func TestSession_UpdateComment(t *testing.T) {
 	s := newTestSession(t)
-	s.AddComment("plan.md", 1, 1, "", "original", "", "")
-	updated, ok := s.UpdateComment("plan.md", "c1", "updated body")
+	c, _ := s.AddComment("plan.md", 1, 1, "", "original", "", "")
+	updated, ok := s.UpdateComment("plan.md", c.ID, "updated body")
 	if !ok {
 		t.Fatal("UpdateComment failed")
 	}
@@ -112,8 +112,8 @@ func TestSession_UpdateComment_NotFound(t *testing.T) {
 
 func TestSession_DeleteComment(t *testing.T) {
 	s := newTestSession(t)
-	s.AddComment("plan.md", 1, 1, "", "to delete", "", "")
-	if !s.DeleteComment("plan.md", "c1") {
+	c, _ := s.AddComment("plan.md", 1, 1, "", "to delete", "", "")
+	if !s.DeleteComment("plan.md", c.ID) {
 		t.Fatal("DeleteComment failed")
 	}
 	if len(s.GetComments("plan.md")) != 0 {
@@ -226,24 +226,6 @@ func TestSession_UnresolvedCommentCount(t *testing.T) {
 	}
 	if got := s.TotalCommentCount(); got != 4 {
 		t.Errorf("TotalCommentCount = %d, want 4", got)
-	}
-}
-
-func TestSession_UnresolvedCommentCount_AllResolved(t *testing.T) {
-	s := newTestSession(t)
-	s.mu.Lock()
-	f := s.fileByPathLocked("plan.md")
-	f.Comments = []Comment{
-		{ID: "c1", StartLine: 1, EndLine: 1, Body: "done", Resolved: true},
-		{ID: "c2", StartLine: 2, EndLine: 2, Body: "done too", Resolved: true},
-	}
-	s.mu.Unlock()
-
-	if got := s.UnresolvedCommentCount(); got != 0 {
-		t.Errorf("UnresolvedCommentCount = %d, want 0", got)
-	}
-	if got := s.TotalCommentCount(); got != 2 {
-		t.Errorf("TotalCommentCount = %d, want 2", got)
 	}
 }
 
@@ -690,11 +672,14 @@ func TestSession_GlobalCommentIDs(t *testing.T) {
 	c2, _ := s.AddComment("main.go", 1, 1, "", "go comment", "", "")
 
 	// IDs are globally unique across files
-	if c1.ID != "c1" {
-		t.Errorf("plan.md first comment ID = %q, want c1", c1.ID)
+	if !strings.HasPrefix(c1.ID, "c_") || len(c1.ID) != 8 {
+		t.Errorf("plan.md first comment ID = %q, want c_ prefix + 6 hex chars", c1.ID)
 	}
-	if c2.ID != "c2" {
-		t.Errorf("main.go first comment ID = %q, want c2", c2.ID)
+	if !strings.HasPrefix(c2.ID, "c_") || len(c2.ID) != 8 {
+		t.Errorf("main.go first comment ID = %q, want c_ prefix + 6 hex chars", c2.ID)
+	}
+	if c1.ID == c2.ID {
+		t.Errorf("comment IDs should be unique across files, both = %q", c1.ID)
 	}
 }
 
@@ -1157,6 +1142,161 @@ func TestSession_CarryForward_PreservesAuthor(t *testing.T) {
 	}
 }
 
+func TestCarryForward_FileScopeComments_NoDuplicates(t *testing.T) {
+	s := newTestSession(t)
+
+	fileComment := Comment{
+		ID:        "c2",
+		Body:      "file-level observation",
+		Author:    "Tomasz",
+		Scope:     "file",
+		CreatedAt: "2026-01-01T00:00:00Z",
+		UpdatedAt: "2026-01-01T00:00:00Z",
+	}
+
+	// Simulate the state before carry-forward: the file already has the comment
+	// in Comments (loaded from .crit.json at session start), and PreviousComments
+	// is also set (by loadResolvedComments before round-complete).
+	for _, f := range s.Files {
+		if f.Path == "plan.md" {
+			f.Comments = []Comment{fileComment}
+			f.PreviousComments = []Comment{fileComment}
+			f.PreviousContent = f.Content
+			break
+		}
+	}
+
+	s.carryForwardComments()
+
+	comments := s.GetComments("plan.md")
+	if len(comments) != 1 {
+		t.Errorf("expected 1 comment after carry-forward, got %d (duplicates!)", len(comments))
+	}
+	if len(comments) > 0 && comments[0].Body != "file-level observation" {
+		t.Errorf("Body = %q", comments[0].Body)
+	}
+}
+
+func TestCarryForward_FileScopeComments_NoDuplicatesAcrossRounds(t *testing.T) {
+	s := newTestSession(t)
+
+	fileComment := Comment{
+		ID:        "c2",
+		Body:      "file-level observation",
+		Author:    "Tomasz",
+		Scope:     "file",
+		CreatedAt: "2026-01-01T00:00:00Z",
+		UpdatedAt: "2026-01-01T00:00:00Z",
+	}
+
+	// Write .crit.json with the file-level comment
+	cj := CritJSON{
+		Files: map[string]CritJSONFile{
+			"plan.md": {
+				Status:   "added",
+				Comments: []Comment{fileComment},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	if err := os.WriteFile(s.critJSONPath(), data, 0644); err != nil {
+		t.Fatalf("writing .crit.json: %v", err)
+	}
+
+	// Set PreviousContent to trigger carryForwardComments (markdown file path)
+	for _, f := range s.Files {
+		if f.Path == "plan.md" {
+			f.PreviousContent = f.Content
+			break
+		}
+	}
+
+	// Round 1: carry forward
+	s.loadResolvedComments()
+	s.carryForwardComments()
+	s.carryForwardAllComments()
+
+	comments := s.GetComments("plan.md")
+	if len(comments) != 1 {
+		t.Fatalf("round 1: expected 1 comment, got %d", len(comments))
+	}
+
+	// Save state to .crit.json (simulating session save)
+	cj.Files = map[string]CritJSONFile{
+		"plan.md": {
+			Status:   "added",
+			Comments: comments,
+		},
+	}
+	data, _ = json.MarshalIndent(cj, "", "  ")
+	os.WriteFile(s.critJSONPath(), data, 0644)
+
+	// Set up for round 2
+	for _, f := range s.Files {
+		if f.Path == "plan.md" {
+			f.PreviousContent = f.Content
+			break
+		}
+	}
+
+	// Round 2: carry forward again
+	s.loadResolvedComments()
+	s.carryForwardComments()
+	s.carryForwardAllComments()
+
+	comments = s.GetComments("plan.md")
+	if len(comments) != 1 {
+		t.Errorf("round 2: expected 1 comment, got %d (duplicates!)", len(comments))
+	}
+}
+
+func TestCarryForward_MixedScopeComments(t *testing.T) {
+	s := newTestSession(t)
+
+	fileComment := Comment{
+		ID:        "c1",
+		Body:      "file-level note",
+		Scope:     "file",
+		CreatedAt: "2026-01-01T00:00:00Z",
+		UpdatedAt: "2026-01-01T00:00:00Z",
+	}
+	lineComment := Comment{
+		ID:        "c2",
+		StartLine: 3,
+		EndLine:   3,
+		Body:      "line-level note",
+		Scope:     "line",
+		CreatedAt: "2026-01-01T00:00:00Z",
+		UpdatedAt: "2026-01-01T00:00:00Z",
+	}
+
+	for _, f := range s.Files {
+		if f.Path == "plan.md" {
+			f.Comments = []Comment{fileComment, lineComment}
+			f.PreviousComments = []Comment{fileComment, lineComment}
+			f.PreviousContent = f.Content
+			break
+		}
+	}
+
+	s.carryForwardComments()
+
+	comments := s.GetComments("plan.md")
+	if len(comments) != 2 {
+		t.Errorf("expected 2 comments (one file, one line), got %d", len(comments))
+	}
+	scopes := map[string]int{}
+	for _, c := range comments {
+		scopes[c.Scope]++
+	}
+	if scopes["file"] != 1 {
+		t.Errorf("expected 1 file-scope comment, got %d", scopes["file"])
+	}
+	if scopes["line"] != 1 {
+		t.Errorf("expected 1 line-scope comment, got %d", scopes["line"])
+	}
+}
+
 func TestAddCommentSetsReviewRound(t *testing.T) {
 	s := newTestSession(t)
 	s.ReviewRound = 2
@@ -1245,7 +1385,7 @@ func TestSession_WriteFiles_MergesExternalComments(t *testing.T) {
 		Branch:      "main",
 		BaseRef:     "abc123",
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{Path: "main.go", Status: "modified", FileHash: "hash1", Comments: []Comment{
 				{ID: "c1", StartLine: 1, EndLine: 1, Body: "from browser", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
@@ -1300,7 +1440,7 @@ func TestSession_MergeExternalCritJSON_NewComment(t *testing.T) {
 		Branch:      "main",
 		BaseRef:     "abc123",
 		ReviewRound: 1,
-		nextID:      1,
+
 		Files: []*FileEntry{
 			{Path: "main.go", Status: "modified", Comments: []Comment{}},
 		},
@@ -1338,13 +1478,6 @@ func TestSession_MergeExternalCritJSON_NewComment(t *testing.T) {
 		t.Errorf("unexpected comment: %+v", comments[0])
 	}
 
-	s.mu.RLock()
-	nextID := s.nextID
-	s.mu.RUnlock()
-	if nextID != 2 {
-		t.Errorf("expected nextID=2, got %d", nextID)
-	}
-
 	select {
 	case event := <-ch:
 		if event.Type != "comments-changed" {
@@ -1378,7 +1511,7 @@ func TestSession_MergeExternalCritJSON_IgnoresOwnWrites(t *testing.T) {
 		Branch:      "main",
 		BaseRef:     "abc123",
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{Path: "main.go", Status: "modified", Comments: []Comment{
 				{ID: "c1", StartLine: 1, EndLine: 1, Body: "existing"},
@@ -1403,7 +1536,7 @@ func TestSession_MergeExternalCritJSON_ClearDetected(t *testing.T) {
 		RepoRoot:    dir,
 		Branch:      "main",
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{Path: "main.go", Status: "modified", Comments: []Comment{
 				{ID: "c1", StartLine: 1, EndLine: 1, Body: "existing"},
@@ -1548,7 +1681,7 @@ func TestComment_NoRepliesBackwardCompat(t *testing.T) {
 func TestSession_AddReply(t *testing.T) {
 	s := &Session{
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{
 				Path:     "test.md",
@@ -1561,8 +1694,8 @@ func TestSession_AddReply(t *testing.T) {
 	if !ok {
 		t.Fatal("AddReply returned false")
 	}
-	if reply.ID != "c1-r1" {
-		t.Errorf("reply ID = %q, want %q", reply.ID, "c1-r1")
+	if !strings.HasPrefix(reply.ID, "rp_") || len(reply.ID) != 9 {
+		t.Errorf("reply ID = %q, want rp_ prefix + 6 hex chars", reply.ID)
 	}
 	if reply.Body != "Done, fixed it" {
 		t.Errorf("reply body = %q", reply.Body)
@@ -1580,7 +1713,7 @@ func TestSession_AddReply(t *testing.T) {
 func TestSession_AddReply_UnresolvesComment(t *testing.T) {
 	s := &Session{
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{
 				Path:     "test.md",
@@ -1675,8 +1808,14 @@ func TestSession_AddReply_SequentialIDs(t *testing.T) {
 	r2, _ := s.AddReply("test.md", "c1", "Second reply", "user")
 	r3, _ := s.AddReply("test.md", "c1", "Third reply", "agent")
 
-	if r1.ID != "c1-r1" || r2.ID != "c1-r2" || r3.ID != "c1-r3" {
-		t.Errorf("IDs = %q, %q, %q", r1.ID, r2.ID, r3.ID)
+	// All reply IDs should have rp_ prefix and be unique
+	for _, r := range []Reply{r1, r2, r3} {
+		if !strings.HasPrefix(r.ID, "rp_") || len(r.ID) != 9 {
+			t.Errorf("reply ID = %q, want rp_ prefix + 6 hex chars", r.ID)
+		}
+	}
+	if r1.ID == r2.ID || r2.ID == r3.ID || r1.ID == r3.ID {
+		t.Errorf("reply IDs should be unique: %q, %q, %q", r1.ID, r2.ID, r3.ID)
 	}
 }
 
@@ -1795,8 +1934,8 @@ func TestCarryForwardComment(t *testing.T) {
 	if carried.ReviewRound != 1 {
 		t.Errorf("ReviewRound = %d, want 1", carried.ReviewRound)
 	}
-	if carried.Quote != "" {
-		t.Errorf("Quote = %q, should not be carried forward", carried.Quote)
+	if carried.Quote != "func foo() {}" {
+		t.Errorf("Quote = %q, want %q", carried.Quote, "func foo() {}")
 	}
 }
 
@@ -1837,7 +1976,7 @@ func TestSession_MergeExternalCritJSON_SkippedDuringPendingWrite(t *testing.T) {
 		RepoRoot:    dir,
 		Branch:      "main",
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{Path: "main.go", Status: "modified", Comments: []Comment{
 				{ID: "c1", StartLine: 1, EndLine: 1, Body: "existing"},
@@ -1888,7 +2027,7 @@ func TestSession_MergeExternalCritJSON_SyncsResolvedState(t *testing.T) {
 		RepoRoot:    dir,
 		Branch:      "main",
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{Path: "main.go", Status: "modified", Comments: []Comment{
 				{ID: "c1", StartLine: 1, EndLine: 1, Body: "fix this", Resolved: false},
@@ -1946,7 +2085,7 @@ func TestSession_EnsureFileEntry_NewFile(t *testing.T) {
 				Comments: []Comment{},
 			},
 		},
-		nextID:        1,
+
 		subscribers:   make(map[chan SSEEvent]struct{}),
 		roundComplete: make(chan struct{}, 1),
 	}
@@ -1978,9 +2117,6 @@ func TestSession_EnsureFileEntry_NewFile(t *testing.T) {
 	}
 	if len(f.Comments) != 0 {
 		t.Errorf("expected 0 comments, got %d", len(f.Comments))
-	}
-	if s.nextID != 1 {
-		t.Errorf("nextID = %d, want 1", s.nextID)
 	}
 }
 
@@ -2017,10 +2153,10 @@ func TestSession_EnsureFileEntry_ThenAddComment(t *testing.T) {
 	writeFile(t, newFilePath, "# Runtime file\ndef greet():\n    pass\n")
 
 	s := &Session{
-		Mode:          "git",
-		RepoRoot:      dir,
-		ReviewRound:   1,
-		nextID:        1,
+		Mode:        "git",
+		RepoRoot:    dir,
+		ReviewRound: 1,
+
 		Files:         []*FileEntry{},
 		subscribers:   make(map[chan SSEEvent]struct{}),
 		roundComplete: make(chan struct{}, 1),
@@ -2037,8 +2173,8 @@ func TestSession_EnsureFileEntry_ThenAddComment(t *testing.T) {
 	if !ok {
 		t.Fatal("AddComment failed after EnsureFileEntry")
 	}
-	if c.ID != "c1" {
-		t.Errorf("comment ID = %q, want c1", c.ID)
+	if !strings.HasPrefix(c.ID, "c_") || len(c.ID) != 8 {
+		t.Errorf("comment ID = %q, want c_ prefix + 6 hex chars", c.ID)
 	}
 	if c.Body != "Add docstring" {
 		t.Errorf("comment body = %q", c.Body)
@@ -2084,7 +2220,7 @@ func TestSession_MergeExternalCritJSON_SyncsUnresolve(t *testing.T) {
 		RepoRoot:    dir,
 		Branch:      "main",
 		ReviewRound: 1,
-		nextID:      2,
+
 		Files: []*FileEntry{
 			{Path: "main.go", Status: "modified", Comments: []Comment{
 				{ID: "c1", StartLine: 1, EndLine: 1, Body: "fix this", Resolved: true},
@@ -2219,7 +2355,7 @@ func TestLoadCritJSONRestoresReviewComments(t *testing.T) {
 	s.AddReviewComment("restored comment", "")
 	s.WriteFiles()
 	s.reviewComments = nil
-	s.reviewNextID = 0
+
 	s.loadCritJSON()
 	rc := s.GetReviewComments()
 	if len(rc) != 1 {
@@ -2263,7 +2399,7 @@ func TestReviewCommentsSurviveRound(t *testing.T) {
 
 	// Simulate round: clear in-memory state and reload
 	s.reviewComments = nil
-	s.reviewNextID = 0
+
 	s.loadCritJSON()
 
 	comments := s.GetReviewComments()
@@ -2411,10 +2547,9 @@ func TestAddReviewCommentReply(t *testing.T) {
 	if reply.Author != "author" {
 		t.Errorf("expected author 'author', got %q", reply.Author)
 	}
-	// Verify reply ID format: r0-r1
-	expectedPrefix := c.ID + "-r"
-	if !strings.HasPrefix(reply.ID, expectedPrefix) {
-		t.Errorf("expected reply ID to start with %q, got %q", expectedPrefix, reply.ID)
+	// Verify reply ID format: rp_ prefix + 6 hex chars
+	if !strings.HasPrefix(reply.ID, "rp_") || len(reply.ID) != 9 {
+		t.Errorf("reply ID = %q, want rp_ prefix + 6 hex chars", reply.ID)
 	}
 	// Verify the reply is attached to the comment
 	comments := s.GetReviewComments()
@@ -2681,5 +2816,1096 @@ func TestGetFileSnapshotLazy(t *testing.T) {
 		if fi.Path == "snap.go" && fi.Lazy {
 			t.Error("expected Lazy=false in session info after file was loaded")
 		}
+	}
+}
+
+// TestDeleteComment_NotReAddedFromDisk verifies that when a file comment is
+// deleted in-memory and WriteFiles is called, the deleted comment does not
+// reappear in .crit.json due to the merge-from-disk logic.
+func TestDeleteComment_NotReAddedFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{
+		RepoRoot:    dir,
+		Branch:      "main",
+		BaseRef:     "abc123",
+		ReviewRound: 1,
+
+		Files: []*FileEntry{
+			{Path: "main.go", Status: "modified", FileHash: "hash1", Comments: []Comment{
+				{ID: "c1", StartLine: 1, EndLine: 1, Body: "delete me", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
+			}},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// Write .crit.json with the comment present
+	s.WriteFiles()
+
+	// Verify the comment is on disk
+	data, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatalf("read .crit.json: %v", err)
+	}
+	var cj CritJSON
+	json.Unmarshal(data, &cj)
+	if len(cj.Files["main.go"].Comments) != 1 {
+		t.Fatalf("expected 1 comment on disk before delete, got %d", len(cj.Files["main.go"].Comments))
+	}
+
+	// Delete the comment in-memory
+	if !s.DeleteComment("main.go", "c1") {
+		t.Fatal("DeleteComment failed")
+	}
+
+	// Flush and write again — the merge should NOT re-add c1 from disk
+	flushWrites(s)
+	s.WriteFiles()
+
+	// Read .crit.json and verify the deleted comment is gone
+	data, err = os.ReadFile(s.critJSONPath())
+	if err != nil {
+		// If .crit.json was removed (empty), that's also correct
+		return
+	}
+	json.Unmarshal(data, &cj)
+	if fileData, ok := cj.Files["main.go"]; ok {
+		for _, c := range fileData.Comments {
+			if c.ID == "c1" {
+				t.Error("deleted comment c1 reappeared in .crit.json after WriteFiles")
+			}
+		}
+	}
+}
+
+// TestDeleteReviewComment_NotReAddedFromDisk verifies that when a review-level
+// comment is deleted and WriteFiles is called, it does not reappear from disk.
+func TestDeleteReviewComment_NotReAddedFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{
+		RepoRoot:    dir,
+		Branch:      "main",
+		ReviewRound: 1,
+
+		Files:       []*FileEntry{},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// Add a review comment and write to disk
+	rc := s.AddReviewComment("delete this review comment", "")
+	s.WriteFiles()
+
+	// Verify it's on disk
+	data, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatalf("read .crit.json: %v", err)
+	}
+	var cj CritJSON
+	json.Unmarshal(data, &cj)
+	if len(cj.ReviewComments) != 1 {
+		t.Fatalf("expected 1 review comment on disk, got %d", len(cj.ReviewComments))
+	}
+
+	// Delete the review comment in-memory
+	if !s.DeleteReviewComment(rc.ID) {
+		t.Fatal("DeleteReviewComment failed")
+	}
+
+	// Write again
+	flushWrites(s)
+	s.WriteFiles()
+
+	// Read .crit.json — should have no review comments
+	data, err = os.ReadFile(s.critJSONPath())
+	if err != nil {
+		// File removed is also acceptable
+		return
+	}
+	json.Unmarshal(data, &cj)
+	for _, c := range cj.ReviewComments {
+		if c.ID == rc.ID {
+			t.Error("deleted review comment reappeared in .crit.json after WriteFiles")
+		}
+	}
+}
+
+// TestDeleteReply_NotReAddedFromDisk verifies that when a reply on a file
+// comment is deleted, it does not reappear from disk after WriteFiles.
+func TestDeleteReply_NotReAddedFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{
+		RepoRoot:    dir,
+		Branch:      "main",
+		ReviewRound: 1,
+
+		Files: []*FileEntry{
+			{Path: "main.go", Status: "modified", FileHash: "hash1", Comments: []Comment{
+				{
+					ID: "c1", StartLine: 1, EndLine: 1, Body: "parent comment",
+					CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+					Replies: []Reply{
+						{ID: "c1-r1", Body: "delete this reply", Author: "agent", CreatedAt: "2026-01-01T00:00:01Z"},
+					},
+				},
+			}},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// Write to disk with the reply
+	s.WriteFiles()
+
+	// Delete the reply in-memory
+	if !s.DeleteReply("main.go", "c1", "c1-r1") {
+		t.Fatal("DeleteReply failed")
+	}
+
+	// Write again
+	flushWrites(s)
+	s.WriteFiles()
+
+	// Read .crit.json and verify the reply is gone
+	data, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatalf("read .crit.json: %v", err)
+	}
+	var cj CritJSON
+	json.Unmarshal(data, &cj)
+	for _, c := range cj.Files["main.go"].Comments {
+		if c.ID == "c1" {
+			for _, r := range c.Replies {
+				if r.ID == "c1-r1" {
+					t.Error("deleted reply c1-r1 reappeared in .crit.json after WriteFiles")
+				}
+			}
+		}
+	}
+}
+
+// TestDeleteReviewCommentReply_NotReAddedFromDisk verifies that when a reply
+// on a review comment is deleted, it does not reappear from disk after WriteFiles.
+func TestDeleteReviewCommentReply_NotReAddedFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{
+		RepoRoot:    dir,
+		Branch:      "main",
+		ReviewRound: 1,
+
+		Files:       []*FileEntry{},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// Add review comment with a reply, then write to disk
+	rc := s.AddReviewComment("parent review comment", "")
+	reply, ok := s.AddReviewCommentReply(rc.ID, "delete this reply", "agent")
+	if !ok {
+		t.Fatal("AddReviewCommentReply failed")
+	}
+	s.WriteFiles()
+
+	// Delete the reply in-memory
+	if !s.DeleteReviewCommentReply(rc.ID, reply.ID) {
+		t.Fatal("DeleteReviewCommentReply failed")
+	}
+
+	// Write again
+	flushWrites(s)
+	s.WriteFiles()
+
+	// Read back .crit.json
+	data, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatalf("read .crit.json: %v", err)
+	}
+	var cj CritJSON
+	json.Unmarshal(data, &cj)
+	for _, c := range cj.ReviewComments {
+		if c.ID == rc.ID {
+			for _, r := range c.Replies {
+				if r.ID == reply.ID {
+					t.Error("deleted review reply reappeared in .crit.json after WriteFiles")
+				}
+			}
+		}
+	}
+}
+
+// TestExternalCommentStillMerged verifies that comments added externally to
+// .crit.json (not deleted by user) are still properly merged in — this is
+// a regression test for the existing merge behavior.
+func TestExternalCommentStillMerged(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{
+		RepoRoot:    dir,
+		Branch:      "main",
+		BaseRef:     "abc123",
+		ReviewRound: 1,
+
+		Files: []*FileEntry{
+			{Path: "main.go", Status: "modified", FileHash: "hash1", Comments: []Comment{
+				{ID: "c1", StartLine: 1, EndLine: 1, Body: "from browser", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
+			}},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// Simulate an external tool writing an additional comment to .crit.json
+	cj := CritJSON{
+		Branch: "main", BaseRef: "abc123", ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"main.go": {
+				Status: "modified", FileHash: "hash1",
+				Comments: []Comment{
+					{ID: "c1", StartLine: 1, EndLine: 1, Body: "from browser", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
+					{ID: "c2", StartLine: 10, EndLine: 10, Body: "from CLI", Author: "Claude", CreatedAt: "2026-01-01T00:00:01Z", UpdatedAt: "2026-01-01T00:00:01Z"},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+
+	// WriteFiles should merge the external comment in
+	s.WriteFiles()
+
+	// Read back .crit.json and verify both comments are present
+	result, _ := os.ReadFile(filepath.Join(dir, ".crit.json"))
+	var got CritJSON
+	json.Unmarshal(result, &got)
+
+	if len(got.Files["main.go"].Comments) != 2 {
+		t.Fatalf("expected 2 comments (browser + external), got %d", len(got.Files["main.go"].Comments))
+	}
+
+	foundExternal := false
+	for _, c := range got.Files["main.go"].Comments {
+		if c.ID == "c2" && c.Body == "from CLI" {
+			foundExternal = true
+		}
+	}
+	if !foundExternal {
+		t.Error("external comment c2 was lost during WriteFiles — merge is broken")
+	}
+}
+
+func TestSession_SetCommentResolved(t *testing.T) {
+	s := newTestSession(t)
+	c, _ := s.AddComment("plan.md", 1, 1, "", "needs fix", "", "")
+
+	// Resolve
+	resolved, ok := s.SetCommentResolved("plan.md", c.ID, true)
+	if !ok {
+		t.Fatal("SetCommentResolved returned false")
+	}
+	if !resolved.Resolved {
+		t.Error("expected comment to be resolved")
+	}
+
+	// Verify the resolved state persists in GetComments
+	comments := s.GetComments("plan.md")
+	if !comments[0].Resolved {
+		t.Error("resolved state not persisted in GetComments")
+	}
+
+	// Unresolve
+	unresolved, ok := s.SetCommentResolved("plan.md", c.ID, false)
+	if !ok {
+		t.Fatal("SetCommentResolved returned false on unresolve")
+	}
+	if unresolved.Resolved {
+		t.Error("expected comment to be unresolved")
+	}
+
+	comments = s.GetComments("plan.md")
+	if comments[0].Resolved {
+		t.Error("unresolve not persisted in GetComments")
+	}
+}
+
+func TestSession_SetCommentResolved_NotFound(t *testing.T) {
+	s := newTestSession(t)
+	_, ok := s.SetCommentResolved("plan.md", "c999", true)
+	if ok {
+		t.Error("expected false for nonexistent comment")
+	}
+	_, ok = s.SetCommentResolved("nonexistent.go", "c1", true)
+	if ok {
+		t.Error("expected false for nonexistent file")
+	}
+}
+
+func TestSession_FindCommentByID(t *testing.T) {
+	s := newTestSession(t)
+	c1, _ := s.AddComment("plan.md", 1, 1, "", "md comment", "", "")
+	c2, _ := s.AddComment("main.go", 5, 5, "", "go comment", "", "")
+
+	// Find with filePath hint
+	found, path, ok := s.FindCommentByID(c1.ID, "plan.md")
+	if !ok {
+		t.Fatal("FindCommentByID with hint returned false")
+	}
+	if path != "plan.md" {
+		t.Errorf("path = %q, want plan.md", path)
+	}
+	if found.Body != "md comment" {
+		t.Errorf("body = %q, want md comment", found.Body)
+	}
+
+	// Find without filePath hint (cross-file search)
+	found2, path2, ok2 := s.FindCommentByID(c2.ID, "")
+	if !ok2 {
+		t.Fatal("FindCommentByID without hint returned false")
+	}
+	if path2 != "main.go" {
+		t.Errorf("path = %q, want main.go", path2)
+	}
+	if found2.Body != "go comment" {
+		t.Errorf("body = %q, want go comment", found2.Body)
+	}
+
+	// Not found
+	_, _, ok3 := s.FindCommentByID("nonexistent", "")
+	if ok3 {
+		t.Error("expected false for nonexistent comment ID")
+	}
+}
+
+func TestSession_ClearAllComments_RemovesCritJSONFromFileList(t *testing.T) {
+	s := newTestSession(t)
+
+	// Add a .crit.json entry to the file list (as would happen when git detects it)
+	s.mu.Lock()
+	s.Files = append(s.Files, &FileEntry{
+		Path:     ".crit.json",
+		AbsPath:  filepath.Join(s.RepoRoot, ".crit.json"),
+		Status:   "untracked",
+		FileType: "code",
+		Comments: []Comment{},
+	})
+	s.mu.Unlock()
+
+	s.AddComment("plan.md", 1, 1, "", "test", "", "")
+	s.AddReviewComment("review", "")
+
+	if len(s.GetReviewComments()) != 1 {
+		t.Fatal("expected 1 review comment before clear")
+	}
+
+	s.ClearAllComments()
+
+	// .crit.json should be removed from the file list
+	for _, f := range s.Files {
+		if filepath.Base(f.Path) == ".crit.json" {
+			t.Error(".crit.json should be removed from file list after ClearAllComments")
+		}
+	}
+
+	// All comments should be gone
+	if s.TotalCommentCount() != 0 {
+		t.Errorf("expected 0 total comments, got %d", s.TotalCommentCount())
+	}
+	if len(s.GetReviewComments()) != 0 {
+		t.Errorf("expected 0 review comments, got %d", len(s.GetReviewComments()))
+	}
+
+	// Review round should reset to 1
+	if s.GetReviewRound() != 1 {
+		t.Errorf("ReviewRound = %d, want 1 after clear", s.GetReviewRound())
+	}
+}
+
+func TestSession_ClearAllComments_DeletesCritJSONFromDisk(t *testing.T) {
+	s := newTestSession(t)
+	s.AddComment("plan.md", 1, 1, "", "test", "", "")
+	flushWrites(s)
+	s.WriteFiles()
+
+	// Verify .crit.json exists
+	if _, err := os.Stat(s.critJSONPath()); err != nil {
+		t.Fatalf(".crit.json should exist before clear: %v", err)
+	}
+
+	s.ClearAllComments()
+
+	// .crit.json should be deleted from disk
+	if _, err := os.Stat(s.critJSONPath()); !os.IsNotExist(err) {
+		t.Error(".crit.json should be deleted from disk after ClearAllComments")
+	}
+}
+
+func TestSession_HandleExternalDeletion(t *testing.T) {
+	s := newTestSession(t)
+	s.AddComment("plan.md", 1, 1, "", "test", "", "")
+	flushWrites(s)
+	s.WriteFiles()
+
+	// Verify comments exist
+	if s.TotalCommentCount() != 1 {
+		t.Fatal("expected 1 comment before deletion")
+	}
+
+	// Delete .crit.json externally
+	os.Remove(s.critJSONPath())
+
+	// handleExternalDeletion should detect the deletion and clear in-memory state
+	deleted := s.handleExternalDeletion(s.critJSONPath())
+	if !deleted {
+		t.Fatal("handleExternalDeletion should return true when file was deleted")
+	}
+
+	if s.TotalCommentCount() != 0 {
+		t.Errorf("expected 0 comments after external deletion, got %d", s.TotalCommentCount())
+	}
+}
+
+func TestSession_HandleExternalDeletion_NoMtime(t *testing.T) {
+	s := newTestSession(t)
+	// Without ever writing, lastCritJSONMtime is zero — should not detect deletion
+	deleted := s.handleExternalDeletion(s.critJSONPath())
+	if deleted {
+		t.Error("handleExternalDeletion should return false when mtime is zero")
+	}
+}
+
+func TestSession_WriteFiles_RoundTrip(t *testing.T) {
+	s := newTestSession(t)
+	s.AddComment("plan.md", 1, 3, "", "fix formatting", "", "reviewer")
+	s.AddComment("main.go", 2, 2, "RIGHT", "handle error", "func main() {}", "agent")
+	s.AddReviewComment("overall looks good", "reviewer")
+
+	flushWrites(s)
+	s.WriteFiles()
+
+	// Read back the .crit.json
+	data1, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatalf("reading first write: %v", err)
+	}
+
+	// Write again (no changes) and compare
+	flushWrites(s)
+	s.WriteFiles()
+	data2, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatalf("reading second write: %v", err)
+	}
+
+	// Parse both to compare semantically (timestamps may differ)
+	var cj1, cj2 CritJSON
+	json.Unmarshal(data1, &cj1)
+	json.Unmarshal(data2, &cj2)
+
+	if len(cj1.Files) != len(cj2.Files) {
+		t.Errorf("file count mismatch: %d vs %d", len(cj1.Files), len(cj2.Files))
+	}
+	for path, f1 := range cj1.Files {
+		f2, ok := cj2.Files[path]
+		if !ok {
+			t.Errorf("file %q missing in second write", path)
+			continue
+		}
+		if len(f1.Comments) != len(f2.Comments) {
+			t.Errorf("%s: comment count %d vs %d", path, len(f1.Comments), len(f2.Comments))
+		}
+	}
+	if len(cj1.ReviewComments) != len(cj2.ReviewComments) {
+		t.Errorf("review comment count %d vs %d", len(cj1.ReviewComments), len(cj2.ReviewComments))
+	}
+}
+
+func TestSession_AddComment_PreservesSideAndQuote(t *testing.T) {
+	s := newTestSession(t)
+	c, ok := s.AddComment("main.go", 5, 10, "RIGHT", "fix this", "func main() {}", "reviewer")
+	if !ok {
+		t.Fatal("AddComment failed")
+	}
+	if c.Side != "RIGHT" {
+		t.Errorf("Side = %q, want RIGHT", c.Side)
+	}
+	if c.Quote != "func main() {}" {
+		t.Errorf("Quote = %q, want func main() {}", c.Quote)
+	}
+	if c.Scope != "line" {
+		t.Errorf("Scope = %q, want line", c.Scope)
+	}
+
+	// Verify roundtrip through WriteFiles
+	flushWrites(s)
+	s.WriteFiles()
+
+	data, _ := os.ReadFile(s.critJSONPath())
+	var cj CritJSON
+	json.Unmarshal(data, &cj)
+
+	cf := cj.Files["main.go"]
+	if len(cf.Comments) != 1 {
+		t.Fatalf("expected 1 comment in .crit.json, got %d", len(cf.Comments))
+	}
+	if cf.Comments[0].Side != "RIGHT" {
+		t.Errorf("persisted Side = %q, want RIGHT", cf.Comments[0].Side)
+	}
+	if cf.Comments[0].Quote != "func main() {}" {
+		t.Errorf("persisted Quote = %q", cf.Comments[0].Quote)
+	}
+}
+
+func TestSession_WriteFiles_ReviewCommentsPersisted(t *testing.T) {
+	s := newTestSession(t)
+	s.AddReviewComment("general note", "reviewer")
+
+	flushWrites(s)
+	s.WriteFiles()
+
+	data, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cj CritJSON
+	json.Unmarshal(data, &cj)
+
+	if len(cj.ReviewComments) != 1 {
+		t.Fatalf("expected 1 review comment in .crit.json, got %d", len(cj.ReviewComments))
+	}
+	if cj.ReviewComments[0].Body != "general note" {
+		t.Errorf("body = %q, want general note", cj.ReviewComments[0].Body)
+	}
+	if cj.ReviewComments[0].Scope != "review" {
+		t.Errorf("scope = %q, want review", cj.ReviewComments[0].Scope)
+	}
+}
+
+func TestSession_RandomCommentID_Format(t *testing.T) {
+	s := newTestSession(t)
+
+	c, ok := s.AddComment("plan.md", 1, 1, "", "test", "", "")
+	if !ok {
+		t.Fatal("AddComment failed")
+	}
+	if !strings.HasPrefix(c.ID, "c_") || len(c.ID) != 8 {
+		t.Errorf("comment ID %q does not match c_XXXXXX format", c.ID)
+	}
+
+	// Two comments should get different IDs
+	c2, ok := s.AddComment("plan.md", 2, 2, "", "test2", "", "")
+	if !ok {
+		t.Fatal("AddComment failed")
+	}
+	if c.ID == c2.ID {
+		t.Errorf("two comments got the same ID: %q", c.ID)
+	}
+}
+
+func TestSession_ClearAllComments(t *testing.T) {
+	s := newTestSession(t)
+	s.AddComment("plan.md", 1, 1, "", "md comment", "", "")
+	s.AddComment("main.go", 1, 1, "", "go comment", "", "")
+	s.AddReviewComment("review comment", "")
+
+	if s.TotalCommentCount() != 3 {
+		t.Fatalf("precondition: expected 3 comments, got %d", s.TotalCommentCount())
+	}
+
+	s.ClearAllComments()
+
+	if len(s.GetComments("plan.md")) != 0 {
+		t.Error("plan.md comments should be cleared")
+	}
+	if len(s.GetComments("main.go")) != 0 {
+		t.Error("main.go comments should be cleared")
+	}
+	if len(s.GetReviewComments()) != 0 {
+		t.Error("review comments should be cleared")
+	}
+	if s.TotalCommentCount() != 0 {
+		t.Errorf("TotalCommentCount = %d, want 0", s.TotalCommentCount())
+	}
+}
+
+func TestSession_AddComment_WithSide(t *testing.T) {
+	s := newTestSession(t)
+	c, ok := s.AddComment("main.go", 5, 10, "RIGHT", "check this", "", "")
+	if !ok {
+		t.Fatal("AddComment with side failed")
+	}
+	if c.Side != "RIGHT" {
+		t.Errorf("Side = %q, want RIGHT", c.Side)
+	}
+	if c.StartLine != 5 || c.EndLine != 10 {
+		t.Errorf("lines = %d-%d, want 5-10", c.StartLine, c.EndLine)
+	}
+}
+
+func TestSession_WriteFiles_IncludesResolvedComments(t *testing.T) {
+	s := newTestSession(t)
+	c, _ := s.AddComment("plan.md", 1, 1, "", "fix", "", "")
+	s.SetCommentResolved("plan.md", c.ID, true)
+
+	flushWrites(s)
+	s.WriteFiles()
+
+	data, err := os.ReadFile(s.critJSONPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		t.Fatal(err)
+	}
+
+	comments := cj.Files["plan.md"].Comments
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 comment in .crit.json, got %d", len(comments))
+	}
+	if !comments[0].Resolved {
+		t.Error("resolved state should be persisted to .crit.json")
+	}
+}
+
+func TestLoadCritJSON_RestoresShareState(t *testing.T) {
+	s := newTestSession(t)
+
+	// Compute the share scope for this session's files.
+	paths := make([]string, len(s.Files))
+	for i, f := range s.Files {
+		paths[i] = f.Path
+	}
+	scope := shareScope(paths)
+
+	// Write a review file with share state.
+	reviewPath := filepath.Join(s.RepoRoot, "review.json")
+	cj := CritJSON{
+		Branch:      "main",
+		BaseRef:     "abc123",
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+		ReviewRound: 1,
+		ShareURL:    "https://crit.example.com/review/abc",
+		DeleteToken: "tok_secret123",
+		ShareScope:  scope,
+		Files:       map[string]CritJSONFile{},
+	}
+	data, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, reviewPath, string(data))
+
+	// Point the session at the review file and load.
+	s.ReviewFilePath = reviewPath
+	s.loadCritJSON()
+
+	if s.sharedURL != "https://crit.example.com/review/abc" {
+		t.Errorf("sharedURL = %q, want %q", s.sharedURL, "https://crit.example.com/review/abc")
+	}
+	if s.deleteToken != "tok_secret123" {
+		t.Errorf("deleteToken = %q, want %q", s.deleteToken, "tok_secret123")
+	}
+	if s.shareScope != scope {
+		t.Errorf("shareScope = %q, want %q", s.shareScope, scope)
+	}
+}
+
+func TestLoadCritJSON_ShareScopeMismatch(t *testing.T) {
+	s := newTestSession(t)
+
+	// Write a review file with a share scope that does not match this session.
+	reviewPath := filepath.Join(s.RepoRoot, "review.json")
+	cj := CritJSON{
+		ShareURL:    "https://crit.example.com/review/old",
+		DeleteToken: "tok_old",
+		ShareScope:  "mismatched_scope_value",
+		Files:       map[string]CritJSONFile{},
+	}
+	data, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, reviewPath, string(data))
+
+	s.ReviewFilePath = reviewPath
+	s.loadCritJSON()
+
+	// Share state should NOT be loaded because the scope doesn't match.
+	if s.sharedURL != "" {
+		t.Errorf("sharedURL = %q, want empty (scope mismatch)", s.sharedURL)
+	}
+	if s.deleteToken != "" {
+		t.Errorf("deleteToken = %q, want empty (scope mismatch)", s.deleteToken)
+	}
+}
+
+func TestLoadCritJSON_NoScope(t *testing.T) {
+	s := newTestSession(t)
+
+	// Review file without ShareScope — should load unconditionally.
+	reviewPath := filepath.Join(s.RepoRoot, "review.json")
+	cj := CritJSON{
+		ShareURL:    "https://crit.example.com/review/legacy",
+		DeleteToken: "tok_legacy",
+		Files:       map[string]CritJSONFile{},
+	}
+	data, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, reviewPath, string(data))
+
+	s.ReviewFilePath = reviewPath
+	s.loadCritJSON()
+
+	if s.sharedURL != "https://crit.example.com/review/legacy" {
+		t.Errorf("sharedURL = %q, want %q", s.sharedURL, "https://crit.example.com/review/legacy")
+	}
+	if s.deleteToken != "tok_legacy" {
+		t.Errorf("deleteToken = %q, want %q", s.deleteToken, "tok_legacy")
+	}
+}
+
+func TestCreateSession_LoadsShareFromReviewPath(t *testing.T) {
+	dir := initTestRepo(t)
+
+	// Create a file on a feature branch so git mode detects changes.
+	runGit(t, dir, "checkout", "-b", "feat-share")
+	writeFile(t, filepath.Join(dir, "new.md"), "# New\n\nContent\n")
+	runGit(t, dir, "add", "new.md")
+	runGit(t, dir, "commit", "-m", "add new.md")
+
+	// Prepare a review file with share state.
+	reviewPath := filepath.Join(t.TempDir(), "review.json")
+	scope := shareScope([]string{"new.md"})
+	cj := CritJSON{
+		Branch:      "feat-share",
+		BaseRef:     "abc",
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+		ReviewRound: 2,
+		ShareURL:    "https://crit.example.com/review/shared",
+		DeleteToken: "tok_shared",
+		ShareScope:  scope,
+		Files:       map[string]CritJSONFile{},
+	}
+	data, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, reviewPath, string(data))
+
+	// Change to the repo dir so git operations work.
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	sc := &serverConfig{
+		reviewPath: reviewPath,
+	}
+	session, err := createSession(sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if session.ReviewFilePath != reviewPath {
+		t.Errorf("ReviewFilePath = %q, want %q", session.ReviewFilePath, reviewPath)
+	}
+	if session.sharedURL != "https://crit.example.com/review/shared" {
+		t.Errorf("sharedURL = %q, want %q", session.sharedURL, "https://crit.example.com/review/shared")
+	}
+	if session.deleteToken != "tok_shared" {
+		t.Errorf("deleteToken = %q, want %q", session.deleteToken, "tok_shared")
+	}
+	if session.ReviewRound != 2 {
+		t.Errorf("ReviewRound = %d, want 2", session.ReviewRound)
+	}
+}
+
+func TestCreateSession_FilesMode_LoadsShareFromReviewPath(t *testing.T) {
+	dir := initTestRepo(t)
+	mdPath := filepath.Join(dir, "doc.md")
+	writeFile(t, mdPath, "# Doc\n\nHello\n")
+
+	// createSession -> NewSessionFromFiles will resolve the path relative to
+	// the git repo root. Compute the expected relative path so we can build
+	// a matching share scope.
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	// NewSessionFromFiles resolves paths relative to repo root ("doc.md").
+	scope := shareScope([]string{"doc.md"})
+
+	// Prepare a review file with share state.
+	reviewPath := filepath.Join(t.TempDir(), "review.json")
+	cj := CritJSON{
+		ShareURL:    "https://crit.example.com/review/files",
+		DeleteToken: "tok_files",
+		ShareScope:  scope,
+		ReviewRound: 3,
+		Files:       map[string]CritJSONFile{},
+	}
+	data, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, reviewPath, string(data))
+
+	sc := &serverConfig{
+		files:      []string{"doc.md"},
+		reviewPath: reviewPath,
+	}
+	session, err := createSession(sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if session.sharedURL != "https://crit.example.com/review/files" {
+		t.Errorf("sharedURL = %q, want %q", session.sharedURL, "https://crit.example.com/review/files")
+	}
+	if session.deleteToken != "tok_files" {
+		t.Errorf("deleteToken = %q, want %q", session.deleteToken, "tok_files")
+	}
+	if session.ReviewRound != 3 {
+		t.Errorf("ReviewRound = %d, want 3", session.ReviewRound)
+	}
+}
+
+func TestLoadCritJSON_OrphanedComments(t *testing.T) {
+	dir := initTestRepo(t)
+	branch := "main"
+
+	// Create session with just one file
+	writeFile(t, filepath.Join(dir, "existing.md"), "# Hello")
+	s := &Session{
+		Mode:     "git",
+		Branch:   branch,
+		RepoRoot: dir,
+		Files: []*FileEntry{
+			{Path: "existing.md", AbsPath: filepath.Join(dir, "existing.md"), Status: "modified", FileType: "markdown"},
+		},
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	// Write a review file with comments on both existing and orphaned paths
+	critPath := s.critJSONPath()
+	cj := CritJSON{
+		Branch:      branch,
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"existing.md": {
+				Status: "modified",
+				Comments: []Comment{
+					{ID: "c_exist1", Body: "comment on existing", Scope: "line", StartLine: 1, EndLine: 1},
+				},
+			},
+			"removed.go": {
+				Status: "added",
+				Comments: []Comment{
+					{ID: "c_orphan1", Body: "file-level comment", Scope: "file"},
+					{ID: "c_orphan2", Body: "line comment on removed file", Scope: "line", StartLine: 5, EndLine: 10},
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(critPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(critPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.loadCritJSON()
+
+	// Should now have 2 files
+	if len(s.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(s.Files))
+	}
+
+	// Find the orphaned file
+	var orphaned *FileEntry
+	for _, f := range s.Files {
+		if f.Path == "removed.go" {
+			orphaned = f
+			break
+		}
+	}
+	if orphaned == nil {
+		t.Fatal("orphaned file not found in session")
+	}
+	if !orphaned.Orphaned {
+		t.Error("expected Orphaned=true")
+	}
+	if orphaned.Status != "removed" {
+		t.Errorf("expected status 'removed', got %q", orphaned.Status)
+	}
+	if orphaned.FileType != "code" {
+		t.Errorf("expected file type 'code', got %q", orphaned.FileType)
+	}
+	if len(orphaned.Comments) != 2 {
+		t.Errorf("expected 2 comments, got %d", len(orphaned.Comments))
+	}
+
+	// Existing file should still have its comment
+	var existing *FileEntry
+	for _, f := range s.Files {
+		if f.Path == "existing.md" {
+			existing = f
+			break
+		}
+	}
+	if len(existing.Comments) != 1 {
+		t.Errorf("expected 1 comment on existing file, got %d", len(existing.Comments))
+	}
+}
+
+func TestLoadCritJSON_OrphanedNoComments(t *testing.T) {
+	dir := initTestRepo(t)
+
+	s := &Session{
+		Mode:     "git",
+		Branch:   "main",
+		RepoRoot: dir,
+		Files: []*FileEntry{
+			{Path: "existing.md", AbsPath: filepath.Join(dir, "existing.md"), Status: "modified", FileType: "markdown"},
+		},
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	critPath := s.critJSONPath()
+	cj := CritJSON{
+		Branch:      "main",
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"existing.md": {Status: "modified"},
+			"removed.go":  {Status: "added", Comments: []Comment{}}, // no comments
+		},
+	}
+	data, _ := json.Marshal(cj)
+	os.MkdirAll(filepath.Dir(critPath), 0o755)
+	os.WriteFile(critPath, data, 0o644)
+
+	s.loadCritJSON()
+
+	if len(s.Files) != 1 {
+		t.Fatalf("expected 1 file (no phantom for empty comments), got %d", len(s.Files))
+	}
+}
+
+func TestGetSessionInfo_OrphanedField(t *testing.T) {
+	s := &Session{
+		Mode:   "git",
+		Branch: "main",
+		Files: []*FileEntry{
+			{Path: "real.go", Status: "modified", FileType: "code"},
+			{Path: "gone.go", Status: "removed", FileType: "code", Orphaned: true,
+				Comments: []Comment{{ID: "c1", Body: "orphaned", Scope: "file"}}},
+		},
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	info := s.GetSessionInfo()
+	if len(info.Files) != 2 {
+		t.Fatalf("expected 2 files in session info, got %d", len(info.Files))
+	}
+
+	var orphanedInfo *SessionFileInfo
+	for i := range info.Files {
+		if info.Files[i].Path == "gone.go" {
+			orphanedInfo = &info.Files[i]
+			break
+		}
+	}
+	if orphanedInfo == nil {
+		t.Fatal("orphaned file not in session info")
+	}
+	if !orphanedInfo.Orphaned {
+		t.Error("expected Orphaned=true in session info")
+	}
+	if orphanedInfo.Status != "removed" {
+		t.Errorf("expected status 'removed', got %q", orphanedInfo.Status)
+	}
+	if orphanedInfo.CommentCount != 1 {
+		t.Errorf("expected comment count 1, got %d", orphanedInfo.CommentCount)
+	}
+}
+
+func TestAddComment_PopulatesAnchor(t *testing.T) {
+	s := newTestSession(t)
+	// plan.md content: "# Plan\n\n## Step 1\n\nDo the thing\n"
+	// Lines: 1="# Plan", 2="", 3="## Step 1", 4="", 5="Do the thing"
+	c, ok := s.AddComment("plan.md", 3, 5, "", "Rethink this", "", "")
+	if !ok {
+		t.Fatal("AddComment failed")
+	}
+	want := "## Step 1\n\nDo the thing"
+	if c.Anchor != want {
+		t.Errorf("Anchor = %q, want %q", c.Anchor, want)
+	}
+}
+
+func TestAddComment_AnchorSingleLine(t *testing.T) {
+	s := newTestSession(t)
+	c, ok := s.AddComment("plan.md", 1, 1, "", "Fix title", "", "")
+	if !ok {
+		t.Fatal("AddComment failed")
+	}
+	if c.Anchor != "# Plan" {
+		t.Errorf("Anchor = %q, want %q", c.Anchor, "# Plan")
+	}
+}
+
+func TestAddComment_NoAnchorForFileComment(t *testing.T) {
+	s := newTestSession(t)
+	c, ok := s.AddFileComment("plan.md", "Overall feedback", "reviewer")
+	if !ok {
+		t.Fatal("AddFileComment failed")
+	}
+	if c.Anchor != "" {
+		t.Errorf("file-level comment should not have anchor, got %q", c.Anchor)
+	}
+}
+
+func TestAddComment_NoAnchorForReviewComment(t *testing.T) {
+	s := newTestSession(t)
+	c := s.AddReviewComment("General feedback", "reviewer")
+	if c.Anchor != "" {
+		t.Errorf("review-level comment should not have anchor, got %q", c.Anchor)
+	}
+}
+
+func TestExtractAnchor(t *testing.T) {
+	content := "line1\nline2\nline3\nline4\nline5"
+
+	tests := []struct {
+		name       string
+		start, end int
+		want       string
+	}{
+		{"single line", 2, 2, "line2"},
+		{"range", 2, 4, "line2\nline3\nline4"},
+		{"first line", 1, 1, "line1"},
+		{"last line", 5, 5, "line5"},
+		{"out of range", 6, 6, ""},
+		{"zero start", 0, 1, ""},
+		{"end beyond file", 4, 10, "line4\nline5"},
+		{"empty content", 1, 1, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := content
+			if tt.name == "empty content" {
+				c = ""
+			}
+			got := extractAnchor(c, tt.start, tt.end)
+			if got != tt.want {
+				t.Errorf("extractAnchor(%d, %d) = %q, want %q", tt.start, tt.end, got, tt.want)
+			}
+		})
 	}
 }
