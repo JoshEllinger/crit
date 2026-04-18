@@ -81,7 +81,31 @@
       "Bash(brew list:*)",
       "Bash(codesign --force --sign - \"$HOME/.local/bin/crit\" 2>&1 && echo \"Re-signed\" && \"$HOME/.local/bin/crit\" --version 2>&1; echo \"Exit: $?\")",
       "Bash(PATH=\"/opt/homebrew/bin:$PATH\" go test ./... 2>&1)",
-      "Bash(find /opt/homebrew /usr/local -name \"go\" -type f 2>/dev/null | grep -v \".go$\" | head -5; ls /usr/local/go/bin/ 2>/dev/null)"
+      "Bash(find /opt/homebrew /usr/local -name \"go\" -type f 2>/dev/null | grep -v \".go$\" | head -5; ls /usr/local/go/bin/ 2>/dev/null)",
+      "Bash(crit --version 2>&1; echo \"Exit: $?\")",
+      "Bash(zsh -i -c \"which go && go version\" 2>&1)",
+      "Bash(zsh -i -c \"go version\" 2>&1)",
+      "Bash(grep -E \"\\\\.go$\")",
+      "Bash(sort wc:*)",
+      "Bash(sort git:*)",
+      "Bash(grep -rn \"^func availableIntegrations\\\\|^func installIntegration\" *.go)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "Bash(grep -rn \"checkForUpdates\\\\|latestVersion\\\\|latest_version\" /Users/joshuaellinger/Sites/crit/.worktrees/merge-upstream-v0.8.3/*.go)",
+      "Bash(python3 -m json.tool)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\('hooks', 'NOT SET'\\), indent=2\\)\\)\")",
+      "Skill(update-config)",
+      "Bash(cat ~/.claude/plugins/cache/lucidworks/mcp-playwright/*/plugin.json)",
+      "Bash(cat ~/.claude/plugins/marketplaces/lucidworks/plugins/mcp-playwright/*/plugin.json)",
+      "Bash(cat ~/.claude/plugins/data/mcp-playwright-lucidworks/*/data.json)",
+      "Bash(npm list:*)",
+      "Bash(npx --no-install @playwright/mcp --version)",
+      "Bash(npm root:*)",
+      "Bash(xargs ls:*)",
+      "Bash(echo \"Monitoring PR #4 build in background \\(PID: $!\\)\")",
+      "Read(//Users/joshuaellinger/Sites/ai-adoption-tool/**)",
+      "Bash(npm test *)",
+      "Bash(npm run *)",
+      "Bash(python3 -c \"import sys,json; jobs=json.load\\(sys.stdin\\)['jobs']; [print\\(j['name'], j['conclusion']\\) for j in jobs]\")"
     ]
   }
 }
