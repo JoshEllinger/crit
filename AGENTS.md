@@ -402,6 +402,16 @@ Review data lives in `~/.crit/reviews/<key>.json` (same key as the session).
 
 Internal command: `crit _serve` runs the server in foreground (used by daemon spawning, not user-facing).
 
+## GitHub & PRs
+
+This is a fork of `tomasz-tomczyk/crit`. The `upstream` remote points to the original repo. **Always create PRs against `JoshEllinger/crit`, never against `tomasz-tomczyk/crit`.**
+
+When using `gh pr create`, always pass `--repo JoshEllinger/crit` explicitly, since the `upstream` remote can cause `gh` to default to the wrong repo:
+
+```bash
+gh pr create --repo JoshEllinger/crit --base main --head <branch> ...
+```
+
 ## Releasing
 
 Releases are fully automated via GitHub Actions (`.github/workflows/release.yml`). To cut a release:

@@ -77,8 +77,8 @@ test.describe('Settings Panel', () => {
   test('settings pane shows configuration cards', async ({ page }) => {
     await page.click('#settingsToggle');
     const pane = page.locator('.settings-pane[data-pane="settings"]');
-    // Account, Agent Command, AI Integration, Share — always rendered (in various states)
-    await expect(pane.locator('.config-card')).toHaveCount(4);
+    // Agent Command, AI Integration, Share — always rendered; Account only when share_url is set
+    await expect(pane.locator('.config-card')).toHaveCount(3);
   });
 
   test('about pane shows version and session info', async ({ page }) => {

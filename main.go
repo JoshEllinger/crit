@@ -2470,6 +2470,13 @@ func availableIntegrations() []string {
 	return []string{"claude-code", "codex", "cursor", "opencode", "windsurf", "github-copilot", "cline"}
 }
 
+func resolveInstallDest(dest string, baseDir string) string {
+	if baseDir != "" {
+		return filepath.Join(baseDir, dest)
+	}
+	return dest
+}
+
 func installIntegration(name string, force bool, global bool) {
 	files, ok := integrationMap[name]
 	if !ok {
@@ -2492,10 +2499,7 @@ func installIntegration(name string, force bool, global bool) {
 
 	var hints []string
 	for _, f := range files {
-		dest := f.dest
-		if global {
-			dest = filepath.Join(baseDir, f.dest)
-		}
+		dest := resolveInstallDest(f.dest, baseDir)
 
 		if !force {
 			if _, err := os.Stat(dest); err == nil {
