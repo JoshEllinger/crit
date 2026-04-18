@@ -1,6 +1,6 @@
 ---
 name: crit
-description: Use when working with crit CLI commands, .crit.json files, addressing review comments, leaving inline code review comments, sharing reviews via crit share/unpublish, pushing reviews to GitHub PRs, or pulling PR comments locally. Covers crit comment, crit share, crit unpublish, crit pull, crit push, .crit.json format, and resolution workflow.
+description: Use when working with crit CLI commands, review files, addressing review comments, leaving inline code review comments, sharing reviews via crit share/unpublish, pushing reviews to GitHub PRs, or pulling PR comments locally. Covers crit comment, crit share, crit unpublish, crit pull, crit push, review file format, and resolution workflow.
 compatibility: opencode
 ---
 
@@ -8,7 +8,7 @@ compatibility: opencode
 
 - Launch Crit for a plan file or the current git diff.
 - Wait for the user to review changes in the browser.
-- Read `.crit.json` and address unresolved inline comments.
+- Read the review file and address unresolved inline comments.
 - Signal the next review round with `crit` when edits are done.
 - Leave inline review comments programmatically with `crit comment`.
 - Sync reviews with GitHub PRs via `crit pull` and `crit push`.
@@ -17,9 +17,9 @@ compatibility: opencode
 
 Use this when the user asks to review a plan, spec, or code changes in Crit, when project instructions require a Crit pass before accepting non-trivial changes, when leaving inline comments on code, or when syncing reviews with GitHub PRs.
 
-## .crit.json Format
+## Review File Format
 
-After a crit review session, comments are in `.crit.json`. Comments have three scopes:
+After a crit review session, comments are in the review file (see `crit status` for the path). Comments have three scopes:
 
 - **Line comments** (`scope: "line"`) — tied to specific lines in a file, stored in `files.<path>.comments`
 - **File comments** (`scope: "file"`) — about a file overall, stored in `files.<path>.comments` with `start_line: 0`
@@ -29,13 +29,13 @@ After a crit review session, comments are in `.crit.json`. Comments have three s
 {
   "review_comments": [
     {
-      "id": "r0",
+      "id": "r_f1e2d3",
       "body": "Overall the architecture looks good",
       "scope": "review",
       "author": "User Name",
       "resolved": false,
       "replies": [
-        { "id": "r0-r1", "body": "Thanks, addressed the minor issues", "author": "OpenCode" }
+        { "id": "rp_b4a5c6", "body": "Thanks, addressed the minor issues", "author": "OpenCode" }
       ]
     }
   ],
@@ -43,15 +43,16 @@ After a crit review session, comments are in `.crit.json`. Comments have three s
     "path/to/file.go": {
       "comments": [
         {
-          "id": "c1",
+          "id": "c_a1b2c3",
           "start_line": 5,
           "end_line": 10,
           "body": "Comment text",
           "quote": "the specific words selected",
+          "anchor": "The sessions table needs a complete rewrite...",
           "author": "User Name",
           "resolved": false,
           "replies": [
-            { "id": "c1-r1", "body": "Fixed by extracting to helper", "author": "OpenCode" }
+            { "id": "rp_c7d8e9", "body": "Fixed by extracting to helper", "author": "OpenCode" }
           ]
         }
       ]
@@ -66,6 +67,8 @@ After a crit review session, comments are in `.crit.json`. Comments have three s
 - **File comments** are in the same per-file array but have `start_line: 0, end_line: 0, scope: "file"`
 - **Review comments** are in the top-level `review_comments` array (not tied to any file)
 - `quote` (optional): the specific text the reviewer selected — narrows the comment's scope within the line range. When present, focus your changes on the quoted text rather than the entire line range
+- `anchor` (present on line comments): the full text of the commented lines when the comment was placed. When your edits shift line numbers, use the anchor text to locate the current position of the content rather than trusting `start_line`/`end_line` which may be stale after edits
+- `drifted`: if `true`, the original content was removed or heavily rewritten — the line numbers are approximate at best
 - `resolved`: `false` or **missing** — both mean unresolved. Only `true` means resolved.
 - Address each unresolved comment by editing the relevant file at the referenced location
 
@@ -74,15 +77,29 @@ After a crit review session, comments are in `.crit.json`. Comments have three s
 After addressing a comment, reply to it using the CLI:
 
 ```bash
-crit comment --reply-to c1 --author 'OpenCode' 'Fixed by extracting to helper'
-crit comment --reply-to r0 --author 'OpenCode' 'All issues addressed'
+crit comment --reply-to c_a1b2c3 --author 'OpenCode' 'Fixed by extracting to helper'
+crit comment --reply-to r_f1e2d3 --author 'OpenCode' 'All issues addressed'
 ```
 
-This adds a reply to the comment thread. Works for both file comment IDs (`c1`, `c2`, ...) and review comment IDs (`r0`, `r1`, ...). Resolving is a user action — do not mark comments resolved from AI.
+This adds a reply to the comment thread. Works for both file comment IDs (e.g. `c_a1b2c3`) and review comment IDs (e.g. `r_f1e2d3`). Only use `--resolve` when the user explicitly asks you to resolve a comment — never resolve proactively.
+
+**Multi-file disambiguation**: Comment IDs are unique per session, but if you encounter an error like "comment found in multiple files", use `--path` to specify which file:
+
+```bash
+crit comment --reply-to c_a1b2c3 --path src/auth.go --author 'OpenCode' 'Fixed the null check'
+```
+
+In `--json` bulk mode, use the `file` field on the reply entry:
+
+```bash
+echo '[{"reply_to": "c_a1b2c3", "file": "src/auth.go", "body": "Fixed"}]' | crit comment --json --author 'OpenCode'
+```
+
+Review-level comment IDs (`r_XXXXXX`) are globally unique and never need disambiguation.
 
 ## Leaving Comments with crit comment CLI
 
-Use `crit comment` to add review comments to `.crit.json` programmatically — no browser needed:
+Use `crit comment` to add review comments to the review file programmatically — no browser needed:
 
 ```bash
 # Review-level comment (general feedback, not tied to any file)
@@ -97,9 +114,8 @@ crit comment --author 'OpenCode' <path>:<line> '<body>'
 # Line comment (range)
 crit comment --author 'OpenCode' <path>:<start>-<end> '<body>'
 
-# Reply to an existing comment (with optional --resolve)
+# Reply to an existing comment
 crit comment --reply-to <id> --author 'OpenCode' '<body>'
-crit comment --reply-to <id> --resolve --author 'OpenCode' '<body>'
 ```
 
 Rules:
@@ -108,7 +124,7 @@ Rules:
 - **Paths** are relative to the current working directory
 - **Line numbers** reference the file as it exists on disk (1-indexed), not diff line numbers
 - **Comments are appended** — calling `crit comment` multiple times adds to the list, never replaces
-- **No setup needed** — `crit comment` creates `.crit.json` automatically if it doesn't exist
+- **No setup needed** — `crit comment` creates the review file automatically if it doesn't exist
 - **Do NOT run `crit` after leaving comments** — that triggers a new review round
 
 ### Bulk commenting (recommended for multiple comments)
@@ -121,8 +137,8 @@ echo '[
   {"path": "session.go", "body": "restructure", "scope": "file"},
   {"file": "src/auth.go", "line": 42, "body": "Missing null check"},
   {"file": "src/auth.go", "line": "50-55", "body": "Extract to helper"},
-  {"reply_to": "c1", "body": "Fixed — added null check"},
-  {"reply_to": "r0", "body": "Done"}
+  {"reply_to": "c_a1b2c3", "body": "Fixed — added null check"},
+  {"reply_to": "r_f1e2d3", "body": "Done"}
 ]' | crit comment --json --author 'OpenCode'
 ```
 
@@ -130,15 +146,15 @@ JSON schema per entry:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `file` | string | yes (line comment) | Relative file path |
+| `file` | string | yes (line comment) / no (reply) | Relative file path. For replies, disambiguates when the same ID exists in multiple files |
 | `path` | string | alt for `file` | Alias for `file`; when used with no `line`, infers file-level |
 | `line` | int/string | yes (line comment) | Start line (`42`) or range (`"45-47"`) |
 | `end_line` | int | no | End line (defaults to `line`) |
 | `body` | string | yes | Comment text |
 | `author` | string | no | Per-entry override (falls back to `--author`) |
 | `scope` | string | no | `"review"`, `"file"`, or omit to infer from context |
-| `reply_to` | string | yes (reply) | Comment ID (`"c1"` or `"r0"`) |
-| `resolve` | bool | no | Mark the parent comment resolved (user action — don't set from AI) |
+| `reply_to` | string | yes (reply) | Comment ID (e.g. `"c_a1b2c3"` or `"r_f1e2d3"`) |
+| `resolve` | bool | no | Only set when user explicitly asks to resolve — never resolve proactively |
 
 Scope inference when `scope` is omitted:
 - Has `reply_to` → reply
@@ -147,15 +163,15 @@ Scope inference when `scope` is omitted:
 - Has `file`/`path` and `line` → line-level
 
 Benefits over individual `crit comment` calls:
-- **Atomic** — one write to `.crit.json`, no partial state
+- **Atomic** — one write to the review file, no partial state
 - **Faster** — single process invocation instead of N
 - **Safer** — no race conditions with concurrent crit processes
 
 ## GitHub PR Integration
 
 ```bash
-crit pull [pr-number]                                    # Fetch PR review comments into .crit.json
-crit push [--dry-run] [--event <type>] [-m <msg>] [pr]  # Post .crit.json comments as a GitHub PR review
+crit pull [pr-number]                                    # Fetch PR review comments into the review file
+crit push [--dry-run] [--event <type>] [-m <msg>] [pr]  # Post review comments as a GitHub PR review
 ```
 
 Requires `gh` CLI installed and authenticated. PR number is auto-detected from the current branch, or pass it explicitly.
@@ -183,13 +199,13 @@ crit share --share-url https://crit.md <file>  # Explicit share URL
 Rules:
 - **No server needed** — `crit share` reads files directly from disk
 - **`--qr` is terminal-only** — only use when the user has a real terminal with monospace font rendering. Do not use in mobile apps (e.g. Claude Code mobile), web chat UIs, or any environment where Unicode block characters won't render correctly
-- **Comments included** — if `.crit.json` exists, comments for the shared files are included automatically
+- **Comments included** — if the review file exists, comments for the shared files are included automatically
 - **Relay the output** — always copy the URL (and QR code if `--qr` was used) from the command output and include it directly in your response to the user. Do not make them dig through tool output
-- **State persisted** — share URL and delete token are saved to `.crit.json`
-- **Unpublish reads `.crit.json`** — uses the stored delete token to remove the review
+- **State persisted** — share URL and delete token are saved to the review file
+- **Unpublish reads the review file** — uses the stored delete token to remove the review
 
 ## Guardrails
 
 - Do not continue past the review step until the user confirms they are done.
-- Treat `.crit.json` as the source of truth for line references and comment status.
+- Treat the review file as the source of truth for line references and comment status.
 - If there are no unresolved comments, tell the user no changes were requested and stop.

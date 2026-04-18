@@ -10,12 +10,15 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// defaultShareURL is the production crit-web service URL, used as the fallback
+// when no share URL is configured via flag, env, or config.
+const defaultShareURL = "https://crit.md"
 
 // shareScope computes a hash of sorted file paths, used to detect when
 // share state belongs to a different file set.
@@ -29,7 +32,7 @@ func shareScope(paths []string) string {
 
 // computeShareHash returns a short stable hash of the current share state:
 // file contents (for change detection) and comment resolution states.
-// If the hash equals LastShareHash in .crit.json, nothing has changed since
+// If the hash equals LastShareHash in the review file, nothing has changed since
 // the last push and no new round is needed.
 func computeShareHash(files []shareFile, comments []shareComment) string {
 	sorted := make([]shareFile, len(files))
@@ -196,6 +199,7 @@ func buildShareFromSession(s *Session) ([]shareFile, []shareComment, int) {
 				Body:      c.Body,
 				Quote:     c.Quote,
 				Author:    c.Author,
+				Scope:     c.Scope,
 			}
 			if c.ReviewRound >= 1 {
 				sc.ReviewRound = c.ReviewRound
@@ -209,24 +213,51 @@ func buildShareFromSession(s *Session) ([]shareFile, []shareComment, int) {
 	return files, comments, s.ReviewRound
 }
 
-// loadCommentsForShare reads .crit.json from dir and returns shareComment entries
+// loadCommentsForShare reads the review file at critPath and returns shareComment entries
 // for the given file paths, plus the review round. Resolved comments are excluded.
-func loadCommentsForShare(dir string, filePaths []string) ([]shareComment, int) {
-	return loadCommentsFromCritJSON(dir, filePaths, false)
+func loadCommentsForShare(critPath string, filePaths []string) ([]shareComment, int) {
+	return loadCommentsFromCritJSON(critPath, filePaths, false, false)
 }
 
-// loadAllCommentsForShare is like loadCommentsForShare but includes resolved comments.
-// Used for upsert pushes so crit-web shows which comments the agent addressed.
-// Sets ExternalID on each comment from the local Comment.ID.
-func loadAllCommentsForShare(dir string, filePaths []string) ([]shareComment, int) {
-	return loadCommentsFromCritJSON(dir, filePaths, true)
+// loadCommentsForUpsert loads unresolved comments with ExternalID set for
+// round-trip tracking. Resolved comments are excluded — same as initial share.
+func loadCommentsForUpsert(critPath string, filePaths []string) ([]shareComment, int) {
+	return loadCommentsFromCritJSON(critPath, filePaths, false, true)
 }
 
-// loadCommentsFromCritJSON reads .crit.json from dir and returns shareComment entries
-// for the given file paths, plus the review round. When includeResolved is true,
-// resolved comments are included and ExternalID is set from the local comment ID.
-func loadCommentsFromCritJSON(dir string, filePaths []string, includeResolved bool) ([]shareComment, int) {
-	critPath := filepath.Join(dir, ".crit.json")
+// commentToShareComment converts a Comment into a shareComment, applying the
+// includeResolved and setExternalID flags. The filePath and scope fields are
+// set by the caller based on context.
+func commentToShareComment(c Comment, filePath, scope string, includeResolved, setExternalID bool) shareComment {
+	sc := shareComment{
+		File:      filePath,
+		StartLine: c.StartLine,
+		EndLine:   c.EndLine,
+		Body:      c.Body,
+		Quote:     c.Quote,
+		Author:    c.Author,
+		Scope:     scope,
+	}
+	if includeResolved {
+		sc.Resolved = c.Resolved
+	}
+	if setExternalID {
+		sc.ExternalID = c.ID
+	}
+	if c.ReviewRound >= 1 {
+		sc.ReviewRound = c.ReviewRound
+	}
+	for _, r := range c.Replies {
+		sc.Replies = append(sc.Replies, shareReply{Body: r.Body, Author: r.Author})
+	}
+	return sc
+}
+
+// loadCommentsFromCritJSON reads the review file at critPath and returns shareComment
+// entries for the given file paths, plus the review round. When includeResolved is true,
+// resolved comments are included. When setExternalID is true, ExternalID is set
+// from the local comment ID for round-trip tracking.
+func loadCommentsFromCritJSON(critPath string, filePaths []string, includeResolved, setExternalID bool) ([]shareComment, int) {
 	data, err := os.ReadFile(critPath)
 	if err != nil {
 		return nil, 1
@@ -255,47 +286,15 @@ func loadCommentsFromCritJSON(dir string, filePaths []string, includeResolved bo
 			if !includeResolved && c.Resolved {
 				continue
 			}
-			sc := shareComment{
-				File:      filePath,
-				StartLine: c.StartLine,
-				EndLine:   c.EndLine,
-				Body:      c.Body,
-				Quote:     c.Quote,
-				Author:    c.Author,
-			}
-			if includeResolved {
-				sc.Resolved = c.Resolved
-				sc.ExternalID = c.ID
-			}
-			if c.ReviewRound >= 1 {
-				sc.ReviewRound = c.ReviewRound
-			}
-			for _, r := range c.Replies {
-				sc.Replies = append(sc.Replies, shareReply{Body: r.Body, Author: r.Author})
-			}
-			comments = append(comments, sc)
+			scope := c.Scope
+			comments = append(comments, commentToShareComment(c, filePath, scope, includeResolved, setExternalID))
 		}
 	}
 	for _, c := range cj.ReviewComments {
 		if !includeResolved && c.Resolved {
 			continue
 		}
-		sc := shareComment{
-			Body:   c.Body,
-			Author: c.Author,
-			Scope:  "review",
-		}
-		if includeResolved {
-			sc.Resolved = c.Resolved
-			sc.ExternalID = c.ID
-		}
-		if c.ReviewRound >= 1 {
-			sc.ReviewRound = c.ReviewRound
-		}
-		for _, r := range c.Replies {
-			sc.Replies = append(sc.Replies, shareReply{Body: r.Body, Author: r.Author})
-		}
-		comments = append(comments, sc)
+		comments = append(comments, commentToShareComment(c, "", "review", includeResolved, setExternalID))
 	}
 	return comments, round
 }
@@ -339,7 +338,7 @@ func buildLocalFingerprints(cj CritJSON) map[string]bool {
 // i.e., when the agent calls `crit share <files>` after applying changes from
 // the crit-web prompt. This captures any web-reviewer comments added after the
 // prompt was generated (e.g., a late-arriving review) so they appear in local
-// .crit.json before the next round is pushed.
+// the review file before the next round is pushed.
 //
 // shareURL is the full review URL, e.g. "https://crit.md/r/abc123".
 func fetchNewWebComments(shareURL string, localIDs map[string]bool, localFingerprints map[string]bool, authToken string) ([]webComment, error) {
@@ -471,8 +470,7 @@ func upsertShareToWeb(cfg CritJSON, files []shareFile, comments []shareComment, 
 }
 
 // loadExistingShareCfg returns the full CritJSON if a matching share exists (same file scope).
-func loadExistingShareCfg(dir string, paths []string) (CritJSON, bool) {
-	critPath := filepath.Join(dir, ".crit.json")
+func loadExistingShareCfg(critPath string, paths []string) (CritJSON, bool) {
 	data, err := os.ReadFile(critPath)
 	if err != nil {
 		return CritJSON{}, false
@@ -508,10 +506,32 @@ func buildLocalIDSet(cj CritJSON) map[string]bool {
 	return ids
 }
 
-// mergeWebComments adds web-reviewer comments into .crit.json under their respective files
-// or into review_comments for review-level (scope:"review") comments.
-func mergeWebComments(dir string, newComments []webComment) error {
-	critPath := filepath.Join(dir, ".crit.json")
+// highestWebIndex returns the highest numeric suffix among "web-N" comment IDs
+// in a CritJSON structure. This ensures new web comment IDs are globally unique.
+func highestWebIndex(cj CritJSON) int {
+	max := 0
+	for _, f := range cj.Files {
+		for _, c := range f.Comments {
+			if strings.HasPrefix(c.ID, "web-") {
+				if n, err := strconv.Atoi(strings.TrimPrefix(c.ID, "web-")); err == nil && n > max {
+					max = n
+				}
+			}
+		}
+	}
+	for _, c := range cj.ReviewComments {
+		if strings.HasPrefix(c.ID, "web-") {
+			if n, err := strconv.Atoi(strings.TrimPrefix(c.ID, "web-")); err == nil && n > max {
+				max = n
+			}
+		}
+	}
+	return max
+}
+
+// mergeWebComments adds web-reviewer comments into the review file under their respective
+// files or into review_comments for review-level (scope:"review") comments.
+func mergeWebComments(critPath string, newComments []webComment) error {
 	data, err := os.ReadFile(critPath)
 	if err != nil {
 		return err
@@ -525,20 +545,8 @@ func mergeWebComments(dir string, newComments []webComment) error {
 	}
 
 	// Find the highest existing web-N index so new IDs are globally unique
-	// even if earlier ones were deleted from .crit.json.
-	webCount := 0
-	for _, f := range cj.Files {
-		for _, c := range f.Comments {
-			if n, err := strconv.Atoi(strings.TrimPrefix(c.ID, "web-")); err == nil && strings.HasPrefix(c.ID, "web-") && n > webCount {
-				webCount = n
-			}
-		}
-	}
-	for _, c := range cj.ReviewComments {
-		if n, err := strconv.Atoi(strings.TrimPrefix(c.ID, "web-")); err == nil && strings.HasPrefix(c.ID, "web-") && n > webCount {
-			webCount = n
-		}
-	}
+	// even if earlier ones were deleted from the review file.
+	webCount := highestWebIndex(cj)
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, wc := range newComments {
@@ -568,9 +576,8 @@ func mergeWebComments(dir string, newComments []webComment) error {
 	return saveCritJSON(critPath, cj)
 }
 
-// updateShareState writes LastShareHash and ReviewRound back to .crit.json.
-func updateShareState(dir string, hash string, reviewRound int) error {
-	critPath := filepath.Join(dir, ".crit.json")
+// updateShareState writes LastShareHash and ReviewRound back to the review file.
+func updateShareState(critPath string, hash string, reviewRound int) error {
 	data, err := os.ReadFile(critPath)
 	if err != nil {
 		return err
@@ -585,10 +592,9 @@ func updateShareState(dir string, hash string, reviewRound int) error {
 	return saveCritJSON(critPath, cj)
 }
 
-// persistShareState writes the share URL, delete token, and scope hash to .crit.json,
+// persistShareState writes the share URL, delete token, and scope hash to the review file,
 // preserving any existing content.
-func persistShareState(dir string, shareURL string, deleteToken string, scope string) error {
-	critPath := filepath.Join(dir, ".crit.json")
+func persistShareState(critPath string, shareURL string, deleteToken string, scope string) error {
 	var cj CritJSON
 	if data, err := os.ReadFile(critPath); err == nil {
 		_ = json.Unmarshal(data, &cj)
@@ -604,20 +610,22 @@ func persistShareState(dir string, shareURL string, deleteToken string, scope st
 	return saveCritJSON(critPath, cj)
 }
 
-// clearShareState removes share URL and delete token from .crit.json.
-func clearShareState(dir string) error {
-	critPath := filepath.Join(dir, ".crit.json")
+// clearShareState removes share URL, delete token, share scope, and last-share
+// hash from the review file. It is the single source of truth for "undo share
+// metadata" — used by both the unpublish CLI path and tests.
+func clearShareState(critPath string) error {
 	data, err := os.ReadFile(critPath)
 	if err != nil {
-		return nil // no .crit.json, nothing to clear
+		return nil //nolint:nilerr // no review file means nothing to clear
 	}
 	var cj CritJSON
 	if err := json.Unmarshal(data, &cj); err != nil {
-		return fmt.Errorf("invalid .crit.json: %w", err)
+		return fmt.Errorf("invalid review file: %w", err)
 	}
 	cj.ShareURL = ""
 	cj.DeleteToken = ""
 	cj.ShareScope = ""
+	cj.LastShareHash = ""
 	cj.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
 	return saveCritJSON(critPath, cj)
@@ -636,9 +644,12 @@ func loadShareConfig() Config {
 	return LoadConfig(cfgDir)
 }
 
-// resolveShareURL resolves the share service URL from flag > env > config > default.
+// resolveShareURL resolves the share service URL from flag > env > config > fallback.
 // cfg is the already-loaded Config so callers avoid redundant config parsing.
-func resolveShareURL(flagValue string, cfg Config) string {
+// fallback is returned when no other source provides a value (typically
+// "https://crit.md" for share/auth commands, or "" for the serve path where an
+// empty URL means "sharing not configured").
+func resolveShareURL(flagValue string, cfg Config, fallback string) string {
 	if flagValue != "" {
 		return flagValue
 	}
@@ -648,7 +659,7 @@ func resolveShareURL(flagValue string, cfg Config) string {
 	if cfg.ShareURL != "" {
 		return cfg.ShareURL
 	}
-	return "https://crit.md"
+	return fallback
 }
 
 // resolveAuthToken returns the auth token from env > config.

@@ -27,11 +27,13 @@ var browserClient = &http.Client{Timeout: 2 * time.Second}
 
 // sessionEntry tracks a running daemon process in ~/.crit/sessions/.
 type sessionEntry struct {
-	PID       int      `json:"pid"`
-	Port      int      `json:"port"`
-	CWD       string   `json:"cwd"`
-	Args      []string `json:"args,omitempty"`
-	StartedAt string   `json:"started_at"`
+	PID        int      `json:"pid"`
+	Port       int      `json:"port"`
+	CWD        string   `json:"cwd"`
+	Args       []string `json:"args,omitempty"`
+	Branch     string   `json:"branch"`
+	ReviewPath string   `json:"review_path"`
+	StartedAt  string   `json:"started_at"`
 }
 
 // resolvedCWD returns the current working directory with symlinks resolved.
@@ -43,19 +45,26 @@ func resolvedCWD() (string, error) {
 	}
 	resolved, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
-		return cwd, nil // fall back to unresolved
+		return cwd, nil //nolint:nilerr // best-effort: fall back to unresolved path
 	}
 	return resolved, nil
 }
 
-// sessionKey returns a deterministic hash for cwd + args, used as the session filename.
-// Format: sha256(cwd + "\0" + arg1 + "\0" + arg2 + ...)[:12]
-func sessionKey(cwd string, args []string) string {
+// sessionKey returns a deterministic hash used as the session filename.
+// Git mode (no args): sha256(cwd + "\0" + branch)[:12] — branch-scoped because diffs depend on it.
+// File mode (args present): sha256(cwd + "\0" + arg1 + "\0" + arg2 + ...)[:12] — branch-independent
+// because file reviews are not tied to a specific branch.
+func sessionKey(cwd string, branch string, args []string) string {
 	sorted := make([]string, len(args))
 	copy(sorted, args)
 	sort.Strings(sorted)
 	h := sha256.New()
 	h.Write([]byte(cwd))
+	h.Write([]byte{0})
+	if len(sorted) == 0 {
+		// Git mode: include branch so different branches get separate sessions.
+		h.Write([]byte(branch))
+	}
 	for _, a := range sorted {
 		h.Write([]byte{0})
 		h.Write([]byte(a))
@@ -81,23 +90,32 @@ func sessionFilePath(key string) (string, error) {
 	return filepath.Join(dir, key+".json"), nil
 }
 
-// writeSessionFile writes a session entry to ~/.crit/sessions/<key>.json.
-// Uses atomic temp file + fsync + rename to prevent corruption.
-func writeSessionFile(key string, entry sessionEntry) error {
-	dir, err := sessionsDir()
+// reviewsDir returns the path to ~/.crit/reviews/.
+func reviewsDir() (string, error) {
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return err
+		return "", fmt.Errorf("finding home directory: %w", err)
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating sessions directory: %w", err)
-	}
-	data, err := json.MarshalIndent(entry, "", "  ")
+	return filepath.Join(home, ".crit", "reviews"), nil
+}
+
+// reviewFilePath returns the full path for a review data file.
+func reviewFilePath(key string) (string, error) {
+	dir, err := reviewsDir()
 	if err != nil {
-		return err
+		return "", err
+	}
+	return filepath.Join(dir, key+".json"), nil
+}
+
+// atomicWriteFile writes data to the target path atomically using temp file + fsync + rename.
+func atomicWriteFile(target string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("creating directory %s: %w", dir, err)
 	}
 
-	target := filepath.Join(dir, key+".json")
-	tmp, err := os.CreateTemp(dir, key+"*.tmp")
+	tmp, err := os.CreateTemp(dir, filepath.Base(target)+"*.tmp")
 	if err != nil {
 		return err
 	}
@@ -117,7 +135,24 @@ func writeSessionFile(key string, entry sessionEntry) error {
 		os.Remove(tmpName)
 		return err
 	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
 	return os.Rename(tmpName, target)
+}
+
+// writeSessionFile writes a session entry to ~/.crit/sessions/<key>.json.
+func writeSessionFile(key string, entry sessionEntry) error {
+	path, err := sessionFilePath(key)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(path, data, 0600)
 }
 
 // readSessionFile reads a session entry from ~/.crit/sessions/<key>.json.
@@ -197,9 +232,64 @@ func listSessionsForCWD(cwd string) ([]sessionEntry, []string) {
 			alive = append(alive, entry)
 			keys = append(keys, key)
 		} else {
-			os.Remove(filepath.Join(dir, de.Name()))
-			os.Remove(filepath.Join(dir, key+".log"))
-			os.Remove(filepath.Join(dir, key+".lock"))
+			removeSessionFile(key)
+		}
+	}
+	return alive, keys
+}
+
+// findSessionForCWDBranch scans all alive sessions for the given cwd and branch.
+// Returns the session, its key, and the number of branch matches found.
+// The session and key are only valid when matchCount == 1.
+func findSessionForCWDBranch(cwd, branch string) (entry sessionEntry, key string, matchCount int) {
+	sessions, keys := listSessionsForCWD(cwd)
+	var matched []int
+	for i, s := range sessions {
+		if s.Branch == branch {
+			matched = append(matched, i)
+		}
+	}
+	if len(matched) == 1 {
+		return sessions[matched[0]], keys[matched[0]], 1
+	}
+	return sessionEntry{}, "", len(matched)
+}
+
+// listSessionsForRepoRoot returns alive sessions whose CWD is within the given
+// git repository root. This handles the case where `crit` was started from a
+// subdirectory (e.g. repo/api) but `crit comment` is run from a different
+// subdirectory or the repo root itself.
+func listSessionsForRepoRoot(repoRoot string) ([]sessionEntry, []string) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return nil, nil
+	}
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil
+	}
+	prefix := repoRoot + string(filepath.Separator)
+	var alive []sessionEntry
+	var keys []string
+	for _, de := range dirEntries {
+		if !strings.HasSuffix(de.Name(), ".json") {
+			continue
+		}
+		key := strings.TrimSuffix(de.Name(), ".json")
+		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		if err != nil {
+			continue
+		}
+		var entry sessionEntry
+		if err := json.Unmarshal(data, &entry); err != nil {
+			continue
+		}
+		if entry.CWD != repoRoot && !strings.HasPrefix(entry.CWD, prefix) {
+			continue
+		}
+		if isDaemonAlive(entry) {
+			alive = append(alive, entry)
+			keys = append(keys, key)
 		}
 	}
 	return alive, keys
@@ -269,7 +359,7 @@ func acquireSessionLock(key string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating sessions directory: %w", err)
 	}
 	lockPath := filepath.Join(dir, key+".lock")
@@ -369,6 +459,7 @@ func readPortFromPipe(readEnd *os.File) (portCh chan int, errCh chan error) {
 	return portCh, errCh
 }
 
+//nolint:unparam // error return is kept for consistent startDaemon select-case handling
 func handleDaemonReady(key string, port, pid int, readEnd *os.File, cmd *exec.Cmd) (sessionEntry, error) {
 	readEnd.Close()
 	cmd.Process.Release()
@@ -387,6 +478,7 @@ func handleDaemonReady(key string, port, pid int, readEnd *os.File, cmd *exec.Cm
 	return entry, nil
 }
 
+//nolint:unparam // sessionEntry return is kept for consistent startDaemon select-case handling
 func handleDaemonPipeError(key string, readErr error, readEnd *os.File, cmd *exec.Cmd, exited chan error) (sessionEntry, error) {
 	readEnd.Close()
 	// Wait briefly for daemon exit — pipe EOF usually means it already crashed.
@@ -402,11 +494,11 @@ func handleDaemonPipeError(key string, readErr error, readEnd *os.File, cmd *exe
 	if msg != "" {
 		return sessionEntry{}, fmt.Errorf("daemon exited: %s", msg)
 	}
-	return sessionEntry{}, fmt.Errorf("daemon startup failed: %v", readErr)
+	return sessionEntry{}, fmt.Errorf("daemon startup failed: %w", readErr)
 }
 
 // startDaemon spawns a crit _serve process in the background and waits for it to be ready.
-// The key must match what the daemon computes in runServe (sessionKey(cwd, fileArgs)).
+// The key must match what the daemon computes in runServe (sessionKey(cwd, branch, fileArgs)).
 // Raw args (including flags) are passed through to _serve which parses them itself.
 // Uses an OS pipe (FD 3) for the daemon to signal readiness by writing its port number.
 func startDaemon(key string, args []string) (sessionEntry, error) {
@@ -455,7 +547,7 @@ func startDaemon(key string, args []string) (sessionEntry, error) {
 		if msg != "" {
 			return sessionEntry{}, fmt.Errorf("daemon exited: %s", msg)
 		}
-		return sessionEntry{}, fmt.Errorf("daemon exited: %v", err)
+		return sessionEntry{}, fmt.Errorf("daemon exited: %w", err)
 
 	case <-time.After(10 * time.Second):
 		readEnd.Close()
@@ -543,12 +635,12 @@ func stopDaemon(key string) error {
 	proc, err := os.FindProcess(entry.PID)
 	if err != nil {
 		removeSessionFile(key)
-		return nil
+		return nil //nolint:nilerr // process not found, session already cleaned up
 	}
 
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
 		removeSessionFile(key)
-		return nil // already gone
+		return nil //nolint:nilerr // process already gone, cleanup is sufficient
 	}
 
 	// Poll for process exit, escalate to SIGKILL if needed
@@ -572,5 +664,38 @@ func stopAllDaemonsForCWD(cwd string) {
 	_, keys := listSessionsForCWD(cwd)
 	for _, key := range keys {
 		stopDaemon(key)
+	}
+}
+
+// cleanOrphanedSessions removes session files whose daemon PID is dead.
+// It silently ignores all errors — intended for best-effort background use.
+func cleanOrphanedSessions() {
+	sessDir, err := sessionsDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(sessDir)
+	if err != nil {
+		return
+	}
+	for _, de := range entries {
+		if !strings.HasSuffix(de.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(sessDir, de.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var entry sessionEntry
+		if json.Unmarshal(data, &entry) != nil {
+			continue
+		}
+		if !isDaemonAlive(entry) {
+			os.Remove(path)
+			key := strings.TrimSuffix(de.Name(), ".json")
+			os.Remove(filepath.Join(sessDir, key+".log"))
+			os.Remove(filepath.Join(sessDir, key+".lock"))
+		}
 	}
 }

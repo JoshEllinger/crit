@@ -273,7 +273,7 @@ func TestFileDiffUnified_RealRepo(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "README.md"), "# Modified\n\nNew content\n")
 	runGit(t, dir, "add", "README.md")
 
-	hunks, err := FileDiffUnified("README.md", "HEAD")
+	hunks, err := fileDiffUnified("README.md", "HEAD", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +690,7 @@ func TestFileDiffScoped_Default(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(hunks) == 0 {
-		t.Error("expected diff hunks for default scope (delegates to FileDiffUnified)")
+		t.Error("expected diff hunks for default scope (delegates to fileDiffUnified)")
 	}
 }
 
@@ -1348,18 +1348,14 @@ func TestDiffNumstat(t *testing.T) {
 
 	if s, ok := stats["stats.go"]; !ok {
 		t.Fatal("missing stats.go in numstat output")
-	} else {
-		if s.Additions != 5 || s.Deletions != 1 {
-			t.Errorf("stats.go: got +%d/-%d, want +5/-1", s.Additions, s.Deletions)
-		}
+	} else if s.Additions != 5 || s.Deletions != 1 {
+		t.Errorf("stats.go: got +%d/-%d, want +5/-1", s.Additions, s.Deletions)
 	}
 
 	if s, ok := stats["newfile.txt"]; !ok {
 		t.Fatal("missing newfile.txt in numstat output")
-	} else {
-		if s.Additions != 3 || s.Deletions != 0 {
-			t.Errorf("newfile.txt: got +%d/-%d, want +3/-0", s.Additions, s.Deletions)
-		}
+	} else if s.Additions != 3 || s.Deletions != 0 {
+		t.Errorf("newfile.txt: got +%d/-%d, want +3/-0", s.Additions, s.Deletions)
 	}
 }
 
@@ -1384,9 +1380,7 @@ func TestDiffNumstatBinary(t *testing.T) {
 
 	if s, ok := stats["image.png"]; !ok {
 		t.Fatal("missing image.png in numstat output")
-	} else {
-		if s.Additions != 0 || s.Deletions != 0 {
-			t.Errorf("image.png: got +%d/-%d, want +0/-0", s.Additions, s.Deletions)
-		}
+	} else if s.Additions != 0 || s.Deletions != 0 {
+		t.Errorf("image.png: got +%d/-%d, want +0/-0", s.Additions, s.Deletions)
 	}
 }
