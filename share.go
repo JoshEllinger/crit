@@ -45,7 +45,7 @@ func computeShareHash(files []shareFile, comments []shareComment) string {
 
 	h := sha256.New()
 	for _, f := range sorted {
-		fmt.Fprintf(h, "file:%s:%s\n", f.Path, f.Content)
+		fmt.Fprintf(h, "file:%s:%s:%s\n", f.Path, f.Content, f.Status)
 	}
 	for _, c := range sortedC {
 		fmt.Fprintf(h, "comment:%s:%v\n", c.ExternalID, c.Resolved)
@@ -54,9 +54,12 @@ func computeShareHash(files []shareFile, comments []shareComment) string {
 }
 
 // shareFile represents a file to be shared.
+// Status values: "added", "modified", "deleted", "renamed", "removed".
+// "removed" means the file is orphaned (no longer in the review but has comments).
 type shareFile struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	Status  string `json:"status,omitempty"`
 }
 
 // shareReply represents a reply to include in the shared review.
@@ -82,9 +85,13 @@ type shareComment struct {
 
 // buildSharePayload constructs the JSON payload for POST /api/reviews.
 func buildSharePayload(files []shareFile, comments []shareComment, reviewRound int) map[string]any {
-	fileList := make([]map[string]string, len(files))
+	fileList := make([]map[string]any, len(files))
 	for i, f := range files {
-		fileList[i] = map[string]string{"path": f.Path, "content": f.Content}
+		entry := map[string]any{"path": f.Path, "content": f.Content}
+		if f.Status != "" {
+			entry["status"] = f.Status
+		}
+		fileList[i] = entry
 	}
 	if comments == nil {
 		comments = []shareComment{}
@@ -380,9 +387,13 @@ func upsertShareToWeb(cfg CritJSON, files []shareFile, comments []shareComment, 
 	}
 	apiURL := u.Scheme + "://" + u.Host + "/api/reviews/" + token
 
-	fileList := make([]map[string]string, len(files))
+	fileList := make([]map[string]any, len(files))
 	for i, f := range files {
-		fileList[i] = map[string]string{"path": f.Path, "content": f.Content}
+		entry := map[string]any{"path": f.Path, "content": f.Content}
+		if f.Status != "" {
+			entry["status"] = f.Status
+		}
+		fileList[i] = entry
 	}
 
 	payload := map[string]any{
