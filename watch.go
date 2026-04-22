@@ -33,6 +33,7 @@ func (s *Session) RefreshDiffs() {
 	}
 	baseRef := s.BaseRef
 	repoRoot := s.RepoRoot
+	vcs := s.VCS
 	s.mu.RUnlock()
 
 	// Compute diffs without holding any lock
@@ -45,10 +46,10 @@ func (s *Session) RefreshDiffs() {
 		var hunks []DiffHunk
 		if snap.status == "added" || snap.status == "untracked" {
 			hunks = FileDiffUnifiedNewFile(snap.content)
-		} else {
-			h, err := fileDiffUnified(snap.path, baseRef, repoRoot)
+		} else if vcs != nil {
+			h, err := vcs.FileDiffUnified(snap.path, baseRef, repoRoot)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: git diff failed for %s: %v\n", snap.path, err)
+				fmt.Fprintf(os.Stderr, "Warning: diff failed for %s: %v\n", snap.path, err)
 			} else {
 				hunks = h
 			}
@@ -67,8 +68,27 @@ func (s *Session) RefreshDiffs() {
 // RefreshFileList re-runs ChangedFiles and updates the session's file list.
 // New files are added, removed files are dropped.
 func (s *Session) RefreshFileList() {
-	// ChangedFiles shells out to git — no lock needed
-	changes, err := ChangedFiles()
+	s.mu.RLock()
+	vcs := s.VCS
+	s.mu.RUnlock()
+
+	if vcs == nil {
+		return
+	}
+
+	// Shell out to VCS for changed files — no lock held.
+	s.mu.RLock()
+	baseRef := s.BaseRef
+	repoRoot := s.RepoRoot
+	s.mu.RUnlock()
+
+	var changes []FileChange
+	var err error
+	if vcs.CurrentBranch() == vcs.DefaultBranch() {
+		changes, err = vcs.ChangedFilesOnDefaultInDir(repoRoot)
+	} else {
+		changes, err = vcs.ChangedFilesFromBaseInDir(baseRef, repoRoot)
+	}
 	if err != nil {
 		return
 	}
@@ -82,15 +102,13 @@ func (s *Session) RefreshFileList() {
 	for _, f := range s.Files {
 		existing[f.Path] = f
 	}
-	repoRoot := s.RepoRoot
-	baseRef := s.BaseRef
 	s.mu.RUnlock()
 
 	// Fetch numstats if we might need them for lazy files
 	var numstats map[string]NumstatEntry
 	if len(changes) > lazyFileThreshold {
 		if baseRef != "" {
-			numstats, _ = DiffNumstatDir(baseRef, repoRoot)
+			numstats, _ = vcs.DiffNumstat(baseRef, repoRoot)
 		}
 	}
 
@@ -164,6 +182,11 @@ func (s *Session) watchGit(stop <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	// Read VCS once under lock — it doesn't change after session init.
+	s.mu.RLock()
+	vcs := s.VCS
+	s.mu.RUnlock()
+
 	var lastFP string
 	wasWaiting := false
 
@@ -175,13 +198,18 @@ func (s *Session) watchGit(stop <-chan struct{}) {
 			// Check for external review file changes (e.g. crit comment).
 			s.mergeExternalCritJSON()
 
-			// Only poll git status while waiting for the agent to make edits.
+			// Only poll VCS status while waiting for the agent to make edits.
 			if !s.isWaitingForAgent() {
 				wasWaiting = false
 				continue
 			}
 
-			fp := WorkingTreeFingerprint()
+			var fp string
+			if vcs != nil {
+				fp = vcs.WorkingTreeFingerprint()
+			} else {
+				fp = WorkingTreeFingerprint()
+			}
 			if !wasWaiting {
 				// Just entered waiting state — establish baseline.
 				lastFP = fp

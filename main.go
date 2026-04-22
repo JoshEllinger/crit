@@ -432,8 +432,8 @@ func runConfig(args []string) {
 		}
 	}
 	configDir := ""
-	if IsGitRepo() {
-		configDir, _ = RepoRoot()
+	if vcs := DetectVCS(""); vcs != nil {
+		configDir, _ = vcs.RepoRoot()
 	}
 	if configDir == "" {
 		configDir, _ = os.Getwd()
@@ -773,11 +773,11 @@ func resolveCommentFlags(f *commentFlags) {
 		}
 	}
 
-	// Resolve author: --author flag > config > git user.name
+	// Resolve author: --author flag > config > VCS user.name
 	if f.author == "" {
 		cfgDir, _ := os.Getwd()
-		if IsGitRepo() {
-			cfgDir, _ = RepoRoot()
+		if vcs := DetectVCS(""); vcs != nil {
+			cfgDir, _ = vcs.RepoRoot()
 		}
 		cfg := LoadConfig(cfgDir)
 		f.author = cfg.Author
@@ -987,9 +987,9 @@ func fileExistsOnDiskOrSession(path string, outputDir string) bool {
 	if info, err := os.Stat(path); err == nil && !info.IsDir() {
 		return true
 	}
-	// Check in repo root if we're in a git repo
-	if IsGitRepo() {
-		if root, err := RepoRoot(); err == nil {
+	// Check in repo root if we're in a VCS repo
+	if vcs := DetectVCS(""); vcs != nil {
+		if root, err := vcs.RepoRoot(); err == nil {
 			absPath := filepath.Join(root, path)
 			if info, err := os.Stat(absPath); err == nil && !info.IsDir() {
 				return true
@@ -1394,8 +1394,8 @@ func runReview(args []string) {
 
 	cwd, _ := resolvedCWD()
 	branch := ""
-	if IsGitRepo() {
-		branch = CurrentBranch()
+	if vcs := DetectVCS(sc.vcsOverride); vcs != nil {
+		branch = vcs.CurrentBranch()
 	}
 	key := sessionKey(cwd, branch, sc.files)
 
@@ -1500,6 +1500,9 @@ func runReviewClient(entry sessionEntry) (approved bool) {
 	return false
 }
 
+// TODO: runStop, runStatus, and other subcommands use DetectVCS("") for auto-detection.
+// The --vcs flag from the main server command is not threaded through to these subcommands yet.
+// This is acceptable for v1 since subcommands primarily need to locate the daemon, not run VCS ops.
 func runStop(args []string) {
 	all := false
 	var fileArgs []string
@@ -1520,8 +1523,8 @@ func runStop(args []string) {
 	}
 
 	branch := ""
-	if IsGitRepo() {
-		branch = CurrentBranch()
+	if vcs := DetectVCS(""); vcs != nil {
+		branch = vcs.CurrentBranch()
 	}
 
 	// If file args were given, use the exact key (user knows which session).
@@ -1588,6 +1591,7 @@ type serverConfig struct {
 	authToken          string
 	outputDir          string
 	author             string
+	baseBranch         string // --base-branch override for diff base
 	ignorePatterns     []string
 	files              []string // explicit file arguments (empty = git mode)
 	noIntegrationCheck bool
@@ -1596,6 +1600,7 @@ type serverConfig struct {
 	planDir            string // managed storage directory for plan mode
 	planName           string // display name for plan content
 	reviewPath         string // centralized review file path (~/.crit/reviews/<key>.json)
+	vcsOverride        string // "git", "sl"/"sapling", or "" for auto-detect
 	cfg                Config // full resolved config for the settings panel
 }
 
@@ -1609,6 +1614,7 @@ type serverFlagSet struct {
 	quiet       bool
 	noIgnore    bool
 	baseBranch  string
+	vcsOverride string
 	planDir     string
 	planName    string
 	fileArgs    []string
@@ -1628,6 +1634,7 @@ func parseServerFlags(args []string) serverFlagSet {
 	fs.BoolVar(quiet, "q", false, "Suppress status output (shorthand)")
 	noIgnore := fs.Bool("no-ignore", false, "Disable all ignore patterns from config files")
 	baseBranch := fs.String("base-branch", "", "Base branch to diff against (overrides auto-detection)")
+	vcsFlag := fs.String("vcs", "", "VCS backend to use: git, sl/sapling (default: auto-detect)")
 	planDir := fs.String("plan-dir", "", "")
 	planName := fs.String("name", "", "")
 	fs.Usage = func() {
@@ -1644,6 +1651,7 @@ func parseServerFlags(args []string) serverFlagSet {
 		quiet:       *quiet,
 		noIgnore:    *noIgnore,
 		baseBranch:  *baseBranch,
+		vcsOverride: *vcsFlag,
 		planDir:     *planDir,
 		planName:    *planName,
 		fileArgs:    fs.Args(),
@@ -1696,8 +1704,8 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 	}
 
 	configDir := ""
-	if IsGitRepo() {
-		configDir, _ = RepoRoot()
+	if vcs := DetectVCS(sf.vcsOverride); vcs != nil {
+		configDir, _ = vcs.RepoRoot()
 	}
 	if configDir == "" {
 		configDir, _ = os.Getwd()
@@ -1719,6 +1727,7 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 		authToken:          cfg.AuthToken,
 		outputDir:          sf.outputDir,
 		author:             cfg.Author,
+		baseBranch:         sf.baseBranch,
 		ignorePatterns:     ignorePatterns,
 		noIntegrationCheck: cfg.NoIntegrationCheck,
 		noUpdateCheck:      cfg.NoUpdateCheck,
@@ -1726,23 +1735,43 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 		files:              sf.fileArgs,
 		planDir:            sf.planDir,
 		planName:           sf.planName,
+		vcsOverride:        resolveVCSOverride(sf.vcsOverride, cfg.VCS),
 		cfg:                cfg,
 	}, nil
+}
+
+// resolveVCSOverride returns the effective VCS override.
+// --vcs flag takes precedence over config "vcs" field.
+func resolveVCSOverride(flag, config string) string {
+	if flag != "" {
+		return flag
+	}
+	return config
 }
 
 func createSession(sc *serverConfig) (*Session, error) {
 	var session *Session
 	var err error
 	if len(sc.files) == 0 {
-		if !IsGitRepo() {
-			return nil, fmt.Errorf("not in a git repository and no files specified")
+		vcs := DetectVCS(sc.vcsOverride)
+		if vcs == nil {
+			return nil, fmt.Errorf("not in a version-controlled repository and no files specified")
 		}
-		session, err = NewSessionFromGit(sc.ignorePatterns)
+		if sc.baseBranch != "" {
+			vcs.SetDefaultBranchOverride(sc.baseBranch)
+		}
+		session, err = NewSessionFromVCS(vcs, sc.ignorePatterns)
 	} else {
 		session, err = NewSessionFromFiles(sc.files, sc.ignorePatterns)
 	}
 	if err != nil {
 		return nil, err
+	}
+	// Apply --base-branch override to the session's VCS instance. This covers
+	// files mode where resolveGitContext creates a fresh VCS that doesn't have
+	// the override yet. For Sapling, the instance-level field must be set.
+	if sc.baseBranch != "" && session.VCS != nil {
+		session.VCS.SetDefaultBranchOverride(sc.baseBranch)
 	}
 	// Set ReviewFilePath before loadCritJSON so it reads from the centralized
 	// review file.
@@ -1790,8 +1819,8 @@ func serveSessionKey(sc *serverConfig) string {
 		return planSessionKey(cwd, sc.planName)
 	}
 	branch := ""
-	if IsGitRepo() {
-		branch = CurrentBranch()
+	if vcs := DetectVCS(sc.vcsOverride); vcs != nil {
+		branch = vcs.CurrentBranch()
 	}
 	return sessionKey(cwd, branch, sc.files)
 }
@@ -1861,8 +1890,8 @@ func runServe(args []string) {
 	}
 	key := serveSessionKey(sc)
 	branch := ""
-	if IsGitRepo() {
-		branch = CurrentBranch()
+	if vcs := DetectVCS(sc.vcsOverride); vcs != nil {
+		branch = vcs.CurrentBranch()
 	}
 	if sc.outputDir != "" {
 		abs, _ := filepath.Abs(sc.outputDir)
@@ -2001,9 +2030,11 @@ func runStatus(args []string) {
 		os.Exit(1)
 	}
 
+	vcsName := ""
 	branch := ""
-	if IsGitRepo() {
-		branch = CurrentBranch()
+	if vcs := DetectVCS(""); vcs != nil {
+		vcsName = vcs.Name()
+		branch = vcs.CurrentBranch()
 	}
 
 	sessions, keys := listSessionsForCWD(cwd)
@@ -2030,15 +2061,16 @@ func runStatus(args []string) {
 	}
 
 	if jsonOutput {
-		printStatusJSON(branch, revPath, revExists, matchedSession)
+		printStatusJSON(vcsName, branch, revPath, revExists, matchedSession)
 		return
 	}
 
-	printStatusHuman(branch, revPath, revExists, matchedSession)
+	printStatusHuman(vcsName, branch, revPath, revExists, matchedSession)
 }
 
-func printStatusJSON(branch, revPath string, revExists bool, session *sessionEntry) {
+func printStatusJSON(vcsName, branch, revPath string, revExists bool, session *sessionEntry) {
 	result := map[string]interface{}{
+		"vcs":                vcsName,
 		"branch":             branch,
 		"review_file":        revPath,
 		"review_file_exists": revExists,
@@ -2076,7 +2108,10 @@ func addReviewStats(result map[string]interface{}, revPath string) {
 	}
 }
 
-func printStatusHuman(branch, revPath string, revExists bool, session *sessionEntry) {
+func printStatusHuman(vcsName, branch, revPath string, revExists bool, session *sessionEntry) {
+	if vcsName != "" {
+		fmt.Printf("VCS:         %s\n", vcsName)
+	}
 	if branch != "" {
 		fmt.Printf("Branch:      %s\n", branch)
 	}
