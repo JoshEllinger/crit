@@ -207,7 +207,7 @@ func TestBuildSharePayload_SingleFile(t *testing.T) {
 	payload := buildSharePayload(files, nil, 1)
 
 	// Multi-file format is always used
-	pFiles, ok := payload["files"].([]map[string]string)
+	pFiles, ok := payload["files"].([]map[string]any)
 	if !ok {
 		t.Fatal("expected files array in payload")
 	}
@@ -239,7 +239,7 @@ func TestBuildSharePayload_MultiFile(t *testing.T) {
 	}
 	payload := buildSharePayload(files, nil, 2)
 
-	pFiles := payload["files"].([]map[string]string)
+	pFiles := payload["files"].([]map[string]any)
 	if len(pFiles) != 2 {
 		t.Fatalf("expected 2 files, got %d", len(pFiles))
 	}
@@ -601,75 +601,25 @@ func TestClearShareState(t *testing.T) {
 	}
 }
 
-func TestBuildShareFromSession(t *testing.T) {
-	s := &Session{
-		ReviewRound: 3,
-		Files: []*FileEntry{
-			{
-				Path:    "plan.md",
-				Content: "# Plan",
-				Comments: []Comment{
-					{ID: "c1", StartLine: 1, EndLine: 1, Body: "Open comment", Author: "Alice", Quote: "# Plan"},
-					{ID: "c2", StartLine: 2, EndLine: 2, Body: "Resolved comment", Author: "Bob", Resolved: true},
-					{ID: "c3", StartLine: 3, EndLine: 3, Body: "Another open", Author: "Alice", ReviewRound: 2},
-				},
-			},
-			{
-				Path:    "src/main.go",
-				Content: "package main",
-				Comments: []Comment{
-					{ID: "c4", StartLine: 10, EndLine: 15, Body: "All resolved", Resolved: true},
-				},
-			},
-		},
-	}
-
-	files, comments, round := buildShareFromSession(s)
-	if round != 3 {
-		t.Errorf("expected round 3, got %d", round)
-	}
-	if len(files) != 2 {
-		t.Fatalf("expected 2 files, got %d", len(files))
-	}
-	if files[0].Path != "plan.md" || files[0].Content != "# Plan" {
-		t.Errorf("unexpected first file: %+v", files[0])
-	}
-	// Only unresolved comments: c1 and c3
-	if len(comments) != 2 {
-		t.Fatalf("expected 2 unresolved comments, got %d", len(comments))
-	}
-	if comments[0].Body != "Open comment" {
-		t.Errorf("expected first comment body 'Open comment', got %s", comments[0].Body)
-	}
-	if comments[0].Quote != "# Plan" {
-		t.Errorf("expected first comment quote '# Plan', got %s", comments[0].Quote)
-	}
-	if comments[1].ReviewRound != 2 {
-		t.Errorf("expected review_round 2 on second comment, got %d", comments[1].ReviewRound)
-	}
-}
-
-func TestBuildShareFromSession_NoComments(t *testing.T) {
-	s := &Session{
-		ReviewRound: 1,
-		Files: []*FileEntry{
-			{Path: "readme.md", Content: "# Hello"},
-		},
-	}
-
-	files, comments, round := buildShareFromSession(s)
-	if round != 1 {
-		t.Errorf("expected round 1, got %d", round)
-	}
-	if len(files) != 1 {
-		t.Fatalf("expected 1 file, got %d", len(files))
-	}
-	if len(comments) != 0 {
-		t.Errorf("expected 0 comments, got %d", len(comments))
-	}
-}
-
 func TestHandleShare_Success(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write file on disk
+	os.WriteFile(filepath.Join(dir, "plan.md"), []byte("# Plan"), 0644)
+
+	// Write review file with comments (one unresolved, one resolved)
+	cj := CritJSON{
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"plan.md": {Comments: []Comment{
+				{ID: "c1", StartLine: 1, EndLine: 1, Body: "Fix this"},
+				{ID: "c2", StartLine: 2, EndLine: 2, Body: "Done", Resolved: true},
+			}},
+		},
+	}
+	data, _ := json.Marshal(cj)
+	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+
 	// Mock crit-web server
 	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]any
@@ -690,22 +640,19 @@ func TestHandleShare_Success(t *testing.T) {
 	defer critWeb.Close()
 
 	sess := &Session{
+		OutputDir:   dir,
 		ReviewRound: 1,
 		Files: []*FileEntry{
 			{
 				Path:    "plan.md",
-				Content: "# Plan",
-				Comments: []Comment{
-					{ID: "c1", StartLine: 1, EndLine: 1, Body: "Fix this"},
-					{ID: "c2", StartLine: 2, EndLine: 2, Body: "Done", Resolved: true},
-				},
+				AbsPath: filepath.Join(dir, "plan.md"),
 			},
 		},
 		subscribers: make(map[chan SSEEvent]struct{}),
 	}
 
-	srv := &Server{session: sess, shareURL: critWeb.URL}
-	srv.ready.Store(true)
+	srv := &Server{shareURL: critWeb.URL}
+	srv.session.Store(sess)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/share", nil)
 	w := httptest.NewRecorder()
@@ -725,7 +672,96 @@ func TestHandleShare_Success(t *testing.T) {
 	}
 }
 
+func TestHandleShare_OrphanedFileIncluded(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a live file on disk
+	os.WriteFile(filepath.Join(dir, "active.go"), []byte("package main"), 0644)
+
+	// Write review file with comments on the orphaned file
+	cj := CritJSON{
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"removed.go": {
+				Status: "removed",
+				Comments: []Comment{
+					{ID: "c1", StartLine: 1, EndLine: 1, Body: "orphaned comment"},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(cj)
+	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+
+	// Mock crit-web server that captures the payload
+	var receivedPayload map[string]any
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedPayload)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"url":          "https://crit.md/r/orphan123",
+			"delete_token": "tok_orphan",
+		})
+	}))
+	defer critWeb.Close()
+
+	sess := &Session{
+		OutputDir:   dir,
+		ReviewRound: 1,
+		Files: []*FileEntry{
+			{Path: "active.go", AbsPath: filepath.Join(dir, "active.go"), Status: "modified"},
+			{Path: "removed.go", Status: "removed", Orphaned: true, Comments: []Comment{
+				{ID: "c1", StartLine: 1, EndLine: 1, Body: "orphaned comment"},
+			}},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	srv := &Server{shareURL: critWeb.URL}
+	srv.session.Store(sess)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share", nil)
+	w := httptest.NewRecorder()
+	srv.handleShare(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify the payload sent to crit-web includes both files
+	rawFiles, ok := receivedPayload["files"].([]any)
+	if !ok {
+		t.Fatal("expected files array in payload")
+	}
+	if len(rawFiles) != 2 {
+		t.Fatalf("expected 2 files (1 active + 1 orphaned), got %d", len(rawFiles))
+	}
+
+	// Find the orphaned file in the payload
+	var orphanedFile map[string]any
+	for _, rf := range rawFiles {
+		f := rf.(map[string]any)
+		if f["path"] == "removed.go" {
+			orphanedFile = f
+		}
+	}
+	if orphanedFile == nil {
+		t.Fatal("orphaned file 'removed.go' not found in share payload")
+	}
+	if orphanedFile["status"] != "removed" {
+		t.Errorf("expected status 'removed', got %v", orphanedFile["status"])
+	}
+	if orphanedFile["content"] != "" {
+		t.Errorf("expected empty content for orphaned file, got %v", orphanedFile["content"])
+	}
+}
+
 func TestHandleShare_ShareServiceError(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write file on disk
+	os.WriteFile(filepath.Join(dir, "plan.md"), []byte("# Plan"), 0644)
+
 	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "internal error"})
@@ -733,15 +769,16 @@ func TestHandleShare_ShareServiceError(t *testing.T) {
 	defer critWeb.Close()
 
 	sess := &Session{
+		OutputDir:   dir,
 		ReviewRound: 1,
 		Files: []*FileEntry{
-			{Path: "plan.md", Content: "# Plan"},
+			{Path: "plan.md", AbsPath: filepath.Join(dir, "plan.md")},
 		},
 		subscribers: make(map[chan SSEEvent]struct{}),
 	}
 
-	srv := &Server{session: sess, shareURL: critWeb.URL}
-	srv.ready.Store(true)
+	srv := &Server{shareURL: critWeb.URL}
+	srv.session.Store(sess)
 	req := httptest.NewRequest(http.MethodPost, "/api/share", nil)
 	w := httptest.NewRecorder()
 	srv.handleShare(w, req)
@@ -757,8 +794,8 @@ func TestHandleShare_ShareServiceError(t *testing.T) {
 }
 
 func TestHandleShare_NoShareURL(t *testing.T) {
-	srv := &Server{session: &Session{}, shareURL: ""}
-	srv.ready.Store(true)
+	srv := &Server{shareURL: ""}
+	srv.session.Store(&Session{})
 	req := httptest.NewRequest(http.MethodPost, "/api/share", nil)
 	w := httptest.NewRecorder()
 	srv.handleShare(w, req)
@@ -769,7 +806,8 @@ func TestHandleShare_NoShareURL(t *testing.T) {
 }
 
 func TestHandleShare_WrongMethod(t *testing.T) {
-	srv := &Server{session: &Session{}, shareURL: "https://crit.md"}
+	srv := &Server{shareURL: "https://crit.md"}
+	srv.session.Store(&Session{})
 	req := httptest.NewRequest(http.MethodGet, "/api/share", nil)
 	w := httptest.NewRecorder()
 	srv.handleShare(w, req)
@@ -800,8 +838,8 @@ func TestHandleShare_AlreadyShared(t *testing.T) {
 	}
 	sess.SetSharedURLAndToken("https://crit.md/r/existing", "existing-del-token")
 
-	srv := &Server{session: sess, shareURL: mockServer.URL}
-	srv.ready.Store(true)
+	srv := &Server{shareURL: mockServer.URL}
+	srv.session.Store(sess)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/share", nil)
 	w := httptest.NewRecorder()
@@ -967,6 +1005,97 @@ func TestShareScope(t *testing.T) {
 	}
 }
 
+func TestBuildSharePayload_WithStatusAndOrphaned(t *testing.T) {
+	files := []shareFile{
+		{Path: "active.go", Content: "package main", Status: "modified"},
+		{Path: "removed.go", Content: "", Status: "removed"},
+		{Path: "nostat.md", Content: "# Hello"},
+	}
+	payload := buildSharePayload(files, nil, 1)
+
+	pFiles, ok := payload["files"].([]map[string]any)
+	if !ok {
+		t.Fatal("expected files array in payload")
+	}
+	if len(pFiles) != 3 {
+		t.Fatalf("expected 3 files, got %d", len(pFiles))
+	}
+
+	// File with status set
+	if pFiles[0]["status"] != "modified" {
+		t.Errorf("expected status 'modified', got %v", pFiles[0]["status"])
+	}
+	// Orphaned file — status "removed", no separate orphaned field
+	if pFiles[1]["status"] != "removed" {
+		t.Errorf("expected status 'removed', got %v", pFiles[1]["status"])
+	}
+
+	// File without status — key should be absent
+	if _, hasStatus := pFiles[2]["status"]; hasStatus {
+		t.Error("file without status should not have status key")
+	}
+}
+
+func TestLoadShareFilesFromDisk_OrphanedFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a live file
+	activePath := filepath.Join(dir, "active.go")
+	if err := os.WriteFile(activePath, []byte("package main"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := &Session{
+		Files: []*FileEntry{
+			{Path: "active.go", AbsPath: activePath, Status: "modified"},
+			{Path: "removed.go", Status: "removed", Orphaned: true, Comments: []Comment{
+				{ID: "c1", Body: "unresolved comment"},
+			}},
+			{Path: "resolved-removed.go", Status: "removed", Orphaned: true, Comments: []Comment{
+				{ID: "c2", Body: "resolved comment", Resolved: true},
+			}},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	files := sess.LoadShareFilesFromDisk()
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(files))
+	}
+
+	// Find the orphaned file
+	var orphaned *shareFile
+	var active *shareFile
+	for i := range files {
+		if files[i].Path == "removed.go" {
+			orphaned = &files[i]
+		}
+		if files[i].Path == "active.go" {
+			active = &files[i]
+		}
+	}
+
+	if orphaned == nil {
+		t.Fatal("orphaned file not found in share files")
+	}
+	if orphaned.Status != "removed" {
+		t.Errorf("expected status 'removed', got %q", orphaned.Status)
+	}
+	if orphaned.Content != "" {
+		t.Errorf("expected empty content for orphaned file, got %q", orphaned.Content)
+	}
+
+	if active == nil {
+		t.Fatal("active file not found in share files")
+	}
+	if active.Status != "modified" {
+		t.Errorf("expected status 'modified', got %q", active.Status)
+	}
+	if active.Content != "package main" {
+		t.Errorf("expected content 'package main', got %q", active.Content)
+	}
+}
+
 func TestBuildSharePayload_WithReplies(t *testing.T) {
 	files := []shareFile{{Path: "f.md", Content: "hello"}}
 	comments := []shareComment{{
@@ -989,52 +1118,6 @@ func TestBuildSharePayload_WithReplies(t *testing.T) {
 	}
 	if cs[0].Replies[1].Author != "Alice" {
 		t.Errorf("expected reply author 'Alice', got %q", cs[0].Replies[1].Author)
-	}
-}
-
-func TestBuildShareFromSession_WithReplies(t *testing.T) {
-	s := &Session{
-		Files: []*FileEntry{{
-			Path:    "f.md",
-			Content: "hello",
-			Comments: []Comment{{
-				ID: "c1", StartLine: 1, EndLine: 1, Body: "fix",
-				Author: "Alice",
-				Replies: []Reply{
-					{ID: "c1-r1", Body: "done", Author: "Bob"},
-				},
-			}},
-		}},
-		ReviewRound: 1,
-	}
-	_, comments, _ := buildShareFromSession(s)
-	if len(comments) != 1 {
-		t.Fatalf("expected 1 comment, got %d", len(comments))
-	}
-	if len(comments[0].Replies) != 1 {
-		t.Fatalf("expected 1 reply, got %d", len(comments[0].Replies))
-	}
-	if comments[0].Replies[0].Body != "done" {
-		t.Errorf("expected reply body 'done', got %q", comments[0].Replies[0].Body)
-	}
-}
-
-func TestBuildShareFromSession_SkipsResolvedWithReplies(t *testing.T) {
-	s := &Session{
-		Files: []*FileEntry{{
-			Path:    "f.md",
-			Content: "hello",
-			Comments: []Comment{{
-				ID: "c1", StartLine: 1, EndLine: 1, Body: "old issue",
-				Resolved: true,
-				Replies:  []Reply{{ID: "c1-r1", Body: "fixed"}},
-			}},
-		}},
-		ReviewRound: 1,
-	}
-	_, comments, _ := buildShareFromSession(s)
-	if len(comments) != 0 {
-		t.Fatalf("expected 0 comments (resolved should be skipped), got %d", len(comments))
 	}
 }
 

@@ -1,0 +1,6 @@
+# Copy node_modules from primary worktree (install once, reuse everywhere)
+[[pre-start]]
+root-deps = "cp -R {{ primary_worktree_path }}/node_modules {{ worktree_path }}/node_modules"
+
+[[pre-start]]
+e2e-deps = "cp -R {{ primary_worktree_path }}/e2e/node_modules {{ worktree_path }}/e2e/node_modules"

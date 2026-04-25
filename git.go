@@ -165,6 +165,21 @@ func MergeBase(base string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// fileContentAtRef returns the content of a file at the given git ref.
+// Returns empty string on any error (file doesn't exist at ref, not a git repo, etc.).
+func fileContentAtRef(path, ref, dir string) string {
+	if ref == "" {
+		return ""
+	}
+	cmd := exec.Command("git", "show", ref+":"+path)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
 // ChangedFiles returns the list of files changed in the current working state.
 // On the default branch: staged + unstaged + untracked files.
 // On a feature branch: all changes since the merge base with the default branch + untracked.
@@ -243,11 +258,11 @@ func FileDiffScoped(path, scope, baseRef, dir string) ([]DiffHunk, error) {
 		if baseRef == "" {
 			return nil, nil
 		}
-		cmd = exec.Command("git", "diff", "--no-color", baseRef+"..HEAD", "--", path)
+		cmd = exec.Command("git", "diff", "--no-color", "--no-ext-diff", baseRef+"..HEAD", "--", path)
 	case "staged":
-		cmd = exec.Command("git", "diff", "--no-color", "--cached", "--", path)
+		cmd = exec.Command("git", "diff", "--no-color", "--no-ext-diff", "--cached", "--", path)
 	case "unstaged":
-		cmd = exec.Command("git", "diff", "--no-color", "--", path)
+		cmd = exec.Command("git", "diff", "--no-color", "--no-ext-diff", "--", path)
 	default:
 		return fileDiffUnified(path, baseRef, dir)
 	}
@@ -331,7 +346,7 @@ func ChangedFilesForCommit(sha, dir string) ([]FileChange, error) {
 // The dir parameter sets the working directory for the git command.
 // For the initial (root) commit, sha^ is undefined so we diff against the empty tree.
 func FileDiffForCommit(path, sha, dir string) ([]DiffHunk, error) {
-	cmd := exec.Command("git", "diff", "--no-color", sha+"^.."+sha, "--", path)
+	cmd := exec.Command("git", "diff", "--no-color", "--no-ext-diff", sha+"^.."+sha, "--", path)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -344,7 +359,7 @@ func FileDiffForCommit(path, sha, dir string) ([]DiffHunk, error) {
 		case errors.As(err, &exitErr) && exitErr.ExitCode() == 128:
 			// sha^ failed (root commit) — diff against the empty tree
 			emptyTree := "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-			cmd2 := exec.Command("git", "diff", "--no-color", emptyTree+".."+sha, "--", path)
+			cmd2 := exec.Command("git", "diff", "--no-color", "--no-ext-diff", emptyTree+".."+sha, "--", path)
 			if dir != "" {
 				cmd2.Dir = dir
 			}
@@ -519,6 +534,7 @@ var skipDirs = map[string]bool{
 	"vendor":       true,
 	"__pycache__":  true,
 	".git":         true,
+	".sl":          true,
 	"dist":         true,
 	"build":        true,
 	"_build":       true,
@@ -640,9 +656,9 @@ func dedup(changes []FileChange) []FileChange {
 func fileDiffUnified(path, baseRef, dir string) ([]DiffHunk, error) {
 	var cmd *exec.Cmd
 	if baseRef == "" {
-		cmd = exec.Command("git", "diff", "--no-color", "HEAD", "--", path)
+		cmd = exec.Command("git", "diff", "--no-color", "--no-ext-diff", "HEAD", "--", path)
 	} else {
-		cmd = exec.Command("git", "diff", "--no-color", baseRef, "--", path)
+		cmd = exec.Command("git", "diff", "--no-color", "--no-ext-diff", baseRef, "--", path)
 	}
 	if dir != "" {
 		cmd.Dir = dir
@@ -664,9 +680,9 @@ func fileDiffUnified(path, baseRef, dir string) ([]DiffHunk, error) {
 func fileDiffUnifiedCtx(ctx context.Context, path, baseRef, dir string) ([]DiffHunk, error) {
 	var cmd *exec.Cmd
 	if baseRef == "" {
-		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", "HEAD", "--", path)
+		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", "--no-ext-diff", "HEAD", "--", path)
 	} else {
-		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", baseRef, "--", path)
+		cmd = exec.CommandContext(ctx, "git", "diff", "--no-color", "--no-ext-diff", baseRef, "--", path)
 	}
 	if dir != "" {
 		cmd.Dir = dir
@@ -721,7 +737,7 @@ type NumstatEntry struct {
 // DiffNumstatDir runs git diff --numstat against the given base ref and returns per-file stats.
 // If dir is non-empty, git runs in that directory.
 func DiffNumstatDir(baseRef, dir string) (map[string]NumstatEntry, error) {
-	cmd := exec.Command("git", "diff", "--numstat", baseRef)
+	cmd := exec.Command("git", "diff", "--no-ext-diff", "--numstat", baseRef)
 	if dir != "" {
 		cmd.Dir = dir
 	}
