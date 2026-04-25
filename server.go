@@ -1082,7 +1082,7 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	// If the path is absolute, verify it's a known session file before serving.
 	// This handles files outside the repo root (e.g., ~/.claude/plans/).
 	if filepath.IsAbs(reqPath) {
-		if s.session.isSessionFile(reqPath) {
+		if s.session.Load().isSessionFile(reqPath) {
 			http.ServeFile(w, r, reqPath)
 		} else {
 			http.Error(w, "Access denied", http.StatusForbidden)
