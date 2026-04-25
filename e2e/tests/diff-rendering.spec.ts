@@ -62,59 +62,67 @@ test.describe('Diff Rendering — Split Mode (default)', () => {
     await expect(placeholder).toHaveText('This file was deleted.');
   });
 
-  test('spacer shows "Expand" between hunks', async ({ page }) => {
+  test('spacer shows hunk header between hunks', async ({ page }) => {
     await loadPage(page);
 
-    // server.go has a multi-hunk diff, so spacers should exist
-    const spacer = page.locator('.diff-spacer').first();
+    // routes.go has a large gap (>20 lines) between hunks, so a spacer should exist
+    // with directional expand controls and the @@ hunk header text.
+    const treeEntry = page.locator('.tree-file-name', { hasText: 'routes.go' });
+    await treeEntry.click();
+
+    const routesSection = page.locator('#file-section-routes\\.go');
+    const spacer = routesSection.locator('.diff-spacer').first();
     await expect(spacer).toBeVisible();
-    await expect(spacer).toContainText('Expand');
-    await expect(spacer).toContainText('unchanged line');
+    await expect(spacer.locator('.spacer-hunk-text')).toContainText('@@');
   });
 
   test('clicking spacer expands context lines', async ({ page }) => {
     await loadPage(page);
 
-    // Find the server.go section which has multi-hunk diffs with spacers
-    const serverSection = page.locator('#file-section-server\\.go');
-    await expect(serverSection).toBeVisible();
+    // routes.go has a large gap between hunks — use it for spacer expansion testing
+    const treeEntry = page.locator('.tree-file-name', { hasText: 'routes.go' });
+    await treeEntry.click();
 
-    // Count spacers before click
-    const spacersBefore = serverSection.locator('.diff-spacer');
-    const spacerCountBefore = await spacersBefore.count();
-    expect(spacerCountBefore).toBeGreaterThan(0);
+    const routesSection = page.locator('#file-section-routes\\.go');
+
+    // routes.go has a large gap (>20 lines) — spacer shows directional controls
+    const spacer = routesSection.locator('.diff-spacer').first();
+    await expect(spacer).toBeVisible();
 
     // Count diff rows before expansion
-    const rowsBefore = await serverSection.locator('.diff-split-row').count();
+    const rowsBefore = await routesSection.locator('.diff-split-row').count();
 
-    // Click the first spacer
-    const firstSpacer = spacersBefore.first();
-    await firstSpacer.click();
-
-    // After clicking, the spacer count should decrease by 1 (it gets merged)
-    const spacerCountAfter = await serverSection.locator('.diff-spacer').count();
-    expect(spacerCountAfter).toBeLessThan(spacerCountBefore);
+    // Click the expand-down button to reveal context lines
+    const expandDown = spacer.locator('[aria-label="Expand 20 lines down"]');
+    await expandDown.click();
 
     // More rows should be visible after expansion
-    const rowsAfter = await serverSection.locator('.diff-split-row').count();
-    expect(rowsAfter).toBeGreaterThan(rowsBefore);
+    await expect(async () => {
+      const rowsAfter = await routesSection.locator('.diff-split-row').count();
+      expect(rowsAfter).toBeGreaterThan(rowsBefore);
+    }).toPass();
   });
 
   test('expanded lines have comment gutter (+ button) on hover', async ({ page }) => {
     await loadPage(page);
 
-    const serverSection = page.locator('#file-section-server\\.go');
-    const spacer = serverSection.locator('.diff-spacer').first();
+    // routes.go has a large gap spacer for expansion testing
+    const treeEntry = page.locator('.tree-file-name', { hasText: 'routes.go' });
+    await treeEntry.click();
+
+    const routesSection = page.locator('#file-section-routes\\.go');
+    const spacer = routesSection.locator('.diff-spacer').first();
     await expect(spacer).toBeVisible();
 
-    // Click the spacer to expand context lines
-    await spacer.click();
+    // Click expand-down button to expand context lines
+    const expandDown = spacer.locator('[aria-label="Expand 20 lines down"]');
+    await expandDown.click();
 
     // Wait for re-render — new rows should appear
-    await expect(serverSection.locator('.diff-split-row').first()).toBeVisible();
+    await expect(routesSection.locator('.diff-split-row').first()).toBeVisible();
 
     // Hover over one of the split sides in the section — the comment button should become visible
-    const splitSide = serverSection.locator('.diff-split-side').first();
+    const splitSide = routesSection.locator('.diff-split-side').first();
     await splitSide.hover();
 
     const commentBtn = splitSide.locator('.diff-comment-btn');

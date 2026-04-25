@@ -1897,6 +1897,7 @@ func TestCarryForwardComment(t *testing.T) {
 		Resolved:       true,
 		CarriedForward: false,
 		ReviewRound:    1,
+		GitHubID:       98765,
 	}
 
 	carried := carryForwardComment(old, "c42", "2026-02-01T00:00:00Z")
@@ -1936,6 +1937,9 @@ func TestCarryForwardComment(t *testing.T) {
 	}
 	if carried.Quote != "func foo() {}" {
 		t.Errorf("Quote = %q, want %q", carried.Quote, "func foo() {}")
+	}
+	if carried.GitHubID != 98765 {
+		t.Errorf("GitHubID = %d, want 98765", carried.GitHubID)
 	}
 }
 
@@ -2639,7 +2643,7 @@ func TestEnsureLoaded(t *testing.T) {
 		t.Fatal("expected no diff hunks before ensureLoaded")
 	}
 
-	err := fe.ensureLoaded(dir, base)
+	err := fe.ensureLoaded(dir, base, nil)
 	if err != nil {
 		t.Fatalf("ensureLoaded failed: %v", err)
 	}
@@ -2658,7 +2662,7 @@ func TestEnsureLoaded(t *testing.T) {
 	}
 
 	// Second call is a no-op (sync.Once)
-	err = fe.ensureLoaded(dir, base)
+	err = fe.ensureLoaded(dir, base, nil)
 	if err != nil {
 		t.Fatalf("second ensureLoaded should not fail: %v", err)
 	}
@@ -2670,7 +2674,7 @@ func TestEnsureLoadedNotLazy(t *testing.T) {
 		Content: "already loaded",
 		Lazy:    false,
 	}
-	err := fe.ensureLoaded("/tmp", "abc123")
+	err := fe.ensureLoaded("/tmp", "abc123", nil)
 	if err != nil {
 		t.Fatalf("ensureLoaded on non-lazy file should be no-op, got: %v", err)
 	}
@@ -3875,6 +3879,57 @@ func TestAddComment_NoAnchorForReviewComment(t *testing.T) {
 	c := s.AddReviewComment("General feedback", "reviewer")
 	if c.Anchor != "" {
 		t.Errorf("review-level comment should not have anchor, got %q", c.Anchor)
+	}
+}
+
+func TestAddComment_OldSideAnchorFromBase(t *testing.T) {
+	// Old-side comments reference the base version's line numbers.
+	// extractAnchor should fall back to git show <baseRef>:<path> for the anchor.
+	dir := initTestRepo(t)
+
+	// Create a file on the base branch with known content.
+	goPath := filepath.Join(dir, "main.go")
+	writeFile(t, goPath, "package main\n\nfunc deleted() {\n\t// old code\n}\n")
+	runGit(t, dir, "add", "main.go")
+	runGit(t, dir, "commit", "-m", "add main.go")
+	baseRef := runGit(t, dir, "rev-parse", "HEAD")
+
+	// Create feature branch and modify the file (removing the old function).
+	runGit(t, dir, "checkout", "-b", "feat")
+	writeFile(t, goPath, "package main\n\nfunc newFunc() {\n\t// new code\n}\n")
+	runGit(t, dir, "add", "main.go")
+	runGit(t, dir, "commit", "-m", "replace function")
+
+	s := &Session{
+		Mode:        "git",
+		RepoRoot:    dir,
+		BaseRef:     baseRef,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files: []*FileEntry{
+			{
+				Path:     "main.go",
+				AbsPath:  goPath,
+				Status:   "modified",
+				FileType: "code",
+				Content:  "package main\n\nfunc newFunc() {\n\t// new code\n}\n",
+				Comments: []Comment{},
+			},
+		},
+		roundComplete: make(chan struct{}, 1),
+	}
+
+	// Comment on old-side line 3 ("func deleted() {") — this line doesn't exist
+	// in the working tree, so anchor must come from the base ref.
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+	c, ok := s.AddComment("main.go", 3, 3, "old", "Why was this removed?", "", "reviewer")
+	if !ok {
+		t.Fatal("AddComment failed")
+	}
+	if c.Anchor != "func deleted() {" {
+		t.Errorf("old-side Anchor = %q, want %q", c.Anchor, "func deleted() {")
 	}
 }
 

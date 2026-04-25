@@ -195,6 +195,9 @@
   let agentName = 'agent';
   const pendingAgentRequests = new Set();
 
+  // Track active reply form state so it survives DOM re-renders (commentId → { text })
+  const activeReplyForms = new Map();
+
   // Track manually toggled collapse state (comment ID → boolean, true = collapsed)
   const commentCollapseOverrides = {};
 
@@ -314,6 +317,7 @@
         lazy: true,
         diffTooLarge: false,
         diffLoaded: false,
+        fileHash: '',
       };
     });
 
@@ -346,6 +350,7 @@
         orphaned: true,
         diffTooLarge: false,
         diffLoaded: false,
+        fileHash: '',
       };
     }
     let diffUrl = '/api/file/diff?path=' + enc(fi.path);
@@ -378,6 +383,7 @@
       deletions: fi.deletions || 0,
       lazy: false,
       orphaned: false,
+      fileHash: fileRes.file_hash || '',
     };
 
     // Mark large diffs for deferred rendering
@@ -475,7 +481,7 @@
         const el = document.getElementById('filesContainer');
         if (el) {
           el.innerHTML =
-            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
             'Server disconnected</div>';
         }
         throw new Error('Server disconnected');
@@ -488,7 +494,7 @@
         const loadingEl = document.getElementById('filesContainer');
         if (loadingEl) {
           loadingEl.innerHTML =
-            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
             'Initializing\u2026 (' + elapsed + 's)</div>';
         }
         await new Promise(function(resolve) { setTimeout(resolve, 500); });
@@ -499,7 +505,7 @@
         try { body = await r.json(); } catch {}
         const msg = body.message || 'Server initialization failed';
         document.getElementById('filesContainer').innerHTML =
-          '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">' +
+          '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
           msg + '</div>';
         throw new Error(msg);
       }
@@ -524,7 +530,7 @@
     window.addEventListener('resize', updateHeaderHeight);
 
     document.getElementById('filesContainer').innerHTML =
-      '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">Loading...</div>';
+      '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
 
     const [sessionRes, configRes] = await Promise.all([
       fetchWhenReady('/api/session?scope=' + enc(diffScope)).then(r => r.json()),
@@ -1294,24 +1300,24 @@
     const doc = '<path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/>';
     if (status === 'added' || status === 'untracked') {
       return '<svg class="tree-file-status-icon added" viewBox="0 0 16 16">' + doc +
-        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--green)"/>' +
-        '<path d="M11.5 10v1.5H13v1h-1.5V14h-1v-1.5H9v-1h1.5V10z" fill="var(--bg-secondary)"/></svg>';
+        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--crit-green)"/>' +
+        '<path d="M11.5 10v1.5H13v1h-1.5V14h-1v-1.5H9v-1h1.5V10z" fill="var(--crit-editor-bg-card)"/></svg>';
     }
     if (status === 'deleted') {
       return '<svg class="tree-file-status-icon deleted" viewBox="0 0 16 16">' + doc +
-        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--red)"/>' +
-        '<path d="M9.5 11.5h4v1h-4z" fill="var(--bg-secondary)"/></svg>';
+        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--crit-red)"/>' +
+        '<path d="M9.5 11.5h4v1h-4z" fill="var(--crit-editor-bg-card)"/></svg>';
     }
     if (status === 'modified') {
       return '<svg class="tree-file-status-icon modified" viewBox="0 0 16 16">' + doc +
-        '<circle cx="11.5" cy="11.5" r="3.5" fill="var(--yellow)"/>' +
-        '<circle cx="11.5" cy="11.5" r="1.5" fill="var(--bg-secondary)"/>' +
+        '<circle cx="11.5" cy="11.5" r="3.5" fill="var(--crit-yellow)"/>' +
+        '<circle cx="11.5" cy="11.5" r="1.5" fill="var(--crit-editor-bg-card)"/>' +
         '</svg>';
     }
     if (status === 'removed') {
       return '<svg class="tree-file-status-icon removed" viewBox="0 0 16 16">' + doc +
-        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--fg-dimmed)"/>' +
-        '<path d="M10 10.5l3 3m0-3l-3 3" stroke="var(--bg-secondary)" stroke-width="1.2" fill="none"/></svg>';
+        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--crit-editor-fg-muted)"/>' +
+        '<path d="M10 10.5l3 3m0-3l-3 3" stroke="var(--crit-editor-bg-card)" stroke-width="1.2" fill="none"/></svg>';
     }
     // renamed or other
     return '<svg class="tree-file-status-icon" viewBox="0 0 16 16">' + doc + '</svg>';
@@ -1651,6 +1657,18 @@
       const ta = document.querySelector('.comment-form[data-form-key="' + fileForms[i].formKey + '"] textarea');
       if (ta) fileForms[i].draftBody = ta.value;
     }
+    // Save expanded reply form state before DOM re-render
+    const section = document.getElementById('file-section-' + filePath);
+    if (section) {
+      const expandedForms = section.querySelectorAll('.reply-form.expanded');
+      for (let i = 0; i < expandedForms.length; i++) {
+        const card = expandedForms[i].closest('.comment-card');
+        if (card && card.dataset.commentId) {
+          const ta = expandedForms[i].querySelector('.reply-textarea');
+          activeReplyForms.set(card.dataset.commentId, { text: ta ? ta.value : '' });
+        }
+      }
+    }
   }
 
   function renderFileByPath(filePath) {
@@ -1716,6 +1734,7 @@
           file.previousContent = loaded.previousContent;
           file.comments = loaded.comments;
           file.diffHunks = loaded.diffHunks;
+          file._autoExpandDone = false;
           file.lineBlocks = loaded.lineBlocks;
           file.previousLineBlocks = loaded.previousLineBlocks;
           file.tocItems = loaded.tocItems;
@@ -1764,7 +1783,7 @@
 
     header.innerHTML =
       '<div class="file-header-chevron"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"/></svg></div>' +
-      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--fg-dimmed)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
+      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
       '<span class="file-header-name"><span class="dir">' + escapeHtml(dirPath) + '</span>' + escapeHtml(fileName) + '</span>' +
       (showBadge ? '<span class="file-header-badge ' + escapeHtml(file.status) + '">' + escapeHtml(badgeLabel) + '</span>' : '') +
       (file.additions || file.deletions ? '<span class="file-header-stats">' +
@@ -2857,51 +2876,299 @@
     });
   }
 
-  // Helper: render hunk spacer
-  // prevIdx/nextIdx are indices into file.diffHunks so we can merge on expand
-  function renderDiffSpacer(prevHunk, nextHunk, file, prevIdx, nextIdx) {
+  // Pre-expand spacer gaps that contain comments so comments render inline
+  // instead of falling through to the "outdated" section. Modifies file.diffHunks in place.
+  function expandHunksForComments(file) {
+    const hunks = file.diffHunks;
+    if (!hunks || hunks.length < 2 || !file.content) return;
+    const comments = file.comments || [];
+    const lineComments = comments.filter(function(c) { return c.scope !== 'file'; });
+    if (lineComments.length === 0) return;
+
+    // Work backwards so splicing doesn't shift indices we haven't visited yet
+    for (let i = hunks.length - 1; i > 0; i--) {
+      const prevHunk = hunks[i - 1];
+      const nextHunk = hunks[i];
+      const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
+      const prevOldEnd = prevHunk.OldStart + prevHunk.OldCount;
+      const gap = nextHunk.NewStart - prevNewEnd;
+      if (gap <= 0) continue;
+
+      // Check if any comment targets a line in this gap
+      const hasComment = lineComments.some(function(c) {
+        if (c.side === 'old') {
+          // Old-side comment: check old line number range
+          const gapOldStart = prevOldEnd;
+          const gapOldEnd = nextHunk.OldStart - 1;
+          return c.end_line >= gapOldStart && c.end_line <= gapOldEnd;
+        }
+        // New-side comment: check new line number range
+        return c.end_line >= prevNewEnd && c.end_line < nextHunk.NewStart;
+      });
+      if (!hasComment) continue;
+
+      // Merge: same logic as the spacer click handler
+      const contextLines = buildContextLines(file, prevNewEnd, prevOldEnd, gap);
+      const merged = {
+        OldStart: prevHunk.OldStart,
+        NewStart: prevHunk.NewStart,
+        Header: prevHunk.Header,
+        Lines: prevHunk.Lines.concat(contextLines, nextHunk.Lines)
+      };
+      merged.OldCount = (nextHunk.OldStart + nextHunk.OldCount) - merged.OldStart;
+      merged.NewCount = (nextHunk.NewStart + nextHunk.NewCount) - merged.NewStart;
+      hunks.splice(i - 1, 2, merged);
+    }
+  }
+
+  // Helper: build context lines from file content for a range of line numbers
+  function buildContextLines(file, newStart, oldStart, count) {
+    const contentLines = file.content ? file.content.split('\n') : [];
+    const lines = [];
+    for (let i = 0; i < count; i++) {
+      const newLineNum = newStart + i;
+      const oldLineNum = oldStart + i;
+      const text = newLineNum <= contentLines.length ? contentLines[newLineNum - 1] : '';
+      lines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
+    }
+    return lines;
+  }
+
+  // Build a hunk header string from numeric fields, preserving any suffix
+  // (e.g. function name) from the original header.
+  function buildHunkHeader(oldStart, oldCount, newStart, newCount, origHeader) {
+    let suffix = '';
+    if (origHeader) {
+      const m = origHeader.match(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(.*)$/);
+      if (m) suffix = m[1];
+    }
+    return '@@ -' + oldStart + ',' + oldCount + ' +' + newStart + ',' + newCount + ' @@' + suffix;
+  }
+
+  // Expand N context lines downward from the previous hunk (top of gap).
+  // Inserts a bridge hunk after prevIdx.
+  function expandDown(file, prevIdx, count) {
+    if (!file.content) return;
+    const hunks = file.diffHunks;
+    const prevHunk = hunks[prevIdx];
+    const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
+    const prevOldEnd = prevHunk.OldStart + prevHunk.OldCount;
+
+    const lines = buildContextLines(file, prevNewEnd, prevOldEnd, count);
+    const bridge = {
+      OldStart: prevOldEnd,
+      OldCount: count,
+      NewStart: prevNewEnd,
+      NewCount: count,
+      Header: buildHunkHeader(prevOldEnd, count, prevNewEnd, count, ''),
+      Lines: lines
+    };
+    hunks.splice(prevIdx + 1, 0, bridge);
+    renderFileByPath(file.path);
+  }
+
+  // Expand N context lines upward from the next hunk (bottom of gap).
+  // Inserts a bridge hunk before nextIdx.
+  function expandUp(file, nextIdx, count) {
+    if (!file.content) return;
+    const hunks = file.diffHunks;
+    const nextHunk = hunks[nextIdx];
+    const startNew = nextHunk.NewStart - count;
+    const startOld = nextHunk.OldStart - count;
+
+    const lines = buildContextLines(file, startNew, startOld, count);
+    const bridge = {
+      OldStart: startOld,
+      OldCount: count,
+      NewStart: startNew,
+      NewCount: count,
+      Header: buildHunkHeader(startOld, count, startNew, count, ''),
+      Lines: lines
+    };
+    hunks.splice(nextIdx, 0, bridge);
+    renderFileByPath(file.path);
+  }
+
+  // Expand all remaining context lines in a gap, merging prev + context + next into one hunk.
+  function expandAll(file, prevIdx, nextIdx) {
+    if (!file.content) return;
+    const hunks = file.diffHunks;
+    const prevHunk = hunks[prevIdx];
+    const nextHunk = hunks[nextIdx];
     const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
     const prevOldEnd = prevHunk.OldStart + prevHunk.OldCount;
     const gap = nextHunk.NewStart - prevNewEnd;
-    if (gap <= 0) return null;
-    const spacer = document.createElement('div');
-    spacer.className = 'diff-spacer';
-    spacer.innerHTML =
-      '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 2a.75.75 0 0 1 .75.75v4.5h4.5a.75.75 0 0 1 0 1.5h-4.5v4.5a.75.75 0 0 1-1.5 0v-4.5h-4.5a.75.75 0 0 1 0-1.5h4.5v-4.5A.75.75 0 0 1 8 2z"/></svg>' +
-      'Expand ' + gap + ' unchanged line' + (gap === 1 ? '' : 's');
 
-    spacer.addEventListener('click', function() {
+    const contextLines = buildContextLines(file, prevNewEnd, prevOldEnd, gap);
+    const mergedOldCount = (nextHunk.OldStart + nextHunk.OldCount) - prevHunk.OldStart;
+    const mergedNewCount = (nextHunk.NewStart + nextHunk.NewCount) - prevHunk.NewStart;
+    const merged = {
+      OldStart: prevHunk.OldStart,
+      OldCount: mergedOldCount,
+      NewStart: prevHunk.NewStart,
+      NewCount: mergedNewCount,
+      Header: buildHunkHeader(prevHunk.OldStart, mergedOldCount, prevHunk.NewStart, mergedNewCount, prevHunk.Header),
+      Lines: prevHunk.Lines.concat(contextLines, nextHunk.Lines)
+    };
+    hunks.splice(prevIdx, nextIdx - prevIdx + 1, merged);
+    renderFileByPath(file.path);
+  }
+
+  const EXPAND_STEP = 20;
+
+  // SVG icon paths for expand controls (GitHub-style)
+  const ICON_EXPAND_DOWN = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 10.5a.75.75 0 0 1-.53-.22l-3.5-3.5a.75.75 0 0 1 1.06-1.06L8 8.69l2.97-2.97a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-.53.22z"/></svg>';
+  const ICON_EXPAND_UP = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a.75.75 0 0 1 .53.22l3.5 3.5a.75.75 0 0 1-1.06 1.06L8 7.31 5.03 10.28a.75.75 0 0 1-1.06-1.06l3.5-3.5A.75.75 0 0 1 8 5.5z"/></svg>';
+  const ICON_EXPAND_ALL = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8.177 14.323l2.896-2.896a.25.25 0 0 0-.177-.427H8.75V9.25a.75.75 0 0 0-1.5 0V11H5.104a.25.25 0 0 0-.177.427l2.896 2.896a.25.25 0 0 0 .354 0zM7.823 1.677L4.927 4.573a.25.25 0 0 0 .177.427H7.25V6.75a.75.75 0 0 0 1.5 0V5h2.146a.25.25 0 0 0 .177-.427L8.177 1.677a.25.25 0 0 0-.354 0z"/></svg>';
+
+  // Helper: create a single expand button element
+  function createExpandBtn(iconHtml, ariaLabel, handler) {
+    const btn = document.createElement('button');
+    btn.className = 'expand-btn';
+    btn.setAttribute('aria-label', ariaLabel);
+    btn.innerHTML = iconHtml;
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      handler();
+    });
+    return btn;
+  }
+
+  // Helper: build the spacer DOM structure with gutter + hunk text
+  function buildSpacerElement(className, hunkHeaderText, buttons) {
+    const spacer = document.createElement('div');
+    spacer.className = className;
+
+    const gutter = document.createElement('div');
+    gutter.className = 'expand-gutter';
+    for (let i = 0; i < buttons.length; i++) {
+      gutter.appendChild(buttons[i]);
+    }
+    spacer.appendChild(gutter);
+
+    const text = document.createElement('span');
+    text.className = 'spacer-hunk-text';
+    text.textContent = hunkHeaderText || '';
+    spacer.appendChild(text);
+
+    return spacer;
+  }
+
+  // Helper: render hunk spacer with incremental expansion (GitHub-style)
+  // prevIdx/nextIdx are indices into file.diffHunks
+  // Returns spacer element (embeds the next hunk's header text) or null
+  function renderDiffSpacer(prevHunk, nextHunk, file, prevIdx, nextIdx) {
+    const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
+    const gap = nextHunk.NewStart - prevNewEnd;
+    if (gap <= 0) return null;
+
+    const buttons = [];
+
+    if (gap <= EXPAND_STEP) {
+      // Small gap: single bidirectional button expands all
+      buttons.push(createExpandBtn(ICON_EXPAND_ALL, 'Expand all ' + gap + ' lines', function() {
+        expandAll(file, prevIdx, nextIdx);
+      }));
+    } else {
+      // Large gap: two stacked buttons — down, up (GitHub-style)
+      buttons.push(createExpandBtn(ICON_EXPAND_DOWN, 'Expand ' + EXPAND_STEP + ' lines down', function() {
+        expandDown(file, prevIdx, EXPAND_STEP);
+      }));
+      buttons.push(createExpandBtn(ICON_EXPAND_UP, 'Expand ' + EXPAND_STEP + ' lines up', function() {
+        expandUp(file, nextIdx, EXPAND_STEP);
+      }));
+    }
+
+    return buildSpacerElement('diff-spacer', nextHunk.Header || '', buttons);
+  }
+
+  // Helper: render leading spacer (before first hunk when it doesn't start at line 1)
+  // Returns the spacer element (includes the first hunk's header text)
+  function renderLeadingSpacer(firstHunk, file) {
+    // Only show if the first hunk doesn't start at line 1
+    if (firstHunk.NewStart <= 1 && firstHunk.OldStart <= 1) return null;
+    // For pure insertion (OldCount===0) or pure deletion (NewCount===0), git uses
+    // position-after semantics for the zero-count side — ignore it for gap calculation.
+    const newGap = firstHunk.NewCount > 0 ? firstHunk.NewStart - 1 : Infinity;
+    const oldGap = firstHunk.OldCount > 0 ? firstHunk.OldStart - 1 : Infinity;
+    const gap = Math.min(newGap, oldGap);
+    if (gap <= 0 || gap === Infinity) return null;
+
+    const expandCount = Math.min(gap, EXPAND_STEP);
+
+    const buttons = [];
+    buttons.push(createExpandBtn(ICON_EXPAND_UP, 'Expand ' + expandCount + ' lines above', function() {
       if (!file.content) return;
       const contentLines = file.content.split('\n');
+      const hunks = file.diffHunks;
+      const hunk = hunks[0];
 
-      // Build context lines to bridge the gap
+      // Expand from the bottom of the gap upward (closest to the hunk first)
+      const startNewLine = hunk.NewCount > 0 ? hunk.NewStart - expandCount : hunk.NewStart;
+      const startOldLine = hunk.OldCount > 0 ? hunk.OldStart - expandCount : hunk.OldStart;
       const contextLines = [];
-      for (let i = 0; i < gap; i++) {
-        const newLineNum = prevNewEnd + i;
-        const oldLineNum = prevOldEnd + i;
-        const text = newLineNum <= contentLines.length ? contentLines[newLineNum - 1] : '';
+      for (let i = 0; i < expandCount; i++) {
+        const newLineNum = startNewLine + i;
+        const oldLineNum = startOldLine + i;
+        const text = newLineNum > 0 && newLineNum <= contentLines.length ? contentLines[newLineNum - 1] : '';
         contextLines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
       }
 
-      // Merge: prev hunk + context lines + next hunk → single hunk
-      const hunks = file.diffHunks;
-      const merged = {
-        OldStart: hunks[prevIdx].OldStart,
-        NewStart: hunks[prevIdx].NewStart,
-        Header: hunks[prevIdx].Header,
-        Lines: hunks[prevIdx].Lines.concat(contextLines, hunks[nextIdx].Lines)
-      };
-      merged.OldCount = (hunks[nextIdx].OldStart + hunks[nextIdx].OldCount) - merged.OldStart;
-      merged.NewCount = (hunks[nextIdx].NewStart + hunks[nextIdx].NewCount) - merged.NewStart;
-
-      // Replace prevIdx with merged, remove nextIdx
-      hunks.splice(prevIdx, 2, merged);
-
-      // Re-render from data model so all lines get proper interaction
+      hunk.Lines = contextLines.concat(hunk.Lines);
+      hunk.OldStart = startOldLine;
+      hunk.NewStart = startNewLine;
+      hunk.OldCount += expandCount;
+      hunk.NewCount += expandCount;
+      hunk.Header = buildHunkHeader(hunk.OldStart, hunk.OldCount, hunk.NewStart, hunk.NewCount, hunk.Header);
       renderFileByPath(file.path);
-    });
+    }));
 
-    return spacer;
+    return buildSpacerElement('diff-spacer diff-spacer-leading', firstHunk.Header || '', buttons);
+  }
+
+  // Helper: render trailing spacer (after last hunk when it doesn't reach EOF)
+  function renderTrailingSpacer(lastHunk, file) {
+    if (!file.content) return null;
+    const contentLines = file.content.split('\n');
+    let totalNewLines = contentLines.length;
+    if (totalNewLines > 0 && contentLines[totalNewLines - 1] === '') totalNewLines--;
+
+    const lastNewEnd = lastHunk.NewStart + lastHunk.NewCount;
+    const gap = totalNewLines - lastNewEnd + 1;
+    if (gap <= 0) return null;
+
+    const expandCount = Math.min(gap, EXPAND_STEP);
+
+    const buttons = [];
+    buttons.push(createExpandBtn(ICON_EXPAND_DOWN, 'Expand ' + expandCount + ' lines below', function() {
+      if (!file.content) return;
+      const lines = file.content.split('\n');
+      let totalLines = lines.length;
+      if (totalLines > 0 && lines[totalLines - 1] === '') totalLines--;
+      const hunks = file.diffHunks;
+      const hunk = hunks[hunks.length - 1];
+
+      const hunkNewEnd = hunk.NewStart + hunk.NewCount;
+      const hunkOldEnd = hunk.OldStart + hunk.OldCount;
+      const remaining = totalLines - hunkNewEnd + 1;
+      const count = Math.min(remaining, EXPAND_STEP);
+
+      const contextLines = [];
+      for (let i = 0; i < count; i++) {
+        const newLineNum = hunkNewEnd + i;
+        const oldLineNum = hunkOldEnd + i;
+        const text = newLineNum <= lines.length ? lines[newLineNum - 1] : '';
+        contextLines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
+      }
+
+      hunk.Lines = hunk.Lines.concat(contextLines);
+      hunk.OldCount += count;
+      hunk.NewCount += count;
+      hunk.Header = buildHunkHeader(hunk.OldStart, hunk.OldCount, hunk.NewStart, hunk.NewCount, hunk.Header);
+      renderFileByPath(file.path);
+    }));
+
+    return buildSpacerElement('diff-spacer diff-spacer-trailing', '', buttons);
   }
 
   // Helper: render hunk header
@@ -2941,10 +3208,109 @@
     }
   }
 
+  // Helper: render comments whose line keys don't appear in any diff hunk.
+  // These are "outdated" — the comment exists but the line is gone from the current diff.
+  function appendOutdatedDiffComments(container, file, commentsMap, hunks) {
+    // Build set of all end_line:side keys present in the diff hunks
+    const renderedKeys = new Set();
+    for (const hunk of hunks) {
+      for (const line of hunk.Lines) {
+        if (line.Type === 'del' && line.OldNum) {
+          renderedKeys.add(line.OldNum + ':old');
+        }
+        if (line.Type === 'add' && line.NewNum) {
+          renderedKeys.add(line.NewNum + ':');
+        }
+        if (line.Type === 'context') {
+          if (line.OldNum) renderedKeys.add(line.OldNum + ':old');
+          if (line.NewNum) renderedKeys.add(line.NewNum + ':');
+        }
+      }
+    }
+
+    // Collect comments whose keys were not rendered
+    const outdatedComments = [];
+    for (const key of Object.keys(commentsMap)) {
+      if (!renderedKeys.has(key)) {
+        for (const comment of commentsMap[key]) {
+          if (comment.scope !== 'file') {
+            outdatedComments.push(comment);
+          }
+        }
+      }
+    }
+
+    if (outdatedComments.length === 0) return;
+
+    // Render outdated comments section at the bottom of the diff
+    const section = document.createElement('div');
+    section.className = 'outdated-diff-comments';
+
+    for (const comment of outdatedComments) {
+      const el = comment.resolved
+        ? createResolvedElement(comment, file.path)
+        : createCommentElement(comment, file.path);
+      el.classList.add('outdated-comment');
+      const headerLeft = el.querySelector('.comment-header-left');
+      if (headerLeft) {
+        const badge = document.createElement('span');
+        badge.className = 'outdated-badge';
+        badge.textContent = 'Outdated';
+        headerLeft.appendChild(badge);
+      }
+      section.appendChild(el);
+    }
+
+    container.appendChild(section);
+  }
+
   // ===== Unified diff (interleaved lines, single pane) =====
+  // Pre-process diffHunks: merge adjacent hunks where the gap between them
+  // is ≤ 8 unchanged lines. This removes visual noise from tiny spacers.
+  // Mutates file.diffHunks in place so it only runs once per file.
+  function autoExpandSmallGaps(file) {
+    if (!file.content || !file.diffHunks || file.diffHunks.length < 2) return;
+    if (file._autoExpandDone) return;
+    file._autoExpandDone = true;
+
+    const contentLines = file.content.split('\n');
+    const hunks = file.diffHunks;
+    let i = 0;
+    while (i < hunks.length - 1) {
+      const prevNewEnd = hunks[i].NewStart + hunks[i].NewCount;
+      const prevOldEnd = hunks[i].OldStart + hunks[i].OldCount;
+      const gap = hunks[i + 1].NewStart - prevNewEnd;
+      if (gap > 0 && gap <= 8) {
+        // Build context lines to bridge the gap
+        const contextLines = [];
+        for (let j = 0; j < gap; j++) {
+          const newLineNum = prevNewEnd + j;
+          const oldLineNum = prevOldEnd + j;
+          const text = newLineNum <= contentLines.length ? contentLines[newLineNum - 1] : '';
+          contextLines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
+        }
+        // Merge: prev hunk + context lines + next hunk → single hunk
+        const merged = {
+          OldStart: hunks[i].OldStart,
+          NewStart: hunks[i].NewStart,
+          Header: hunks[i].Header,
+          Lines: hunks[i].Lines.concat(contextLines, hunks[i + 1].Lines)
+        };
+        merged.OldCount = (hunks[i + 1].OldStart + hunks[i + 1].OldCount) - merged.OldStart;
+        merged.NewCount = (hunks[i + 1].NewStart + hunks[i + 1].NewCount) - merged.NewStart;
+        // Replace both with merged — don't increment i to check merged against next
+        hunks.splice(i, 2, merged);
+      } else {
+        i++;
+      }
+    }
+  }
+
   function renderDiffUnified(file) {
     const container = document.createElement('div');
     container.className = 'diff-container unified';
+
+    expandHunksForComments(file);
 
     const hunks = file.diffHunks || [];
     if (hunks.length === 0) {
@@ -2952,19 +3318,36 @@
       return container;
     }
 
+    autoExpandSmallGaps(file);
+
     const { diffCommentsMap: commentsMap } = buildCommentIndices(file.comments);
     const commentVisualSet = buildUnifiedCommentVisualSet(hunks, file.comments);
     let visualIdx = 0; // sequential index for unified drag (old/new nums are different spaces)
 
+    // Leading spacer before first hunk (includes hunk header text)
+    const leadingSpacer = renderLeadingSpacer(hunks[0], file);
+    if (leadingSpacer) container.appendChild(leadingSpacer);
+
     for (let hi = 0; hi < hunks.length; hi++) {
       const hunk = hunks[hi];
+      let spacerRendered = false;
 
       if (hi > 0) {
         const spacer = renderDiffSpacer(hunks[hi - 1], hunk, file, hi - 1, hi);
-        if (spacer) container.appendChild(spacer);
+        if (spacer) {
+          container.appendChild(spacer);
+          spacerRendered = true;
+        }
       }
 
-      container.appendChild(renderDiffHunkHeader(hunk));
+      // Skip standalone hunk header when:
+      // - a spacer (which embeds the header) was rendered, or
+      // - the leading spacer covers the first hunk, or
+      // - this hunk is contiguous with the previous one (e.g. bridge hunks from expand)
+      const contiguous = hi > 0 && (hunks[hi - 1].NewStart + hunks[hi - 1].NewCount) >= hunk.NewStart;
+      if (!spacerRendered && !(hi === 0 && leadingSpacer) && !contiguous) {
+        container.appendChild(renderDiffHunkHeader(hunk));
+      }
 
       const wordDiffMap = buildHunkWordDiffs(hunk);
 
@@ -3041,6 +3424,12 @@
       }
     }
 
+    // Trailing spacer after last hunk
+    const trailingSpacerUnified = renderTrailingSpacer(hunks[hunks.length - 1], file);
+    if (trailingSpacerUnified) container.appendChild(trailingSpacerUnified);
+
+    appendOutdatedDiffComments(container, file, commentsMap, hunks);
+
     return container;
   }
 
@@ -3049,23 +3438,42 @@
     const container = document.createElement('div');
     container.className = 'diff-container split';
 
+    expandHunksForComments(file);
+
     const hunks = file.diffHunks || [];
     if (hunks.length === 0) {
       container.innerHTML = '<div class="diff-no-changes">No changes</div>';
       return container;
     }
 
+    autoExpandSmallGaps(file);
+
     const { diffCommentsMap: commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+
+    // Leading spacer before first hunk (includes hunk header text)
+    const leadingSpacerSplit = renderLeadingSpacer(hunks[0], file);
+    if (leadingSpacerSplit) container.appendChild(leadingSpacerSplit);
 
     for (let hi = 0; hi < hunks.length; hi++) {
       const hunk = hunks[hi];
+      let spacerRenderedSplit = false;
 
       if (hi > 0) {
         const spacer = renderDiffSpacer(hunks[hi - 1], hunk, file, hi - 1, hi);
-        if (spacer) container.appendChild(spacer);
+        if (spacer) {
+          container.appendChild(spacer);
+          spacerRenderedSplit = true;
+        }
       }
 
-      container.appendChild(renderDiffHunkHeader(hunk));
+      // Skip standalone hunk header when:
+      // - a spacer (which embeds the header) was rendered, or
+      // - the leading spacer covers the first hunk, or
+      // - this hunk is contiguous with the previous one (e.g. bridge hunks from expand)
+      const contiguousSplit = hi > 0 && (hunks[hi - 1].NewStart + hunks[hi - 1].NewCount) >= hunk.NewStart;
+      if (!spacerRenderedSplit && !(hi === 0 && leadingSpacerSplit) && !contiguousSplit) {
+        container.appendChild(renderDiffHunkHeader(hunk));
+      }
 
       // Group hunk lines into segments: runs of context, or runs of del+add (change pairs)
       const segments = [];
@@ -3160,6 +3568,12 @@
         }
       }
     }
+
+    // Trailing spacer after last hunk
+    const trailingSpacerSplit = renderTrailingSpacer(hunks[hunks.length - 1], file);
+    if (trailingSpacerSplit) container.appendChild(trailingSpacerSplit);
+
+    appendOutdatedDiffComments(container, file, commentsMap, hunks);
 
     return container;
   }
@@ -4181,6 +4595,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ body: body.trim() })
         });
+        if (!res.ok) throw new Error('Server returned ' + res.status);
         const updated = await res.json();
         const idx = file.comments.findIndex(c => c.id === formObj.editingId);
         if (idx >= 0) file.comments[idx] = updated;
@@ -4204,6 +4619,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
+        if (!res.ok) throw new Error('Server returned ' + res.status);
         const newComment = await res.json();
         file.comments.push(newComment);
         created = newComment;
@@ -4385,8 +4801,8 @@
 
   // ===== Agent Button =====
   function isLiveThread(comment) {
-    if (!agentEnabled || !comment.replies) return false;
-    return comment.replies.some(function(r) { return r.author === agentName; });
+    if (!agentEnabled) return false;
+    return !!comment.live;
   }
 
   function checkAgentReplies(comments) {
@@ -4424,8 +4840,8 @@
     card.className = cardClass;
     card.dataset.commentId = comment.id;
 
-    // Collapse state — live threads never auto-collapse
-    const liveOrPending = isLiveThread(comment) || pendingAgentRequests.has(comment.id);
+    // Collapse state — live threads stay expanded unless resolved
+    const liveOrPending = !comment.resolved && (isLiveThread(comment) || pendingAgentRequests.has(comment.id));
     const isCollapsed = liveOrPending ? false
       : opts.collapseDefault
         ? (commentCollapseOverrides[comment.id] !== undefined ? commentCollapseOverrides[comment.id] : true)
@@ -5202,6 +5618,7 @@
       input.replaceWith(textarea);
       form.appendChild(buttons);
       textarea.focus();
+      activeReplyForms.set(commentId, { text: textarea.value });
     }
 
     function collapse() {
@@ -5210,9 +5627,15 @@
       textarea.replaceWith(input);
       input.value = '';
       if (buttons.parentNode) buttons.remove();
+      activeReplyForms.delete(commentId);
     }
 
     input.addEventListener('focus', expand);
+
+    // Keep reply form state in sync for surviving re-renders
+    textarea.addEventListener('input', function() {
+      activeReplyForms.set(commentId, { text: textarea.value });
+    });
 
     cancelBtn.addEventListener('click', collapse);
 
@@ -5256,6 +5679,7 @@
           });
         }
 
+        activeReplyForms.delete(commentId);
         refreshFileComments(filePath);
       } catch (err) {
         console.error('Failed to add reply:', err);
@@ -5278,6 +5702,15 @@
         }
       }
     });
+
+    // Restore saved reply form state after DOM re-render
+    const saved = activeReplyForms.get(commentId);
+    if (saved && saved.text) {
+      form.classList.add('expanded');
+      textarea.value = saved.text;
+      input.replaceWith(textarea);
+      form.appendChild(buttons);
+    }
 
     return form;
   }
@@ -5768,9 +6201,11 @@
       }
 
       try { await navigator.clipboard.writeText(prompt); } catch {}
-    } catch {}
-
-    setUIState('waiting');
+      setUIState('waiting');
+    } catch (err) {
+      console.error('Error finishing review:', err);
+      showMiniToast('Failed to finish review');
+    }
   }
 
   async function resolveAllAndFinish() {
@@ -5895,6 +6330,7 @@
             collapsed: files[pi].collapsed,
             diffLoaded: files[pi].diffLoaded,
             viewed: files[pi].viewed,
+            fileHash: files[pi].fileHash,
           };
         }
 
@@ -5913,17 +6349,19 @@
         for (let fi = 0; fi < files.length; fi++) {
           const prev = prevState[files[fi].path];
           if (prev) {
+            const contentChanged = prev.fileHash && files[fi].fileHash && prev.fileHash !== files[fi].fileHash;
             files[fi].viewMode = prev.viewMode;
             // Lazy files must stay collapsed — they have no content to render
-            if (!files[fi].lazy) files[fi].collapsed = prev.collapsed;
+            if (!files[fi].lazy && !contentChanged) files[fi].collapsed = prev.collapsed;
             if (prev.diffLoaded) files[fi].diffLoaded = prev.diffLoaded;
-            if (prev.viewed) files[fi].viewed = true;
+            if (prev.viewed && !contentChanged) files[fi].viewed = true;
           }
         }
 
         files.sort(fileSortComparator);
 
         activeForms = [];
+        activeReplyForms.clear();
         activeFilePath = null;
         selectionStart = null;
         selectionEnd = null;
@@ -6568,8 +7006,9 @@
     if (reloadInFlight) return reloadInFlight;
     reloadInFlight = (async function() {
       try {
+        activeReplyForms.clear();
         document.getElementById('filesContainer').innerHTML =
-          '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">Loading...</div>';
+          '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
 
         let sessionUrl = '/api/session?scope=' + enc(diffScope);
         if (diffCommit) sessionUrl += '&commit=' + enc(diffCommit);
@@ -6585,7 +7024,7 @@
 
         if (!session.files || session.files.length === 0) {
           document.getElementById('filesContainer').innerHTML =
-            '<div class="loading" style="padding: 40px; text-align: center; color: var(--fg-muted);">No ' + diffScope + ' changes</div>';
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">No ' + diffScope + ' changes</div>';
           files = [];
           renderFileTree();
           updateCommentCount();
@@ -6661,7 +7100,7 @@
       return '<div class="base-branch-item' + active + '" data-branch="' + escapeHtml(b) + '">' + escapeHtml(b) + '</div>';
     }).join('');
     if (filtered.length === 0) {
-      list.innerHTML = '<div style="padding: 8px 10px; font-size: 12px; color: var(--fg-muted);">No matching branches</div>';
+      list.innerHTML = '<div style="padding: 8px 10px; font-size: 12px; color: var(--crit-editor-fg-muted);">No matching branches</div>';
     }
     branchPicker.highlightedIdx = -1;
   }
@@ -6987,7 +7426,7 @@
 
     // Width row
     html += '<div class="settings-display-row">';
-    html += '<span class="settings-display-label">Content Width <span style="font-weight:400;color:var(--fg-muted)">(file mode)</span></span>';
+    html += '<span class="settings-display-label">Content Width <span style="font-weight:400;color:var(--crit-editor-fg-muted)">(file mode)</span></span>';
     html += '<div class="settings-pill settings-pill--width" id="settingsWidthPill" role="group" aria-label="Content width">';
     html += '<div class="settings-pill-indicator" id="settingsWidthIndicator"></div>';
     ['compact', 'default', 'wide'].forEach(function(w) {
@@ -7006,7 +7445,7 @@
       const upgradeCmd = 'brew update && brew upgrade crit';
       const releaseUrl = 'https://github.com/tomasz-tomczyk/crit/releases/tag/v' + escapeHtml(cfg.latest_version);
       html += '<div class="config-card config-card--orange"><div class="config-card-header">';
-      html += '<span class="config-card-icon" style="color:var(--yellow)">&#11014;</span>';
+      html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#11014;</span>';
       html += '<span class="config-card-title">Update available</span>';
       html += '<span class="config-card-value">v' + escapeHtml(cfg.latest_version) + '</span>';
       html += '</div>';
@@ -7020,13 +7459,13 @@
       if (cfg.auth_logged_in) {
         const display = cfg.auth_user_email || cfg.auth_user_name || 'Logged in';
         html += '<div class="config-card config-card--green"><div class="config-card-header">';
-        html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+        html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
         html += '<span class="config-card-title">Account</span>';
         html += '<span class="config-card-value">' + escapeHtml(display) + '</span>';
         html += '</div></div>';
       } else {
         html += '<div class="config-card config-card--red config-card--unconfigured"><div class="config-card-header">';
-        html += '<span class="config-card-icon" style="color:var(--red)">&#9675;</span>';
+        html += '<span class="config-card-icon" style="color:var(--crit-red)">&#9675;</span>';
         html += '<span class="config-card-title">Account</span>';
         html += '</div>';
         html += '<div class="config-card-body">Not logged in. Sign in to link reviews to your account and track review history.</div>';
@@ -7038,17 +7477,17 @@
     // Agent Command card
     if (cfg.agent_cmd_enabled) {
       html += '<div class="config-card config-card--green"><div class="config-card-header">';
-      html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+      html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
       html += '<span class="config-card-title">Agent Command</span>';
       html += '</div>';
       html += '<div class="config-card-cmd-value"><code>' + escapeHtml(cfg.agent_cmd || cfg.agent_name || '') + '</code></div>';
       html += '</div>';
     } else {
       html += '<div class="config-card config-card--orange config-card--unconfigured"><div class="config-card-header">';
-      html += '<span class="config-card-icon" style="color:var(--yellow)">&#9675;</span>';
+      html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#9675;</span>';
       html += '<span class="config-card-title">Agent Command</span>';
       html += '</div>';
-      html += '<div class="config-card-body">Edit <code>~/.crit.config.json</code> and set <code>agent_cmd</code> to send comments directly to your AI agent. <a href="https://github.com/tomasz-tomczyk/crit#send-to-agent-experimental" target="_blank" rel="noopener" style="color:var(--accent)">Learn more</a></div>';
+      html += '<div class="config-card-body">Edit <code>~/.crit.config.json</code> and set <code>agent_cmd</code> to send comments directly to your AI agent. <a href="https://github.com/tomasz-tomczyk/crit#send-to-agent-experimental" target="_blank" rel="noopener" style="color:var(--crit-brand)">Learn more</a></div>';
       html += '<div class="config-card-snippet">{"agent_cmd": "claude -p"}\n// Also: "opencode ask", "aider --message"</div>';
       html += '</div>';
     }
@@ -7064,7 +7503,7 @@
           const si = stale[0];
           const name = si.agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
           html += '<div class="config-card config-card--yellow"><div class="config-card-header">';
-          html += '<span class="config-card-icon" style="color:var(--yellow)">&#9888;</span>';
+          html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#9888;</span>';
           html += '<span class="config-card-title">AI Integration</span>';
           html += '<span class="config-card-value">' + escapeHtml(name) + ' (update available)</span>';
           html += '</div>';
@@ -7085,7 +7524,7 @@
         } else if (current.length > 0) {
           const name = current[0].agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
           html += '<div class="config-card config-card--green"><div class="config-card-header">';
-          html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+          html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
           html += '<span class="config-card-title">AI Integration</span>';
           html += '<span class="config-card-value">' + escapeHtml(name) + ' (up to date)</span>';
           html += '</div></div>';
@@ -7093,7 +7532,7 @@
       } else {
         const available = (cfg.integrations_available || []).join(' \u00b7 ');
         html += '<div class="config-card config-card--blue config-card--unconfigured"><div class="config-card-header">';
-        html += '<span class="config-card-icon" style="color:var(--accent)">&#128161;</span>';
+        html += '<span class="config-card-icon" style="color:var(--crit-brand)">&#128161;</span>';
         html += '<span class="config-card-title">AI Integration</span>';
         html += '<span class="config-card-badge">Recommended</span>';
         html += '</div>';
@@ -7109,13 +7548,13 @@
       let hostname;
       try { hostname = new URL(cfg.share_url).hostname; } catch { hostname = cfg.share_url; }
       html += '<div class="config-card config-card--green"><div class="config-card-header">';
-      html += '<span class="config-card-icon" style="color:var(--green)">&#10003;</span>';
+      html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
       html += '<span class="config-card-title">Sharing enabled</span>';
       html += '<span class="config-card-value">' + escapeHtml(hostname) + '</span>';
       html += '</div></div>';
     } else {
       html += '<div class="config-card config-card--gray config-card--unconfigured"><div class="config-card-header">';
-      html += '<span class="config-card-icon" style="color:var(--fg-muted)">&mdash;</span>';
+      html += '<span class="config-card-icon" style="color:var(--crit-editor-fg-muted)">&mdash;</span>';
       html += '<span class="config-card-title">Share</span>';
       html += '<span class="config-card-value">Disabled</span>';
       html += '</div></div>';
@@ -7188,7 +7627,7 @@
       { label: 'Review', shortcuts: [
         { key: '<kbd>Shift</kbd>+<kbd>F</kbd>', action: 'Finish review' },
         { key: '<kbd>Shift</kbd>+<kbd>C</kbd>', action: 'Toggle comments panel' },
-        { key: '<kbd>Shift</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>/<kbd>4</kbd>', action: 'Switch scope', mode: 'git mode' },
+        { key: '<kbd>Shift</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>/<kbd>4</kbd>', action: 'Switch scope', mode: 'vcs mode' },
       ]},
       { label: 'View', shortcuts: [
         { key: '<kbd>t</kbd>', action: 'Toggle table of contents', mode: 'file mode' },
@@ -7231,7 +7670,7 @@
     // Session info
     html += '<div class="settings-section-label">Current Session</div>';
     html += '<div class="about-session"><div class="about-session-grid">';
-    html += '<span class="about-session-label">Mode</span><span class="about-session-value">' + (session.mode || 'unknown') + '</span>';
+    html += '<span class="about-session-label">Mode</span><span class="about-session-value">' + (session.vcs_name || session.mode || 'unknown') + '</span>';
     if (session.mode === 'git' && session.branch) {
       html += '<span class="about-session-label">Branch</span><span class="about-session-value">' + escapeHtml(session.branch) + '</span>';
     }

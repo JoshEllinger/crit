@@ -45,7 +45,7 @@ func computeShareHash(files []shareFile, comments []shareComment) string {
 
 	h := sha256.New()
 	for _, f := range sorted {
-		fmt.Fprintf(h, "file:%s:%s\n", f.Path, f.Content)
+		fmt.Fprintf(h, "file:%s:%s:%s\n", f.Path, f.Content, f.Status)
 	}
 	for _, c := range sortedC {
 		fmt.Fprintf(h, "comment:%s:%v\n", c.ExternalID, c.Resolved)
@@ -54,9 +54,12 @@ func computeShareHash(files []shareFile, comments []shareComment) string {
 }
 
 // shareFile represents a file to be shared.
+// Status values: "added", "modified", "deleted", "renamed", "removed".
+// "removed" means the file is orphaned (no longer in the review but has comments).
 type shareFile struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	Status  string `json:"status,omitempty"`
 }
 
 // shareReply represents a reply to include in the shared review.
@@ -82,9 +85,13 @@ type shareComment struct {
 
 // buildSharePayload constructs the JSON payload for POST /api/reviews.
 func buildSharePayload(files []shareFile, comments []shareComment, reviewRound int) map[string]any {
-	fileList := make([]map[string]string, len(files))
+	fileList := make([]map[string]any, len(files))
 	for i, f := range files {
-		fileList[i] = map[string]string{"path": f.Path, "content": f.Content}
+		entry := map[string]any{"path": f.Path, "content": f.Content}
+		if f.Status != "" {
+			entry["status"] = f.Status
+		}
+		fileList[i] = entry
 	}
 	if comments == nil {
 		comments = []shareComment{}
@@ -177,40 +184,6 @@ func setBearer(req *http.Request, token string) {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-}
-
-// buildShareFromSession extracts files and unresolved comments from a live session.
-func buildShareFromSession(s *Session) ([]shareFile, []shareComment, int) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var files []shareFile
-	var comments []shareComment
-	for _, f := range s.Files {
-		files = append(files, shareFile{Path: f.Path, Content: f.Content})
-		for _, c := range f.Comments {
-			if c.Resolved {
-				continue
-			}
-			sc := shareComment{
-				File:      f.Path,
-				StartLine: c.StartLine,
-				EndLine:   c.EndLine,
-				Body:      c.Body,
-				Quote:     c.Quote,
-				Author:    c.Author,
-				Scope:     c.Scope,
-			}
-			if c.ReviewRound >= 1 {
-				sc.ReviewRound = c.ReviewRound
-			}
-			for _, r := range c.Replies {
-				sc.Replies = append(sc.Replies, shareReply{Body: r.Body, Author: r.Author})
-			}
-			comments = append(comments, sc)
-		}
-	}
-	return files, comments, s.ReviewRound
 }
 
 // loadCommentsForShare reads the review file at critPath and returns shareComment entries
@@ -414,9 +387,13 @@ func upsertShareToWeb(cfg CritJSON, files []shareFile, comments []shareComment, 
 	}
 	apiURL := u.Scheme + "://" + u.Host + "/api/reviews/" + token
 
-	fileList := make([]map[string]string, len(files))
+	fileList := make([]map[string]any, len(files))
 	for i, f := range files {
-		fileList[i] = map[string]string{"path": f.Path, "content": f.Content}
+		entry := map[string]any{"path": f.Path, "content": f.Content}
+		if f.Status != "" {
+			entry["status"] = f.Status
+		}
+		fileList[i] = entry
 	}
 
 	payload := map[string]any{
@@ -635,8 +612,8 @@ func clearShareState(critPath string) error {
 // Used by share/fetch/unpublish commands to avoid redundant config parsing.
 func loadShareConfig() Config {
 	cfgDir := ""
-	if IsGitRepo() {
-		cfgDir, _ = RepoRoot()
+	if vcs := DetectVCS(""); vcs != nil {
+		cfgDir, _ = vcs.RepoRoot()
 	}
 	if cfgDir == "" {
 		cfgDir, _ = os.Getwd()
