@@ -2932,7 +2932,6 @@ func installIntegration(name string, force bool) error {
 		return installAider(force)
 	}
 
-
 	files, ok := integrationMap[name]
 	if !ok {
 		var b strings.Builder
