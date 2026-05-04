@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +51,7 @@ var commandDispatch = map[string]func([]string){
 	"install":   runInstall,
 	"config":    runConfig,
 	"check":     func([]string) { runCheck() },
+	"pr":        runPR,
 	"pull":      runPull,
 	"push":      runPush,
 	"comment":   runComment,
@@ -155,21 +158,37 @@ func printQR(url string, showQR bool) {
 	}
 }
 
-func runShareExisting(existingCfg CritJSON, critPath string, files []shareFile, sharePaths []string, authToken string, showQR bool) {
+// handleShareAuthError clears cached credentials and prints the standard
+// re-auth message to stderr when a share-related call returned 401.
+// It does NOT exit; callers decide whether to exit immediately or fall through
+// (e.g. so a subsequent generic "Error: %v" line still gets printed).
+func handleShareAuthError() {
+	clearAuthIdentity()
+	fmt.Fprintln(os.Stderr, "Auth token rejected by server; cleared local credentials. Run 'crit auth login' to re-authenticate.")
+}
+
+func runShareExisting(existingCfg CritJSON, critPath string, files []shareFile, sharePaths []string, authToken, fallbackAuthor string, showQR bool) {
 	localIDs := buildLocalIDSet(existingCfg)
-	localFingerprints := buildLocalFingerprints(existingCfg)
-	if webComments, err := fetchNewWebComments(existingCfg.ShareURL, localIDs, localFingerprints, authToken); err != nil {
+	localFingerprints, localFingerprintIDs := buildLocalFingerprintIndex(existingCfg)
+	if fetched, err := fetchWebComments(existingCfg.ShareURL, localIDs, localFingerprints, localFingerprintIDs, authToken); err != nil {
+		if errors.Is(err, errShareUnauthorized) {
+			handleShareAuthError()
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "warning: could not pull remote comments: %v\n", err)
-	} else if len(webComments) > 0 {
-		if err := mergeWebComments(critPath, webComments); err != nil {
+	} else if len(fetched.NewComments) > 0 || len(fetched.ReplyUpdates) > 0 {
+		if err := mergeWebComments(critPath, fetched.NewComments, fetched.ReplyUpdates); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not merge remote comments: %v\n", err)
 		}
 	}
 
-	allComments, _ := loadCommentsForUpsert(critPath, sharePaths)
+	allComments, _ := loadCommentsForShare(critPath, sharePaths, fallbackAuthor)
 
 	result, err := upsertShareToWeb(existingCfg, files, allComments, authToken)
 	if err != nil {
+		if errors.Is(err, errShareUnauthorized) {
+			handleShareAuthError()
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -186,24 +205,25 @@ func runShareExisting(existingCfg CritJSON, critPath string, files []shareFile, 
 	printQR(result.URL, showQR)
 }
 
-func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL, authToken string, showQR bool) {
-	comments, reviewRound := loadCommentsForShare(critPath, filePaths)
-
-	url, deleteToken, err := shareFilesToWeb(files, comments, svcURL, reviewRound, authToken)
+func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL, authToken, fallbackAuthor string, showQR bool) {
+	res, err := shareReviewFiles(critPath, files, filePaths, svcURL, authToken, fallbackAuthor)
 	if err != nil {
+		if errors.Is(err, errShareUnauthorized) {
+			handleShareAuthError()
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := persistShareState(critPath, url, deleteToken, shareScope(filePaths)); err != nil {
+	if err := persistShareState(critPath, res.URL, res.DeleteToken, shareScope(filePaths)); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save share state to review file: %v\n", err)
 	}
 
-	initialComments, _ := loadCommentsForUpsert(critPath, filePaths)
-	_ = updateShareState(critPath, computeShareHash(files, initialComments), reviewRound)
+	initialComments, _ := loadCommentsForShare(critPath, filePaths, fallbackAuthor)
+	_ = updateShareState(critPath, computeShareHash(files, initialComments), res.ReviewRound)
 
-	fmt.Println(url)
-	printQR(url, showQR)
+	fmt.Println(res.URL)
+	printQR(res.URL, showQR)
 
 	if authToken == "" {
 		showLoginHint()
@@ -219,7 +239,12 @@ func runShare(args []string) {
 
 	cfg := loadShareConfig()
 	sf.svcURL = resolveShareURL(sf.svcURL, cfg, defaultShareURL)
-	authToken := resolveAuthToken(cfg)
+	cfg.AuthToken = resolveAuthToken(cfg)
+	// If we have a token but no cached user id, fetch it from /api/auth/whoami
+	// before building the share payload so authenticated comments carry the
+	// user id. Best-effort: failures fall through to anonymous attribution.
+	lazyBackfillAuthUserID(&cfg, sf.svcURL)
+	authToken := cfg.AuthToken
 
 	files := loadShareFiles(sf.files)
 
@@ -235,11 +260,11 @@ func runShare(args []string) {
 	}
 
 	if existingCfg, ok := loadExistingShareCfg(critPath, sharePaths); ok {
-		runShareExisting(existingCfg, critPath, files, sharePaths, authToken, sf.showQR)
+		runShareExisting(existingCfg, critPath, files, sharePaths, authToken, cfg.Author, sf.showQR)
 		return
 	}
 
-	runShareNew(critPath, files, sharePaths, sf.svcURL, authToken, sf.showQR)
+	runShareNew(critPath, files, sharePaths, sf.svcURL, authToken, cfg.Author, sf.showQR)
 }
 
 func parseFetchOutputDir(args []string) string {
@@ -307,26 +332,37 @@ func runFetch(args []string) {
 
 	authToken := resolveAuthToken(loadShareConfig())
 	localIDs := buildLocalIDSet(cj)
-	localFingerprints := buildLocalFingerprints(cj)
+	localFingerprints, localFingerprintIDs := buildLocalFingerprintIndex(cj)
 
-	webComments, err := fetchNewWebComments(cj.ShareURL, localIDs, localFingerprints, authToken)
+	fetched, err := fetchWebComments(cj.ShareURL, localIDs, localFingerprints, localFingerprintIDs, authToken)
 	if err != nil {
+		if errors.Is(err, errShareUnauthorized) {
+			handleShareAuthError()
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "Error fetching remote comments: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(webComments) == 0 {
+	if len(fetched.NewComments) == 0 && len(fetched.ReplyUpdates) == 0 {
 		fmt.Println("No new comments.")
 		fmt.Printf("Review file: %s\n", critPath)
 		return
 	}
 
-	if err := mergeWebComments(critPath, webComments); err != nil {
+	if err := mergeWebComments(critPath, fetched.NewComments, fetched.ReplyUpdates); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving review file: %v\n", err)
 		os.Exit(1)
 	}
 
-	printFetchedComments(webComments)
+	printFetchedComments(fetched.NewComments)
+	if len(fetched.ReplyUpdates) > 0 {
+		replyCount := 0
+		for _, replies := range fetched.ReplyUpdates {
+			replyCount += len(replies)
+		}
+		fmt.Printf("Updated %d comment(s) with %d new reply(ies).\n", len(fetched.ReplyUpdates), replyCount)
+	}
 	fmt.Printf("Review file: %s\n", critPath)
 }
 
@@ -406,27 +442,32 @@ func runInstall(args []string) {
 	}
 
 	force := false
-	global := false
 	for _, arg := range args[1:] {
 		if arg == "--force" || arg == "-f" {
 			force = true
-		}
-		if arg == "--global" || arg == "-g" {
-			global = true
 		}
 	}
 
 	target := args[0]
 	if target == "all" {
-		if global {
-			fmt.Fprintln(os.Stderr, "Error: --global is not supported with 'all'")
-			os.Exit(1)
-		}
+		cwd, _ := os.Getwd()
+		home, _ := os.UserHomeDir()
+		global := isGlobalInstall(cwd, home)
 		for _, name := range availableIntegrations() {
-			installIntegration(name, force, false)
+			if name == "windsurf" && global {
+				fmt.Fprintln(os.Stderr, "  Skipped: windsurf (no global install supported — run from a project)")
+				continue
+			}
+			if err := installIntegration(name, force); err != nil {
+				fmt.Fprintf(os.Stderr, "  Failed: %s: %v\n", name, err)
+				continue
+			}
 		}
-	} else {
-		installIntegration(target, force, global)
+		return
+	}
+	if err := installIntegration(target, force); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
+		os.Exit(1)
 	}
 }
 
@@ -480,6 +521,23 @@ func parsePullFlags(args []string) pullFlags {
 	return f
 }
 
+// resolvePullScope picks the (HeadSHA, DiffScope) pair stamped on imported
+// GitHub PR comments. Per spec §E "crit pull interaction": pulled comments
+// always anchor to the PR's actual diff, so DiffScope is always "layer". The
+// HeadSHA is best-effort: a running range-mode daemon's HeadSHA wins;
+// otherwise the on-disk ActiveDiffScope tells us a range mode is active but
+// HeadSHA is unknown. When neither indicates range mode, scope is empty
+// (legacy working-tree behavior — comments stay visible in working-tree view).
+func resolvePullScope(outputDir string, cj *CritJSON) inheritedScope {
+	if focus := probeDaemonFocus(outputDir); focus != nil && focus.Kind == FocusRange {
+		return inheritedScope{HeadSHA: focus.HeadSHA, DiffScope: "layer"}
+	}
+	if cj != nil && cj.ActiveDiffScope != "" {
+		return inheritedScope{DiffScope: "layer"}
+	}
+	return inheritedScope{}
+}
+
 func runPull(args []string) {
 	if err := requireGH(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -493,6 +551,11 @@ func runPull(args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+
+	// `crit pull` is the user's explicit refresh signal — drop any cached
+	// metadata for this PR so a daemon already running on it sees fresh
+	// title/body/head_sha on the next focus resolution.
+	invalidatePRCache(prNumber)
 
 	ghComments, err := fetchPRComments(prNumber)
 	if err != nil {
@@ -517,13 +580,14 @@ func runPull(args []string) {
 		cfg := LoadConfig("")
 		base := cfg.BaseBranch
 		if base == "" {
-			base = DefaultBranch()
+			base = defaultBaseRef()
 		}
 		cj.BaseRef, _ = MergeBase(base)
 		cj.ReviewRound = 1
 	}
 
-	added := mergeGHComments(&cj, ghComments)
+	scope := resolvePullScope(f.outputDir, &cj)
+	added := mergeGHCommentsScoped(&cj, ghComments, scope)
 
 	if added == 0 {
 		fmt.Printf("No new inline comments found on PR #%d\n", prNumber)
@@ -592,28 +656,6 @@ func parsePushFlags(args []string) pushFlags {
 	return f
 }
 
-func displayPushDryRun(ghComments []map[string]interface{}, allReplies []ghReplyForPush, prNumber int, event, message string) {
-	displayEvent := strings.ToLower(strings.ReplaceAll(event, "_", "-"))
-	fmt.Printf("Would post %d comments to PR #%d (event: %s):\n\n", len(ghComments), prNumber, displayEvent)
-	if message != "" {
-		fmt.Printf("  Review body: %s\n\n", message)
-	}
-	for _, c := range ghComments {
-		path, _ := c["path"].(string)
-		line, _ := c["line"].(int)
-		body, _ := c["body"].(string)
-		if sl, ok := c["start_line"].(int); ok {
-			fmt.Printf("  %s:%d-%d\n", path, sl, line)
-		} else {
-			fmt.Printf("  %s:%d\n", path, line)
-		}
-		fmt.Printf("    %s\n\n", body)
-	}
-	for _, reply := range allReplies {
-		fmt.Printf("  Would reply to GitHub comment %d: %.60s\n", reply.ParentGHID, reply.Body)
-	}
-}
-
 func postPushReplies(prNumber int, allReplies []ghReplyForPush) map[replyKey]int64 {
 	replyCount := 0
 	replyIDs := make(map[replyKey]int64)
@@ -634,7 +676,48 @@ func postPushReplies(prNumber int, allReplies []ghReplyForPush) map[replyKey]int
 	return replyIDs
 }
 
-func runPush(args []string) {
+// resolveCurrentPRHead fetches the PR's current head SHA when in range mode.
+// Returns "" silently when not in range mode or on tolerated fetch failure
+// (dry-run); returns an error when fetching is required but failed.
+//
+// On dry-run with a fetch error, surfaces a stderr note so the user knows the
+// stale-head check was skipped — silent skipping makes the dry-run plan
+// misleading.
+func resolveCurrentPRHead(prNumber int, inRange, dryRun bool) (string, error) {
+	if !inRange {
+		return "", nil
+	}
+	info, err := fetchPRByNumber(prNumber)
+	if err != nil {
+		if dryRun {
+			fmt.Fprintf(os.Stderr,
+				"Note: could not resolve current PR #%d head; stale-head check not enforced in this dry-run: %v\n",
+				prNumber, err)
+			return "", nil
+		}
+		return "", fmt.Errorf("fetching PR #%d for stale-head check: %w", prNumber, err)
+	}
+	if info == nil {
+		return "", nil
+	}
+	return info.HeadRefOid, nil
+}
+
+// pushContext captures everything runPush needs after parsing flags +
+// loading the review file. Splitting this out keeps runPush itself short
+// and the cyclomatic complexity inside Go Report Card limits.
+type pushContext struct {
+	flags    pushFlags
+	event    string
+	prNumber int
+	critPath string
+	cj       CritJSON
+}
+
+// loadPushContext parses flags, validates them, resolves the PR number, and
+// reads + parses the review file. Exits the process on any error since this
+// runs at the top of a CLI subcommand.
+func loadPushContext(args []string) pushContext {
 	if err := requireGH(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -674,93 +757,178 @@ func runPush(args []string) {
 		os.Exit(1)
 	}
 
-	ghComments := critJSONToGHComments(cj)
-	if len(ghComments) == 0 && event == "COMMENT" {
-		fmt.Println("No unresolved comments to push.")
+	return pushContext{flags: f, event: event, prNumber: prNumber, critPath: critPath, cj: cj}
+}
+
+// runPushDryRun prints the bucket plan to stdout and returns. Does not write
+// the export file — dry-run is read-only by definition.
+func runPushDryRun(ctx pushContext, b pushBuckets) {
+	fmt.Println(summarizeBuckets(ctx.prNumber, b))
+	fmt.Println()
+	fmt.Print(detailedDryRun(b))
+	fmt.Printf("Use `crit push --pr %d` to confirm.\n", ctx.prNumber)
+}
+
+// runPushLive performs the actual push: writes the orphan export (if any
+// orphans), posts the postable bucket via gh, and prints a summary. Replies
+// to existing GitHub comments are also posted (only for postable parents).
+func runPushLive(ctx pushContext, b pushBuckets) {
+	exportPath := ""
+	if len(b.FullStack)+len(b.Unmapped) > 0 {
+		dir, err := exportsDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not resolve export dir: %v\n", err)
+		} else {
+			path, werr := writeOrphanExport(ctx.prNumber, b, dir)
+			if werr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write orphan export: %v\n", werr)
+			} else {
+				exportPath = path
+			}
+		}
+	}
+
+	posted := 0
+	postFailed := false
+	if len(b.Postable) > 0 {
+		ghComments := bucketsToGHComments(b.Postable)
+		commentIDs, err := createGHReview(ctx.prNumber, ghComments, ctx.flags.message, ctx.event)
+		if err != nil {
+			postFailed = true
+			fmt.Fprintf(os.Stderr, "Error posting review: %v\n", err)
+		} else {
+			posted = len(ghComments)
+
+			// Replies to GitHub-anchored comments only make sense after a
+			// successful review post (so parent IDs are stable).
+			var allReplies []ghReplyForPush
+			for _, cf := range ctx.cj.Files {
+				allReplies = append(allReplies, collectNewRepliesForPush(cf)...)
+			}
+			replyIDs := postPushReplies(ctx.prNumber, allReplies)
+			if uerr := updateCritJSONWithGitHubIDs(ctx.critPath, commentIDs, replyIDs); uerr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to update review file with GitHub IDs: %v\n", uerr)
+			}
+		}
+	}
+
+	printPushSummary(posted, len(b.FullStack)+len(b.Unmapped), exportPath)
+
+	// Exit code: only fail when gh errored AND we have no orphans to fall
+	// back on. Otherwise something useful happened (export written), so
+	// exit 0.
+	if postFailed && exportPath == "" {
+		os.Exit(1)
+	}
+}
+
+// printPushSummary writes the one-line stdout summary describing what
+// happened. Adapts wording to the actual outcome (no orphans, no posts, etc).
+func printPushSummary(posted, orphans int, exportPath string) {
+	if posted == 0 && orphans == 0 {
+		fmt.Println("No comments to push.")
 		return
 	}
-
-	var allReplies []ghReplyForPush
-	for _, cf := range cj.Files {
-		allReplies = append(allReplies, collectNewRepliesForPush(cf)...)
-	}
-
-	if f.dryRun {
-		displayPushDryRun(ghComments, allReplies, prNumber, event, f.message)
+	if exportPath == "" {
+		fmt.Printf("Posted %d comments.\n", posted)
 		return
 	}
+	fmt.Printf("Posted %d comments. %d comments exported to %s.\n", posted, orphans, exportPath)
+}
 
-	displayEvent := strings.ToLower(strings.ReplaceAll(event, "_", "-"))
-	fmt.Printf("Pushing %d comments to PR #%d (%s)...\n", len(ghComments), prNumber, displayEvent)
-	commentIDs, err := createGHReview(prNumber, ghComments, f.message, event)
+// fullStackPushGateMessage is the user-facing error string emitted when
+// `crit push` is invoked while the active diff scope is the cumulative
+// stack range. Comments authored under that scope carry line numbers that
+// don't correspond to the PR's head diff, so the entire push is refused.
+// The exact wording is asserted by test/test-diff.sh Instance 6.
+const fullStackPushGateMessage = "Switch to Layer diff before posting a platform review"
+
+// pushBlockedByFullStackScope reports whether the on-disk active diff scope
+// requires `crit push` to abort with the gate message.
+func pushBlockedByFullStackScope(activeScope string) bool {
+	return activeScope == string(DiffScopeFullStack)
+}
+
+func runPush(args []string) {
+	ctx := loadPushContext(args)
+
+	// Full-stack push gate — see fullStackPushGateMessage.
+	if pushBlockedByFullStackScope(ctx.cj.ActiveDiffScope) {
+		fmt.Fprintln(os.Stderr, "Error: "+fullStackPushGateMessage)
+		os.Exit(1)
+	}
+
+	inRange := ctx.cj.ActiveDiffScope != ""
+	currentHead, err := resolveCurrentPRHead(ctx.prNumber, inRange, ctx.flags.dryRun)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Posted %d review comments to PR #%d (%s)\n", len(ghComments), prNumber, displayEvent)
 
-	replyIDs := postPushReplies(prNumber, allReplies)
+	b := bucketCommentsForPush(ctx.cj, currentHead, inRange)
 
-	if err := updateCritJSONWithGitHubIDs(critPath, commentIDs, replyIDs); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to update review file with GitHub IDs: %v\n", err)
+	if ctx.flags.dryRun {
+		runPushDryRun(ctx, b)
+		return
 	}
+	runPushLive(ctx, b)
 }
 
 type commentFlags struct {
 	outputDir string
 	author    string
+	userID    string
 	replyTo   string
 	resolve   bool
 	path      string
 	json      bool
 	plan      string
+	scope     commentFocusOverride
 	args      []string
+}
+
+// requireFlagValue extracts the value following a flag at position i, exiting
+// with an error message when the value is missing.
+func requireFlagValue(args []string, i int, flag string) string {
+	if i+1 >= len(args) {
+		fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", flag)
+		os.Exit(1)
+	}
+	return args[i+1]
 }
 
 func parseCommentFlags(args []string) commentFlags {
 	var f commentFlags
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		switch {
-		case arg == "--plan":
-			if i+1 >= len(args) {
-				fmt.Fprintf(os.Stderr, "Error: --plan requires a slug\n")
-				os.Exit(1)
-			}
+		switch arg {
+		case "--plan":
+			f.plan = requireFlagValue(args, i, "--plan")
 			i++
-			f.plan = args[i]
-		case arg == "--output" || arg == "-o":
-			if i+1 >= len(args) {
-				fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", arg)
-				os.Exit(1)
-			}
+		case "--output", "-o":
+			f.outputDir = requireFlagValue(args, i, arg)
 			i++
-			f.outputDir = args[i]
-		case arg == "--author":
-			if i+1 >= len(args) {
-				fmt.Fprintf(os.Stderr, "Error: --author requires a value\n")
-				os.Exit(1)
-			}
+		case "--author":
+			f.author = requireFlagValue(args, i, "--author")
 			i++
-			f.author = args[i]
-		case arg == "--reply-to":
-			if i+1 >= len(args) {
-				fmt.Fprintf(os.Stderr, "Error: --reply-to requires a comment ID\n")
-				os.Exit(1)
-			}
+		case "--reply-to":
+			f.replyTo = requireFlagValue(args, i, "--reply-to")
 			i++
-			f.replyTo = args[i]
-		case arg == "--resolve":
+		case "--resolve":
 			f.resolve = true
-		case arg == "--path":
-			if i+1 >= len(args) {
-				fmt.Fprintf(os.Stderr, "Error: --path requires a value\n")
+		case "--path":
+			f.path = requireFlagValue(args, i, "--path")
+			i++
+		case "--json":
+			f.json = true
+		case "--scope":
+			override, err := commentScopeOverrideFromFlag(requireFlagValue(args, i, "--scope"))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
+			f.scope = override
 			i++
-			f.path = args[i]
-		case arg == "--json":
-			f.json = true
 		default:
 			f.args = append(f.args, arg)
 		}
@@ -783,18 +951,27 @@ func resolveCommentFlags(f *commentFlags) {
 		}
 	}
 
-	// Resolve author: --author flag > config > VCS user.name
+	// Resolve author: --author flag > config > VCS user.name.
+	// Stamp AuthUserID alongside the author so authenticated comments
+	// carry the user identity into the share payload.
+	cfgDir, _ := os.Getwd()
+	if vcs := DetectVCS(""); vcs != nil {
+		cfgDir, _ = vcs.RepoRoot()
+	}
+	cfg := LoadConfig(cfgDir)
 	if f.author == "" {
-		cfgDir, _ := os.Getwd()
-		if vcs := DetectVCS(""); vcs != nil {
-			cfgDir, _ = vcs.RepoRoot()
-		}
-		cfg := LoadConfig(cfgDir)
 		f.author = cfg.Author
+	}
+	if f.userID == "" {
+		f.userID = cfg.AuthUserID
 	}
 }
 
 func runCommentJSON(f commentFlags) {
+	runCommentJSONScoped(f, inheritedScope{})
+}
+
+func runCommentJSONScoped(f commentFlags, scope inheritedScope) {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
@@ -807,7 +984,7 @@ func runCommentJSON(f commentFlags) {
 		os.Exit(1)
 	}
 
-	if err := bulkAddCommentsToCritJSON(entries, f.author, f.outputDir); err != nil {
+	if err := bulkAddCommentsToCritJSONScoped(entries, f.author, f.userID, f.outputDir, scope); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -837,7 +1014,7 @@ func runCommentReply(f commentFlags) {
 		os.Exit(1)
 	}
 	replyBody := strings.Join(f.args, " ")
-	if err := addReplyToCritJSON(f.replyTo, replyBody, f.author, f.resolve, f.outputDir, f.path); err != nil {
+	if err := addReplyToCritJSON(f.replyTo, replyBody, f.author, f.userID, f.resolve, f.outputDir, f.path); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -880,7 +1057,11 @@ func printCommentUsage() {
 	os.Exit(1)
 }
 
-func runCommentLineLevel(loc string, commentArgs []string, author, outputDir string) {
+func runCommentLineLevel(loc string, commentArgs []string, author, userID, outputDir string) {
+	runCommentLineLevelScoped(loc, commentArgs, author, userID, outputDir, inheritedScope{})
+}
+
+func runCommentLineLevelScoped(loc string, commentArgs []string, author, userID, outputDir string, scope inheritedScope) {
 	colonIdx := strings.LastIndex(loc, ":")
 	lineSpec := loc[colonIdx+1:]
 	filePath := loc[:colonIdx]
@@ -906,7 +1087,7 @@ func runCommentLineLevel(loc string, commentArgs []string, author, outputDir str
 		startLine, endLine = n, n
 	}
 	body := strings.Join(commentArgs[1:], " ")
-	if err := addCommentToCritJSON(filePath, startLine, endLine, body, author, outputDir); err != nil {
+	if err := addCommentToCritJSONScoped(filePath, startLine, endLine, body, author, userID, outputDir, scope); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -917,8 +1098,14 @@ func runComment(args []string) {
 	f := parseCommentFlags(args)
 	resolveCommentFlags(&f)
 
+	scope, err := resolveCommentScope(f.scope, f.outputDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	if f.json {
-		runCommentJSON(f)
+		runCommentJSONScoped(f, scope)
 		return
 	}
 
@@ -939,7 +1126,7 @@ func runComment(args []string) {
 	// 1 arg: review-level comment
 	if len(f.args) == 1 {
 		body := f.args[0]
-		if err := addReviewCommentToCritJSON(body, f.author, f.outputDir); err != nil {
+		if err := addReviewCommentToCritJSONScoped(body, f.author, f.userID, f.outputDir, scope); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -951,7 +1138,7 @@ func runComment(args []string) {
 	loc := f.args[0]
 	colonIdx := strings.LastIndex(loc, ":")
 	if colonIdx > 0 && looksLikeLineSpec(loc[colonIdx+1:]) {
-		runCommentLineLevel(loc, f.args, f.author, f.outputDir)
+		runCommentLineLevelScoped(loc, f.args, f.author, f.userID, f.outputDir, scope)
 		return
 	}
 
@@ -960,7 +1147,7 @@ func runComment(args []string) {
 		candidatePath := f.args[0]
 		if fileExistsOnDiskOrSession(candidatePath, f.outputDir) {
 			body := strings.Join(f.args[1:], " ")
-			if err := addFileCommentToCritJSON(candidatePath, body, f.author, f.outputDir); err != nil {
+			if err := addFileCommentToCritJSONScoped(candidatePath, body, f.author, f.userID, f.outputDir, scope); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -1102,7 +1289,7 @@ func resolvePlanSlug(name string, content []byte) string {
 func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry, bool) {
 	entry, alive := findAliveSession(key)
 	if alive {
-		fmt.Fprintf(os.Stderr, "Connected to crit daemon on port %d\n", entry.Port)
+		fmt.Fprintf(os.Stderr, "Connected to crit daemon at http://localhost:%d\n", entry.Port)
 		if !noOpen && !daemonHasBrowser(entry) {
 			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
 		}
@@ -1115,7 +1302,7 @@ func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry,
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "Started crit daemon on port %d (PID %d)\n", entry.Port, entry.PID)
+	fmt.Fprintf(os.Stderr, "Started crit daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
 	return entry, true
 }
 
@@ -1301,7 +1488,7 @@ func runPlanHook() {
 	weStartedDaemon := false
 
 	if alive {
-		fmt.Fprintf(os.Stderr, "crit plan-hook: connected to daemon on port %d\n", entry.Port)
+		fmt.Fprintf(os.Stderr, "crit plan-hook: connected to daemon at http://localhost:%d\n", entry.Port)
 		if !daemonHasBrowser(entry) {
 			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
 		}
@@ -1311,7 +1498,7 @@ func runPlanHook() {
 			fmt.Fprintf(os.Stderr, "crit plan-hook: error starting daemon: %v\n", err)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "crit plan-hook: started daemon on port %d (PID %d)\n", entry.Port, entry.PID)
+		fmt.Fprintf(os.Stderr, "crit plan-hook: started daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
 		weStartedDaemon = true
 	}
 
@@ -1388,6 +1575,32 @@ func runReviewClientRaw(entry sessionEntry) (approved bool, prompt string) {
 	return result.Approved, result.Prompt
 }
 
+// runPR is the `crit pr <num|url>` subcommand. Thin shim that forwards to
+// runReview with a synthesized --pr flag so the daemon path is shared.
+func runPR(args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "Usage: crit pr <num|url>")
+		os.Exit(1)
+	}
+	runReview([]string{"--pr", args[0]})
+}
+
+// focusKeyArgs returns the args slice used to key the daemon session for a
+// PR/range focus. PR-keyed daemons reuse the same review file across head
+// changes; range-keyed daemons are unique per (base, head) pair.
+//
+// Crucially, DiffScope is NOT part of the key — the picker must let users
+// toggle scopes within a single session.
+func focusKeyArgs(sc *serverConfig) []string {
+	if sc == nil || sc.focus == nil || sc.focus.Kind != FocusRange {
+		return sc.files
+	}
+	if sc.focus.PRNumber > 0 {
+		return []string{fmt.Sprintf("pr:%d", sc.focus.PRNumber)}
+	}
+	return []string{fmt.Sprintf("range:%s..%s", sc.focus.BaseSHA, sc.focus.HeadSHA)}
+}
+
 func runReview(args []string) {
 	go backgroundCleanup()
 
@@ -1407,14 +1620,14 @@ func runReview(args []string) {
 	if vcs := DetectVCS(sc.vcsOverride); vcs != nil {
 		branch = vcs.CurrentBranch()
 	}
-	key := sessionKey(cwd, branch, sc.files)
+	key := sessionKey(cwd, branch, focusKeyArgs(sc))
 
 	// Check for running daemon with the same session key
 	entry, alive := findAliveSession(key)
 	weStartedDaemon := false
 
 	if alive {
-		fmt.Fprintf(os.Stderr, "Connected to crit daemon on port %d\n", entry.Port)
+		fmt.Fprintf(os.Stderr, "Connected to crit daemon at http://localhost:%d\n", entry.Port)
 		// Re-open browser if no browser tab is connected (user closed it)
 		if !sc.noOpen && !daemonHasBrowser(entry) {
 			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
@@ -1426,7 +1639,7 @@ func runReview(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Started crit daemon on port %d (PID %d)\n", entry.Port, entry.PID)
+		fmt.Fprintf(os.Stderr, "Started crit daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
 		weStartedDaemon = true
 	}
 
@@ -1502,9 +1715,17 @@ func runReviewClient(entry sessionEntry) (approved bool) {
 
 	// Check if the review was approved (no unresolved comments).
 	var result struct {
-		Approved bool `json:"approved"`
+		Approved    bool   `json:"approved"`
+		NextCommand string `json:"next_command"`
 	}
 	if json.Unmarshal(body, &result) == nil {
+		// Print the exact command for the next round so the agent can
+		// re-invoke crit without reconstructing args. Skip on approve —
+		// the loop is over. Prepend a newline because the JSON body may
+		// or may not end with one.
+		if !result.Approved && result.NextCommand != "" {
+			fmt.Fprintf(os.Stdout, "\nNext round: %s\n", result.NextCommand)
+		}
 		return result.Approved
 	}
 	return false
@@ -1612,6 +1833,19 @@ type serverConfig struct {
 	reviewPath         string // centralized review file path (~/.crit/reviews/<key>.json)
 	vcsOverride        string // "git", "sl"/"sapling", or "" for auto-detect
 	cfg                Config // full resolved config for the settings panel
+
+	// focus is populated by resolveFocus when --pr or --range is set;
+	// nil means "default" (working-tree, derived inside the session).
+	focus *Focus
+
+	// remoteFiles enables API-based file content reads (gh api repos/.../contents/)
+	// when in PR/range focus, bypassing the local-fetch + git show path. Diff and
+	// changed-file lists still use local git.
+	remoteFiles bool
+
+	// workingTree forces working-tree mode regardless of stack auto-detection.
+	// Set by --working-tree.
+	workingTree bool
 }
 
 // serverFlagSet holds the parsed flag values before config resolution.
@@ -1628,6 +1862,19 @@ type serverFlagSet struct {
 	planDir     string
 	planName    string
 	fileArgs    []string
+
+	// PR-scoped / commit-range review (issue #300).
+	prSpec    string // --pr <num|url>
+	rangeSpec string // --range <baseSHA>..<headSHA>
+	scopeSpec string // --scope layer | full-stack
+
+	// remoteFiles is the parsed --remote flag. When true, file content reads
+	// in PR/range mode go through `gh api` instead of local git.
+	remoteFiles bool
+
+	// workingTree is the parsed --working-tree flag. When true, the boot
+	// path skips stacked-PR / local-stack auto-detection.
+	workingTree bool
 }
 
 func parseServerFlags(args []string) serverFlagSet {
@@ -1647,6 +1894,11 @@ func parseServerFlags(args []string) serverFlagSet {
 	vcsFlag := fs.String("vcs", "", "VCS backend to use: git, sl/sapling (default: auto-detect)")
 	planDir := fs.String("plan-dir", "", "")
 	planName := fs.String("name", "", "")
+	prSpec := fs.String("pr", "", "Review a specific PR by number or URL (e.g. 295 or https://github.com/o/r/pull/295)")
+	rangeSpec := fs.String("range", "", "Review a commit range, base..head (e.g. abc1234..def5678)")
+	scopeSpec := fs.String("scope", "", "Diff scope when reviewing a PR: layer (default) or full-stack")
+	remoteFiles := fs.Bool("remote", false, "Read PR file content via GitHub API instead of local git (avoids `git fetch`; requires gh)")
+	workingTree := fs.Bool("working-tree", false, "Force working-tree mode (skip auto-detection of stacked PR / branch)")
 	fs.Usage = func() {
 		printHelp()
 	}
@@ -1665,6 +1917,11 @@ func parseServerFlags(args []string) serverFlagSet {
 		planDir:     *planDir,
 		planName:    *planName,
 		fileArgs:    fs.Args(),
+		prSpec:      *prSpec,
+		rangeSpec:   *rangeSpec,
+		scopeSpec:   *scopeSpec,
+		remoteFiles: *remoteFiles,
+		workingTree: *workingTree,
 	}
 }
 
@@ -1714,8 +1971,11 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 	}
 
 	configDir := ""
-	if vcs := DetectVCS(sf.vcsOverride); vcs != nil {
+	vcs := DetectVCS(sf.vcsOverride)
+	repoRoot := ""
+	if vcs != nil {
 		configDir, _ = vcs.RepoRoot()
+		repoRoot = configDir
 	}
 	if configDir == "" {
 		configDir, _ = os.Getwd()
@@ -1727,6 +1987,17 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 	var ignorePatterns []string
 	if !sf.noIgnore {
 		ignorePatterns = cfg.IgnorePatterns
+	}
+
+	// Resolve --pr / --range / --scope into a Focus. nil = working-tree default.
+	focus, err := resolveFocus(sf.prSpec, sf.rangeSpec, sf.scopeSpec, sf.remoteFiles, vcs, repoRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	// --remote only takes effect in PR/range mode. Warn but don't fail.
+	if sf.remoteFiles && focus == nil {
+		fmt.Fprintln(os.Stderr, "Warning: --remote has no effect without --pr or --range; ignoring")
 	}
 
 	return &serverConfig{
@@ -1747,6 +2018,9 @@ func resolveServerConfig(args []string) (*serverConfig, error) {
 		planName:           sf.planName,
 		vcsOverride:        resolveVCSOverride(sf.vcsOverride, cfg.VCS),
 		cfg:                cfg,
+		focus:              focus,
+		remoteFiles:        sf.remoteFiles,
+		workingTree:        sf.workingTree,
 	}, nil
 }
 
@@ -1805,6 +2079,26 @@ func applySessionOverrides(session *Session, sc *serverConfig) {
 		abs, _ := filepath.Abs(sc.outputDir)
 		session.OutputDir = abs
 	}
+	// Auto-detect stacked PR / local branch stack when no explicit focus
+	// was requested. Best-effort — any failure falls through to working-tree
+	// mode. Skipped in file mode or by --working-tree.
+	if sc.focus == nil && !sc.workingTree && len(sc.files) == 0 {
+		if detected := autoDetectStackedFocus(session.VCS, session.RepoRoot); detected != nil {
+			sc.focus = detected
+		}
+	}
+	// Apply --pr / --range focus, if requested. SetFocus rebuilds the file
+	// list from the SHA range and persists ActiveDiffScope; failure leaves
+	// the working-tree state intact and reports via stderr.
+	if sc.focus != nil {
+		// Set RemoteFiles BEFORE SetFocus so the focus rebuild's file content
+		// reads route through the API path instead of local git.
+		session.RemoteFiles = sc.remoteFiles
+		if err := session.SetFocus(*sc.focus); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to apply focus: %v\n", err)
+			return
+		}
+	}
 }
 
 func bindListener(port int) (net.Listener, error) {
@@ -1832,7 +2126,7 @@ func serveSessionKey(sc *serverConfig) string {
 	if vcs := DetectVCS(sc.vcsOverride); vcs != nil {
 		branch = vcs.CurrentBranch()
 	}
-	return sessionKey(cwd, branch, sc.files)
+	return sessionKey(cwd, branch, focusKeyArgs(sc))
 }
 
 func checkStaleIntegrations(sc *serverConfig, srv *Server, cwd string) {
@@ -1910,6 +2204,7 @@ func runServe(args []string) {
 		sc.reviewPath, _ = reviewFilePath(key)
 	}
 	srv.reviewPath = sc.reviewPath
+	srv.cliArgs = sc.files
 	if err := writeSessionFile(key, sessionEntry{
 		PID:        os.Getpid(),
 		Port:       addr.Port,
@@ -1953,6 +2248,18 @@ func runServe(args []string) {
 
 	if !sc.noOpen {
 		go openBrowser(fmt.Sprintf("http://localhost:%d", addr.Port))
+	}
+
+	// Prime the open-PR cache in the background. `gh pr list` can take
+	// 2-5s on large orgs and the picker waits on it; running this during
+	// boot means the first /api/picker call lands on a warm cache instead
+	// of paying the network cost while the user watches the page render.
+	// Best-effort — failures (no gh, no remote, file mode) are silently
+	// dropped; the picker handler still degrades gracefully. Tied to the
+	// daemon's shutdown ctx so a Ctrl+C during boot terminates the gh
+	// subprocess instead of orphaning it.
+	if srv.prList != nil {
+		go func() { _, _ = srv.prList.getCtx(ctx) }()
 	}
 
 	go runIdleTimeoutChecker(ctx, stop, &idleMu, &lastActivity)
@@ -2347,6 +2654,9 @@ func printHelp() {
 Usage:
   crit                                       Auto-detect changed files via git
   crit <file|dir> [...]                      Review specific files or directories
+  crit --pr <num|url>                        Review a GitHub pull request (range mode)
+  crit pr <num|url>                          Review a GitHub pull request (alias for --pr)
+  crit --range <baseSHA>..<headSHA>          Review a commit range (range mode)
   crit stop [files...]                       Stop the daemon for current directory (and args)
   crit stop --all                            Stop all daemons for current directory
   crit comment <path>:<line[-end]> <body>    Add a review comment
@@ -2381,6 +2691,9 @@ Options:
   -q, --quiet                 Suppress status output
       --share-url <url>       Share service URL (e.g. https://crit.md or self-hosted)
       --base-branch <branch>  Base branch to diff against (overrides auto-detection)
+      --working-tree          Force working-tree mode (skip auto-detection of stacked PR / branch)
+      --scope <mode>          Diff scope when reviewing a PR: layer (default) or full-stack
+      --remote                Read PR file content via GitHub API instead of local git (requires gh)
       --qr                    Print QR code of share URL (with crit share)
   -v, --version               Print version
 
@@ -2468,10 +2781,31 @@ func printVersion() {
 	fmt.Println("Inline code review for AI agent workflows")
 }
 
+// globalDestKind selects how an integration's globalDest is interpreted.
+type globalDestKind int
+
+const (
+	// globalDestNone means the integration has no separate global path —
+	// use dest joined to home (the default for global installs).
+	globalDestNone globalDestKind = iota
+	// globalDestRelHome: globalDest is relative to $HOME.
+	globalDestRelHome
+	// globalDestDocuments: globalDest is relative to the platform Documents
+	// directory (used by Cline).
+	globalDestDocuments
+	// globalDestAbsolute: globalDest is an absolute path used verbatim.
+	globalDestAbsolute
+)
+
 type integration struct {
 	source string // path inside integrations/ embed
 	dest   string // destination relative to cwd
 	hint   string // usage hint printed after install
+	// globalDest, when set together with a non-zero globalDestKind, overrides
+	// dest in global mode (cwd == $HOME). The kind determines how it's
+	// resolved (see globalDestKind).
+	globalDest     string
+	globalDestKind globalDestKind
 }
 
 var integrationMap = map[string][]integration{
@@ -2484,18 +2818,23 @@ var integrationMap = map[string][]integration{
 		{source: "integrations/cursor/skills/crit-cli/SKILL.md", dest: ".cursor/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Cursor agents when needed"},
 	},
 	"opencode": {
+		// command stays at ~/.opencode/commands/ globally (works there)
 		{source: "integrations/opencode/crit.md", dest: ".opencode/commands/crit.md", hint: "Run /crit in OpenCode to start a review loop"},
-		{source: "integrations/opencode/SKILL.md", dest: ".opencode/skills/crit/SKILL.md", hint: "The crit skill is available to OpenCode agents when needed"},
+		// opencode does NOT read ~/.opencode/skills/ globally — redirect to ~/.agents/skills/
+		{source: "integrations/opencode/SKILL.md", dest: ".opencode/skills/crit/SKILL.md", globalDest: ".agents/skills/crit/SKILL.md", globalDestKind: globalDestRelHome, hint: "The crit skill is available to OpenCode agents when needed"},
 	},
 	"windsurf": {
+		// windsurf has no per-tool global rules dir — global install rejected in installIntegration.
 		{source: "integrations/windsurf/crit.md", dest: ".windsurf/rules/crit.md", hint: "Windsurf will suggest Crit when writing plans"},
 	},
 	"github-copilot": {
-		{source: "integrations/github-copilot/skills/crit/SKILL.md", dest: ".github/skills/crit/SKILL.md", hint: "Run /crit in GitHub Copilot to start a review loop"},
-		{source: "integrations/github-copilot/skills/crit-cli/SKILL.md", dest: ".github/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to GitHub Copilot agents when needed"},
+		// Copilot does NOT read ~/.github/skills/ globally — redirect to ~/.agents/skills/
+		{source: "integrations/github-copilot/skills/crit/SKILL.md", dest: ".github/skills/crit/SKILL.md", globalDest: ".agents/skills/crit/SKILL.md", globalDestKind: globalDestRelHome, hint: "Run /crit in GitHub Copilot to start a review loop"},
+		{source: "integrations/github-copilot/skills/crit-cli/SKILL.md", dest: ".github/skills/crit-cli/SKILL.md", globalDest: ".agents/skills/crit-cli/SKILL.md", globalDestKind: globalDestRelHome, hint: "The crit-cli skill is available to GitHub Copilot agents when needed"},
 	},
 	"cline": {
-		{source: "integrations/cline/crit.md", dest: ".clinerules/crit.md", hint: "Cline will suggest Crit when writing plans"},
+		// Cline does NOT read ~/.clinerules/ globally — redirect to platform Documents dir.
+		{source: "integrations/cline/crit.md", dest: ".clinerules/crit.md", globalDest: "Cline/Rules/crit.md", globalDestKind: globalDestDocuments, hint: "Cline will suggest Crit when writing plans"},
 	},
 	"codex": {
 		{source: "integrations/codex/skills/crit/SKILL.md", dest: ".agents/skills/crit/SKILL.md", hint: "Use $crit in Codex to start a review loop"},
@@ -2503,82 +2842,180 @@ var integrationMap = map[string][]integration{
 	},
 }
 
+// availableIntegrations returns the sorted list of integration names that
+// `crit install <name>` accepts. Derived from integrationMap keys plus the
+// special-cased "aider" entry (which does not live in the map because its
+// install flow is bespoke — see installAider).
 func availableIntegrations() []string {
-	return []string{"claude-code", "codex", "cursor", "opencode", "windsurf", "github-copilot", "cline"}
-}
-
-func resolveInstallDest(dest string, baseDir string) string {
-	if baseDir != "" {
-		return filepath.Join(baseDir, dest)
+	names := make([]string, 0, len(integrationMap)+1)
+	for name := range integrationMap {
+		names = append(names, name)
 	}
-	return dest
+	names = append(names, "aider")
+	sort.Strings(names)
+	return names
 }
 
-func installIntegration(name string, force bool, global bool) {
+// isGlobalInstall reports whether the install should be treated as global
+// (user-wide) rather than project-scoped. True when cwd == $HOME.
+func isGlobalInstall(cwd, home string) bool {
+	if cwd == "" || home == "" {
+		return false
+	}
+	a, errA := filepath.Abs(cwd)
+	b, errB := filepath.Abs(home)
+	if errA != nil || errB != nil {
+		return cwd == home
+	}
+	return a == b
+}
+
+// resolveGlobalDest expands an integration's globalDest into an absolute
+// path according to its globalDestKind.
+func resolveGlobalDest(kind globalDestKind, globalDest, home string) (string, error) {
+	switch kind {
+	case globalDestAbsolute:
+		return globalDest, nil
+	case globalDestDocuments:
+		return filepath.Join(documentsDir(home), globalDest), nil
+	case globalDestRelHome, globalDestNone:
+		if filepath.IsAbs(globalDest) {
+			return globalDest, nil
+		}
+		return filepath.Join(home, globalDest), nil
+	default:
+		return "", fmt.Errorf("unknown globalDestKind %d", kind)
+	}
+}
+
+// xdgUserDirFn is the seam used by documentsDir to query xdg-user-dir.
+// Tests override this; production code uses the default that shells out.
+var xdgUserDirFn = xdgUserDir
+
+// documentsDir returns the platform Documents directory for the current user.
+//
+//	macOS:   $HOME/Documents
+//	Linux:   $(xdg-user-dir DOCUMENTS), falling back to $HOME/Documents.
+//	         If xdg-user-dir returns $HOME (its documented behavior when
+//	         user-dirs.dirs is missing), we treat that as "no answer" and
+//	         fall back to $HOME/Documents to avoid polluting the home dir.
+//	Windows: filepath.Join(home, "Documents") — the real MyDocuments folder
+//	         can differ; querying FOLDERID_Documents needs x/sys/windows.
+//	         The $USERPROFILE\Documents convention is a pragmatic default.
+func documentsDir(home string) string {
+	if runtime.GOOS == "linux" {
+		path, err := xdgUserDirFn("DOCUMENTS")
+		if err == nil && path != "" && path != home {
+			return path
+		}
+	}
+	return filepath.Join(home, "Documents")
+}
+
+// xdgUserDir shells out to the xdg-user-dir binary to query a user dir.
+// Returns ("", error) if the binary is missing or returns non-zero. The
+// returned path is whitespace-trimmed; it may equal $HOME when the spec
+// says no user-dirs.dirs entry exists — callers must handle that case.
+func xdgUserDir(name string) (string, error) {
+	out, err := exec.Command("xdg-user-dir", name).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// installIntegration installs the named agent integration. It returns an
+// error suitable for printing to stderr; callers decide whether to exit or
+// continue (the `install all` loop continues past per-agent failures).
+func installIntegration(name string, force bool) error {
+	if name == "aider" {
+		return installAider(force)
+	}
+
+
 	files, ok := integrationMap[name]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "Unknown agent: %s\n\nAvailable agents:\n", name)
+		var b strings.Builder
+		fmt.Fprintf(&b, "unknown agent: %s\n\nAvailable agents:\n", name)
 		for _, a := range availableIntegrations() {
-			fmt.Fprintf(os.Stderr, "  %s\n", a)
+			fmt.Fprintf(&b, "  %s\n", a)
 		}
-		os.Exit(1)
+		return errors.New(strings.TrimRight(b.String(), "\n"))
 	}
 
-	var baseDir string
-	if global {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting home directory: %v\n", err)
-			os.Exit(1)
-		}
-		baseDir = home
+	cwd, _ := os.Getwd()
+	home, _ := os.UserHomeDir()
+	global := isGlobalInstall(cwd, home)
+
+	if name == "windsurf" && global {
+		return errors.New("windsurf does not support a global per-tool install. " +
+			"Windsurf only loads a single ~/.codeium/windsurf/memories/global_rules.md (6k char cap), " +
+			"not a per-tool rules directory. Run `crit install windsurf` from a project directory " +
+			"instead, which writes .windsurf/rules/crit.md (workspace-scoped)")
 	}
 
 	var hints []string
 	for _, f := range files {
-		dest := resolveInstallDest(f.dest, baseDir)
-
-		if !force {
-			if _, err := os.Stat(dest); err == nil {
-				fmt.Printf("  Skipped:   %s (already exists, use --force to overwrite)\n", dest)
-				if f.hint != "" {
-					hints = append(hints, f.hint)
-				}
-				continue
-			}
-		}
-
-		data, err := integrationsFS.ReadFile(f.source)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading embedded file %s: %v\n", f.source, err)
-			os.Exit(1)
-		}
-
-		dir := filepath.Dir(dest)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", dir, err)
-			os.Exit(1)
-		}
-
-		if err := os.WriteFile(dest, data, 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", dest, err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("  Installed: %s\n", dest)
+		dest := destFor(f, global, home, name)
+		installOneFile(f, dest, force)
 		if f.hint != "" {
 			hints = append(hints, f.hint)
 		}
 	}
-	seenHints := make(map[string]bool)
+	printUniqueHints(hints)
+	fmt.Println()
+	return nil
+}
+
+// destFor returns the destination path for an integration file, accounting
+// for global vs project install mode.
+func destFor(f integration, global bool, home, name string) string {
+	if global && f.globalDest != "" {
+		resolved, err := resolveGlobalDest(f.globalDestKind, f.globalDest, home)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving global destination for %s: %v\n", name, err)
+			os.Exit(1)
+		}
+		return resolved
+	}
+	return f.dest
+}
+
+// installOneFile copies a single embedded integration file to dest, skipping
+// if it already exists (unless force is set). Exits on I/O errors.
+func installOneFile(f integration, dest string, force bool) {
+	if !force {
+		if _, err := os.Stat(dest); err == nil {
+			fmt.Printf("  Skipped:   %s (already exists, use --force to overwrite)\n", dest)
+			return
+		}
+	}
+	data, err := integrationsFS.ReadFile(f.source)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading embedded file %s: %v\n", f.source, err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", filepath.Dir(dest), err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", dest, err)
+		os.Exit(1)
+	}
+	fmt.Printf("  Installed: %s\n", dest)
+}
+
+// printUniqueHints prints each hint once, in the order it first appeared.
+func printUniqueHints(hints []string) {
+	seen := make(map[string]bool)
 	for _, hint := range hints {
-		if seenHints[hint] {
+		if seen[hint] {
 			continue
 		}
-		seenHints[hint] = true
+		seen[hint] = true
 		fmt.Printf("  %s\n", hint)
 	}
-	fmt.Println()
 }
 
 func openBrowser(url string) {

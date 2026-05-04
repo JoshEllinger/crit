@@ -50,6 +50,7 @@ type staleFile struct {
 	file     string // source file name
 	dest     string // absolute path where the stale file was found
 	location string // one of the location* constants
+	hash     string // expected (bundled) content hash for this integration source
 }
 
 // toolDirFromDest extracts the tool config directory from a dest path
@@ -60,7 +61,7 @@ func toolDirFromDest(dest string) string {
 
 // marketplaceUpdateHint returns tool-specific advice for updating a marketplace plugin.
 var marketplaceUpdateHints = map[string]string{
-	".claude": "In Claude Code|/plugin marketplace update crit\nIn terminal|claude plugin update crit@crit",
+	".claude": "claude plugin marketplace update crit\nclaude plugin update crit@crit",
 	".cursor": "Update the crit plugin in Cursor settings",
 }
 
@@ -91,6 +92,7 @@ type integrationStatus struct {
 	Status   string `json:"status"`   // "current" or "stale"
 	Location string `json:"location"` // "project", "home", "marketplace", "cache"
 	Hint     string `json:"hint"`     // update hint (stale only)
+	Hash     string `json:"hash,omitempty"`
 }
 
 // detectInstalledIntegrations scans all candidate paths for each agent
@@ -129,7 +131,7 @@ func detectInstalledIntegrations(projectDir, homeDir string) []integrationStatus
 				hint := ""
 				if computeFileHash(installed) != expectedHash {
 					status = "stale"
-					sf := staleFile{agent: agent, file: filepath.Base(f.dest), dest: c.path, location: c.location}
+					sf := staleFile{agent: agent, file: filepath.Base(f.dest), dest: c.path, location: c.location, hash: expectedHash}
 					hint = sf.updateHint()
 				}
 				results = append(results, integrationStatus{
@@ -137,6 +139,7 @@ func detectInstalledIntegrations(projectDir, homeDir string) []integrationStatus
 					Status:   status,
 					Location: c.location,
 					Hint:     hint,
+					Hash:     expectedHash,
 				})
 				seen[agent] = true
 				break // first found file per agent is enough
@@ -214,6 +217,7 @@ func checkInstalledIntegrations(projectDir, homeDir string) []staleFile {
 						file:     filepath.Base(f.dest),
 						dest:     c.path,
 						location: c.location,
+						hash:     expectedHash,
 					})
 				}
 			}

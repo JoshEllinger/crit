@@ -1,6 +1,7 @@
 # Crit
 
 [![CI](https://github.com/tomasz-tomczyk/crit/actions/workflows/test.yml/badge.svg)](https://github.com/tomasz-tomczyk/crit/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/tomasz-tomczyk/crit/graph/badge.svg)](https://codecov.io/gh/tomasz-tomczyk/crit)
 [![Release](https://img.shields.io/github/release/tomasz-tomczyk/crit.svg)](https://github.com/tomasz-tomczyk/crit/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/tomasz-tomczyk/crit)](https://goreportcard.com/report/github.com/tomasz-tomczyk/crit)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -45,8 +46,8 @@ See [`integrations/`](integrations/) for all install methods and details.
 For the full experience - installs globally with a `/crit` command plus a `crit` skill that auto-activates when your agent works with review files, `crit comment`, `crit pull/push`, etc:
 
 ```
-/plugin marketplace add tomasz-tomczyk/crit
-/plugin install crit
+claude plugin marketplace add tomasz-tomczyk/crit
+claude plugin install crit@crit
 ```
 
 ### `/crit` command
@@ -355,6 +356,10 @@ inputs.crit.url = "github:tomasz-tomczyk/crit";
 ### Download Binary
 
 Grab the latest binary for your platform from [Releases](https://github.com/tomasz-tomczyk/crit/releases).
+
+### Docker (sandboxed agents)
+
+For running crit alongside an AI agent inside a container, with the review UI reachable from your host browser, see [`integrations/docker/`](integrations/docker/). Includes a working `Dockerfile` + `entrypoint.sh` that bridges crit's loopback-bound server via `socat` so `docker -p` forwarding works without changing crit's threat model.
 
 ## Acknowledgements
 

@@ -158,6 +158,84 @@
     return match ? decodeURIComponent(match[1]) : null;
   }
 
+  // ===== Settings (consolidated cookie) =====
+  // All persisted view preferences live in a single `crit-settings` JSON cookie.
+  // Exception: `crit-templates` stays in its own cookie because it's user-defined
+  // and can be longer than the rest combined.
+  const SETTINGS_COOKIE = 'crit-settings';
+  let settingsCache = null;
+
+  function loadSettings() {
+    if (settingsCache) return settingsCache;
+    const raw = getCookie(SETTINGS_COOKIE);
+    try { settingsCache = raw ? JSON.parse(raw) : {}; }
+    catch { settingsCache = {}; }
+    return settingsCache;
+  }
+
+  function getSetting(key, fallback) {
+    const v = loadSettings()[key];
+    return v === undefined ? fallback : v;
+  }
+
+  function setSetting(key, value) {
+    const s = loadSettings();
+    s[key] = value;
+    setCookie(SETTINGS_COOKIE, JSON.stringify(s));
+  }
+
+  // One-time migration from legacy per-setting cookies into the consolidated
+  // `crit-settings` blob. Idempotent: after first run, legacy cookies are
+  // expired and this loop becomes a no-op. `crit-templates` is intentionally
+  // excluded — it stays in its own cookie.
+  (function migrateLegacySettings() {
+    const legacy = [
+      { name: 'crit-theme',                          key: 'theme',              type: 'string'  },
+      { name: 'crit-width',                          key: 'width',              type: 'string'  },
+      { name: 'crit-diff-mode',                      key: 'diffMode',           type: 'string'  },
+      { name: 'crit-diff-scope',                     key: 'diffScope',          type: 'string'  },
+      { name: 'crit-hide-resolved',                  key: 'hideResolved',       type: 'boolTF'  }, // 'true'/'false'
+      { name: 'crit-toc',                            key: 'toc',                type: 'string'  },
+      { name: 'crit-review-conversation-collapsed',  key: 'reviewConvCollapsed', type: 'bool10' }, // '1'/'0'
+      { name: 'crit-updates-dismissed',              key: 'updatesDismissed',   type: 'string'  },
+    ];
+    const settings = loadSettings();
+    let changed = false;
+    legacy.forEach(function(l) {
+      const v = getCookie(l.name);
+      if (v === null) return;
+      if (settings[l.key] === undefined) {
+        if (l.type === 'boolTF') settings[l.key] = (v === 'true');
+        else if (l.type === 'bool10') settings[l.key] = (v === '1');
+        else settings[l.key] = v;
+        changed = true;
+      }
+      // Expire the legacy cookie regardless of whether we needed its value.
+      document.cookie = l.name + '=; path=/; max-age=0; SameSite=Strict';
+    });
+    if (changed) {
+      settingsCache = settings;
+      setCookie(SETTINGS_COOKIE, JSON.stringify(settings));
+    }
+  })();
+
+  // Bind Ctrl/Cmd+Enter (submit) and Escape (cancel) to a text input/textarea.
+  // opts.stopPropagation defaults to true (matches comment-form keydown behavior).
+  function bindSubmitCancelKeys(el, onSubmit, onCancel, opts) {
+    const stop = !opts || opts.stopPropagation !== false;
+    el.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        if (stop) e.stopPropagation();
+        onSubmit(e);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        if (stop) e.stopPropagation();
+        onCancel(e);
+      }
+    });
+  }
+
   // ===== State =====
   let session = {};       // { mode, branch, base_ref, review_round, files: [...] }
   let files = [];         // [{ path, status, fileType, content, diffHunks, comments, lineBlocks, tocItems, collapsed, viewMode }]
@@ -170,6 +248,26 @@
   let pendingUpdates = [];
   let pendingUpdatesVersion = '';
 
+  // Returns true if at least one pending update entry has not been dismissed.
+  // Brew dismiss is keyed by version; integration dismiss is keyed per-agent
+  // by content hash (so re-prompts when we ship a new template).
+  function hasActivePendingUpdates() {
+    if (!pendingUpdates.length) return false;
+    const brewDismissed = getSetting('updatesDismissed', '');
+    const intDismissed = getSetting('dismissedIntegrations', {}) || {};
+    for (let i = 0; i < pendingUpdates.length; i++) {
+      const u = pendingUpdates[i];
+      if (u.kind === 'brew') {
+        if (brewDismissed !== pendingUpdatesVersion) return true;
+      } else if (u.kind === 'integration') {
+        if (!u.hash || intDismissed[u.agent] !== u.hash) return true;
+      } else {
+        return true;
+      }
+    }
+    return false;
+  }
+
   let reviewComments = []; // review-level (general) comments
   let reviewCommentFormActive = false; // is the review comment form open?
   let reviewCommentEditingId = null; // id of review comment being edited, or null
@@ -178,8 +276,21 @@
   let settingsPanelTab = 'settings';
   let cachedConfig = null; // populated on first panel open
 
-  let diffMode = getCookie('crit-diff-mode') || 'split'; // 'split' or 'unified'
-  let diffScope = getCookie('crit-diff-scope') || 'all'; // 'all', 'branch', 'staged', or 'unstaged'
+  let diffMode = getSetting('diffMode', 'split'); // 'split' or 'unified'
+  let diffScope = getSetting('diffScope', 'all'); // 'all', 'branch', 'staged', or 'unstaged'
+
+  // Single source of truth for hide-resolved state. Persisted via the
+  // consolidated `crit-settings` cookie (not localStorage) so the setting
+  // survives random-port server restarts — localStorage is scoped per origin
+  // (incl. port), cookies are host-scoped.
+  let hideResolvedState = getSetting('hideResolved', false);
+  function isHideResolved() { return hideResolvedState; }
+  function setHideResolved(v) {
+    hideResolvedState = !!v;
+    setSetting('hideResolved', hideResolvedState);
+    document.body.classList.toggle('hide-resolved', hideResolvedState);
+  }
+
   let diffCommit = '';
   let commitList = [];
   let diffActive = false; // rendered diff view toggle for file mode
@@ -394,15 +505,15 @@
     f.diffTooLarge = diffLineCount > 1000;
     f.diffLoaded = !f.diffTooLarge;
 
-    // Pre-highlight code files for diff rendering
-    if (f.fileType === 'code') {
+    // Pre-highlight code and markdown files for diff rendering
+    if (f.fileType === 'code' || f.fileType === 'markdown') {
       f.highlightCache = preHighlightFile(f);
       f.lang = langFromPath(f.path);
+    }
 
-      // In file mode, build line blocks so code files render as document view
-      if (session.mode !== 'git') {
-        f.lineBlocks = buildCodeLineBlocks(f);
-      }
+    // In file mode, build line blocks so code files render as document view
+    if (f.fileType === 'code' && session.mode !== 'git') {
+      f.lineBlocks = buildCodeLineBlocks(f);
     }
 
     // Parse markdown content into line blocks
@@ -520,6 +631,7 @@
   async function init() {
     initTheme();
     initWidth();
+    initSidebarWidths();
 
     // Measure actual header height and set CSS variable for sticky offsets
     function updateHeaderHeight() {
@@ -566,6 +678,8 @@
     const hasBrew = configRes.latest_version && configRes.version && configRes.latest_version !== configRes.version;
     if (hasBrew) {
       pendingUpdates.push({
+        kind: 'brew',
+        version: configRes.latest_version,
         label: 'Crit ' + configRes.latest_version + ' available',
         labelUrl: 'https://github.com/tomasz-tomczyk/crit/releases/tag/v' + configRes.latest_version,
         hint: 'brew update && brew upgrade crit'
@@ -575,13 +689,18 @@
       configRes.stale_integrations.forEach(function(si) {
         // Capitalize agent name for display
         const name = si.agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
-        pendingUpdates.push({ label: name + ' plugin outdated', hint: si.hint });
+        pendingUpdates.push({
+          kind: 'integration',
+          agent: si.agent,
+          hash: si.hash || '',
+          label: name + ' plugin outdated',
+          hint: si.hint
+        });
       });
     }
 
     pendingUpdatesVersion = configRes.latest_version || configRes.version || '';
-    const dismissed = getCookie('crit-updates-dismissed');
-    if (pendingUpdates.length > 0 && dismissed !== pendingUpdatesVersion) {
+    if (hasActivePendingUpdates()) {
       document.getElementById('updateBtn').style.display = '';
     }
 
@@ -635,7 +754,7 @@
       });
       if (scopes.indexOf(diffScope) === -1) {
         diffScope = 'all';
-        setCookie('crit-diff-scope', 'all');
+        setSetting('diffScope', 'all');
         // Re-fetch session with corrected scope — the initial fetch used the
         // stale cookie value and may have returned an empty file list.
         const corrected = await fetchWhenReady('/api/session?scope=all').then(r => r.json());
@@ -672,6 +791,7 @@
     updateCommentCount();
     updateViewedCount();
     restoreDrafts();
+    applyHideResolved();
   }
 
   // Show/hide the Toggle Diff button and Split/Unified toggle in file mode
@@ -695,30 +815,46 @@
   }
 
   // ===== Syntax Highlighting for Diffs =====
+  // Most extensions are resolved via hljs's built-in alias system
+  // (e.g. .feature → gherkin, .md → markdown, .tsx → typescript, .toml → ini,
+  // .scss → scss, .h/.hpp → c/cpp, .yml → yaml, .kt → kotlin, .rb → ruby,
+  // .dockerfile → dockerfile, .makefile → makefile). Only extensions that hljs
+  // does NOT cover via aliases need entries here.
+  const EXT_OVERRIDES = {
+    tf: 'hcl',         // Terraform — hljs has no .tf alias
+    htm: 'xml',        // hljs aliases html but not htm
+    svg: 'xml',
+    cs: 'csharp',
+    sh: 'bash',
+    zig: 'zig',        // not a built-in alias in our bundle
+    md: 'markdown',    // normalize: callers compare lang against 'markdown'
+  };
+  // Files identified by basename rather than extension.
+  const BASENAME_LANG = {
+    dockerfile: 'dockerfile',
+    makefile: 'makefile',
+    gemfile: 'ruby',
+    rakefile: 'ruby',
+  };
   function langFromPath(filePath) {
-    const ext = (filePath || '').split('.').pop().toLowerCase();
-    const map = {
-      js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'typescript',
-      go: 'go', py: 'python', rb: 'ruby', rs: 'rust',
-      sql: 'sql', sh: 'bash', bash: 'bash', zsh: 'bash',
-      json: 'json', yaml: 'yaml', yml: 'yaml',
-      html: 'xml', htm: 'xml', xml: 'xml', svg: 'xml',
-      css: 'css', scss: 'css', less: 'css',
-      ex: 'elixir', exs: 'elixir',
-      md: 'markdown', java: 'java', kt: 'kotlin',
-      c: 'c', h: 'c', cpp: 'cpp', hpp: 'cpp',
-      cs: 'csharp', swift: 'swift', php: 'php',
-      r: 'r', lua: 'lua', zig: 'zig', nim: 'nim',
-      toml: 'ini', ini: 'ini', dockerfile: 'dockerfile',
-      makefile: 'makefile', tf: 'hcl',
-    };
-    return map[ext] || null;
+    if (!filePath) return null;
+    const base = filePath.split('/').pop() || '';
+    const baseLower = base.toLowerCase();
+    // Pure basename (no extension) — Dockerfile, Makefile, etc.
+    if (!baseLower.includes('.') && BASENAME_LANG[baseLower]) {
+      return BASENAME_LANG[baseLower];
+    }
+    const ext = baseLower.includes('.') ? baseLower.split('.').pop() : '';
+    if (ext && EXT_OVERRIDES[ext]) return EXT_OVERRIDES[ext];
+    if (ext && hljs.getLanguage(ext)) return ext;
+    // Fall back to basename match (catches Dockerfile.something edge cases too).
+    return BASENAME_LANG[baseLower] || null;
   }
 
   // Pre-highlight file content and return array of highlighted lines (1-indexed).
   // highlightedLines[lineNum] = highlighted HTML for that line.
   function preHighlightFile(file) {
-    if (!file.content || file.fileType !== 'code') return null;
+    if (!file.content) return null;
     const lang = langFromPath(file.path);
     if (!lang || !hljs.getLanguage(lang)) return null;
     try {
@@ -862,9 +998,7 @@
     }
 
     let highlighted = '';
-    // Skip hljs for markdown fences — syntax highlighting (bold headings,
-    // italic emphasis) makes raw markdown source look half-rendered.
-    if (lang && lang !== 'markdown' && lang !== 'md' && hljs.getLanguage(lang)) {
+    if (lang && hljs.getLanguage(lang)) {
       try { highlighted = hljs.highlight(token.content, { language: lang }).value; } catch {}
     }
     if (!highlighted) highlighted = escapeHtml(token.content);
@@ -1289,10 +1423,32 @@
     tree = collapseCommonPrefixes(tree);
     const body = document.getElementById('fileTreeBody');
     body.innerHTML = '';
+
+    // Review Conversation pseudo-row sits in its own section above FILES.
+    const conversationSection = document.getElementById('treeConversationSection');
+    conversationSection.innerHTML = '';
+    conversationSection.appendChild(buildReviewConversationTreeRow());
+
     renderTreeNode(body, tree, 0, '');
 
     // Set up intersection observer for active file tracking
     setupTreeObserver();
+  }
+
+  function buildReviewConversationTreeRow() {
+    const row = document.createElement('div');
+    row.className = 'tree-conversation-row' + (activeTreePath === REVIEW_CONVERSATION_PATH ? ' active' : '');
+    row.dataset.treePath = REVIEW_CONVERSATION_PATH;
+    let inner =
+      '<span class="tree-conversation-icon">' + ICON_REVIEW_CONVERSATION + '</span>' +
+      '<span class="tree-conversation-name">Review conversation</span>';
+    const unresolved = reviewComments.filter(function(c) { return !c.resolved; }).length;
+    if (unresolved > 0) {
+      inner += '<span class="tree-conversation-badge">' + unresolved + '</span>';
+    }
+    row.innerHTML = inner;
+    row.addEventListener('click', scrollToReviewConversation);
+    return row;
   }
 
   function fileStatusIcon(status) {
@@ -1403,13 +1559,13 @@
   function updateTreeActive(filePath) {
     if (filePath === activeTreePath) return;
     activeTreePath = filePath;
-    const allFiles = document.querySelectorAll('.tree-file');
-    for (let i = 0; i < allFiles.length; i++) {
-      allFiles[i].classList.toggle('active', allFiles[i].dataset.treePath === filePath);
+    const allRows = document.querySelectorAll('.tree-file, .tree-conversation-row');
+    for (let i = 0; i < allRows.length; i++) {
+      allRows[i].classList.toggle('active', allRows[i].dataset.treePath === filePath);
     }
     // Scroll active item into view within the tree panel (manual scroll
     // to avoid scrollIntoView affecting ancestor scroll containers)
-    const activeEl = document.querySelector('.tree-file.active');
+    const activeEl = document.querySelector('.tree-file.active, .tree-conversation-row.active');
     if (activeEl) {
       const panel = document.getElementById('fileTreeBody');
       const rect = activeEl.getBoundingClientRect();
@@ -1475,7 +1631,8 @@
   function setupTreeObserver() {
     if (treeObserver) treeObserver.disconnect();
     const sections = document.querySelectorAll('.file-section[id]');
-    if (sections.length === 0) return;
+    const reviewSection = document.getElementById('reviewConversation');
+    if (sections.length === 0 && !reviewSection) return;
 
     treeObserver = new IntersectionObserver(function(entries) {
       // Skip observer updates briefly after a manual scrollToFile click
@@ -1488,13 +1645,19 @@
           const top = entries[i].boundingClientRect.top;
           if (top < bestTop) {
             bestTop = top;
-            bestPath = entries[i].target.id.replace('file-section-', '');
+            const id = entries[i].target.id;
+            bestPath = id === 'reviewConversation'
+              ? REVIEW_CONVERSATION_PATH
+              : id.replace('file-section-', '');
           }
         }
       }
       if (bestPath) updateTreeActive(bestPath);
     }, { rootMargin: '-60px 0px -70% 0px' });
 
+    if (reviewSection && !reviewSection.hidden) {
+      treeObserver.observe(reviewSection);
+    }
     for (let i = 0; i < sections.length; i++) {
       treeObserver.observe(sections[i]);
     }
@@ -1525,9 +1688,13 @@
     // Render mermaid diagrams
     renderMermaidBlocks();
 
+    // Render the inline Review Conversation section above filesContainer
+    renderReviewConversation();
+
     // Re-attach intersection observer for file tree active tracking
     setupTreeObserver();
     rebuildNavList();
+    applyHideResolved();
   }
 
   function rebuildNavList() {
@@ -1680,6 +1847,7 @@
     oldSection.replaceWith(renderFileSection(file));
     renderMermaidBlocks();
     rebuildNavList();
+    applyHideResolved();
   }
 
   function renderFileSection(file) {
@@ -1798,8 +1966,8 @@
       const toggle = document.createElement('div');
       toggle.className = 'file-header-toggle';
       toggle.innerHTML =
-        '<button class="toggle-btn' + (file.viewMode === 'document' ? ' active' : '') + '" data-mode="document">Document</button>' +
-        '<button class="toggle-btn' + (file.viewMode === 'diff' ? ' active' : '') + '" data-mode="diff">Diff</button>';
+        '<button type="button" class="toggle-btn' + (file.viewMode === 'document' ? ' active' : '') + '" data-mode="document">Document</button>' +
+        '<button type="button" class="toggle-btn' + (file.viewMode === 'diff' ? ' active' : '') + '" data-mode="diff">Diff</button>';
       toggle.addEventListener('click', function(e) {
         const btn = e.target.closest('.toggle-btn');
         if (!btn) return;
@@ -2425,17 +2593,6 @@
 
   // ===== Word-Level Diff =====
 
-  // Split a line into tokens for similarity comparison.
-  function tokenize(line) {
-    const tokens = [];
-    const re = /[\w]+|[^\w]/g;
-    let match;
-    while ((match = re.exec(line)) !== null) {
-      tokens.push(match[0]);
-    }
-    return tokens;
-  }
-
   // Compute similarity between two strings using token multiset Dice coefficient.
   // Returns 0–1 (1 = identical tokens, 0 = nothing in common).
   // Only counts word tokens (identifiers, numbers) — single punctuation characters
@@ -2444,9 +2601,12 @@
   function lineSimilarity(a, b) {
     if (a === b) return 1;
     if (!a || !b) return 0;
-    const wordRe = /^\w+$/;
-    const tokA = tokenize(a).filter(function(t) { return wordRe.test(t); });
-    const tokB = tokenize(b).filter(function(t) { return wordRe.test(t); });
+    // \w+ matches word tokens directly — no need for a separate tokenize pass
+    // followed by a filter (the previous custom LCS path used tokenize for
+    // more, but after the @sanity/diff-match-patch swap this is the only call
+    // site, so it is inlined).
+    const tokA = a.match(/\w+/g) || [];
+    const tokB = b.match(/\w+/g) || [];
     if (tokA.length === 0 && tokB.length === 0) return 1;
     if (tokA.length === 0 || tokB.length === 0) return 0;
     const counts = {};
@@ -2501,45 +2661,8 @@
     return pairs;
   }
 
-  // Compute LCS membership for two token arrays.
-  // Returns { oldKeep: boolean[], newKeep: boolean[] } where true = token is in LCS (unchanged).
-  function computeTokenLCS(oldTokens, newTokens) {
-    const m = oldTokens.length;
-    const n = newTokens.length;
-    const dp = [];
-    for (let i = 0; i <= m; i++) {
-      dp[i] = new Array(n + 1).fill(0);
-    }
-    for (let i = 1; i <= m; i++) {
-      for (let j = 1; j <= n; j++) {
-        if (oldTokens[i - 1] === newTokens[j - 1]) {
-          dp[i][j] = dp[i - 1][j - 1] + 1;
-        } else {
-          dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-        }
-      }
-    }
-    const oldKeep = new Array(m).fill(false);
-    const newKeep = new Array(n).fill(false);
-    let i = m, j = n;
-    while (i > 0 && j > 0) {
-      if (oldTokens[i - 1] === newTokens[j - 1]) {
-        oldKeep[i - 1] = true;
-        newKeep[j - 1] = true;
-        i--; j--;
-      } else if (dp[i - 1][j] >= dp[i][j - 1]) {
-        i--;
-      } else {
-        j--;
-      }
-    }
-    return { oldKeep: oldKeep, newKeep: newKeep };
-  }
-
-  // Compute word-level diff between two lines using token LCS.
-  // Tokenizes into words/punctuation, finds the longest common subsequence,
-  // then builds character ranges for changed tokens.
-  // This produces whole-word highlights (like GitHub) instead of character-level fragments.
+  // Compute word-level diff between two lines using diff-match-patch.
+  // Runs character-level diff with semantic cleanup to produce word-aligned highlights.
   // Returns { oldRanges, newRanges } where each range is [startCharIdx, endCharIdx] in the raw text.
   // Returns null if lines are too long, identical, or completely different.
   function wordDiff(oldLine, newLine) {
@@ -2551,46 +2674,33 @@
     // Identical lines — no diff needed
     if (oldLine === newLine) return null;
 
-    const oldTokens = tokenize(oldLine);
-    const newTokens = tokenize(newLine);
-    if (oldTokens.length === 0 && newTokens.length === 0) return null;
-    // Skip if token counts are huge (LCS is O(m*n))
-    if (oldTokens.length > 200 || newTokens.length > 200) return null;
+    const dmp = window.DiffMatchPatch;
+    const diffs = dmp.cleanupSemantic(dmp.makeDiff(oldLine, newLine));
 
-    const result = computeTokenLCS(oldTokens, newTokens);
-    const oldKeep = result.oldKeep;
-    const newKeep = result.newKeep;
+    // Build character ranges from diff tuples.
+    // DIFF_DELETE (-1) tuples advance old position, DIFF_INSERT (1) advance new,
+    // DIFF_EQUAL (0) advances both.
+    const oldRanges = [];
+    const newRanges = [];
+    let oldIdx = 0;
+    let newIdx = 0;
 
-    // If everything changed (no LCS), skip — lines probably don't correspond
-    const oldUnchanged = oldKeep.filter(Boolean).length;
-    const newUnchanged = newKeep.filter(Boolean).length;
-    if (oldUnchanged === 0 && newUnchanged === 0) return null;
-    // If nothing changed, skip
-    if (oldUnchanged === oldTokens.length && newUnchanged === newTokens.length) return null;
+    for (let i = 0; i < diffs.length; i++) {
+      const op = diffs[i][0];
+      const text = diffs[i][1];
+      const len = text.length;
 
-    // Build character ranges for changed tokens.
-    // Adjacent changed tokens merge into one range automatically.
-    function buildRanges(tokens, keep) {
-      const ranges = [];
-      let charIdx = 0;
-      let rangeStart = -1;
-      for (let i = 0; i < tokens.length; i++) {
-        if (!keep[i]) {
-          if (rangeStart === -1) rangeStart = charIdx;
-        } else {
-          if (rangeStart !== -1) {
-            ranges.push([rangeStart, charIdx]);
-            rangeStart = -1;
-          }
-        }
-        charIdx += tokens[i].length;
+      if (op === dmp.DIFF_EQUAL) {
+        oldIdx += len;
+        newIdx += len;
+      } else if (op === dmp.DIFF_DELETE) {
+        oldRanges.push([oldIdx, oldIdx + len]);
+        oldIdx += len;
+      } else if (op === dmp.DIFF_INSERT) {
+        newRanges.push([newIdx, newIdx + len]);
+        newIdx += len;
       }
-      if (rangeStart !== -1) ranges.push([rangeStart, charIdx]);
-      return ranges;
     }
-
-    const oldRanges = buildRanges(oldTokens, oldKeep);
-    const newRanges = buildRanges(newTokens, newKeep);
 
     if (oldRanges.length === 0 && newRanges.length === 0) return null;
 
@@ -3680,6 +3790,7 @@
     const commentsMap = {};
     const diffCommentsMap = {};
     const rangeSet = new Set();
+    const hideResolved = isHideResolved();
     for (const c of comments) {
       // commentsMap — keyed by end_line only
       const lineKey = c.end_line;
@@ -3689,8 +3800,9 @@
       const sideKey = c.end_line + ':' + (c.side || '');
       if (!diffCommentsMap[sideKey]) diffCommentsMap[sideKey] = [];
       diffCommentsMap[sideKey].push(c);
-      // commentedRangeSet — only unresolved, non-file-scope comments
-      if (!c.resolved && c.scope !== 'file') {
+      // commentedRangeSet — non-file-scope comments; skip resolved when the
+      // hide-resolved toggle is on so the line highlight tracks card visibility.
+      if (c.scope !== 'file' && !(hideResolved && c.resolved)) {
         const side = c.side || '';
         for (let ln = c.start_line; ln <= c.end_line; ln++) rangeSet.add(ln + ':' + side);
       }
@@ -3710,8 +3822,10 @@
       }
     }
     const set = new Set();
+    const hideResolved = isHideResolved();
     for (const c of comments) {
       if (c.scope === 'file') continue;
+      if (hideResolved && c.resolved) continue;
       const side = c.side || '';
       let startIdx = -1, endIdx = -1;
       for (let i = 0; i < lines.length; i++) {
@@ -4010,6 +4124,25 @@
     return { filePath, startLine, endLine, afterBlockIndex, side };
   }
 
+  function closeEmptyReviewForm() {
+    if (!reviewCommentFormActive || reviewCommentEditingId) return;
+    const ta = document.querySelector('#reviewConversation .comment-form textarea');
+    if (ta && ta.value.trim()) return;
+    cancelReviewCommentForm();
+  }
+
+  function closeEmptyForms(exceptKey) {
+    const toClose = [];
+    activeForms.forEach(function(f) {
+      if (f.formKey === exceptKey) return;
+      if (f.editingId) return; // never auto-close edit-in-progress forms
+      const ta = document.querySelector('.comment-form[data-form-key="' + f.formKey + '"] textarea');
+      const text = ta ? ta.value : (f.draftBody || '');
+      if (!text.trim()) toClose.push(f);
+    });
+    toClose.forEach(function(f) { cancelComment(f); });
+  }
+
   function openForm(newForm) {
     const fk = formKey(newForm);
     const existing = activeForms.find(function(f) { return f.formKey === fk; });
@@ -4021,6 +4154,8 @@
       focusCommentTextarea(existing.formKey);
       return;
     }
+    closeEmptyForms(fk);
+    closeEmptyReviewForm();
     addForm(newForm);
     activeFilePath = newForm.filePath;
     selectionStart = newForm.startLine;
@@ -4044,6 +4179,8 @@
       focusCommentTextarea(existing.formKey);
       return;
     }
+    closeEmptyForms(fk);
+    closeEmptyReviewForm();
     addForm(newForm);
     renderFileByPath(filePath);
     focusCommentTextarea(newForm.formKey);
@@ -4063,7 +4200,7 @@
     return createCommentFormUI({
       formObj: formObj,
       headerText: formObj.editingId ? 'Editing comment' : 'Comment',
-      submitText: formObj.editingId ? 'Update' : 'Submit',
+      submitText: formObj.editingId ? 'Update' : 'Comment',
       initialBody: initialBody,
       autoFocus: false
     });
@@ -4223,15 +4360,7 @@
     btns.appendChild(saveBtn);
     dialog.appendChild(btns);
 
-    input.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        saveBtn.click();
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        cancelBtn.click();
-      }
-    });
+    bindSubmitCancelKeys(input, function() { saveBtn.click(); }, function() { cancelBtn.click(); }, { stopPropagation: false });
 
     overlay.appendChild(dialog);
     overlay.addEventListener('click', function(e) {
@@ -4438,18 +4567,14 @@
     const doCancel = opts.onCancel
       ? function() { opts.onCancel(); }
       : function() { cancelComment(formObj); };
+    // Esc is ambiguous (could be a fat-finger), so gate it on a confirm if
+    // there's unsaved content. The Cancel button is an explicit, labeled
+    // discard action — no prompt there (matches GitHub).
+    const doCancelFromEsc = opts.onCancel
+      ? function() { if (confirmDiscardReviewCommentForm()) opts.onCancel(); }
+      : function() { if (confirmDiscardCommentForm(formObj)) cancelComment(formObj); };
 
-    textarea.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        e.stopPropagation();
-        doSubmit();
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        doCancel();
-      }
-    });
+    bindSubmitCancelKeys(textarea, doSubmit, doCancelFromEsc);
 
     if (!opts.onSubmit) {
       textarea.addEventListener('input', function() { debouncedSaveDraft(textarea.value, formObj); });
@@ -4533,7 +4658,7 @@
     return createCommentFormUI({
       formObj: formObj,
       headerText: (formObj.editingId ? 'Editing comment on ' : 'Comment on ') + lineRef,
-      submitText: formObj.editingId ? 'Update' : 'Submit',
+      submitText: formObj.editingId ? 'Update' : 'Comment',
       initialBody: initialBody,
       autoFocus: false
     });
@@ -4645,6 +4770,24 @@
     updateTreeCommentBadges();
     updateCommentCount();
     return created || null;
+  }
+
+  // Returns true if it's safe to discard the form (form is empty or user
+  // confirmed). Reads the textarea live so unsaved typing is respected even
+  // before the autosave debounce fires.
+  function confirmDiscardCommentForm(formObj) {
+    if (!formObj) return true;
+    const ta = document.querySelector('.comment-form[data-form-key="' + formObj.formKey + '"] textarea');
+    const text = ta ? ta.value : (formObj.draftBody || '');
+    if (!text.trim()) return true;
+    return window.confirm('Discard comment?');
+  }
+
+  function confirmDiscardReviewCommentForm() {
+    const ta = document.querySelector('#reviewConversation .comment-form textarea');
+    const text = ta ? ta.value : '';
+    if (!text.trim()) return true;
+    return window.confirm('Discard comment?');
   }
 
   function cancelComment(formObj) {
@@ -5007,9 +5150,9 @@
       card.appendChild(pending);
     }
 
-    // Reply input
-    if (opts.showReplyInput && filePath) {
-      card.appendChild(createReplyInput(comment.id, filePath));
+    // Reply input (filePath empty/null → review-level reply)
+    if (opts.showReplyInput) {
+      card.appendChild(createReplyInput(comment.id, filePath || ''));
     }
 
     if (pendingAgentRequests.has(comment.id) || isLiveThread(comment)) {
@@ -5346,7 +5489,9 @@
       refreshFileComments(filePath);
     } else {
       await refreshReviewComments();
+      renderReviewConversation();
       renderCommentsPanel();
+      renderFileTree();
     }
   }
 
@@ -5392,7 +5537,15 @@
     reviewCommentSubmitting = false;
     reviewCommentFormActive = false;
     reviewCommentEditingId = null;
+    // Clear the just-submitted textarea so renderReviewConversation's draft
+    // snapshot (line ~5670) doesn't mistake it for in-progress typing and
+    // re-open the form pre-populated with the submitted text.
+    const submittedTa = document.querySelector('#reviewConversation .comment-form[data-form-key="review:new"] textarea');
+    if (submittedTa) submittedTa.value = '';
     updateCommentCount();
+    renderReviewConversation();
+    renderCommentsPanel();
+    renderFileTree();
   }
 
   async function updateReviewComment(id, body) {
@@ -5416,6 +5569,8 @@
     reviewCommentFormActive = false;
     reviewCommentEditingId = null;
     updateCommentCount();
+    renderReviewConversation();
+    renderCommentsPanel();
   }
 
   async function deleteReviewComment(id) {
@@ -5431,39 +5586,34 @@
     }
     if (navCommentId === id) navCommentId = null;
     updateCommentCount();
+    renderReviewConversation();
+    renderCommentsPanel();
+    renderFileTree();
   }
 
   function openReviewCommentForm() {
     // No-op if form is already open
     if (reviewCommentFormActive && !reviewCommentEditingId) return;
-    // Open panel if closed
-    const panel = document.getElementById('commentsPanel');
-    if (panel.classList.contains('comments-panel-hidden')) {
-      panel.classList.remove('comments-panel-hidden');
-      updateTocPosition();
-    }
+    closeEmptyForms(null);
     reviewCommentFormActive = true;
     reviewCommentEditingId = null;
+    renderReviewConversation();
     renderCommentsPanel();
-    // Focus the textarea
+    scrollToReviewConversation();
     requestAnimationFrame(function() {
-      const ta = document.querySelector('#commentsPanelBody textarea');
+      const ta = document.querySelector('#reviewConversation textarea');
       if (ta) ta.focus();
     });
   }
 
   function openReviewCommentEditForm(comment) {
-    // Open panel if closed
-    const panel = document.getElementById('commentsPanel');
-    if (panel.classList.contains('comments-panel-hidden')) {
-      panel.classList.remove('comments-panel-hidden');
-      updateTocPosition();
-    }
     reviewCommentFormActive = true;
     reviewCommentEditingId = comment.id;
+    renderReviewConversation();
     renderCommentsPanel();
+    scrollToReviewConversation();
     requestAnimationFrame(function() {
-      const ta = document.querySelector('#commentsPanelBody textarea');
+      const ta = document.querySelector('#reviewConversation textarea');
       if (ta) ta.focus();
     });
   }
@@ -5471,6 +5621,7 @@
   function cancelReviewCommentForm() {
     reviewCommentFormActive = false;
     reviewCommentEditingId = null;
+    renderReviewConversation();
     renderCommentsPanel();
   }
 
@@ -5479,7 +5630,7 @@
     return createCommentFormUI({
       formObj: formObj,
       headerText: 'Comment',
-      submitText: 'Submit',
+      submitText: 'Comment',
       initialBody: '',
       autoFocus: false,
       onSubmit: function(body) { addReviewComment(body); },
@@ -5514,6 +5665,272 @@
     updateCommentCount();
   }
 
+  // ===== Inline Review Conversation Section (top of document) =====
+
+  const REVIEW_CONVERSATION_PATH = '__review_conversation__';
+  const ICON_REVIEW_CONVERSATION =
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6A1.5 1.5 0 0 1 12.5 11H8.5l-3 2.75V11H3.5A1.5 1.5 0 0 1 2 9.5Z"/>' +
+    '</svg>';
+
+  function createReviewConversationCard(comment) {
+    const isResolved = comment.resolved;
+    const cardClassExtra = [
+      isResolved ? 'resolved-card' : '',
+      comment.carried_forward ? 'carried-forward' : '',
+    ].filter(Boolean).join(' ');
+
+    const parts = buildCommentCard(comment, '', {
+      wrapperClass: 'comment-block',
+      cardClassExtra: cardClassExtra,
+      collapseDefault: isResolved,
+      showLineRef: false,
+      showCarriedForward: true,
+      showReplyInput: true,
+    });
+
+    if (isResolved) {
+      const unresolveBtn = document.createElement('button');
+      unresolveBtn.className = 'resolve-btn resolve-btn--active';
+      unresolveBtn.title = 'Unresolve';
+      unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
+      unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
+      unresolveBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        toggleResolveStatus(comment.id, 'review', 'unresolve', null);
+      });
+      parts.actions.appendChild(unresolveBtn);
+    } else {
+      const resolveBtn = document.createElement('button');
+      resolveBtn.className = 'resolve-btn';
+      resolveBtn.title = 'Resolve';
+      resolveBtn.setAttribute('aria-label', 'Resolve thread');
+      resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
+      resolveBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        toggleResolveStatus(comment.id, 'review', 'resolve', null);
+      });
+      parts.actions.appendChild(resolveBtn);
+    }
+
+    const editBtn = document.createElement('button');
+    editBtn.title = 'Edit';
+    editBtn.innerHTML = ICON_EDIT;
+    editBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      openReviewCommentEditForm(comment);
+    });
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'delete-btn';
+    deleteBtn.title = 'Delete';
+    deleteBtn.innerHTML = ICON_DELETE;
+    deleteBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      deleteReviewComment(comment.id);
+    });
+    parts.actions.appendChild(editBtn);
+    parts.actions.appendChild(deleteBtn);
+
+    return parts.wrapper;
+  }
+
+  // Collapse state — host preference, persisted via cookie like other view prefs.
+  function isReviewConversationCollapsed() {
+    return getSetting('reviewConvCollapsed', false);
+  }
+  function setReviewConversationCollapsed(collapsed) {
+    setSetting('reviewConvCollapsed', !!collapsed);
+  }
+
+  const ICON_CHEVRON_DOWN =
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">' +
+    '<path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+  function renderReviewConversation() {
+    const section = document.getElementById('reviewConversation');
+    if (!section) return;
+
+    // Hide entirely until session is loaded
+    if (!session || !Array.isArray(files)) {
+      section.hidden = true;
+      return;
+    }
+
+    // Snapshot any in-progress NEW review-comment draft text before we wipe
+    // the DOM. Empty drafts intentionally fall through to the discard
+    // behavior — only protect non-empty text so refreshAfterReplyChange and
+    // sibling state changes don't blow away the user's typing.
+    let pendingNewDraft = '';
+    const existingNewTa = section.querySelector('.comment-form[data-form-key="review:new"] textarea');
+    if (existingNewTa && existingNewTa.value && existingNewTa.value.trim()) {
+      pendingNewDraft = existingNewTa.value;
+    }
+
+    section.hidden = false;
+    section.innerHTML = '';
+
+    // Match doc layout: file mode centers `.document-wrapper`, so we center the
+    // section too. Git mode renders file-sections full-width, so left-anchor.
+    if (session.mode === 'files') {
+      section.dataset.docLayout = 'centered';
+    } else {
+      delete section.dataset.docLayout;
+    }
+
+    const collapsed = isReviewConversationCollapsed() && !reviewCommentFormActive;
+    section.classList.toggle('collapsed', collapsed);
+
+    // Header — chevron on the left, matching `.tree-folder` and `.comment-card`
+    // collapse conventions elsewhere in the UI.
+    const header = document.createElement('div');
+    header.className = 'review-conversation-header';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'review-conversation-toggle';
+    toggle.title = collapsed ? 'Expand review conversation' : 'Collapse review conversation';
+    toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    toggle.setAttribute('aria-label', toggle.title);
+    toggle.innerHTML = ICON_CHEVRON_DOWN;
+    toggle.addEventListener('click', function() {
+      setReviewConversationCollapsed(!isReviewConversationCollapsed());
+      renderReviewConversation();
+    });
+    header.appendChild(toggle);
+
+    const headerLabel = document.createElement('span');
+    headerLabel.className = 'icon';
+    headerLabel.innerHTML = ICON_REVIEW_CONVERSATION;
+    header.appendChild(headerLabel);
+
+    const labelText = document.createElement('span');
+    labelText.className = 'label';
+    labelText.textContent = 'Review conversation';
+    header.appendChild(labelText);
+
+    // Match the file-tree badge convention: count unresolved (the "needs attention" signal),
+    // not total. Resolved threads are visible but de-emphasised.
+    const unresolvedCount = reviewComments.filter(function(c) { return !c.resolved; }).length;
+    if (unresolvedCount > 0) {
+      const count = document.createElement('span');
+      count.className = 'count';
+      count.textContent = String(unresolvedCount);
+      header.appendChild(count);
+    }
+    section.appendChild(header);
+
+    if (collapsed) return;
+
+    const body = document.createElement('div');
+    body.className = 'review-conversation-body';
+    section.appendChild(body);
+
+    // Threads (existing comments first; the editor renders inline at the matching position)
+    for (const comment of reviewComments) {
+      if (reviewCommentEditingId === comment.id) {
+        body.appendChild(createReviewCommentEditor(comment));
+      } else {
+        body.appendChild(createReviewConversationCard(comment));
+      }
+    }
+
+    // Footer: new-comment form (when active) | "Add comment" ghost button.
+    // The same button is used for both empty and populated states.
+    // If a non-empty draft existed before the re-render, keep the form open
+    // even if the active flag was somehow cleared — the user is typing.
+    const showNewForm = (reviewCommentFormActive || !!pendingNewDraft) && !reviewCommentEditingId;
+    if (showNewForm) {
+      const formEl = createReviewCommentFormUI();
+      body.appendChild(formEl);
+      if (pendingNewDraft) {
+        const ta = formEl.querySelector('textarea');
+        if (ta) {
+          ta.value = pendingNewDraft;
+          // Match the "expanded" state the user was in (createCommentFormUI
+          // builds the textarea directly, so just place caret at the end).
+          // Restore focus too — the user was actively typing when the
+          // re-render fired (refreshAfterReplyChange, SSE), so dropping
+          // focus would force them to click back into the textarea.
+          try {
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+            ta.focus();
+          } catch {}
+        }
+      }
+    } else {
+      const addMore = document.createElement('button');
+      // .review-conversation-empty doubles as an E2E selector for the
+      // empty-state composer and is intentionally only added when the
+      // conversation has no comments.
+      const isEmpty = reviewComments.length === 0;
+      addMore.className = 'review-conversation-add-more' + (isEmpty ? ' review-conversation-empty' : '');
+      addMore.type = 'button';
+      addMore.textContent = 'Add comment';
+      addMore.addEventListener('click', function() { openReviewCommentForm(); });
+      body.appendChild(addMore);
+    }
+  }
+
+  function scrollToReviewConversation() {
+    // If the user collapsed it, expand on navigate so the target is visible.
+    if (isReviewConversationCollapsed()) {
+      setReviewConversationCollapsed(false);
+      renderReviewConversation();
+    }
+    const section = document.getElementById('reviewConversation');
+    if (!section) return;
+    ignoreTreeObserverUntil = Date.now() + 200;
+    // Only scroll if the section isn't already comfortably in view —
+    // otherwise clicking the in-view "Add comment" button feels jarring.
+    const rect = section.getBoundingClientRect();
+    const headerOffset = (document.querySelector('.app-header') || {}).offsetHeight || 0;
+    if (rect.top < headerOffset || rect.top > window.innerHeight) {
+      section.scrollIntoView({ block: 'start', behavior: 'instant' });
+    }
+    updateTreeActive(REVIEW_CONVERSATION_PATH);
+  }
+
+  // Scroll to and flash a specific review-level comment card. Mirrors scrollToComment.
+  function scrollToReviewComment(commentId) {
+    if (isReviewConversationCollapsed()) {
+      setReviewConversationCollapsed(false);
+      renderReviewConversation();
+    }
+    const section = document.getElementById('reviewConversation');
+    if (!section) return;
+    const card = section.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
+    if (!card) {
+      scrollToReviewConversation();
+      return;
+    }
+    ignoreTreeObserverUntil = Date.now() + 200;
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.remove('comment-card-highlight');
+    void card.offsetWidth;
+    card.classList.add('comment-card-highlight');
+    card.addEventListener('animationend', function() {
+      card.classList.remove('comment-card-highlight');
+    }, { once: true });
+    updateTreeActive(REVIEW_CONVERSATION_PATH);
+  }
+
+  // Build the URL for a reply mutation (edit or delete). filePath empty → review-level.
+  function replyMutationUrl(commentId, replyId, filePath) {
+    return filePath
+      ? '/api/comment/' + commentId + '/replies/' + replyId + '?path=' + enc(filePath)
+      : '/api/review-comment/' + commentId + '/replies/' + replyId;
+  }
+
+  async function refreshAfterReplyChange(filePath) {
+    if (filePath) {
+      refreshFileComments(filePath);
+    } else {
+      await refreshReviewComments();
+      renderReviewConversation();
+      renderCommentsPanel();
+      renderFileTree();
+    }
+  }
+
   async function editReply(commentId, replyId, filePath) {
     const replyEl = document.querySelector('[data-reply-id="' + replyId + '"]');
     if (!replyEl) return;
@@ -5542,36 +5959,40 @@
     btnRow.appendChild(cancelBtn);
     replyEl.appendChild(btnRow);
 
-    cancelBtn.addEventListener('click', () => refreshFileComments(filePath));
+    cancelBtn.addEventListener('click', () => refreshAfterReplyChange(filePath));
     saveBtn.addEventListener('click', async () => {
       const newBody = textarea.value.trim();
       if (!newBody) return;
       try {
-        await fetch('/api/comment/' + commentId + '/replies/' + replyId + '?path=' + enc(filePath), {
+        const res = await fetch(replyMutationUrl(commentId, replyId, filePath), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ body: newBody })
         });
+        if (!res.ok) throw new Error('Server returned ' + res.status);
       } catch (err) {
         console.error('Error editing reply:', err);
         showMiniToast('Failed to edit reply');
         return;
       }
       userActedThisRound = true;
-      refreshFileComments(filePath);
+      refreshAfterReplyChange(filePath);
     });
+
+    bindSubmitCancelKeys(textarea, function() { saveBtn.click(); }, function() { cancelBtn.click(); });
   }
 
   async function deleteReply(commentId, replyId, filePath) {
     try {
-      await fetch('/api/comment/' + commentId + '/replies/' + replyId + '?path=' + enc(filePath), {
+      const res = await fetch(replyMutationUrl(commentId, replyId, filePath), {
         method: 'DELETE'
       });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
       userActedThisRound = true;
     } catch (err) {
       console.error('Error deleting reply:', err);
     }
-    refreshFileComments(filePath);
+    refreshAfterReplyChange(filePath);
   }
 
   function createReplyInput(commentId, filePath) {
@@ -5613,6 +6034,8 @@
 
     function expand() {
       if (form.classList.contains('expanded')) return;
+      closeEmptyReviewForm();
+      closeEmptyForms(null);
       form.classList.add('expanded');
       textarea.value = input.value;
       input.replaceWith(textarea);
@@ -5655,7 +6078,10 @@
       try {
         const payload = { body: body };
         if (configAuthor) payload.author = configAuthor;
-        const res = await fetch('/api/comment/' + commentId + '/replies?path=' + enc(filePath), {
+        const url = filePath
+          ? '/api/comment/' + commentId + '/replies?path=' + enc(filePath)
+          : '/api/review-comment/' + commentId + '/replies';
+        const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -5663,24 +6089,27 @@
         if (!res.ok) throw new Error('Server returned ' + res.status);
         userActedThisRound = true;
 
-        // In live threads, also send the reply to the agent
-        const file = getFileByPath(filePath);
-        const comment = file && file.comments ? file.comments.find(function(c) { return c.id === commentId; }) : null;
-        if (comment && (isLiveThread(comment) || pendingAgentRequests.has(commentId))) {
-          pendingAgentRequests.add(commentId);
-          fetch('/api/agent/request', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ comment_id: commentId, file_path: filePath }),
-          }).catch(function(err) {
-            console.error('Error sending reply to agent:', err);
-            pendingAgentRequests.delete(commentId);
-            showMiniToast('Failed to send to agent');
-          });
+        // Live-thread agent dispatch only applies to file-scoped comments.
+        if (filePath) {
+          const file = getFileByPath(filePath);
+          const comment = file && file.comments ? file.comments.find(function(c) { return c.id === commentId; }) : null;
+          if (comment && (isLiveThread(comment) || pendingAgentRequests.has(commentId))) {
+            pendingAgentRequests.add(commentId);
+            fetch('/api/agent/request', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ comment_id: commentId, file_path: filePath }),
+            }).catch(function(err) {
+              console.error('Error sending reply to agent:', err);
+              pendingAgentRequests.delete(commentId);
+              showMiniToast('Failed to send to agent');
+            });
+          }
         }
 
         activeReplyForms.delete(commentId);
-        refreshFileComments(filePath);
+        collapse();
+        refreshAfterReplyChange(filePath);
       } catch (err) {
         console.error('Failed to add reply:', err);
         showMiniToast('Failed to save reply');
@@ -5831,50 +6260,13 @@
     });
 
     if (isGeneral) {
-      // General comments: resolve/unresolve, edit, and delete
-      if (isResolved) {
-        const unresolveBtn = document.createElement('button');
-        unresolveBtn.className = 'resolve-btn resolve-btn--active';
-        unresolveBtn.title = 'Unresolve';
-        unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
-        unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
-        unresolveBtn.addEventListener('click', function(e) {
-          e.stopPropagation();
-          toggleResolveStatus(comment.id, 'review', 'unresolve', null);
-        });
-        parts.actions.appendChild(unresolveBtn);
-      } else {
-        const resolveBtn = document.createElement('button');
-        resolveBtn.className = 'resolve-btn';
-        resolveBtn.title = 'Resolve';
-        resolveBtn.setAttribute('aria-label', 'Resolve thread');
-        resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
-        resolveBtn.addEventListener('click', function(e) {
-          e.stopPropagation();
-          toggleResolveStatus(comment.id, 'review', 'resolve', null);
-        });
-        parts.actions.appendChild(resolveBtn);
-      }
-      const editBtn = document.createElement('button');
-      editBtn.title = 'Edit';
-      editBtn.innerHTML = ICON_EDIT;
-      editBtn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        openReviewCommentEditForm(comment);
-      });
-      const deleteBtn = document.createElement('button');
-      deleteBtn.className = 'delete-btn';
-      deleteBtn.title = 'Delete';
-      deleteBtn.innerHTML = ICON_DELETE;
-      deleteBtn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        deleteReviewComment(comment.id);
-      });
-      parts.actions.appendChild(editBtn);
-      parts.actions.appendChild(deleteBtn);
-    }
-    // File comments are clickable to scroll to inline location
-    if (!isGeneral) {
+      // General comments are edited/resolved/deleted from the inline
+      // Review Conversation section. Panel cards navigate + flash the inline card,
+      // matching the line-comment behaviour.
+      parts.wrapper.style.cursor = 'pointer';
+      parts.wrapper.addEventListener('click', function() { scrollToReviewComment(comment.id); });
+    } else {
+      // File comments are clickable to scroll to inline location
       parts.wrapper.style.cursor = 'pointer';
       parts.wrapper.addEventListener('click', function(e) {
         // Don't scroll if clicking action buttons
@@ -5886,62 +6278,81 @@
     return parts.wrapper;
   }
 
+  // Track active filter: 'all', 'open', 'resolved'. In-memory only —
+  // sticky filter would hide new open comments on a new review session.
+  let commentsActiveFilter = 'all';
+
   function renderCommentsPanel() {
     const panel = document.getElementById('commentsPanel');
     if (panel.classList.contains('comments-panel-hidden')) return;
 
-    const showResolved = document.getElementById('showResolvedToggle').checked;
     const body = document.getElementById('commentsPanelBody');
     const savedScroll = body.scrollTop;
     body.innerHTML = '';
 
-    // Show/hide the filter bar only when resolved comments exist
-    const hasResolved = files.some(function(f) { return f.comments.some(function(c) { return c.resolved; }); })
-      || reviewComments.some(function(c) { return c.resolved; });
-    document.getElementById('commentsPanelFilter').style.display = hasResolved ? '' : 'none';
+    // Compute counts
+    const allFileComments = files.reduce(function(acc, f) { return acc.concat(f.comments); }, []);
+    const allComments = reviewComments.concat(allFileComments);
+    const totalCount = allComments.length;
+    const openCount = allComments.filter(function(c) { return !c.resolved; }).length;
+    const resolvedCount = allComments.filter(function(c) { return c.resolved; }).length;
+
+    // Update count badge
+    const badge = document.getElementById('commentsPanelCountBadge');
+    if (badge) badge.textContent = totalCount;
+
+    // Update pill counts and sync active-state to persisted filter
+    const pillBtns = document.querySelectorAll('#commentsFilterPill .toggle-btn');
+    pillBtns.forEach(function(btn) {
+      const f = btn.dataset.filter;
+      const isActive = f === commentsActiveFilter;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-checked', isActive ? 'true' : 'false');
+      btn.setAttribute('tabindex', isActive ? '0' : '-1');
+      const countEl = btn.querySelector('.filter-count');
+      if (!countEl) return;
+      if (f === 'all') countEl.textContent = totalCount;
+      else if (f === 'open') countEl.textContent = openCount;
+      else if (f === 'resolved') countEl.textContent = resolvedCount;
+    });
+
+    // Filter function based on active pill
+    const visibleFilter = function(c) {
+      if (commentsActiveFilter === 'open') return !c.resolved;
+      if (commentsActiveFilter === 'resolved') return c.resolved;
+      return true;
+    };
 
     let hasComments = false;
 
-    // Render general comment compose form at the top when active
-    if (reviewCommentFormActive && !reviewCommentEditingId) {
-      body.appendChild(createReviewCommentFormUI());
-    }
-
-    // Render review-level (general) comments first
-    const visibleReviewComments = reviewComments.filter(function(c) {
-      return showResolved ? true : !c.resolved;
-    });
+    // Render review-level (general) comments first.
+    // Note: the compose/edit form is rendered in the inline Review Conversation
+    // section at the top of the document (see renderReviewConversation), not here.
+    // Cards in the panel are read-only mirrors that link back to the inline section.
+    const visibleReviewComments = reviewComments.filter(visibleFilter);
     if (visibleReviewComments.length > 0) {
       hasComments = true;
       const group = document.createElement('div');
       group.className = 'comments-panel-file-group';
 
-      const groupName = document.createElement('div');
-      groupName.className = 'comments-panel-file-name';
-      groupName.textContent = 'Review';
-      group.appendChild(groupName);
+      group.appendChild(createFileGroupHeader('Review conversation', visibleReviewComments.length, group));
 
+      const cards = document.createElement('div');
+      cards.className = 'comments-panel-file-cards';
       for (let j = 0; j < visibleReviewComments.length; j++) {
         const comment = visibleReviewComments[j];
-        // If editing this comment, show editor instead
-        if (reviewCommentEditingId === comment.id) {
-          group.appendChild(createReviewCommentEditor(comment));
-          continue;
-        }
-        group.appendChild(createPanelCommentCard(comment, null));
+        cards.appendChild(createPanelCommentCard(comment, null));
       }
+      group.appendChild(cards);
       body.appendChild(group);
     }
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const visibleComments = file.comments.filter(function(c) {
-        return showResolved ? true : !c.resolved;
-      });
+      const visibleComments = file.comments.filter(visibleFilter);
       if (visibleComments.length === 0) continue;
       hasComments = true;
 
-      // Sort by start_line
       visibleComments.sort(function(a, b) { return a.start_line - b.start_line; });
 
       const group = document.createElement('div');
@@ -5949,28 +6360,101 @@
 
       // File name header (only in multi-file mode)
       if (files.length > 1) {
-        const fileName = document.createElement('div');
-        fileName.className = 'comments-panel-file-name';
-        fileName.textContent = file.path;
-        fileName.title = file.path;
-        group.appendChild(fileName);
+        group.appendChild(createFileGroupHeader(file.path, visibleComments.length, group));
       }
 
+      const cards = document.createElement('div');
+      cards.className = 'comments-panel-file-cards';
       for (let j = 0; j < visibleComments.length; j++) {
         const comment = visibleComments[j];
-        group.appendChild(createPanelCommentCard(comment, file.path));
+        cards.appendChild(createPanelCommentCard(comment, file.path));
       }
-
+      group.appendChild(cards);
       body.appendChild(group);
     }
 
     if (!hasComments && !reviewCommentFormActive) {
       const empty = document.createElement('div');
       empty.className = 'comments-panel-empty';
-      empty.textContent = showResolved ? 'No comments yet' : 'No unresolved comments';
+      const emptyMsg = commentsActiveFilter === 'open' ? 'No open comments' : commentsActiveFilter === 'resolved' ? 'No resolved comments' : 'No comments yet';
+      empty.textContent = emptyMsg;
       body.appendChild(empty);
     }
     body.scrollTop = savedScroll;
+    updateExpandAllLabel();
+  }
+
+  function createFileGroupHeader(label, count, groupEl) {
+    const groupName = document.createElement('div');
+    groupName.className = 'comments-panel-file-name';
+    groupName.setAttribute('role', 'button');
+    groupName.setAttribute('tabindex', '0');
+    groupName.setAttribute('aria-expanded', 'true');
+
+    const chevron = document.createElement('span');
+    chevron.className = 'comments-panel-file-chevron';
+    chevron.textContent = '\u25BC';
+    chevron.setAttribute('aria-hidden', 'true');
+    groupName.appendChild(chevron);
+
+    const nameText = document.createElement('span');
+    nameText.className = 'comments-panel-file-name-text';
+    nameText.textContent = label;
+    nameText.title = label;
+    groupName.appendChild(nameText);
+
+    const countEl = document.createElement('span');
+    countEl.className = 'comments-panel-file-count';
+    countEl.textContent = count;
+    groupName.appendChild(countEl);
+
+    groupName.addEventListener('click', function() {
+      groupEl.classList.toggle('collapsed');
+      const expanded = !groupEl.classList.contains('collapsed');
+      groupName.setAttribute('aria-expanded', String(expanded));
+    });
+
+    groupName.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        groupName.click();
+      }
+    });
+
+    return groupName;
+  }
+
+  // All comment cards across the inline document/diff views and the side panel.
+  function getAllCommentCards() {
+    const panelCards = document.querySelectorAll('#commentsPanelBody .comment-card');
+    const inlineCards = document.querySelectorAll('.comment-block:not(.panel-comment-block) .comment-card');
+    return Array.from(panelCards).concat(Array.from(inlineCards));
+  }
+
+  function updateExpandAllLabel() {
+    const btn = document.getElementById('commentsPanelExpandAll');
+    if (!btn) return;
+    const allCards = getAllCommentCards();
+    const anyExpanded = allCards.some(function(c) { return !c.classList.contains('collapsed'); });
+    btn.textContent = anyExpanded ? 'Collapse all' : 'Expand all';
+    btn.setAttribute('aria-pressed', String(anyExpanded));
+  }
+
+  function toggleExpandAllComments() {
+    const allCards = getAllCommentCards();
+    const anyExpanded = allCards.some(function(c) { return !c.classList.contains('collapsed'); });
+
+    allCards.forEach(function(card) {
+      if (anyExpanded) {
+        card.classList.add('collapsed');
+      } else {
+        card.classList.remove('collapsed');
+      }
+      const id = card.dataset.commentId;
+      if (id) commentCollapseOverrides[id] = anyExpanded;
+    });
+
+    updateExpandAllLabel();
   }
 
   function scrollToComment(commentId, filePath) {
@@ -6172,32 +6656,36 @@
   }
 
   // ===== General Comment Button (in panel header) =====
-  document.getElementById('panelAddCommentBtn').addEventListener('click', openReviewCommentForm);
 
   // ===== Finish Review =====
   async function doFinishReview() {
     try {
       const resp = await fetch('/api/finish', { method: 'POST' });
+      if (!resp.ok) {
+        throw new Error('Finish review failed: HTTP ' + resp.status);
+      }
       const data = await resp.json();
-      const hasComments = !!data.prompt;
+      // hasComments must be false when the server says approved=true,
+      // even if a prompt is present (e.g. "All comments resolved —
+      // proceed"). Otherwise the user gets the agent-notified
+      // "waiting for updates" UX instead of the approval path.
+      const hasComments = !!data.prompt && !data.approved;
       waitingHasComments = hasComments;
       const prompt = data.prompt || 'I reviewed the changes, no feedback, good to go!';
 
       document.getElementById('waitingPrompt').textContent = prompt;
 
+      const clipEl = document.getElementById('waitingClipboard');
+      clipEl.textContent = 'Copy prompt';
+      clipEl.classList.remove('clipboard-confirm');
+
       if (hasComments) {
         document.getElementById('waitingMessage').innerHTML =
           'Your agent has been notified. Waiting for updates\u2026' +
           '<span class="waiting-fallback">If your agent wasn\u2019t listening, paste the prompt below.</span>';
-        const clipEl = document.getElementById('waitingClipboard');
-        clipEl.textContent = 'Copy prompt';
-        clipEl.classList.remove('clipboard-confirm');
       } else {
         document.getElementById('waitingMessage').textContent =
           'You can close this browser tab, or leave it open for another round.';
-        const clipEl = document.getElementById('waitingClipboard');
-        clipEl.textContent = 'Copy prompt';
-        clipEl.classList.remove('clipboard-confirm');
       }
 
       try { await navigator.clipboard.writeText(prompt); } catch {}
@@ -6464,6 +6952,39 @@
       fetchCommits();
     });
 
+    source.addEventListener('focus-changed', function(e) {
+      try {
+        // Server SSE wraps every event in {type, filename, content} where
+        // `content` is a JSON string carrying the actual payload. Parse the
+        // SSE envelope first, then the inner content for the focus object.
+        const envelope = JSON.parse(e.data || '{}');
+        const inner = envelope.content ? JSON.parse(envelope.content) : envelope;
+        const focus = inner && inner.focus;
+        if (focus) {
+          if (session) {
+            session.focus = focus;
+            // last_range_focus may flip on every focus transition (server
+            // stashes the old range when leaving range mode). Mirror the
+            // server snapshot so renderResumePill sees the latest value.
+            session.last_range_focus = inner.last_range_focus || null;
+          }
+          applyFocusToHeader(focus);
+          // Re-fetch the stack on any range focus transition — the new
+          // focus may live in a different stack, and the breadcrumb's
+          // visibility uses stack.length (not is_stacked) so we need the
+          // server's view either way. Cheap (cached server-side for 60s).
+          if (session && session.mode === 'git' && focus.kind === 'range') {
+            loadStackFromPicker();
+          }
+        }
+      } catch (err) {
+        console.error('focus-changed parse:', err);
+      }
+      // Reuse the same refresh path as base-changed.
+      reloadForScope();
+      fetchCommits();
+    });
+
     source.addEventListener('server-shutdown', function() {
       source.close();
       showDisconnected();
@@ -6484,13 +7005,39 @@
   }
 
   function showDisconnected() {
-    const overlay = document.createElement('div');
-    overlay.className = 'disconnected-overlay';
-    const box = document.createElement('div');
-    box.className = 'disconnected-dialog';
-    box.innerHTML = '<div class="disconnected-title">Server stopped</div><div class="disconnected-message">You can close this tab.</div>';
-    overlay.appendChild(box);
-    document.body.appendChild(overlay);
+    // Idempotent: bail if a banner is already present.
+    if (document.querySelector('.disconnected-banner')) return;
+
+    const header = document.querySelector('.header');
+    const banner = document.createElement('div');
+    banner.className = 'disconnected-banner';
+    banner.setAttribute('role', 'status');
+    banner.setAttribute('aria-live', 'polite');
+
+    const pill = document.createElement('div');
+    pill.className = 'disconnected-pill';
+    pill.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="6" fill="currentColor" opacity="0.18"/><circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.25"/><path d="M4.5 7.1 L6.3 8.9 L9.5 5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Session complete';
+
+    const text = document.createElement('span');
+    text.className = 'disconnected-text';
+    text.textContent = 'Server stopped \u2014 your review is now read only. Safe to close this tab.';
+
+    banner.appendChild(pill);
+    banner.appendChild(text);
+    header.insertAdjacentElement('afterend', banner);
+
+    // Sticky offset is driven by the --crit-header-height CSS variable, kept
+    // in sync by ResizeObserver below — no inline style, so resize is handled.
+    const setHeaderVar = function() {
+      document.documentElement.style.setProperty('--crit-header-height', header.offsetHeight + 'px');
+    };
+    setHeaderVar();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(setHeaderVar);
+      ro.observe(header);
+    } else {
+      window.addEventListener('resize', setHeaderVar);
+    }
   }
 
   // ===== Share =====
@@ -6715,6 +7262,7 @@
 
     function hideToc() {
       toggleBtn.style.display = 'none';
+      tocEl.classList.add('toc-hidden');
     }
 
     // TOC only for single-file markdown reviews
@@ -6740,7 +7288,7 @@
     toggleBtn.style.display = '';
 
     // Restore TOC open/closed state from cookie
-    if (getCookie('crit-toc') === 'open') {
+    if (getSetting('toc', 'closed') === 'open') {
       tocEl.classList.remove('toc-hidden');
     }
 
@@ -6842,12 +7390,12 @@
 
   // ===== Theme =====
   function initTheme() {
-    const saved = getCookie('crit-theme') || 'system';
+    const saved = getSetting('theme', 'system');
     applyTheme(saved);
   }
 
   window.applyTheme = function(choice) {
-    setCookie('crit-theme', choice);
+    setSetting('theme', choice);
     if (choice === 'light') document.documentElement.setAttribute('data-theme', 'light');
     else if (choice === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
     else document.documentElement.removeAttribute('data-theme');
@@ -6861,15 +7409,77 @@
 
   // ===== Width =====
   function initWidth() {
-    const saved = getCookie('crit-width') || 'default';
+    const saved = getSetting('width', 'default');
     applyWidth(saved);
   }
 
   function applyWidth(choice) {
-    setCookie('crit-width', choice);
+    setSetting('width', choice);
     if (choice === 'compact') document.documentElement.setAttribute('data-width', 'compact');
     else if (choice === 'wide') document.documentElement.setAttribute('data-width', 'wide');
     else document.documentElement.setAttribute('data-width', 'default');
+  }
+
+  // ===== Sidebar Resize =====
+  // File-tree and comments-panel widths are user-resizable via drag handles.
+  // Persisted as numeric pixels in the consolidated `crit-settings` cookie;
+  // absent = use the CSS default.
+  // Only a minimum is enforced (keeps the handle reachable and the panel usable).
+  // No upper bound — ultrawide users may legitimately want very wide sidebars,
+  // and overflow just adds a horizontal scrollbar.
+  const SIDEBAR_RESIZE = [
+    { handleId: 'fileTreeResizer',     targetId: 'fileTreePanel',  settingKey: 'fileTreeWidth',     min: 180, edge: 'right' },
+    { handleId: 'commentsPanelResizer', targetId: 'commentsPanel', settingKey: 'commentsPanelWidth', min: 300, edge: 'left'  },
+  ];
+
+  function initSidebarWidths() {
+    SIDEBAR_RESIZE.forEach(function(cfg) {
+      const target = document.getElementById(cfg.targetId);
+      if (!target) return;
+      const saved = getSetting(cfg.settingKey, null);
+      if (typeof saved === 'number' && saved >= cfg.min) {
+        target.style.width = saved + 'px';
+      }
+      const handle = document.getElementById(cfg.handleId);
+      if (handle) attachSidebarResizeHandle(handle, target, cfg);
+    });
+  }
+
+  function attachSidebarResizeHandle(handle, target, cfg) {
+    // Pointer events + setPointerCapture: the handle keeps receiving move/up
+    // events even if the pointer leaves the window, devtools opens, or the
+    // user alt-tabs. Avoids the "stuck dragging" leak that document-level
+    // mousemove listeners suffer from.
+    handle.addEventListener('pointerdown', function(e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      const startX = e.clientX;
+      const startWidth = target.getBoundingClientRect().width;
+      // For a left-edge handle (comments panel), dragging right shrinks the panel.
+      const dir = cfg.edge === 'left' ? -1 : 1;
+      handle.classList.add('dragging');
+      document.body.classList.add('sidebar-resizing');
+      let lastWidth = startWidth;
+
+      function onMove(ev) {
+        const delta = (ev.clientX - startX) * dir;
+        const w = Math.max(cfg.min, startWidth + delta);
+        target.style.width = w + 'px';
+        lastWidth = w;
+      }
+      function onEnd() {
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onEnd);
+        handle.removeEventListener('pointercancel', onEnd);
+        handle.classList.remove('dragging');
+        document.body.classList.remove('sidebar-resizing');
+        setSetting(cfg.settingKey, Math.round(lastWidth));
+      }
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onEnd);
+      handle.addEventListener('pointercancel', onEnd);
+    });
   }
 
   // ===== Update Button =====
@@ -6883,7 +7493,7 @@
       const mode = btn.dataset.mode;
       if (mode === diffMode) return;
       diffMode = mode;
-      setCookie('crit-diff-mode', mode);
+      setSetting('diffMode', mode);
       document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(b) {
         b.classList.toggle('active', b.dataset.mode === mode);
       });
@@ -6988,7 +7598,7 @@
     const scope = btn.dataset.scope;
     diffScope = scope;
     navCommentId = null;
-    setCookie('crit-diff-scope', scope);
+    setSetting('diffScope', scope);
     if (scope !== 'all' && scope !== 'branch') {
       diffCommit = '';
       commitDropdownEl.style.display = 'none';
@@ -7058,11 +7668,20 @@
     try {
       const res = await fetch('/api/branches');
       if (!res.ok) return;
-      baseBranches = await res.json();
-      if (!baseBranches || baseBranches.length < 2) {
+      // /api/branches returns JSON `null` when the repo has no remote
+      // branches (server marshals a nil Go slice as null). Coerce to [] so
+      // every consumer can rely on baseBranches being array-shaped —
+      // applyFocusToHeader reads baseBranches.length unconditionally on
+      // every focus update, and a null here threw a TypeError that
+      // short-circuited init's promise chain (which silently skipped the
+      // subsequent `.then(connectSSE)` step, leaving the page without any
+      // SSE listeners attached).
+      const parsed = await res.json();
+      baseBranches = Array.isArray(parsed) ? parsed : [];
+      if (baseBranches.length < 2) {
         baseBranchPickerEl.classList.remove('open');
         baseBranchPickerEl.style.display = 'none';
-        document.getElementById('baseBranchArrow').style.display = 'none';
+        if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
         return;
       }
       baseBranchPickerEl.style.display = '';
@@ -7070,7 +7689,7 @@
     } catch {
       baseBranchPickerEl.classList.remove('open');
       baseBranchPickerEl.style.display = 'none';
-      document.getElementById('baseBranchArrow').style.display = 'none';
+      if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
     }
   }
 
@@ -7215,13 +7834,13 @@
   document.getElementById('tocToggle').addEventListener('click', function() {
     const tocEl = document.getElementById('toc');
     tocEl.classList.toggle('toc-hidden');
-    setCookie('crit-toc', tocEl.classList.contains('toc-hidden') ? 'closed' : 'open');
+    setSetting('toc', tocEl.classList.contains('toc-hidden') ? 'closed' : 'open');
     buildToc();
   });
 
   document.querySelector('.toc-close').addEventListener('click', function() {
     document.getElementById('toc').classList.add('toc-hidden');
-    setCookie('crit-toc', 'closed');
+    setSetting('toc', 'closed');
   });
 
   // ===== Comment Navigation =====
@@ -7230,7 +7849,7 @@
 
   function navigateToComment(direction) {
     const panel = document.getElementById('commentsPanel');
-    const container = document.getElementById('filesContainer');
+    const container = document.querySelector('.main-content');
     const cards = Array.from(container.querySelectorAll('.comment-card')).filter(function(card) {
       return !panel || !panel.contains(card);
     });
@@ -7302,8 +7921,48 @@
     togglePRPanel();
   });
 
-  document.getElementById('showResolvedToggle').addEventListener('change', function() {
+  // Segmented pill filter (radiogroup with roving tabindex)
+  const filterPillEl = document.getElementById('commentsFilterPill');
+  function activateFilterBtn(btn, focus) {
+    if (!btn) return;
+    commentsActiveFilter = btn.dataset.filter;
+    filterPillEl.querySelectorAll('.toggle-btn').forEach(function(b) {
+      const active = b === btn;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-checked', active ? 'true' : 'false');
+      b.setAttribute('tabindex', active ? '0' : '-1');
+    });
+    if (focus) btn.focus();
     renderCommentsPanel();
+  }
+  filterPillEl.addEventListener('click', function(e) {
+    const btn = e.target.closest('.toggle-btn');
+    if (!btn) return;
+    activateFilterBtn(btn, false);
+  });
+  filterPillEl.addEventListener('keydown', function(e) {
+    const btns = Array.from(filterPillEl.querySelectorAll('.toggle-btn'));
+    const currentIdx = btns.findIndex(function(b) { return b === document.activeElement; });
+    if (currentIdx === -1) return;
+    let nextIdx;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+      nextIdx = (currentIdx + 1) % btns.length;
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      nextIdx = (currentIdx - 1 + btns.length) % btns.length;
+    } else if (e.key === 'Home') {
+      nextIdx = 0;
+    } else if (e.key === 'End') {
+      nextIdx = btns.length - 1;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    activateFilterBtn(btns[nextIdx], true);
+  });
+
+  // Expand all / Collapse all
+  document.getElementById('commentsPanelExpandAll').addEventListener('click', function() {
+    toggleExpandAllComments();
   });
 
   // ===== Settings Panel =====
@@ -7387,6 +8046,12 @@
     }
   }
 
+  function applyHideResolved() {
+    // State -> CSS via body class. Visibility rules live in style.css under
+    // `body.hide-resolved .comment-block:has(.resolved-card)`. No DOM walk.
+    document.body.classList.toggle('hide-resolved', isHideResolved());
+  }
+
   function updatePillIndicator(indicatorId, values, current) {
     const indicator = document.getElementById(indicatorId);
     if (!indicator) return;
@@ -7399,8 +8064,8 @@
 
   function renderSettingsPane(cfg) {
     const pane = document.getElementById('settingsPane');
-    const currentTheme = getCookie('crit-theme') || 'system';
-    const currentWidth = getCookie('crit-width') || 'default';
+    const currentTheme = getSetting('theme', 'system');
+    const currentWidth = getSetting('width', 'default');
 
     let html = '';
 
@@ -7420,7 +8085,7 @@
     };
     ['system', 'light', 'dark'].forEach(function(theme) {
       const active = theme === currentTheme ? ' active' : '';
-      html += '<button class="settings-pill-btn' + active + '" data-settings-theme="' + theme + '" title="' + theme.charAt(0).toUpperCase() + theme.slice(1) + ' theme">' + themeIcons[theme] + '</button>';
+      html += '<button type="button" class="settings-pill-btn' + active + '" data-settings-theme="' + theme + '" title="' + theme.charAt(0).toUpperCase() + theme.slice(1) + ' theme">' + themeIcons[theme] + '</button>';
     });
     html += '</div></div>';
 
@@ -7431,9 +8096,20 @@
     html += '<div class="settings-pill-indicator" id="settingsWidthIndicator"></div>';
     ['compact', 'default', 'wide'].forEach(function(w) {
       const active = w === currentWidth ? ' active' : '';
-      html += '<button class="settings-pill-btn' + active + '" data-settings-width="' + w + '">' + w.charAt(0).toUpperCase() + w.slice(1) + '</button>';
+      html += '<button type="button" class="settings-pill-btn' + active + '" data-settings-width="' + w + '">' + w.charAt(0).toUpperCase() + w.slice(1) + '</button>';
     });
     html += '</div></div>';
+
+    // Hide resolved row
+    const hideResolved = isHideResolved();
+    html += '<div class="settings-display-row">';
+    html += '<span class="settings-display-label">Hide resolved comments</span>';
+    html += '<label class="comments-panel-switch">';
+    html += '<input type="checkbox" id="hideResolvedToggle" aria-label="Hide resolved comments"' + (hideResolved ? ' checked' : '') + '>';
+    html += '<span class="comments-panel-switch-track"><span class="comments-panel-switch-thumb"></span></span>';
+    html += '</label>';
+    html += '</div>';
+
     html += '</div>'; // close settings-display-group
 
     // Configuration section
@@ -7444,13 +8120,23 @@
     if (cfg.latest_version && cfg.version && cfg.latest_version !== cfg.version && !cfg.no_update_check) {
       const upgradeCmd = 'brew update && brew upgrade crit';
       const releaseUrl = 'https://github.com/tomasz-tomczyk/crit/releases/tag/v' + escapeHtml(cfg.latest_version);
+      const alreadyDismissed = getSetting('updatesDismissed', '') === cfg.latest_version;
       html += '<div class="config-card config-card--orange"><div class="config-card-header">';
       html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#11014;</span>';
       html += '<span class="config-card-title">Update available</span>';
       html += '<span class="config-card-value">v' + escapeHtml(cfg.latest_version) + '</span>';
       html += '</div>';
       html += '<div class="config-card-cmd"><span>$ ' + escapeHtml(upgradeCmd) + '</span><button class="config-card-copy" data-copy="' + escapeHtml(upgradeCmd) + '">Copy</button></div>';
-      html += '<div class="config-card-body"><a class="about-link" href="' + releaseUrl + '" target="_blank" rel="noopener">Release notes</a></div>';
+      html += '<div class="config-card-body" id="updateCardBody">';
+      html += '<div class="config-card-actions">';
+      html += '<a class="about-link" href="' + releaseUrl + '" target="_blank" rel="noopener">Release notes</a>';
+      if (alreadyDismissed) {
+        html += '<span class="config-card-dismissed" id="updateDismissedNote">Dismissed — will remind you on next version</span>';
+      } else {
+        html += '<button type="button" class="config-card-dismiss" id="updateDismissBtn" data-dismiss-version="' + escapeHtml(cfg.latest_version) + '">Don’t remind me until next version</button>';
+      }
+      html += '</div>';
+      html += '</div>';
       html += '</div>';
     }
 
@@ -7502,6 +8188,8 @@
         if (stale.length > 0) {
           const si = stale[0];
           const name = si.agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+          const dismissedMap = getSetting('dismissedIntegrations', {}) || {};
+          const intAlreadyDismissed = !!si.hash && dismissedMap[si.agent] === si.hash;
           html += '<div class="config-card config-card--yellow"><div class="config-card-header">';
           html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#9888;</span>';
           html += '<span class="config-card-title">AI Integration</span>';
@@ -7520,6 +8208,17 @@
             if (label) html += '<span class="config-card-cmd-label">' + escapeHtml(label) + '</span>';
             html += '<span>$ ' + escapeHtml(cmd) + '</span><button class="config-card-copy" data-copy="' + escapeHtml(cmd) + '">Copy</button></div>';
           });
+          if (si.hash) {
+            html += '<div class="config-card-body" id="integrationCardBody">';
+            html += '<div class="config-card-actions config-card-actions--end">';
+            if (intAlreadyDismissed) {
+              html += '<span class="config-card-dismissed" id="integrationDismissedNote">Dismissed — will remind you when this integration changes</span>';
+            } else {
+              html += '<button type="button" class="config-card-dismiss" id="integrationDismissBtn" data-agent="' + escapeHtml(si.agent) + '" data-hash="' + escapeHtml(si.hash) + '">Don’t remind me until next version</button>';
+            }
+            html += '</div>';
+            html += '</div>';
+          }
           html += '</div>';
         } else if (current.length > 0) {
           const name = current[0].agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
@@ -7585,6 +8284,46 @@
     });
     updatePillIndicator('settingsWidthIndicator', ['compact', 'default', 'wide'], currentWidth);
 
+    // Wire up hide-resolved toggle
+    const hideResolvedToggle = pane.querySelector('#hideResolvedToggle');
+    if (hideResolvedToggle) {
+      hideResolvedToggle.addEventListener('change', function() {
+        setHideResolved(hideResolvedToggle.checked);
+        renderAllFiles();
+      });
+    }
+
+    // Wire up "Don't remind me" button on the update card
+    const dismissBtn = pane.querySelector('#updateDismissBtn');
+    if (dismissBtn) {
+      dismissBtn.addEventListener('click', function() {
+        const version = dismissBtn.dataset.dismissVersion || '';
+        setSetting('updatesDismissed', version);
+        const updateBtn = document.getElementById('updateBtn');
+        if (updateBtn && !hasActivePendingUpdates()) updateBtn.style.display = 'none';
+        const body = pane.querySelector('#updateCardBody');
+        if (body) {
+          dismissBtn.outerHTML = '<span class="config-card-dismissed" id="updateDismissedNote">Dismissed — will remind you on next version</span>';
+        }
+      });
+    }
+
+    // Wire up "Don't remind me" button on the AI Integration card
+    const integrationDismissBtn = pane.querySelector('#integrationDismissBtn');
+    if (integrationDismissBtn) {
+      integrationDismissBtn.addEventListener('click', function() {
+        const agent = integrationDismissBtn.dataset.agent || '';
+        const hash = integrationDismissBtn.dataset.hash || '';
+        if (!agent || !hash) return;
+        const map = getSetting('dismissedIntegrations', {}) || {};
+        map[agent] = hash;
+        setSetting('dismissedIntegrations', map);
+        const updateBtn = document.getElementById('updateBtn');
+        if (updateBtn && !hasActivePendingUpdates()) updateBtn.style.display = 'none';
+        integrationDismissBtn.outerHTML = '<span class="config-card-dismissed" id="integrationDismissedNote">Dismissed — will remind you when this integration changes</span>';
+      });
+    }
+
     // Wire up copy buttons
     pane.querySelectorAll('.config-card-copy').forEach(function(btn) {
       btn.addEventListener('click', function() {
@@ -7618,11 +8357,11 @@
         { key: '<kbd>N</kbd>', action: 'Previous change', mode: 'file mode' },
       ]},
       { label: 'Comments', shortcuts: [
-        { key: '<kbd>c</kbd>', action: 'Comment on focused block' },
+        { key: '<kbd>c</kbd>', action: 'Comment on focused block (or text selection, with quote)' },
         { key: '<kbd>e</kbd>', action: 'Edit comment on focused block' },
         { key: '<kbd>d</kbd>', action: 'Delete comment on focused block' },
         { key: '<kbd>G</kbd>', action: 'General comment' },
-        { key: '<kbd>Ctrl</kbd>+<kbd>Enter</kbd>', action: 'Submit comment' },
+        { key: '<kbd>Ctrl</kbd>+<kbd>Enter</kbd>', action: 'Comment' },
       ]},
       { label: 'Review', shortcuts: [
         { key: '<kbd>Shift</kbd>+<kbd>F</kbd>', action: 'Finish review' },
@@ -7631,6 +8370,7 @@
       ]},
       { label: 'View', shortcuts: [
         { key: '<kbd>t</kbd>', action: 'Toggle table of contents', mode: 'file mode' },
+        { key: '<kbd>h</kbd>', action: 'Toggle hide resolved' },
         { key: '<kbd>Esc</kbd>', action: 'Cancel / clear focus' },
         { key: '<kbd>?</kbd>', action: 'Toggle this panel' },
       ]},
@@ -7740,7 +8480,7 @@
         const ta = document.activeElement;
         if (ta && ta.dataset && ta.dataset.formKey) {
           const form = activeForms.find(function(f) { return f.formKey === ta.dataset.formKey; });
-          if (form) cancelComment(form);
+          if (form && confirmDiscardCommentForm(form)) cancelComment(form);
         }
       }
       return;
@@ -7807,6 +8547,9 @@
       }
       case 'c': {
         e.preventDefault();
+        // If text is selected, comment on the selection (with quote).
+        // Otherwise fall back to the focused block.
+        if (tryOpenFormFromSelection()) return;
         if (!focusedElement) return;
         // Markdown line block
         if (focusedElement.dataset.filePath && focusedElement.dataset.blockIndex !== undefined) {
@@ -7867,6 +8610,14 @@
         toggleCommentsPanel();
         break;
       }
+      case 'h': {
+        e.preventDefault();
+        setHideResolved(!isHideResolved());
+        renderAllFiles();
+        const ht = document.getElementById('hideResolvedToggle');
+        if (ht) ht.checked = isHideResolved();
+        break;
+      }
       case 't': {
         const tocBtn = document.getElementById('tocToggle');
         if (tocBtn.style.display === 'none') return;
@@ -7914,8 +8665,13 @@
       }
       case 'Escape': {
         e.preventDefault();
-        if (reviewCommentFormActive) cancelReviewCommentForm();
-        else if (activeForms.length > 0) cancelComment(activeForms[activeForms.length - 1]);
+        if (reviewCommentFormActive) {
+          if (confirmDiscardReviewCommentForm()) cancelReviewCommentForm();
+        }
+        else if (activeForms.length > 0) {
+          const form = activeForms[activeForms.length - 1];
+          if (confirmDiscardCommentForm(form)) cancelComment(form);
+        }
         else if (selectionStart !== null) {
           const clearPath = activeFilePath;
           selectionStart = null;
@@ -7933,134 +8689,623 @@
     }
   });
 
-  // ===== Select-to-Comment: open comment form on text selection =====
-  document.addEventListener('mouseup', function(e) {
-    // Don't interfere with gutter interactions (drag-to-select, + button clicks).
-    if (dragState || diffDragState) return;
-    if (e.target.closest('.line-comment-gutter') || e.target.closest('.diff-comment-btn')) return;
+  // ===== Select-to-Comment helper =====
+  // Selection alone never opens the form — copying text stays unhindered.
+  // The user presses `c` after selecting to comment on the selection.
+  // Returns true if a form was opened from an active selection.
+  function tryOpenFormFromSelection() {
+    const selection = window.getSelection();
+    const range = getLineRangeFromSelection(selection);
+    if (!range) return false;
 
-    // Small delay to let the browser finalize the selection
-    requestAnimationFrame(function() {
-      const selection = window.getSelection();
-      const range = getLineRangeFromSelection(selection);
-      if (!range) return;
+    // Capture the selected text for the quote field.
+    // If the selection covers the full text of the line range, skip the quote.
+    let quote = null;
+    let quoteOffset = null;
+    try {
+      let selectedText = selection.toString().trim();
+      if (selectedText) {
+        // Strip diff gutter markers (+/-) from the start of each line
+        selectedText = selectedText.replace(/^[+\-]/gm, '').trim();
 
-      // If any comment form is already open, don't hijack text selection —
-      // the user is selecting text to copy, not to open another comment.
-      if (activeForms.length > 0) return;
-
-      // Capture the selected text before clearing, for the quote field.
-      // If the selection covers the full text of the line range, skip it — redundant.
-      let quote = null;
-      let quoteOffset = null;
-      try {
-        let selectedText = selection.toString().trim();
-        if (selectedText) {
-          // Strip diff gutter markers (+/-) from the start of each line
-          selectedText = selectedText.replace(/^[+\-]/gm, '').trim();
-
-          // Get the full text content of the lines in this range to compare.
-          // Try both document view (.line-block) and diff view elements.
-          // Also collect content elements in order for offset computation.
-          let fullText = '';
-          const contentEls = [];
-          for (let ln = range.startLine; ln <= range.endLine; ln++) {
-            // Document view
-            document.querySelectorAll('.line-block[data-file-path]').forEach(function(el) {
-              if (el.dataset.filePath !== range.filePath) return;
-              const s = parseInt(el.dataset.startLine), endLn = parseInt(el.dataset.endLine);
-              if (s <= ln && endLn >= ln) {
-                const content = el.querySelector('.line-content');
-                if (content && contentEls.indexOf(content) === -1) {
-                  fullText += (fullText ? '\n' : '') + content.textContent.trim();
-                  contentEls.push(content);
-                }
-              }
-            });
-            // Diff view — filter by side so unified diff doesn't double-count
-            const selSide = range.side || '';
-            document.querySelectorAll('[data-diff-file-path][data-diff-line-num="' + ln + '"]').forEach(function(el) {
-              if (el.dataset.diffFilePath !== range.filePath) return;
-              if (el.dataset.diffSide !== selSide) return;
-              const content = el.querySelector('.diff-content');
+        let fullText = '';
+        const contentEls = [];
+        for (let ln = range.startLine; ln <= range.endLine; ln++) {
+          document.querySelectorAll('.line-block[data-file-path]').forEach(function(el) {
+            if (el.dataset.filePath !== range.filePath) return;
+            const s = parseInt(el.dataset.startLine), endLn = parseInt(el.dataset.endLine);
+            if (s <= ln && endLn >= ln) {
+              const content = el.querySelector('.line-content');
               if (content && contentEls.indexOf(content) === -1) {
                 fullText += (fullText ? '\n' : '') + content.textContent.trim();
                 contentEls.push(content);
               }
-            });
-          }
-          // Only include quote if it's a partial selection (not the full line content)
-          const normalizedSelected = selectedText.replace(/\s+/g, ' ');
-          const normalizedFull = fullText.trim().replace(/\s+/g, ' ');
-          if (normalizedSelected !== normalizedFull && selectedText.length <= 300) {
-            quote = selectedText;
-
-            // Compute quote_offset: character index of the selection start
-            // within the normalized full text.  Disambiguates duplicate
-            // substrings (e.g. "foo foo foo" — selecting the last "foo").
-            try {
-              // Determine which end of the selection comes first in document order
-              const selRange = selection.getRangeAt(0);
-              const startContainer = selRange.startContainer;
-              const startOff = selRange.startOffset;
-
-              // Walk content elements to find total chars before selection start
-              let charsBefore = 0;
-              let foundEl = false;
-              for (let ci = 0; ci < contentEls.length; ci++) {
-                if (contentEls[ci].contains(startContainer)) {
-                  // Walk text nodes in this element up to the start node
-                  const walker = document.createTreeWalker(contentEls[ci], NodeFilter.SHOW_TEXT, null);
-                  let tn;
-                  while ((tn = walker.nextNode())) {
-                    if (tn === startContainer) {
-                      charsBefore += startOff;
-                      break;
-                    }
-                    charsBefore += tn.textContent.length;
-                  }
-                  foundEl = true;
-                  break;
-                }
-                charsBefore += contentEls[ci].textContent.length;
-              }
-
-              if (foundEl) {
-                // Build the raw text up to charsBefore, then normalize to get offset
-                let rawAll = '';
-                const rawUpTo = charsBefore;
-                for (let ri = 0; ri < contentEls.length; ri++) {
-                  rawAll += contentEls[ri].textContent;
-                  if (contentEls[ri].contains(startContainer)) break;
-                }
-                const textBefore = rawAll.slice(0, rawUpTo);
-                quoteOffset = textBefore.replace(/\s+/g, ' ').trimStart().length;
-              }
-            } catch { /* offset is a nice-to-have */ }
-          }
+            }
+          });
+          const selSide = range.side || '';
+          document.querySelectorAll('[data-diff-file-path][data-diff-line-num="' + ln + '"]').forEach(function(el) {
+            if (el.dataset.diffFilePath !== range.filePath) return;
+            if (el.dataset.diffSide !== selSide) return;
+            const content = el.querySelector('.diff-content');
+            if (content && contentEls.indexOf(content) === -1) {
+              fullText += (fullText ? '\n' : '') + content.textContent.trim();
+              contentEls.push(content);
+            }
+          });
         }
-      } catch { /* quote is a nice-to-have, don't break form opening */ }
+        const normalizedSelected = selectedText.replace(/\s+/g, ' ');
+        const normalizedFull = fullText.trim().replace(/\s+/g, ' ');
+        if (normalizedSelected !== normalizedFull && selectedText.length <= 300) {
+          quote = selectedText;
 
-      // Clear the browser selection — the form is the interaction now
-      selection.removeAllRanges();
+          // Compute quote_offset: character index of the selection start within
+          // the normalized full text. Disambiguates duplicate substrings.
+          try {
+            const selRange = selection.getRangeAt(0);
+            const startContainer = selRange.startContainer;
+            const startOff = selRange.startOffset;
 
-      // Open the comment form using the same flow as gutter click / 'c' key.
-      openForm({
-        filePath: range.filePath,
-        afterBlockIndex: range.afterBlockIndex,
-        startLine: range.startLine,
-        endLine: range.endLine,
-        editingId: null,
-        side: range.side,
-        quote: quote,
-        quoteOffset: quoteOffset
-      });
+            let charsBefore = 0;
+            let foundEl = false;
+            for (let ci = 0; ci < contentEls.length; ci++) {
+              if (contentEls[ci].contains(startContainer)) {
+                const walker = document.createTreeWalker(contentEls[ci], NodeFilter.SHOW_TEXT, null);
+                let tn;
+                while ((tn = walker.nextNode())) {
+                  if (tn === startContainer) {
+                    charsBefore += startOff;
+                    break;
+                  }
+                  charsBefore += tn.textContent.length;
+                }
+                foundEl = true;
+                break;
+              }
+              charsBefore += contentEls[ci].textContent.length;
+            }
+
+            if (foundEl) {
+              let rawAll = '';
+              const rawUpTo = charsBefore;
+              for (let ri = 0; ri < contentEls.length; ri++) {
+                rawAll += contentEls[ri].textContent;
+                if (contentEls[ri].contains(startContainer)) break;
+              }
+              const textBefore = rawAll.slice(0, rawUpTo);
+              quoteOffset = textBefore.replace(/\s+/g, ' ').trimStart().length;
+            }
+          } catch { /* offset is a nice-to-have */ }
+        }
+      }
+    } catch { /* quote is a nice-to-have, don't break form opening */ }
+
+    selection.removeAllRanges();
+    openForm({
+      filePath: range.filePath,
+      afterBlockIndex: range.afterBlockIndex,
+      startLine: range.startLine,
+      endLine: range.endLine,
+      editingId: null,
+      side: range.side,
+      quote: quote,
+      quoteOffset: quoteOffset
     });
+    return true;
+  }
+
+  // ===== Stack breadcrumb + working-tree pill =====
+  //
+  // Replaces the old multi-section focus picker popover with a flatter UI:
+  //   - Stack breadcrumb (in-stack PR navigation) — only when focus is a
+  //     stacked range. Inline DOM, not a popover.
+  //   - Working-tree pill — always visible in range focus (git mode).
+  //
+  // Other PRs / Remote branches are deliberately dropped. The CLI is the
+  // only entry point into range mode from working tree (`crit --pr <N>` or
+  // `crit --range A..B`). See printHelp().
+  const stackChipEl = document.getElementById('stackChip');
+  const stackChipBtnEl = document.getElementById('stackChipBtn');
+  const stackChipLabelEl = document.getElementById('stackChipLabel');
+  const stackPopoverEl = document.getElementById('stackPopover');
+  const stackChipExitEl = document.getElementById('stackChipExit');
+  const resumePrPillEl = document.getElementById('resumePrPill');
+  const compareRailEl = document.getElementById('compareRail');
+  const baseBranchArrowEl = document.getElementById('baseBranchArrow');
+  const wtScopeToggleEl = document.getElementById('scopeToggle');
+
+  // Cached /api/picker.stack array. We only consume `stack` now — `other_prs`
+  // and `branches` are intentionally unused. Refreshed on focus-changed SSE.
+  let stackCache = null;
+  // Repo's literal default branch name (e.g. "master" / "main"). Cached
+  // from /api/picker so the popover root marker reflects what the repo
+  // actually calls its default branch instead of hardcoding "main".
+  let defaultBranchNameCache = '';
+  let pickerLoadInFlight = null;
+
+  // Truncate a label so the chip and popover entries stay readable.
+  function truncateLabel(s, max) {
+    if (!s) return '';
+    if (s.length <= max) return s;
+    return s.slice(0, max - 1) + '\u2026';
+  }
+
+  // entryLabel formats a stack entry as "#<num>: <title>" or "<short branch>".
+  function entryLabel(entry, max) {
+    if (!entry) return '';
+    if (max === undefined || max === null) max = 30;
+    if (entry.pr_number) {
+      let suffix = '';
+      const m = (entry.label || '').match(/^PR #\d+:\s*(.+)$/);
+      if (m && m[1]) suffix = ': ' + m[1];
+      return truncateLabel('#' + entry.pr_number + suffix, max);
+    }
+    return truncateLabel(entry.label || (entry.head_sha ? entry.head_sha.slice(0, 7) : ''), max);
+  }
+
+  // Build the focus payload for switching to a different stack entry.
+  function focusPayloadFromStackEntry(entry, currentFocus) {
+    const fallbackDefault = currentFocus && currentFocus.default_sha ? currentFocus.default_sha : '';
+    const focus = {
+      kind: 'range',
+      base_sha: entry.base_sha,
+      head_sha: entry.head_sha,
+      diff_scope: 'layer',
+      is_stacked: true,
+    };
+    if (entry.pr_number) focus.pr_number = entry.pr_number;
+    if (entry.base_ref_name) focus.base_ref_name = entry.base_ref_name;
+    if (!entry.pr_number && entry.label) focus.label = entry.label;
+    const defaultSHA = entry.default_sha || fallbackDefault;
+    if (defaultSHA) focus.default_sha = defaultSHA;
+    return focus;
+  }
+
+  // ----- Stack chip + popover -----
+  //
+  // Replaces the old horizontal breadcrumb. The chip shows the current
+  // entry's label; clicking it opens a vertical tree popover with all
+  // stack entries plus a default-branch entry that flips diff_scope to
+  // full_stack. Scales to any depth without ellipsising the middle.
+  function chipLabelForFocus(focus) {
+    if (!focus || focus.kind !== 'range') return '';
+    if (Array.isArray(stackCache)) {
+      const cur = stackCache.find(function(e) { return e.head_sha === focus.head_sha; });
+      if (cur) return entryLabel(cur, 24);
+    }
+    // No stack data yet (the /api/picker round-trip may take 2+ seconds
+    // because of `gh pr list`). Fall back to fields already on Focus so
+    // the chip's label is correct on first paint.
+    if (focus.pr_number) return '#' + focus.pr_number;
+    if (focus.head_ref_name) return truncateLabel(focus.head_ref_name, 24);
+    if (focus.label) return truncateLabel(focus.label, 24);
+    if (focus.head_sha) return focus.head_sha.slice(0, 7);
+    return 'Stack';
+  }
+
+  function isStackChipOpen() {
+    return stackChipEl && stackChipEl.classList.contains('open');
+  }
+  // Returns interactive popover items in DOM order. Excludes the
+  // non-interactive root marker and any disabled scope option.
+  function focusableStackPopoverItems() {
+    if (!stackPopoverEl) return [];
+    return Array.from(stackPopoverEl.querySelectorAll('button:not(:disabled)'));
+  }
+  function closeStackChip() {
+    if (!stackChipEl) return;
+    const wasOpen = stackChipEl.classList.contains('open');
+    stackChipEl.classList.remove('open');
+    if (stackChipBtnEl) stackChipBtnEl.setAttribute('aria-expanded', 'false');
+    // Return focus to the chip so keyboard users don't lose their place.
+    // Only when we just closed an open popover that has focus inside it.
+    if (wasOpen && stackPopoverEl && stackPopoverEl.contains(document.activeElement) && stackChipBtnEl) {
+      stackChipBtnEl.focus();
+    }
+  }
+  function openStackChip() {
+    if (!stackChipEl) return;
+    stackChipEl.classList.add('open');
+    if (stackChipBtnEl) stackChipBtnEl.setAttribute('aria-expanded', 'true');
+    // Move focus to the first interactive popover item so the menu is
+    // immediately keyboard-navigable. Defer to the next frame so the
+    // popover render has flushed and items exist.
+    requestAnimationFrame(function() {
+      const items = focusableStackPopoverItems();
+      if (items.length > 0) items[0].focus();
+    });
+  }
+
+  // renderStackChip decides whether the chip is visible and paints the
+  // popover contents. The chip hides when stack is < 2 (no navigation
+  // possible). The popover renders a vertical ASCII-tree of all entries.
+  function renderStackChip(focus, stack) {
+    if (!stackChipEl) return;
+    const inRange = focus && focus.kind === 'range';
+    if (!inRange) {
+      stackChipEl.style.display = 'none';
+      stackPopoverEl.innerHTML = '';
+      closeStackChip();
+      return;
+    }
+    // Show the chip immediately from focus data — don't wait for the
+    // /api/picker fetch (which may take 2+ seconds against `gh pr list`).
+    // Three popover states based on stack data:
+    //   stack === null/undefined     → fetch still in flight, show "Loading…"
+    //   stack length ≤ 1             → no surrounding stack to navigate
+    //                                  (e.g. `crit --range A..B` with no
+    //                                  ancestor branches, or an unstacked PR)
+    //   stack length > 1             → render the full tree
+    stackChipEl.style.display = '';
+    if (stackChipLabelEl) stackChipLabelEl.textContent = chipLabelForFocus(focus);
+    if (!Array.isArray(stack)) {
+      stackPopoverEl.innerHTML = '<div class="stack-popover-title">Stack</div>' +
+        '<div class="stack-popover-loading" role="status" aria-live="polite">Loading stack…</div>';
+      return;
+    }
+    if (stack.length <= 1) {
+      // Loaded but no surrounding stack. Render a minimal popover so the
+      // user understands the chip's role (and Escape/click-outside still
+      // close it) without misleading them into thinking there's
+      // somewhere to navigate.
+      stackPopoverEl.innerHTML = '<div class="stack-popover-title">Stack</div>' +
+        '<div class="stack-popover-loading" role="status">No surrounding stack — this is a standalone range.</div>';
+      return;
+    }
+
+    // Filter out the default-branch entry from the linear stack — it's
+    // surfaced separately as the root marker above the tree. Use the focus's
+    // default_sha when available; fall back to per-entry default_sha (stamped
+    // by assignStackBases) so range-mode focuses without a resolved
+    // default_sha still drop the redundant ghost row.
+    // Picker already excludes the literal default branch from `stack`
+    // (see stackTipLabels in picker.go), so no need to filter — just
+    // reverse so the topmost (deepest) entry renders first.
+    const ordered = stack.slice().reverse();
+    // Prefer the repo's actual default branch name (e.g. "master") over
+    // guessing from the topmost stack entry's base_ref_name (often empty
+    // for branch-tier entries) or hardcoding 'main'.
+    // defaultBranchNameCache is populated by /api/picker.
+    const defaultBranchName = defaultBranchNameCache || (ordered[0] && ordered[0].base_ref_name) || 'main';
+
+    const parts = [];
+    parts.push('<div class="stack-popover-title">Stack</div>');
+
+    // Default-branch entry — non-interactive root marker. The
+    // layer/full-stack toggle inside this popover is the canonical
+    // way to switch scopes; clicking here used to flip diff_scope but
+    // that overlapped confusingly with the toggle.
+    parts.push('<span class="stack-popover-item stack-popover-root stack-popover-default" role="presentation">' +
+      '<span class="stack-popover-tree" aria-hidden="true">\u2502 </span>' +
+      '<span class="stack-popover-label">' + escapeHtml(defaultBranchName) + '</span>' +
+      '</span>');
+
+    // Stack entries — base→head, with ├─ / └─ prefixes.
+    ordered.forEach(function(entry, i) {
+      const isLast = i === ordered.length - 1;
+      const tree = isLast ? '\u2514\u2500 ' : '\u251C\u2500 ';
+      const isCurrent = entry.head_sha === focus.head_sha;
+      const label = entryLabel(entry, 40);
+      if (isCurrent) {
+        parts.push('<span class="stack-popover-item stack-popover-current" aria-current="page" role="menuitem"' +
+          ' data-head-sha="' + escapeHtml(entry.head_sha || '') + '">' +
+          '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
+          '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
+          '</span>');
+      } else {
+        const payload = focusPayloadFromStackEntry(entry, focus);
+        const aria = entry.pr_number ? ('Switch to PR #' + entry.pr_number) : ('Switch to ' + label);
+        parts.push('<button type="button" class="stack-popover-item" role="menuitem"' +
+          ' data-action="switch"' +
+          ' data-head-sha="' + escapeHtml(entry.head_sha || '') + '"' +
+          ' data-focus-payload="' + escapeHtml(JSON.stringify(payload)) + '"' +
+          ' aria-label="' + escapeHtml(aria) + '">' +
+          '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
+          '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
+          '</button>');
+      }
+    });
+
+    // "Compare against" radio section. Lives inside the popover so the
+    // page header doesn't need a second toolbar row for what is a
+    // relatively rare action. One-line subcopy explains what each scope
+    // means — first-time users always ask "wait, what does Layer mean?"
+    // Scope rows are always rendered in range mode — Layer is the
+    // canonical default. Full stack is disabled (with explanation) when
+    // default_sha is missing, which keeps the option discoverable so the
+    // user understands why they can't reach it rather than wondering
+    // where the option went.
+    const showScope = true;
+    if (showScope) {
+      const activeScope = focus.diff_scope || 'layer';
+      const fullStackEnabled = !!focus.default_sha;
+      // Subcopy mirrors what full-stack diffs against: the literal
+      // default branch tip.
+      const fullStackBaseName = defaultBranchName || 'default';
+      parts.push('<div class="stack-popover-divider" role="separator"></div>');
+      parts.push('<div class="stack-popover-title">Compare against</div>');
+      parts.push(
+        '<button type="button" class="stack-popover-scope' + (activeScope === 'layer' ? ' is-active' : '') + '"' +
+        ' role="menuitemradio" aria-checked="' + (activeScope === 'layer') + '"' +
+        ' data-action="scope" data-diff-scope="layer">' +
+          '<span class="stack-popover-scope-radio" aria-hidden="true"></span>' +
+          '<span class="stack-popover-scope-text">' +
+            '<span class="stack-popover-scope-name">Layer</span>' +
+            '<span class="stack-popover-scope-sub">Only changes in this layer</span>' +
+          '</span>' +
+        '</button>'
+      );
+      parts.push(
+        '<button type="button" class="stack-popover-scope' + (activeScope === 'full_stack' ? ' is-active' : '') + '"' +
+        ' role="menuitemradio" aria-checked="' + (activeScope === 'full_stack') + '"' +
+        (fullStackEnabled ? '' : ' disabled aria-disabled="true" title="Requires resolved default branch SHA"') +
+        ' data-action="scope" data-diff-scope="full_stack">' +
+          '<span class="stack-popover-scope-radio" aria-hidden="true"></span>' +
+          '<span class="stack-popover-scope-text">' +
+            '<span class="stack-popover-scope-name">Full stack</span>' +
+            '<span class="stack-popover-scope-sub">All changes from ' + escapeHtml(fullStackBaseName) + ' to here</span>' +
+          '</span>' +
+        '</button>'
+      );
+    }
+
+    stackPopoverEl.innerHTML = parts.join('');
+  }
+
+  function renderStackChipExit(focus, mode) {
+    if (!stackChipExitEl) return;
+    const show = mode === 'git' && focus && focus.kind === 'range';
+    stackChipExitEl.style.display = show ? '' : 'none';
+  }
+
+  // renderResumePill shows a "Resume PR #N" (or "Resume A..B" for ranges
+  // without a PR number) affordance whenever the user is in working_tree
+  // mode AND there's a stashed last range focus on the session.
+  function renderResumePill(focus, lastRange, mode) {
+    if (!resumePrPillEl) return;
+    const inWT = focus && (focus.kind === 'working_tree' || !focus.kind);
+    const show = mode === 'git' && inWT && lastRange && lastRange.kind === 'range';
+    if (!show) {
+      resumePrPillEl.style.display = 'none';
+      return;
+    }
+    let label;
+    if (lastRange.pr_number) {
+      label = 'Resume PR #' + lastRange.pr_number;
+    } else if (lastRange.head_ref_name) {
+      label = 'Resume stack: ' + lastRange.head_ref_name;
+    } else {
+      const b = lastRange.base_sha ? lastRange.base_sha.slice(0, 7) : '?';
+      const h = lastRange.head_sha ? lastRange.head_sha.slice(0, 7) : '?';
+      label = 'Resume ' + b + '..' + h;
+    }
+    resumePrPillEl.textContent = label;
+    resumePrPillEl.setAttribute('aria-label', label);
+    resumePrPillEl.style.display = '';
+  }
+
+  function applyFocusToHeader(focus) {
+    const mode = session && session.mode;
+    renderStackChip(focus, stackCache);
+    renderStackChipExit(focus, mode);
+    renderResumePill(focus, session && session.last_range_focus, mode);
+    // Base-branch picker is meaningful only in working-tree mode — range
+    // mode pins BaseSHA..HeadSHA and ignores Session.BaseRef entirely, so
+    // changing the base branch would be a no-op. Hide it (and its chevron)
+    // when a range focus is active; restore visibility otherwise, but only
+    // if there's actually more than one branch to choose from (the
+    // fetchBranches path already enforces that on initial load).
+    const inRange = focus && focus.kind === 'range';
+    if (baseBranchPickerEl) {
+      if (inRange) {
+        baseBranchPickerEl.classList.remove('open');
+        baseBranchPickerEl.style.display = 'none';
+        if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
+      } else if (Array.isArray(baseBranches) && baseBranches.length >= 2) {
+        baseBranchPickerEl.style.display = '';
+        if (baseBranchArrowEl) baseBranchArrowEl.style.display = '';
+      }
+    }
+    // Toggle compare-rail mode class — drives the segmented-composite
+    // visual merge of branch chip + stack chip in stack mode.
+    if (compareRailEl) compareRailEl.classList.toggle('is-stack', !!inRange);
+    // Diff-scope (Layer / Full stack) lives inside the stack popover
+    // (see "Compare against" section in renderStackChip).
+    // Working-tree scope toggle (All / Branch / Staged / Unstaged)
+    // filters by working-tree state vs baseRef — meaningless when the
+    // diff is pinned to BaseSHA..HeadSHA. Hide it in range mode to
+    // prevent confusing half-baked interactions where the file list
+    // gets working-tree-filtered but diffs stay range-pinned. Restore
+    // visibility when leaving range mode in git mode (clicking the ✕
+    // exits to working tree without re-running init's setup, so
+    // without this branch the toggle stays hidden until next reload).
+    if (wtScopeToggleEl) {
+      if (inRange) {
+        wtScopeToggleEl.style.display = 'none';
+      } else if (mode === 'git') {
+        wtScopeToggleEl.style.display = '';
+      }
+    }
+  }
+
+  // Fetch /api/picker and cache the stack array. Concurrent calls share
+  // the in-flight promise so init + focus-changed SSE don't double-fetch,
+  // but a transition that arrives WHILE a previous fetch is still pending
+  // schedules a follow-up refresh — without this, focus A→B→C where A is
+  // still loading would never refetch C-side data and the popover would
+  // stay stale until the next external trigger. The /api/picker endpoint
+  // is server-cached for 60s so the extra round-trip is essentially free.
+  let pickerRefetchQueued = false;
+  async function loadStackFromPicker() {
+    if (pickerLoadInFlight) {
+      pickerRefetchQueued = true;
+      return pickerLoadInFlight;
+    }
+    pickerLoadInFlight = (async function() {
+      try {
+        const res = await fetch('/api/picker');
+        if (!res.ok) {
+          // Stamp an empty cache so the popover transitions out of the
+          // "Loading…" placeholder state. Otherwise a transient picker
+          // failure leaves the user staring at a stuck spinner.
+          if (!Array.isArray(stackCache)) stackCache = [];
+          applyFocusToHeader((session && session.focus) || { kind: 'working_tree' });
+          return;
+        }
+        const data = await res.json();
+        stackCache = Array.isArray(data.stack) ? data.stack : [];
+        defaultBranchNameCache = data.default_branch_name || '';
+        applyFocusToHeader((session && session.focus) || { kind: 'working_tree' });
+      } catch (err) {
+        console.error('picker fetch failed:', err);
+        if (!Array.isArray(stackCache)) stackCache = [];
+        applyFocusToHeader((session && session.focus) || { kind: 'working_tree' });
+      } finally {
+        pickerLoadInFlight = null;
+      }
+    })();
+    const result = pickerLoadInFlight;
+    result.then(function() {
+      if (pickerRefetchQueued) {
+        pickerRefetchQueued = false;
+        loadStackFromPicker();
+      }
+    });
+    return result;
+  }
+
+  async function postFocus(focus) {
+    try {
+      const res = await fetch('/api/focus', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(focus),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        console.error('Focus switch failed:', text);
+      }
+    } catch (err) {
+      console.error('Focus switch error:', err);
+    }
+  }
+
+  if (stackChipBtnEl) {
+    stackChipBtnEl.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (isStackChipOpen()) closeStackChip();
+      else openStackChip();
+    });
+    // ArrowDown / ArrowUp on the chip button opens the popover with
+    // focus already on the first item — standard menu-button pattern.
+    stackChipBtnEl.addEventListener('keydown', function(e) {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      e.preventDefault();
+      if (!isStackChipOpen()) openStackChip();
+    });
+  }
+  if (stackPopoverEl) {
+    stackPopoverEl.addEventListener('click', function(e) {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn || btn.hasAttribute('disabled')) return;
+      const action = btn.getAttribute('data-action');
+      const focus = session && session.focus;
+      if (!focus || focus.kind !== 'range') return;
+      if (action === 'switch') {
+        const payloadAttr = btn.getAttribute('data-focus-payload');
+        closeStackChip();
+        if (!payloadAttr) return;
+        try {
+          postFocus(JSON.parse(payloadAttr));
+        } catch (err) {
+          console.error('Failed to parse stack popover payload:', err);
+        }
+      } else if (action === 'scope') {
+        const newScope = btn.getAttribute('data-diff-scope');
+        if (!newScope || newScope === (focus.diff_scope || 'layer')) return;
+        closeStackChip();
+        postFocus(Object.assign({}, focus, { diff_scope: newScope }));
+      }
+    });
+    // Arrow-key navigation between popover items + Home/End jumps. Tab
+    // continues to work natively (escapes the menu), Escape closes the
+    // popover via the document-level handler.
+    stackPopoverEl.addEventListener('keydown', function(e) {
+      const navKeys = ['ArrowDown', 'ArrowUp', 'Home', 'End'];
+      if (navKeys.indexOf(e.key) === -1) return;
+      const items = focusableStackPopoverItems();
+      if (items.length === 0) return;
+      const currentIdx = items.indexOf(document.activeElement);
+      let nextIdx = currentIdx;
+      if (e.key === 'ArrowDown') {
+        nextIdx = currentIdx < 0 ? 0 : (currentIdx + 1) % items.length;
+      } else if (e.key === 'ArrowUp') {
+        nextIdx = currentIdx <= 0 ? items.length - 1 : currentIdx - 1;
+      } else if (e.key === 'Home') {
+        nextIdx = 0;
+      } else if (e.key === 'End') {
+        nextIdx = items.length - 1;
+      }
+      e.preventDefault();
+      items[nextIdx].focus();
+    });
+  }
+  // Click-outside + Escape close the popover.
+  document.addEventListener('click', function(e) {
+    if (!isStackChipOpen()) return;
+    if (stackChipEl && !stackChipEl.contains(e.target)) closeStackChip();
   });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && isStackChipOpen()) {
+      closeStackChip();
+      e.stopImmediatePropagation();
+    }
+  });
+
+  if (stackChipExitEl) {
+    stackChipExitEl.addEventListener('click', function(e) {
+      e.stopPropagation();
+      closeStackChip();
+      postFocus({ kind: 'working_tree' });
+    });
+  }
+
+  if (resumePrPillEl) {
+    resumePrPillEl.addEventListener('click', function() {
+      const last = session && session.last_range_focus;
+      if (!last || last.kind !== 'range') return;
+      // Build a minimal range-focus payload from the stashed Focus.
+      const payload = {
+        kind: 'range',
+        base_sha: last.base_sha,
+        head_sha: last.head_sha,
+        diff_scope: last.diff_scope || 'layer',
+      };
+      if (last.pr_number) payload.pr_number = last.pr_number;
+      if (last.default_sha) payload.default_sha = last.default_sha;
+      if (last.is_stacked) payload.is_stacked = true;
+      if (last.label) payload.label = last.label;
+      if (last.base_ref_name) payload.base_ref_name = last.base_ref_name;
+      if (last.head_ref_name) payload.head_ref_name = last.head_ref_name;
+      postFocus(payload);
+    });
+  }
 
   // ===== Start =====
-  init().then(connectSSE).catch(function(err) {
-    console.error('Init failed:', err.message);
-  });
+  init()
+    .then(function() {
+      if (session) applyFocusToHeader(session.focus || { kind: 'working_tree' });
+      // Pre-fetch /api/picker.stack so the breadcrumb has data without
+      // waiting for the user to do anything. Fire for any range focus in
+      // git mode — the breadcrumb's visibility decision uses stack.length,
+      // not is_stacked, so we need the stack data to know whether to render.
+      const f = session && session.focus;
+      if (session && session.mode === 'git' && f && f.kind === 'range') {
+        loadStackFromPicker();
+      }
+    })
+    .then(connectSSE)
+    .catch(function(err) {
+      console.error('Init failed:', err.message);
+    });
 
 })();

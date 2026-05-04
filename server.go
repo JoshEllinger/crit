@@ -5,6 +5,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,12 +22,17 @@ import (
 	"rsc.io/qr"
 )
 
+// sseHeartbeatInterval is the cadence for SSE keepalive comments. It's a var
+// so tests can shrink it. 30s comfortably under the server's 60s IdleTimeout.
+var sseHeartbeatInterval = 30 * time.Second
+
 // Server handles HTTP requests for the crit review UI.
 type Server struct {
 	session           atomic.Pointer[Session]
 	mux               *http.ServeMux
 	assets            fs.FS
 	shareURL          string
+	authMu            sync.RWMutex // guards authToken + cfg.Auth* fields
 	authToken         string
 	prInfo            *PRInfo
 	prInfoMu          sync.RWMutex
@@ -44,6 +50,8 @@ type Server struct {
 	homeDir           string
 	cfg               Config
 	reviewPath        string
+	cliArgs           []string     // args the daemon was launched with (used to print "Next round:" command)
+	prList            *prListCache // 60s cache for picker "Other PRs"
 }
 
 // NewServer creates a Server with the given session and configuration.
@@ -53,7 +61,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, authToken
 		return nil, fmt.Errorf("loading frontend assets: %w", err)
 	}
 
-	s := &Server{assets: assets, shareURL: shareURL, authToken: authToken, author: author, agentCmd: agentCmd, currentVersion: currentVersion, port: port}
+	s := &Server{assets: assets, shareURL: shareURL, authToken: authToken, author: author, agentCmd: agentCmd, currentVersion: currentVersion, port: port, prList: &prListCache{}}
 	if session != nil {
 		s.session.Store(session)
 	}
@@ -74,6 +82,8 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, authToken
 	mux.HandleFunc("/api/events", s.withReady(s.handleEvents))
 	mux.HandleFunc("/api/wait-for-event", s.withReady(s.handleWaitForEvent))
 	mux.HandleFunc("/api/round-complete", s.withReady(s.handleRoundComplete))
+	mux.HandleFunc("/api/focus", s.withReady(s.handleFocus))
+	mux.HandleFunc("/api/picker", s.withReady(s.handlePicker))
 
 	mux.HandleFunc("/api/agent/request", s.withReady(s.handleAgentRequest))
 	mux.HandleFunc("/api/branches", s.withReady(s.handleBranches))
@@ -213,9 +223,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"agent_cmd":         s.agentCmd,
 
 		// Auth status
-		"auth_logged_in":  s.authToken != "",
-		"auth_user_name":  s.cfg.AuthUserName,
-		"auth_user_email": s.cfg.AuthUserEmail,
+		"auth_logged_in":  s.authLoggedIn(),
+		"auth_user_name":  s.authUserName(),
+		"auth_user_email": s.authUserEmail(),
 
 		// Review file path
 		"review_path": s.reviewPath,
@@ -236,6 +246,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			Agent    string `json:"agent"`
 			Location string `json:"location"`
 			Hint     string `json:"hint"`
+			Hash     string `json:"hash,omitempty"`
 		}
 		var items []staleInfo
 		seen := make(map[string]bool)
@@ -245,7 +256,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			seen[hint] = true
-			items = append(items, staleInfo{Agent: sf.agent, Location: sf.location, Hint: hint})
+			items = append(items, staleInfo{Agent: sf.agent, Location: sf.location, Hint: hint, Hash: sf.hash})
 		}
 		resp["stale_integrations"] = items
 	}
@@ -356,19 +367,21 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 
 	critPath := s.session.Load().critJSONPath()
-	comments, reviewRound := loadCommentsForShare(critPath, filePaths)
-
-	url, deleteToken, err := shareFilesToWeb(files, comments, s.shareURL, reviewRound, s.authToken)
+	res, err := shareReviewFiles(critPath, files, filePaths, s.shareURL, s.authTokenSnapshot(), s.author)
 	if err != nil {
+		if errors.Is(err, errShareUnauthorized) {
+			clearAuthIdentity()
+			s.clearAuthState()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	s.session.Load().SetSharedURLAndToken(url, deleteToken)
+	s.session.Load().SetSharedURLAndToken(res.URL, res.DeleteToken)
 	s.session.Load().SetShareScope(shareScope(filePaths))
-	writeJSON(w, map[string]any{"url": url, "delete_token": deleteToken})
+	writeJSON(w, map[string]any{"url": res.URL, "delete_token": res.DeleteToken})
 }
 
 // handleFile returns file content + metadata for a single file.
@@ -459,7 +472,7 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 		s.session.Load().EnsureFileEntry(path)
 
 		if req.Scope == "file" {
-			c, ok := s.session.Load().AddFileComment(path, req.Body, req.Author)
+			c, ok := s.session.Load().AddFileComment(path, req.Body, req.Author, s.authUserID())
 			if !ok {
 				http.Error(w, "File not found", http.StatusNotFound)
 				return
@@ -474,7 +487,7 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		c, ok := s.session.Load().AddComment(path, req.StartLine, req.EndLine, req.Side, req.Body, req.Quote, req.Author)
+		c, ok := s.session.Load().AddComment(path, req.StartLine, req.EndLine, normalizeCommentSide(req.Side), req.Body, req.Quote, req.Author, s.authUserID())
 		if !ok {
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
@@ -484,6 +497,24 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// normalizeCommentSide canonicalizes the wire `side` field to crit's internal
+// representation: "" for the new (right) side and "old" for the deletion (left)
+// side. Callers may pass GitHub-style "RIGHT"/"LEFT" (e.g. seeded payloads,
+// pulled PR comments, third-party scripts); without normalization, those values
+// flow into Comment.Side unchanged and cause the frontend's diff renderer to
+// miss them when keying by `lineNumber + ':' + side`, falsely flagging fresh
+// comments as "outdated" on first load.
+func normalizeCommentSide(s string) string {
+	switch strings.ToUpper(s) {
+	case "LEFT", "OLD":
+		return "old"
+	case "RIGHT", "NEW", "":
+		return ""
+	default:
+		return s
 	}
 }
 
@@ -717,7 +748,7 @@ func handleReplyCRUD(w http.ResponseWriter, r *http.Request, replyID string, ops
 func (s *Server) handleReplyRoute(w http.ResponseWriter, r *http.Request, filePath, commentID, replyID string) {
 	handleReplyCRUD(w, r, replyID, replyOps{
 		add: func(body, author string) (Reply, bool) {
-			return s.session.Load().AddReply(filePath, commentID, body, author)
+			return s.session.Load().AddReply(filePath, commentID, body, author, s.authUserID())
 		},
 		update: func(rid, body string) (Reply, bool) {
 			return s.session.Load().UpdateReply(filePath, commentID, rid, body)
@@ -731,7 +762,7 @@ func (s *Server) handleReplyRoute(w http.ResponseWriter, r *http.Request, filePa
 func (s *Server) handleReviewCommentReplyRoute(w http.ResponseWriter, r *http.Request, commentID, replyID string) {
 	handleReplyCRUD(w, r, replyID, replyOps{
 		add: func(body, author string) (Reply, bool) {
-			return s.session.Load().AddReviewCommentReply(commentID, body, author)
+			return s.session.Load().AddReviewCommentReply(commentID, body, author, s.authUserID())
 		},
 		update: func(rid, body string) (Reply, bool) {
 			return s.session.Load().UpdateReviewCommentReply(commentID, rid, body)
@@ -762,7 +793,7 @@ func (s *Server) handleReviewComments(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Comment body is required", http.StatusBadRequest)
 			return
 		}
-		c := s.session.Load().AddReviewComment(req.Body, req.Author)
+		c := s.session.Load().AddReviewComment(req.Body, req.Author, s.authUserID())
 		w.WriteHeader(http.StatusCreated)
 		writeJSON(w, c)
 
@@ -855,7 +886,40 @@ func (s *Server) handleRoundComplete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s.session.Load().SignalRoundComplete()
+	sess := s.session.Load()
+	sess.mu.RLock()
+	isRange := sess.Focus.Kind == FocusRange
+	sess.mu.RUnlock()
+	if isRange {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "round-complete is not meaningful in range mode",
+		})
+		return
+	}
+	sess.SignalRoundComplete()
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// handleFocus accepts POST /api/focus to switch the session's focus.
+// Body is a JSON Focus payload. Rejects full-stack scope without DefaultSHA
+// with HTTP 400. SetFocus emits SSE focus-changed on success.
+func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	var req Focus
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.session.Load().SetFocus(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
@@ -955,6 +1019,33 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// buildNextCommand renders the command the agent should run to start the
+// next review round, given the args the daemon was launched with.
+func buildNextCommand(args []string) string {
+	if len(args) == 0 {
+		return "crit"
+	}
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, "crit")
+	for _, a := range args {
+		parts = append(parts, shellQuoteArg(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+// shellQuoteArg quotes a single CLI arg using POSIX single-quote syntax when
+// it contains whitespace or shell metacharacters; returns it unchanged
+// otherwise. Single quotes inside the arg are escaped as '\”.
+func shellQuoteArg(a string) string {
+	if a == "" {
+		return `''`
+	}
+	if !strings.ContainsAny(a, " \t\n\"'\\$`*?[]{}();&|<>#~!") {
+		return a
+	}
+	return "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+}
+
 // handleReviewCycle is the unified endpoint for the daemon-client pattern.
 // On first call (awaitingFirstReview=true): just blocks until user finishes review.
 // On subsequent calls: signals round-complete first, then blocks.
@@ -990,10 +1081,11 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 				}
 				json.Unmarshal([]byte(event.Content), &finishData)
 				writeJSON(w, map[string]any{
-					"status":      "finished",
-					"review_file": sess.critJSONPath(),
-					"prompt":      finishData.Prompt,
-					"approved":    finishData.Approved,
+					"status":       "finished",
+					"review_file":  sess.critJSONPath(),
+					"prompt":       finishData.Prompt,
+					"approved":     finishData.Approved,
+					"next_command": buildNextCommand(s.cliArgs),
 				})
 				return
 			}
@@ -1045,6 +1137,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
 
+	// Safari won't fire EventSource.onopen until it sees a body byte.
+	fmt.Fprint(w, ":\n\n")
+	flusher.Flush()
+
 	sess := s.session.Load()
 	sess.BrowserConnect()
 	defer sess.BrowserDisconnect()
@@ -1052,10 +1148,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ch := sess.Subscribe()
 	defer sess.Unsubscribe(ch)
 
+	heartbeat := time.NewTicker(sseHeartbeatInterval)
+	defer heartbeat.Stop()
+
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ":\n\n")
+			flusher.Flush()
 		case event, ok := <-ch:
 			if !ok {
 				return
@@ -1400,10 +1502,10 @@ func (s *Server) runAgentCmd(prompt string, commentID string, filePath string) {
 	author := agentName(s.agentCmd)
 	log.Printf("agent-request %s: completed, posting reply (%d bytes)\nResponse: %s\nStderr: %s", commentID, len(response), response, stderr.String())
 	// Try original path first, then search all files (path may have changed during agent run)
-	_, ok := sess.AddReply(filePath, commentID, response, author)
+	_, ok := sess.AddReply(filePath, commentID, response, author, "")
 	if !ok {
 		if _, actualPath, found := sess.FindCommentByID(commentID, ""); found {
-			_, ok = sess.AddReply(actualPath, commentID, response, author)
+			_, ok = sess.AddReply(actualPath, commentID, response, author, "")
 			if ok {
 				filePath = actualPath
 			}
@@ -1420,6 +1522,46 @@ func (s *Server) runAgentCmd(prompt string, commentID string, filePath string) {
 		}
 		sess.notify(SSEEvent{Type: "comments-changed"})
 	}
+}
+
+func (s *Server) authTokenSnapshot() string {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.authToken
+}
+
+func (s *Server) authLoggedIn() bool {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.authToken != ""
+}
+
+func (s *Server) authUserID() string {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.cfg.AuthUserID
+}
+
+func (s *Server) authUserName() string {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.cfg.AuthUserName
+}
+
+func (s *Server) authUserEmail() string {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.cfg.AuthUserEmail
+}
+
+func (s *Server) clearAuthState() {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	s.authToken = ""
+	s.cfg.AuthToken = ""
+	s.cfg.AuthUserID = ""
+	s.cfg.AuthUserName = ""
+	s.cfg.AuthUserEmail = ""
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

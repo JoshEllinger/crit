@@ -92,19 +92,16 @@ func runAuthLogin(args []string) {
 		os.Exit(1)
 	}
 
-	// Cache user identity for the settings panel
-	if token.UserName != "" || token.UserEmail != "" {
-		_ = saveGlobalConfig(func(m map[string]json.RawMessage) error {
-			if token.UserName != "" {
-				name, _ := json.Marshal(token.UserName)
-				m["auth_user_name"] = name
-			}
-			if token.UserEmail != "" {
-				email, _ := json.Marshal(token.UserEmail)
-				m["auth_user_email"] = email
-			}
-			return nil
-		})
+	if err := saveAuthIdentity(token); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to persist auth identity: %v\n", err)
+	}
+
+	// If the server didn't return a user_id (older crit-web), fetch it now via
+	// /api/auth/whoami so the daemon doesn't need to backfill on first share.
+	if token.UserID == "" {
+		freshCfg := loadShareConfig()
+		freshCfg.AuthToken = token.AccessToken
+		lazyBackfillAuthUserID(&freshCfg, serverURL)
 	}
 
 	greeting := "Logged in."
@@ -172,6 +169,7 @@ func requestDeviceCode(serverURL string) (deviceCodeResponse, error) {
 // tokenResponse holds a successful response from POST /api/device/token.
 type tokenResponse struct {
 	AccessToken string `json:"access_token"`
+	UserID      string `json:"user_id"`
 	UserName    string `json:"user_name"`
 	UserEmail   string `json:"user_email"`
 }
@@ -285,6 +283,28 @@ func clearSpinner(dots int) {
 	}
 }
 
+// saveAuthIdentity persists the user identity fields from a token response
+// to the global config. All three fields (auth_user_id, auth_user_name,
+// auth_user_email) are rewritten together so a stale value from a previous
+// account cannot survive a re-login: missing fields in the response remove
+// the corresponding key from disk rather than leaving it untouched.
+func saveAuthIdentity(token tokenResponse) error {
+	return saveGlobalConfig(func(m map[string]json.RawMessage) error {
+		writeOrDelete := func(key, value string) {
+			if value == "" {
+				delete(m, key)
+				return
+			}
+			raw, _ := json.Marshal(value)
+			m[key] = raw
+		}
+		writeOrDelete("auth_user_id", token.UserID)
+		writeOrDelete("auth_user_name", token.UserName)
+		writeOrDelete("auth_user_email", token.UserEmail)
+		return nil
+	})
+}
+
 // saveAuthToken writes the auth_token to the global config file.
 func saveAuthToken(token string) error {
 	return saveGlobalConfig(func(m map[string]json.RawMessage) error {
@@ -321,19 +341,12 @@ func runAuthLogout(args []string) {
 	}
 
 	serverURL := resolveShareURL("", cfg, defaultShareURL)
+	// Revoke server-side first while the token is still valid, then clear
+	// local credentials. clearAuthIdentity() removes the token and all
+	// cached identity fields in a single write — keep this in sync with
+	// the 401-handling paths that also call it.
 	revoked := revokeToken(serverURL, token)
-
-	if err := removeAuthToken(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error removing token from config: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Clear cached identity
-	_ = saveGlobalConfig(func(m map[string]json.RawMessage) error {
-		delete(m, "auth_user_name")
-		delete(m, "auth_user_email")
-		return nil
-	})
+	clearAuthIdentity()
 
 	if revoked {
 		fmt.Fprintln(os.Stderr, "  Logged out.")
@@ -372,52 +385,129 @@ func runAuthWhoami(args []string) {
 	}
 
 	serverURL := resolveShareURL("", cfg, defaultShareURL)
-	name, email, err := fetchWhoami(serverURL, token)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	who, err := fetchWhoami(ctx, serverURL, token)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  Token is invalid or revoked. Run 'crit auth login' to re-authenticate.\n")
 		return
 	}
 
-	if email != "" {
-		fmt.Fprintf(os.Stderr, "  Logged in as %s (%s)\n", name, email)
+	if who.Email != "" {
+		fmt.Fprintf(os.Stderr, "  Logged in as %s (%s)\n", who.Name, who.Email)
 	} else {
-		fmt.Fprintf(os.Stderr, "  Logged in as %s\n", name)
+		fmt.Fprintf(os.Stderr, "  Logged in as %s\n", who.Name)
 	}
 }
 
 // whoamiResponse holds the response from GET /api/auth/whoami.
 type whoamiResponse struct {
+	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Email string `json:"email"`
 }
 
-// fetchWhoami calls the whoami endpoint and returns the user's name and email.
-func fetchWhoami(serverURL string, token string) (string, string, error) {
-	req, err := http.NewRequest(http.MethodGet, serverURL+"/api/auth/whoami", nil)
+// fetchWhoami calls the whoami endpoint and returns the user's whoamiResponse.
+func fetchWhoami(ctx context.Context, serverURL string, token string) (whoamiResponse, error) {
+	var result whoamiResponse
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL+"/api/auth/whoami", nil)
 	if err != nil {
-		return "", "", err
+		return result, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	// Timeout is owned by the caller's context — don't double-bound via client.Timeout.
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("contacting server: %w", err)
+		return result, fmt.Errorf("contacting server: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return "", "", fmt.Errorf("invalid or revoked token")
+		return result, errWhoamiUnauthorized
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("server returned status %d", resp.StatusCode)
+		return result, fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
 
-	var result whoamiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", "", fmt.Errorf("decoding response: %w", err)
+		return result, fmt.Errorf("decoding response: %w", err)
 	}
-	return result.Name, result.Email, nil
+	return result, nil
+}
+
+// errWhoamiUnauthorized indicates the token was rejected by the server.
+var errWhoamiUnauthorized = errors.New("invalid or revoked token")
+
+// lazyBackfillAuthUserID populates cfg.AuthUserID from the server when the
+// token is set but the user id has not been cached yet (e.g. after upgrading
+// from a version that did not store it). On success the value is persisted to
+// the global config and cfg is updated in place. On 401 the cached identity
+// is cleared. Other errors are best-effort: cfg is left unchanged.
+//
+// serverURL must be the already-resolved share URL the caller will use for the
+// upcoming share request. Passing an empty string falls back to the default
+// share URL via resolveShareURL — but callers should prefer to pass the
+// resolved URL explicitly, otherwise a token valid for a selfhosted instance
+// gets checked against https://crit.md, returns 401, and the 401 path wipes
+// the cached identity.
+func lazyBackfillAuthUserID(cfg *Config, serverURL string) {
+	if cfg == nil || cfg.AuthToken == "" || cfg.AuthUserID != "" {
+		return
+	}
+	if serverURL == "" {
+		serverURL = resolveShareURL("", *cfg, defaultShareURL)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	who, err := fetchWhoami(ctx, serverURL, cfg.AuthToken)
+	if err != nil {
+		if errors.Is(err, errWhoamiUnauthorized) {
+			clearAuthIdentity()
+			cfg.AuthToken = ""
+			cfg.AuthUserID = ""
+			cfg.AuthUserName = ""
+			cfg.AuthUserEmail = ""
+		}
+		return
+	}
+	if who.ID == "" {
+		return
+	}
+	_ = saveGlobalConfig(func(m map[string]json.RawMessage) error {
+		idRaw, _ := json.Marshal(who.ID)
+		m["auth_user_id"] = idRaw
+		if who.Name != "" {
+			nameRaw, _ := json.Marshal(who.Name)
+			m["auth_user_name"] = nameRaw
+		}
+		if who.Email != "" {
+			emailRaw, _ := json.Marshal(who.Email)
+			m["auth_user_email"] = emailRaw
+		}
+		return nil
+	})
+	cfg.AuthUserID = who.ID
+	if who.Name != "" {
+		cfg.AuthUserName = who.Name
+	}
+	if who.Email != "" {
+		cfg.AuthUserEmail = who.Email
+	}
+}
+
+// clearAuthIdentity removes the cached token and user identity fields from the
+// global config. Called when the server returns 401 on a share/upsert.
+func clearAuthIdentity() {
+	if err := saveGlobalConfig(func(m map[string]json.RawMessage) error {
+		delete(m, "auth_token")
+		delete(m, "auth_user_id")
+		delete(m, "auth_user_name")
+		delete(m, "auth_user_email")
+		return nil
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to persist credential clear: %v\n", err)
+	}
 }
 
 // errHintAlreadyShown is a sentinel error used by showLoginHint to skip

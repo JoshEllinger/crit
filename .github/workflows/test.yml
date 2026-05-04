@@ -9,9 +9,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -35,8 +35,8 @@ jobs:
   lint-frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
       - name: Install dependencies
@@ -48,37 +48,57 @@ jobs:
       - name: CSS variable validation
         run: bash scripts/check-css-vars.sh
 
+  test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Run frontend smoke tests
+        run: node frontend/test-markdown-patch.mjs
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Check Nix package build
+        run: ./scripts/check-nix-build.sh
+
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
-      - run: go test ./...
-
-      - name: Check coverage threshold
+      - name: Run tests with coverage
         run: |
-          go test -coverprofile=coverage.out ./...
-          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
-          echo "Coverage: $COVERAGE%"
-          if (( $(echo "$COVERAGE < 58" | bc -l) )); then
-            echo "::error::Coverage $COVERAGE% is below 58% threshold"
-            exit 1
-          fi
+          PKGS=$(go list ./... | grep -v /node_modules/)
+          go test -coverprofile=coverage.out -covermode=atomic $PKGS
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: coverage.out
+          flags: unit
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -90,7 +110,7 @@ jobs:
 
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('e2e/package-lock.json') }}
@@ -104,13 +124,36 @@ jobs:
         working-directory: e2e
         run: npx playwright install-deps chromium
 
+      - name: Build crit with coverage instrumentation
+        run: |
+          mkdir -p /tmp/crit-coverdir
+          go build -cover -o /tmp/crit-cover-bin .
+
       - name: Run E2E tests
         working-directory: e2e
         run: bash run.sh
+        env:
+          CRIT_BIN: /tmp/crit-cover-bin
+          GOCOVERDIR: /tmp/crit-coverdir
+
+      - name: Convert E2E coverage data
+        if: always()
+        run: |
+          if [ -d /tmp/crit-coverdir ] && ls /tmp/crit-coverdir/*.* >/dev/null 2>&1; then
+            go tool covdata textfmt -i=/tmp/crit-coverdir -o=e2e-coverage.out
+          fi
+
+      - name: Upload E2E coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: e2e-coverage.out
+          flags: e2e
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-test-results
           path: e2e/test-results/

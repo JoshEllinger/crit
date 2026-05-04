@@ -60,22 +60,47 @@ body {
   width: auto;
 }
 
+/* Compare rail — wraps base picker, arrow, branch chip, stack chip, resume pill.
+   In working-tree mode the rail reads "base ← head" (compare-bar idiom).
+   In stack mode the rail's branch chip + stack chip merge into a single
+   segmented composite via .compare-rail.is-stack adjacent-sibling rules. */
+.compare-rail {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .header-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-family: var(--crit-font-mono);
   font-size: 12px;
-  color: var(--crit-brand);
-  background: var(--crit-brand-subtle);
-  border: 1px solid var(--crit-brand-bg);
+  color: var(--crit-pill-fg);
+  background: var(--crit-pill-bg);
+  border: 1px solid var(--crit-pill-border);
   padding: 3px 10px;
   border-radius: 6px;
   height: 24px;
+  line-height: 1;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* Brand-tint variant — used by the active branch (head) chip. */
+.header-chip.header-context {
+  color: var(--crit-brand);
+}
+.header-chip.header-context .branch-icon { opacity: 1; }
+.header-chip.header-context #branchName {
+  max-width: 38ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .branch-icon {
   display: flex;
   align-items: center;
+  opacity: 0.85;
 }
 .branch-icon svg { width: 14px; height: 14px; }
 
@@ -86,8 +111,9 @@ body {
   align-items: center;
   gap: 4px;
 }
-.base-branch-arrow {
-  color: var(--crit-editor-fg-muted);
+/* Compare arrow ← between base and head. */
+.compare-rail-arrow {
+  color: var(--crit-rail-arrow);
   flex-shrink: 0;
 }
 .base-branch-btn {
@@ -97,7 +123,8 @@ body {
   transition: background 0.1s, border-color 0.1s;
 }
 .base-branch-btn:hover {
-  background: var(--crit-brand-bg);
+  background: var(--crit-pill-bg-hover);
+  border-color: var(--crit-border-strong);
 }
 .base-branch-label {
   max-width: 160px;
@@ -1636,32 +1663,49 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 }
 
 
-/* ===== Disconnected Overlay ===== */
-.disconnected-overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--crit-overlay-bg-heavy);
+/* ===== Disconnected Banner ===== */
+.disconnected-banner {
+  position: sticky;
+  top: var(--crit-header-height, 0px);
+  z-index: 99;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 10000;
+  gap: 12px;
+  padding: 10px 24px;
+  background: var(--crit-bg-card);
+  border-bottom: 1px solid var(--crit-border);
+  animation: disconnected-banner-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-.disconnected-dialog {
-  background: var(--crit-editor-bg);
-  border: 1px solid var(--crit-border);
-  border-radius: 12px;
-  padding: 32px 40px;
-  text-align: center;
-  color: var(--crit-editor-fg);
-  font-family: inherit;
+@keyframes disconnected-banner-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
-.disconnected-title {
-  font-size: 20px;
+.disconnected-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px 3px 7px;
+  background: var(--crit-finish-pill-bg);
+  border: 1px solid var(--crit-finish-pill-border);
+  border-radius: 100px;
+  font-size: 11px;
   font-weight: 600;
-  margin-bottom: 8px;
+  letter-spacing: 0.01em;
+  color: var(--crit-finish-pill-fg);
+  flex-shrink: 0;
 }
-.disconnected-message {
-  color: var(--crit-editor-fg-secondary);
+.disconnected-pill svg {
+  flex-shrink: 0;
+  animation: disconnected-check-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) 0.25s both;
+}
+@keyframes disconnected-check-pop {
+  from { transform: scale(0.5); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.disconnected-text {
+  font-size: 13px;
+  color: var(--crit-finish-body-fg);
 }
 
 /* ===== Waiting Overlay ===== */
@@ -1926,6 +1970,61 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   color: var(--crit-editor-fg);
 }
 
+/* Toggle switch (used in settings panel for hide-resolved). */
+.comments-panel-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.comments-panel-switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+.comments-panel-switch-track {
+  position: absolute;
+  inset: 0;
+  background: var(--crit-bg-card);
+  border: 1px solid var(--crit-border);
+  border-radius: 9999px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.comments-panel-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: var(--crit-editor-fg-muted);
+  border-radius: 9999px;
+  transition: left 0.15s cubic-bezier(0.4, 0, 0.2, 1), background 0.15s;
+}
+.comments-panel-switch input:checked ~ .comments-panel-switch-track {
+  background: var(--crit-brand);
+  border-color: var(--crit-brand);
+}
+.comments-panel-switch input:checked ~ .comments-panel-switch-track .comments-panel-switch-thumb {
+  left: 18px;
+  background: var(--crit-fg-on-brand);
+}
+.comments-panel-switch input:focus-visible ~ .comments-panel-switch-track {
+  outline: 2px solid var(--crit-brand);
+  outline-offset: 2px;
+}
+
+/* Hide-resolved: body-class-driven CSS rule (replaces imperative DOM walk). */
+body.hide-resolved .comment-block:not(.panel-comment-block):has(.resolved-card) {
+  display: none;
+}
+
 /* Reuse theme-pill styling for both theme and width pills inside the panel */
 .settings-pill {
   position: relative;
@@ -2079,6 +2178,37 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 .config-card-copy:hover { color: var(--crit-editor-fg); background: var(--crit-editor-bg-hover); }
 .config-card-copy.copied {
   color: var(--crit-green);
+}
+.config-card-actions {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.config-card-actions--end {
+  justify-content: flex-end;
+}
+.config-card-dismiss {
+  font-size: 12px;
+  color: var(--crit-editor-fg-muted);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 2px 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+.config-card-dismiss:hover { color: var(--crit-editor-fg); background: var(--crit-editor-bg-hover); }
+.config-card-dismiss:focus-visible {
+  outline: none;
+  box-shadow: var(--crit-focus);
+}
+.config-card-dismissed {
+  font-size: 12px;
+  color: var(--crit-editor-fg-muted);
+  font-style: italic;
 }
 .config-card-snippet {
   margin-top: 10px;
@@ -2341,6 +2471,7 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   .header-context { display: none; }
   .base-branch-picker { display: none; }
   .file-tree-panel { display: none; }
+  .sidebar-resize-handle { display: none !important; }
   #updateBtn { display: none !important; }
   .file-header { padding: 8px 12px; }
   .file-header-toggle { display: none; }
@@ -2366,6 +2497,36 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 .main-content {
   flex: 1;
   min-width: 0;
+}
+
+/* ===== Sidebar Resize Handles ===== */
+/* Thin draggable strip on the inner edge of each sidebar. Default transparent;
+   the brand-color line on hover/drag is the only visual affordance. Sticky so
+   it tracks the viewport vertically while pages scroll. */
+.sidebar-resize-handle {
+  flex: 0 0 4px;
+  align-self: stretch;
+  cursor: col-resize;
+  position: sticky;
+  top: var(--header-height, 49px);
+  height: calc(100vh - var(--header-height, 49px));
+  z-index: 86;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+.sidebar-resize-handle:hover,
+.sidebar-resize-handle.dragging {
+  background: var(--crit-brand);
+}
+/* Hide the comments-panel resizer when its panel is hidden. */
+.main-layout:has(#commentsPanel.comments-panel-hidden) #commentsPanelResizer {
+  display: none;
+}
+/* Suppress text selection and force resize cursor while dragging. */
+body.sidebar-resizing,
+body.sidebar-resizing * {
+  user-select: none !important;
+  cursor: col-resize !important;
 }
 
 /* ===== File Tree Sidebar ===== */
@@ -2560,49 +2721,101 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 .comments-panel::-webkit-scrollbar-thumb { background: var(--crit-editor-scrollbar-thumb); border-radius: 3px; }
 .comments-panel-hidden { display: none; }
 
+/* Two-row panel header */
 .comments-panel-header {
-  padding: 12px 16px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   border-bottom: 1px solid var(--crit-border);
   flex-shrink: 0;
 }
+.comments-panel-header-row1 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px 0;
+}
+.comments-panel-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .comments-panel-title {
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  color: var(--crit-editor-fg);
+}
+.comments-panel-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 500;
   color: var(--crit-editor-fg-muted);
+  background: var(--crit-editor-bg-elevated);
+  border-radius: 9999px;
+  line-height: 1;
 }
 .comments-panel-header-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
-.comments-panel-add-btn {
-  background: none;
-  border: 1px solid var(--crit-border);
-  color: var(--crit-editor-fg-muted);
-  cursor: pointer;
-  font-size: 11px;
-  font-weight: 500;
-  padding: 2px 8px;
-  border-radius: 4px;
-  line-height: 1.4;
-}
-.comments-panel-add-btn:hover { background: var(--crit-editor-bg-hover); color: var(--crit-editor-fg); border-color: var(--crit-editor-fg-muted); }
 .comments-panel-close {
   background: none;
   border: none;
   color: var(--crit-editor-fg-muted);
   cursor: pointer;
-  font-size: 14px;
-  padding: 2px 6px;
+  font-size: 11px;
+  padding: 2px 4px;
   border-radius: 4px;
   line-height: 1;
 }
 .comments-panel-close:hover { background: var(--crit-editor-bg-hover); color: var(--crit-editor-fg); }
+
+.comments-panel-header-row2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px 12px;
+}
+
+/* Comments filter — reuses .scope-toggle + .toggle-btn */
+.comments-filter-toggle {
+  display: inline-flex;
+  background: var(--crit-editor-bg-elevated);
+  border: 1px solid var(--crit-border);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 1px;
+}
+.comments-filter-toggle .toggle-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.comments-filter-toggle .filter-count {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+/* Expand all / Collapse all link */
+.comments-panel-expand-all {
+  background: none;
+  border: none;
+  color: var(--crit-editor-fg-muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+  transition: color 0.15s;
+  white-space: nowrap;
+}
+.comments-panel-expand-all:hover { color: var(--crit-editor-fg); }
 
 /* Panel comment cards — real .comment-card inside the panel */
 .panel-comment-block {
@@ -2622,57 +2835,6 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 }
 .comments-panel-body > .comment-form-wrapper .comment-form {
   margin: 0;
-}
-
-/* Filter bar with custom switch */
-.comments-panel-filter {
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--crit-border);
-  flex-shrink: 0;
-}
-.comments-panel-switch {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  user-select: none;
-}
-.comments-panel-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-.comments-panel-switch-track {
-  position: relative;
-  width: 28px;
-  height: 16px;
-  background: var(--crit-editor-bg-elevated);
-  border-radius: 8px;
-  border: 1px solid var(--crit-border);
-  transition: background 0.2s, border-color 0.2s;
-  flex-shrink: 0;
-}
-.comments-panel-switch-thumb {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 10px;
-  height: 10px;
-  background: var(--crit-editor-fg-muted);
-  border-radius: 50%;
-  transition: transform 0.2s, background 0.2s;
-}
-.comments-panel-switch input:checked + .comments-panel-switch-track {
-  background: var(--crit-brand-subtle);
-  border-color: var(--crit-brand);
-}
-.comments-panel-switch input:checked + .comments-panel-switch-track .comments-panel-switch-thumb {
-  transform: translateX(12px);
-  background: var(--crit-brand);
-}
-.comments-panel-switch input:focus-visible + .comments-panel-switch-track {
-  outline: 2px solid var(--crit-brand);
-  outline-offset: 1px;
-}
-.comments-panel-switch-text {
-  font-size: 12px;
-  color: var(--crit-editor-fg-muted);
 }
 
 /* Panel body */
@@ -2703,14 +2865,44 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   border-top: 1px solid var(--crit-border);
 }
 .comments-panel-file-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 10px 12px 2px;
   font-family: var(--crit-font-mono);
   font-size: 11px;
   font-weight: 500;
   color: var(--crit-editor-fg-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.comments-panel-file-name:hover {
+  color: var(--crit-editor-fg);
+}
+.comments-panel-file-chevron {
+  flex-shrink: 0;
+  font-size: 9px;
+  transition: transform 0.15s;
+  display: inline-block;
+}
+.comments-panel-file-group.collapsed .comments-panel-file-chevron {
+  transform: rotate(-90deg);
+}
+.comments-panel-file-name-text {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+}
+.comments-panel-file-count {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--crit-editor-fg-muted);
+  opacity: 0.6;
+  margin-left: auto;
+}
+.comments-panel-file-group.collapsed .comments-panel-file-cards {
+  display: none;
 }
 
 .comment-card-highlight {
@@ -3889,3 +4081,512 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+/* Stack chip + popover — vertical-tree alternative to the old horizontal
+   breadcrumb. Renders only when the picker reports >1 stack entry.
+   Click chip to toggle popover; click outside or Escape to close. */
+/* Stack chip styled to match the .header-chip (branch indicator):
+   soft brand-tinted background, brand-colored text, integrated padding.
+   The chip is a single visual unit composed of three controls:
+   button (label+chevron, opens popover), exit ✕ (switch to working tree),
+   and the popover positioned beneath. */
+.stack-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 4px 0 10px;
+  font-family: var(--crit-font-mono);
+  font-size: 12px;
+  color: var(--crit-brand);
+  background: var(--crit-pill-bg);
+  border: 1px solid var(--crit-pill-border);
+  border-radius: 6px;
+}
+/* Stack-mode segmented composite: branch chip + stack chip read as one
+   unit. Adjacent corners flatten and the inter-chip gap collapses so a
+   single 1px seam separates the segments. Both chips keep the neutral
+   pill chrome so the cluster stays calm — brand color carries on the
+   head label and the stack-chip glyphs only, marking "this is the thing
+   being reviewed". */
+.compare-rail.is-stack .header-chip.header-context {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.compare-rail.is-stack .stack-chip {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left-width: 0;
+  margin-left: 0;
+}
+/* Collapse the inter-chip gap to zero only between the merged segments,
+   without affecting other compare-rail children (resume pill, etc.).
+   The left border returns at 1px so the seam between branch chip and
+   stack chip reads as a clean divider. */
+.compare-rail.is-stack .header-chip.header-context + .stack-chip {
+  margin-left: -6px;
+  border-left-width: 1px;
+  border-left-color: var(--crit-pill-border);
+}
+.stack-chip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.stack-chip-btn:focus-visible {
+  outline: 2px solid var(--crit-brand);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.stack-chip-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  color: var(--crit-pill-fg-muted);
+  opacity: 0.85;
+}
+.stack-chip-label {
+  font-family: var(--crit-font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--crit-brand);
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stack-chip-chevron {
+  color: var(--crit-pill-fg-muted);
+  opacity: 0.7;
+  font-size: 10px;
+  transition: transform 120ms ease;
+}
+.stack-chip.open .stack-chip-chevron { transform: rotate(180deg); }
+.stack-chip-exit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin-left: 4px;
+  border: 0;
+  border-left: 1px solid var(--crit-pill-border);
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--crit-pill-fg-muted);
+  opacity: 0.85;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+.stack-chip-exit:hover {
+  background: var(--crit-pill-bg-hover);
+  opacity: 1;
+}
+.stack-chip-exit:focus-visible {
+  outline: 2px solid var(--crit-brand);
+  outline-offset: 1px;
+  opacity: 1;
+}
+.stack-popover {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  min-width: 220px;
+  max-width: 360px;
+  padding: 6px;
+  border: 1px solid var(--crit-border);
+  border-radius: 6px;
+  background: var(--crit-bg-card);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+.stack-chip.open .stack-popover { display: block; }
+.stack-popover-title {
+  padding: 4px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--crit-editor-fg-muted);
+}
+.stack-popover-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--crit-editor-fg);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.stack-popover-item:hover:not([aria-current]):not(:disabled) {
+  background: var(--crit-editor-bg-hover);
+}
+.stack-popover-item:focus-visible {
+  outline: 2px solid var(--crit-brand);
+  outline-offset: -1px;
+}
+.stack-popover-item:disabled {
+  cursor: default;
+}
+.stack-popover-current {
+  background: var(--crit-brand-bg);
+  font-weight: 600;
+  cursor: default;
+}
+.stack-popover-tree {
+  font-family: monospace;
+  color: var(--crit-editor-fg-muted);
+  white-space: pre;
+}
+.stack-popover-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Default-branch entry in the stack popover is a non-interactive root
+   marker — it indicates "stack starts here" but doesn't trigger any
+   action. */
+.stack-popover-root {
+  cursor: default;
+  color: var(--crit-editor-fg-muted);
+}
+.stack-popover-root:hover { background: transparent; }
+
+/* Compare-against radio rows. Live inside the stack popover — saves a
+   second toolbar bar in the page header for what's a relatively rare
+   action, and the subcopy answers "what does Layer mean" inline. */
+.stack-popover-divider {
+  height: 1px;
+  background: var(--crit-border);
+  margin: 6px 4px;
+}
+.stack-popover-loading {
+  padding: 8px 10px 10px;
+  font-family: var(--crit-font-body);
+  font-size: 12px;
+  color: var(--crit-editor-fg-muted);
+  font-style: italic;
+}
+.stack-popover-scope {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  background: transparent;
+  border-radius: 5px;
+  font-family: var(--crit-font-body);
+  text-align: left;
+  cursor: pointer;
+  color: var(--crit-editor-fg);
+}
+.stack-popover-scope:hover:not(:disabled) {
+  background: var(--crit-editor-bg-hover);
+}
+.stack-popover-scope:focus-visible {
+  outline: 2px solid var(--crit-brand);
+  outline-offset: -1px;
+}
+.stack-popover-scope:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.stack-popover-scope-radio {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  border-radius: 50%;
+  border: 1.5px solid var(--crit-pill-border);
+  background: transparent;
+  position: relative;
+}
+.stack-popover-scope.is-active .stack-popover-scope-radio {
+  border-color: var(--crit-brand);
+}
+.stack-popover-scope.is-active .stack-popover-scope-radio::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--crit-brand);
+}
+.stack-popover-scope-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.stack-popover-scope-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--crit-editor-fg);
+}
+.stack-popover-scope.is-active .stack-popover-scope-name {
+  color: var(--crit-brand);
+}
+.stack-popover-scope-sub {
+  font-size: 11px;
+  color: var(--crit-editor-fg-muted);
+  line-height: 1.35;
+}
+
+/* Resume PR pill — visible only in working-tree focus when the session
+   has a stashed last range focus.
+   Click restores that range focus via POST /api/focus. */
+/* Resume pill — appears in working-tree mode after exiting a stack.
+   Treated as a quiet "you-were-here" breadcrumb annotation rather than a
+   call-to-action: dashed border, no fill, brand color appears only on
+   hover so the affordance reads as available without competing with the
+   live diff target chips. */
+.resume-pr-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px dashed var(--crit-pill-border);
+  background: transparent;
+  color: var(--crit-rail-fg);
+  font-family: var(--crit-font-body);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  margin-left: 4px;
+  max-width: 32ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.resume-pr-pill:hover {
+  border-style: solid;
+  border-color: var(--crit-brand);
+  background: var(--crit-brand-subtle);
+  color: var(--crit-brand);
+}
+.resume-pr-pill:focus-visible {
+  outline: 2px solid var(--crit-brand);
+  outline-offset: 1px;
+}
+
+/* ===== Review Conversation (top-of-doc section) ===== */
+/* Linear-inspired: no card chrome around the container, no brand rails.
+   Hierarchy is carried by typography, rhythm, and a hairline divider in
+   the sidebar. */
+.review-conversation {
+  max-width: var(--content-width);
+  margin: 20px 24px 24px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.review-conversation[data-doc-layout="centered"] { margin: 20px auto 24px; }
+.review-conversation.collapsed .review-conversation-body { display: none; }
+
+.review-conversation-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  user-select: none;
+}
+.review-conversation.collapsed .review-conversation-header { margin-bottom: 0; }
+.review-conversation-toggle {
+  background: none;
+  border: none;
+  color: var(--crit-editor-fg-muted);
+  cursor: pointer;
+  padding: 0;
+  width: 18px;
+  height: 18px;
+  margin-left: -2px;
+  border-radius: var(--crit-r-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform var(--crit-dur-fast) var(--crit-ease),
+              color var(--crit-dur-fast) var(--crit-ease);
+}
+.review-conversation-toggle svg { width: 12px; height: 12px; }
+.review-conversation-toggle:hover { color: var(--crit-editor-fg); }
+.review-conversation.collapsed .review-conversation-toggle { transform: rotate(-90deg); }
+.review-conversation-header .icon {
+  display: inline-flex;
+  color: var(--crit-editor-fg-muted);
+}
+.review-conversation-header .icon svg {
+  width: 13px;
+  height: 13px;
+}
+.review-conversation-header .label {
+  color: var(--crit-editor-fg);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.review-conversation-header .count {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--crit-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--crit-editor-fg-muted);
+  background: none;
+  padding: 0;
+  min-width: 0;
+  height: auto;
+  border-radius: 0;
+}
+
+/* Linear's "calm invitation": ghost button with a dashed plus chip that
+   becomes solid on hover. No solid border around the whole button. */
+.review-conversation-add-more {
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--crit-editor-fg-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--crit-r-md);
+  padding: 7px 10px;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transition: background var(--crit-dur-fast) var(--crit-ease),
+              color var(--crit-dur-fast) var(--crit-ease),
+              border-color var(--crit-dur-fast) var(--crit-ease);
+}
+.review-conversation-add-more::before {
+  content: "";
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--crit-r-sm);
+  border: 1px dashed var(--crit-border-strong);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%23646c85' stroke-width='1.5' stroke-linecap='round'><path d='M8 5.5v5M5.5 8h5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: center;
+  transition: border-color var(--crit-dur-fast) var(--crit-ease),
+              border-style var(--crit-dur-fast) var(--crit-ease);
+}
+.review-conversation-add-more:hover::before {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%2385aaf8' stroke-width='1.5' stroke-linecap='round'><path d='M8 5.5v5M5.5 8h5'/></svg>");
+  border-style: solid;
+  border-color: var(--crit-brand);
+}
+[data-theme="light"] .review-conversation-add-more::before {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%238892a6' stroke-width='1.5' stroke-linecap='round'><path d='M8 5.5v5M5.5 8h5'/></svg>");
+}
+[data-theme="light"] .review-conversation-add-more:hover::before {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%232960bc' stroke-width='1.5' stroke-linecap='round'><path d='M8 5.5v5M5.5 8h5'/></svg>");
+}
+@media (prefers-color-scheme: light) {
+  html:not([data-theme]) .review-conversation-add-more::before {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%238892a6' stroke-width='1.5' stroke-linecap='round'><path d='M8 5.5v5M5.5 8h5'/></svg>");
+  }
+  html:not([data-theme]) .review-conversation-add-more:hover::before {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%232960bc' stroke-width='1.5' stroke-linecap='round'><path d='M8 5.5v5M5.5 8h5'/></svg>");
+  }
+}
+.review-conversation-add-more:hover {
+  background: var(--crit-editor-bg-hover);
+  color: var(--crit-editor-fg);
+  border-color: var(--crit-border);
+}
+
+/* Threads + form inside the section reuse the same renderers — strip the
+   line-anchored 56px gutter so they span the full section width. */
+.review-conversation .comment-block { padding: 0; margin: 0; }
+.review-conversation .comment-block + .comment-block { margin-top: 10px; }
+.review-conversation .comment-form-wrapper { padding-left: 0; }
+
+/* ===== Tree section: review-conversation row sits in its own section
+   above FILES, separated by the file-tree-header's bottom border. ===== */
+.tree-section--conversation {
+  padding: 8px 4px;
+  flex-shrink: 0;
+}
+.tree-conversation-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  padding: 0 10px;
+  margin: 0 4px;
+  cursor: pointer;
+  color: var(--crit-editor-fg-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--crit-r-md);
+  transition: background var(--crit-dur-fast) var(--crit-ease),
+              color var(--crit-dur-fast) var(--crit-ease);
+}
+.tree-conversation-row:hover {
+  background: var(--crit-editor-bg-hover);
+  color: var(--crit-editor-fg);
+}
+.tree-conversation-row.active {
+  background: var(--crit-brand-subtle);
+  color: var(--crit-editor-fg);
+}
+.tree-conversation-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  color: var(--crit-editor-fg-muted);
+  flex-shrink: 0;
+  transition: color var(--crit-dur-fast) var(--crit-ease);
+}
+.tree-conversation-row:hover .tree-conversation-icon,
+.tree-conversation-row.active .tree-conversation-icon {
+  color: var(--crit-editor-fg-secondary);
+}
+.tree-conversation-icon svg { width: 14px; height: 14px; }
+.tree-conversation-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: -0.005em;
+}
+.tree-conversation-badge {
+  font-family: var(--crit-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--crit-editor-fg-muted);
+  background: none;
+  padding: 0;
+}
+.tree-conversation-row.active .tree-conversation-badge {
+  color: var(--crit-brand);
+}
+
