@@ -59,7 +59,7 @@ jobs:
       - name: Check Nix package build
         run: ./scripts/check-nix-build.sh
 
-  release:
+  build-linux:
     needs: [test, e2e, nix]
     runs-on: ubuntu-latest
     steps:
