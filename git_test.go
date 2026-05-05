@@ -525,6 +525,77 @@ func TestMergeBase_OriginMain(t *testing.T) {
 	}
 }
 
+// TestDefaultBaseRef_PrefersOrigin verifies that when origin/<defaultBranch>
+// exists, defaultBaseRef returns it instead of the bare local name. This is
+// the fix for https://github.com/tomasz-tomczyk/crit/issues/377 — auto-detect
+// should diff against the remote-tracking ref so a stale local main doesn't
+// produce a bloated diff.
+func TestDefaultBaseRef_PrefersOrigin(t *testing.T) {
+	dir := initTestRepo(t)
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	// No remote yet — should fall back to the bare local name.
+	defaultBranchOnce = sync.Once{}
+	defaultBranchResult = ""
+	if got := defaultBaseRef(); got != "main" {
+		t.Errorf("without remote: defaultBaseRef() = %q, want %q", got, "main")
+	}
+
+	// Add a remote and push so refs/remotes/origin/main exists.
+	bare := t.TempDir()
+	runGit(t, bare, "init", "--bare")
+	runGit(t, dir, "remote", "add", "origin", bare)
+	runGit(t, dir, "push", "origin", "main")
+
+	defaultBranchOnce = sync.Once{}
+	defaultBranchResult = ""
+	if got := defaultBaseRef(); got != "origin/main" {
+		t.Errorf("with remote: defaultBaseRef() = %q, want %q", got, "origin/main")
+	}
+
+	// Override should suppress remote preference — user picked the ref.
+	setDefaultBranchOverride("custom")
+	defer setDefaultBranchOverride("")
+	if got := defaultBaseRef(); got != "custom" {
+		t.Errorf("with override: defaultBaseRef() = %q, want %q", got, "custom")
+	}
+}
+
+// TestMergeBase_FallsBackToOriginWhenLocalMissing covers the worktree-off-bare
+// scenario where the local default branch ref doesn't exist (only the remote-
+// tracking ref does). MergeBase("main") must transparently fall back to
+// origin/main so callers don't have to special-case it.
+func TestMergeBase_FallsBackToOriginWhenLocalMissing(t *testing.T) {
+	dir := initTestRepo(t)
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	bare := t.TempDir()
+	runGit(t, bare, "init", "--bare")
+	runGit(t, dir, "remote", "add", "origin", bare)
+	runGit(t, dir, "push", "origin", "main")
+	originMainSHA := runGit(t, dir, "rev-parse", "origin/main")
+
+	runGit(t, dir, "checkout", "-b", "feature/no-local-main", "origin/main")
+	writeFile(t, filepath.Join(dir, "feature.go"), "package main\n")
+	runGit(t, dir, "add", "feature.go")
+	runGit(t, dir, "commit", "-m", "feature commit")
+
+	// Delete local main so only origin/main remains — the bare-repo-worktree case
+	runGit(t, dir, "branch", "-D", "main")
+
+	mb, err := MergeBase("main")
+	if err != nil {
+		t.Fatalf("MergeBase(main) should fall back to origin/main: %v", err)
+	}
+	if mb != originMainSHA {
+		t.Errorf("MergeBase(main) = %s, want origin/main %s", mb[:12], originMainSHA[:12])
+	}
+}
+
 func TestChangedFilesBranch_EmptyBaseRef(t *testing.T) {
 	dir := initTestRepo(t)
 	origDir, _ := os.Getwd()
@@ -1143,7 +1214,7 @@ func TestCommitLog(t *testing.T) {
 	runGit(t, dir, "add", "b.go")
 	runGit(t, dir, "commit", "-m", "add function B")
 
-	commits, err := CommitLog(baseRef, dir)
+	commits, err := CommitLog(baseRef, "", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1185,12 +1256,65 @@ func TestCommitLogEmpty(t *testing.T) {
 	dir := initTestRepo(t)
 
 	// Empty baseRef should return nil
-	commits, err := CommitLog("", dir)
+	commits, err := CommitLog("", "", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if commits != nil {
 		t.Errorf("expected nil for empty baseRef, got %+v", commits)
+	}
+}
+
+func TestCommitLog_BetweenSHAs(t *testing.T) {
+	dir := initTestRepo(t)
+	baseRef := runGit(t, dir, "rev-parse", "HEAD")
+
+	runGit(t, dir, "checkout", "-b", "feature/range-head")
+	writeFile(t, filepath.Join(dir, "a.go"), "package main\n\nfunc A() {}\n")
+	runGit(t, dir, "add", "a.go")
+	runGit(t, dir, "commit", "-m", "A")
+	shaA := runGit(t, dir, "rev-parse", "HEAD")
+
+	writeFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc B() {}\n")
+	runGit(t, dir, "add", "b.go")
+	runGit(t, dir, "commit", "-m", "B")
+	shaB := runGit(t, dir, "rev-parse", "HEAD")
+
+	writeFile(t, filepath.Join(dir, "c.go"), "package main\n\nfunc C() {}\n")
+	runGit(t, dir, "add", "c.go")
+	runGit(t, dir, "commit", "-m", "C")
+
+	// HEAD is at C; explicit head=B should return only [B, A].
+	commits, err := CommitLog(baseRef, shaB, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("CommitLog(base, B, dir) = %d commits, want 2", len(commits))
+	}
+	if commits[0].Message != "B" || commits[1].Message != "A" {
+		t.Errorf("messages = [%q, %q], want [B, A]", commits[0].Message, commits[1].Message)
+	}
+
+	// Explicit head=A should return only [A].
+	commits, err = CommitLog(baseRef, shaA, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 1 || commits[0].Message != "A" {
+		t.Fatalf("CommitLog(base, A, dir) = %+v, want [A]", commits)
+	}
+
+	// Empty headRef should default to HEAD (working-tree behavior, returns C, B, A).
+	commits, err = CommitLog(baseRef, "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 3 {
+		t.Fatalf("CommitLog(base, \"\", dir) = %d commits, want 3", len(commits))
+	}
+	if commits[0].Message != "C" {
+		t.Errorf("commits[0].Message = %q, want C", commits[0].Message)
 	}
 }
 
@@ -1471,5 +1595,52 @@ func TestDiffNumstatBinary(t *testing.T) {
 		t.Fatal("missing image.png in numstat output")
 	} else if s.Additions != 0 || s.Deletions != 0 {
 		t.Errorf("image.png: got +%d/-%d, want +0/-0", s.Additions, s.Deletions)
+	}
+}
+
+func TestFileDiffForCommit_RootCommit(t *testing.T) {
+	dir := initTestRepo(t)
+	// Get the initial (root) commit SHA.
+	sha := runGit(t, dir, "rev-parse", "HEAD")
+
+	hunks, err := FileDiffForCommit("README.md", sha, dir)
+	if err != nil {
+		t.Fatalf("FileDiffForCommit on root commit: %v", err)
+	}
+	if len(hunks) == 0 {
+		t.Error("expected hunks for root commit diff")
+	}
+}
+
+func TestFileDiffForCommit_NormalCommit(t *testing.T) {
+	dir := initTestRepo(t)
+	writeFile(t, filepath.Join(dir, "README.md"), "# Test\n\nUpdated content\n")
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "update readme")
+	sha := runGit(t, dir, "rev-parse", "HEAD")
+
+	hunks, err := FileDiffForCommit("README.md", sha, dir)
+	if err != nil {
+		t.Fatalf("FileDiffForCommit: %v", err)
+	}
+	if len(hunks) == 0 {
+		t.Error("expected hunks for modified file commit")
+	}
+}
+
+func TestFileDiffForCommit_FileNotInCommit(t *testing.T) {
+	dir := initTestRepo(t)
+	writeFile(t, filepath.Join(dir, "other.go"), "package main")
+	runGit(t, dir, "add", "other.go")
+	runGit(t, dir, "commit", "-m", "add other")
+	sha := runGit(t, dir, "rev-parse", "HEAD")
+
+	// README.md was not changed in this commit.
+	hunks, err := FileDiffForCommit("README.md", sha, dir)
+	if err != nil {
+		t.Fatalf("FileDiffForCommit: %v", err)
+	}
+	if len(hunks) != 0 {
+		t.Errorf("expected 0 hunks for file not in commit, got %d", len(hunks))
 	}
 }

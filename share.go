@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,6 +20,12 @@ import (
 // defaultShareURL is the production crit-web service URL, used as the fallback
 // when no share URL is configured via flag, env, or config.
 const defaultShareURL = "https://crit.md"
+
+// errShareUnauthorized indicates the share endpoint rejected the bearer token.
+// Callers wrap this and inspect with errors.Is so they can clear the cached
+// auth identity (token + user id + name + email) on top-level share/upsert
+// failures.
+var errShareUnauthorized = errors.New("auth token rejected by share service")
 
 // shareScope computes a hash of sorted file paths, used to detect when
 // share state belongs to a different file set.
@@ -64,8 +71,10 @@ type shareFile struct {
 
 // shareReply represents a reply to include in the shared review.
 type shareReply struct {
-	Body   string `json:"body"`
-	Author string `json:"author_display_name,omitempty"`
+	Body       string `json:"body"`
+	Author     string `json:"author_display_name,omitempty"`
+	UserID     string `json:"user_id,omitempty"`
+	ExternalID string `json:"external_id,omitempty"`
 }
 
 // shareComment represents a comment to include in the shared review.
@@ -76,6 +85,7 @@ type shareComment struct {
 	Body        string       `json:"body"`
 	Quote       string       `json:"quote,omitempty"`
 	Author      string       `json:"author_display_name,omitempty"`
+	UserID      string       `json:"user_id,omitempty"`
 	Scope       string       `json:"scope,omitempty"`
 	ReviewRound int          `json:"review_round,omitempty"`
 	Replies     []shareReply `json:"replies,omitempty"`
@@ -84,7 +94,7 @@ type shareComment struct {
 }
 
 // buildSharePayload constructs the JSON payload for POST /api/reviews.
-func buildSharePayload(files []shareFile, comments []shareComment, reviewRound int) map[string]any {
+func buildSharePayload(files []shareFile, comments []shareComment, reviewRound int, cliArgs []string) map[string]any {
 	fileList := make([]map[string]any, len(files))
 	for i, f := range files {
 		entry := map[string]any{"path": f.Path, "content": f.Content}
@@ -96,16 +106,47 @@ func buildSharePayload(files []shareFile, comments []shareComment, reviewRound i
 	if comments == nil {
 		comments = []shareComment{}
 	}
-	return map[string]any{
+	payload := map[string]any{
 		"files":        fileList,
 		"review_round": reviewRound,
 		"comments":     comments,
 	}
+	if len(cliArgs) > 0 {
+		payload["cli_args"] = cliArgs
+	}
+	return payload
+}
+
+// shareReviewFilesResult is the outcome of a fresh share upload.
+type shareReviewFilesResult struct {
+	URL         string
+	DeleteToken string
+	ReviewRound int
+	Comments    []shareComment
+}
+
+// shareReviewFiles loads comments + cli_args from the review file at critPath
+// and POSTs the files to crit-web. Used by both the CLI (`crit share`) and the
+// server's POST /api/share endpoint so payload wiring stays in one place.
+func shareReviewFiles(critPath string, files []shareFile, filePaths []string, svcURL, authToken, fallbackAuthor string) (shareReviewFilesResult, error) {
+	comments, reviewRound := loadCommentsForShare(critPath, filePaths, fallbackAuthor)
+	cliArgs := loadCliArgsFromReviewFile(critPath)
+
+	url, deleteToken, err := shareFilesToWeb(files, comments, svcURL, reviewRound, authToken, cliArgs)
+	if err != nil {
+		return shareReviewFilesResult{}, err
+	}
+	return shareReviewFilesResult{
+		URL:         url,
+		DeleteToken: deleteToken,
+		ReviewRound: reviewRound,
+		Comments:    comments,
+	}, nil
 }
 
 // shareFilesToWeb uploads files to a crit-web instance and returns the share URL and delete token.
-func shareFilesToWeb(files []shareFile, comments []shareComment, shareURL string, reviewRound int, authToken string) (string, string, error) {
-	payload := buildSharePayload(files, comments, reviewRound)
+func shareFilesToWeb(files []shareFile, comments []shareComment, shareURL string, reviewRound int, authToken string, cliArgs []string) (string, string, error) {
+	payload := buildSharePayload(files, comments, reviewRound, cliArgs)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", "", fmt.Errorf("marshaling payload: %w", err)
@@ -125,6 +166,9 @@ func shareFilesToWeb(files []shareFile, comments []shareComment, shareURL string
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", "", errShareUnauthorized
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		var errBody struct {
 			Error string `json:"error"`
@@ -144,6 +188,25 @@ func shareFilesToWeb(files []shareFile, comments []shareComment, shareURL string
 		return "", "", fmt.Errorf("decoding share response: %w", err)
 	}
 	return result.URL, result.DeleteToken, nil
+}
+
+// loadCliArgsFromReviewFile reads the review file and returns the stored cli_args.
+// A missing file is treated as "no args"; other read or unmarshal errors are
+// logged to stderr so they don't silently disappear.
+func loadCliArgsFromReviewFile(critPath string) []string {
+	data, err := os.ReadFile(critPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: failed to load cli_args from review file: %v\n", err)
+		}
+		return nil
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to load cli_args from review file: %v\n", err)
+		return nil
+	}
+	return cj.CliArgs
 }
 
 // unpublishFromWeb deletes a shared review from a crit-web instance.
@@ -186,29 +249,39 @@ func setBearer(req *http.Request, token string) {
 	}
 }
 
-// loadCommentsForShare reads the review file at critPath and returns shareComment entries
-// for the given file paths, plus the review round. Resolved comments are excluded.
-func loadCommentsForShare(critPath string, filePaths []string) ([]shareComment, int) {
-	return loadCommentsFromCritJSON(critPath, filePaths, false, false)
-}
-
-// loadCommentsForUpsert loads unresolved comments with ExternalID set for
-// round-trip tracking. Resolved comments are excluded — same as initial share.
-func loadCommentsForUpsert(critPath string, filePaths []string) ([]shareComment, int) {
-	return loadCommentsFromCritJSON(critPath, filePaths, false, true)
+// loadCommentsForShare reads the review file at critPath and returns unresolved
+// shareComment entries for the given file paths, plus the review round.
+// fallbackAuthor is used when a comment has no Author set (typically cfg.Author).
+//
+// ExternalID is set so the server persists it on first insert and matches it
+// on subsequent upserts. This enables round-trip carry-forward of `user_id`:
+// replace_comments matches incoming attrs.external_id against the
+// existing-by-external_id map and preserves the verified user_id when the
+// re-sharer is anonymous (rules #3/#4 of the attribution table).
+//
+// Used for both the initial share and the upsert path — they need identical
+// payloads, so they share this loader.
+func loadCommentsForShare(critPath string, filePaths []string, fallbackAuthor string) ([]shareComment, int) {
+	return loadCommentsFromCritJSON(critPath, filePaths, false, true, fallbackAuthor)
 }
 
 // commentToShareComment converts a Comment into a shareComment, applying the
 // includeResolved and setExternalID flags. The filePath and scope fields are
-// set by the caller based on context.
-func commentToShareComment(c Comment, filePath, scope string, includeResolved, setExternalID bool) shareComment {
+// set by the caller based on context. fallbackAuthor is used when c.Author is
+// empty (typically cfg.Author).
+func commentToShareComment(c Comment, filePath, scope, fallbackAuthor string, includeResolved, setExternalID bool) shareComment {
+	author := c.Author
+	if author == "" {
+		author = fallbackAuthor
+	}
 	sc := shareComment{
 		File:      filePath,
 		StartLine: c.StartLine,
 		EndLine:   c.EndLine,
 		Body:      c.Body,
 		Quote:     c.Quote,
-		Author:    c.Author,
+		Author:    author,
+		UserID:    c.UserID,
 		Scope:     scope,
 	}
 	if includeResolved {
@@ -221,7 +294,15 @@ func commentToShareComment(c Comment, filePath, scope string, includeResolved, s
 		sc.ReviewRound = c.ReviewRound
 	}
 	for _, r := range c.Replies {
-		sc.Replies = append(sc.Replies, shareReply{Body: r.Body, Author: r.Author})
+		ra := r.Author
+		if ra == "" {
+			ra = fallbackAuthor
+		}
+		sr := shareReply{Body: r.Body, Author: ra, UserID: r.UserID}
+		if setExternalID {
+			sr.ExternalID = r.ID
+		}
+		sc.Replies = append(sc.Replies, sr)
 	}
 	return sc
 }
@@ -229,8 +310,9 @@ func commentToShareComment(c Comment, filePath, scope string, includeResolved, s
 // loadCommentsFromCritJSON reads the review file at critPath and returns shareComment
 // entries for the given file paths, plus the review round. When includeResolved is true,
 // resolved comments are included. When setExternalID is true, ExternalID is set
-// from the local comment ID for round-trip tracking.
-func loadCommentsFromCritJSON(critPath string, filePaths []string, includeResolved, setExternalID bool) ([]shareComment, int) {
+// from the local comment ID for round-trip tracking. fallbackAuthor fills missing
+// Author fields (typically cfg.Author).
+func loadCommentsFromCritJSON(critPath string, filePaths []string, includeResolved, setExternalID bool, fallbackAuthor string) ([]shareComment, int) {
 	data, err := os.ReadFile(critPath)
 	if err != nil {
 		return nil, 1
@@ -260,107 +342,166 @@ func loadCommentsFromCritJSON(critPath string, filePaths []string, includeResolv
 				continue
 			}
 			scope := c.Scope
-			comments = append(comments, commentToShareComment(c, filePath, scope, includeResolved, setExternalID))
+			comments = append(comments, commentToShareComment(c, filePath, scope, fallbackAuthor, includeResolved, setExternalID))
 		}
 	}
 	for _, c := range cj.ReviewComments {
 		if !includeResolved && c.Resolved {
 			continue
 		}
-		comments = append(comments, commentToShareComment(c, "", "review", includeResolved, setExternalID))
+		comments = append(comments, commentToShareComment(c, "", "review", fallbackAuthor, includeResolved, setExternalID))
 	}
 	return comments, round
 }
 
-// webComment is the shape of a comment returned by GET /api/reviews/:token/comments.
-type webComment struct {
+// webReply is the shape of a reply nested inside a webComment.
+type webReply struct {
 	Body              string `json:"body"`
-	FilePath          string `json:"file_path"`
-	StartLine         int    `json:"start_line"`
-	EndLine           int    `json:"end_line"`
-	ReviewRound       int    `json:"review_round"`
-	Resolved          bool   `json:"resolved"`
-	ExternalID        string `json:"external_id"`
 	AuthorDisplayName string `json:"author_display_name"`
-	Quote             string `json:"quote"`
-	Scope             string `json:"scope"`
+	UserID            string `json:"user_id"`
+}
+
+// webComment is the shape of a comment returned by GET /api/reviews/:token/comments.
+// AuthorIdentity is retained for compatibility with existing crit-web responses
+// and is treated as a session-owner token for anonymous web visitors. UserID
+// is the verified user id, set when the comment was authored by a logged-in
+// user (either CLI with bearer token or LiveView while signed in).
+type webComment struct {
+	Body              string     `json:"body"`
+	FilePath          string     `json:"file_path"`
+	StartLine         int        `json:"start_line"`
+	EndLine           int        `json:"end_line"`
+	ReviewRound       int        `json:"review_round"`
+	Resolved          bool       `json:"resolved"`
+	ExternalID        string     `json:"external_id"`
+	AuthorDisplayName string     `json:"author_display_name"`
+	AuthorIdentity    string     `json:"author_identity"`
+	UserID            string     `json:"user_id"`
+	Quote             string     `json:"quote"`
+	Scope             string     `json:"scope"`
+	Replies           []webReply `json:"replies"`
 }
 
 // buildLocalFingerprints returns a set of body+file+line fingerprints for all
 // local comments. Used to deduplicate web-authored comments (which have no
 // ExternalID) on repeated shares.
 func buildLocalFingerprints(cj CritJSON) map[string]bool {
+	fps, _ := buildLocalFingerprintIndex(cj)
+	return fps
+}
+
+// buildLocalFingerprintIndex returns both the fingerprint set and a map from
+// fingerprint to local comment ID. The ID map lets callers look up the local
+// comment when a web comment matches by fingerprint (so replies can be merged
+// instead of dropped).
+func buildLocalFingerprintIndex(cj CritJSON) (map[string]bool, map[string]string) {
 	fps := make(map[string]bool)
+	ids := make(map[string]string)
 	for path, f := range cj.Files {
 		for _, c := range f.Comments {
 			key := fmt.Sprintf("%s|%s|%d|%d", c.Body, path, c.StartLine, c.EndLine)
 			fps[key] = true
+			if c.ID != "" {
+				ids[key] = c.ID
+			}
 		}
 	}
 	for _, c := range cj.ReviewComments {
 		key := fmt.Sprintf("%s||0|0", c.Body)
 		fps[key] = true
+		if c.ID != "" {
+			ids[key] = c.ID
+		}
 	}
-	return fps
+	return fps, ids
 }
 
-// fetchNewWebComments fetches comments from crit-web and returns only those
-// not already present locally (identified by external_id or body+line fingerprint).
-//
-// Called automatically inside runShare when an existing ShareURL is detected —
-// i.e., when the agent calls `crit share <files>` after applying changes from
-// the crit-web prompt. This captures any web-reviewer comments added after the
-// prompt was generated (e.g., a late-arriving review) so they appear in local
-// the review file before the next round is pushed.
-//
-// shareURL is the full review URL, e.g. "https://crit.md/r/abc123".
-func fetchNewWebComments(shareURL string, localIDs map[string]bool, localFingerprints map[string]bool, authToken string) ([]webComment, error) {
+// fetchWebCommentsResult holds both new comments and reply updates for existing ones.
+type fetchWebCommentsResult struct {
+	NewComments  []webComment
+	ReplyUpdates map[string][]webReply // external_id -> replies from web
+}
+
+// fetchWebComments fetches all comments from crit-web, returning new comments
+// and reply updates for existing comments that have replies added on the web.
+// localFingerprintIDs maps body+file+line fingerprints to the local comment ID,
+// so that web comments matching a previously-imported web-N comment by
+// fingerprint can have their replies merged instead of dropped.
+func fetchWebComments(shareURL string, localIDs map[string]bool, localFingerprints map[string]bool, localFingerprintIDs map[string]string, authToken string) (fetchWebCommentsResult, error) {
+	var result fetchWebCommentsResult
+	result.ReplyUpdates = make(map[string][]webReply)
+
 	token := path.Base(shareURL)
 	u, err := url.Parse(shareURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid share URL: %w", err)
+		return result, fmt.Errorf("invalid share URL: %w", err)
 	}
 	apiURL := u.Scheme + "://" + u.Host + "/api/reviews/" + token + "/comments"
 
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return result, fmt.Errorf("creating request: %w", err)
 	}
 	setBearer(req, authToken)
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetching remote comments: %w", err)
+		return result, fmt.Errorf("fetching remote comments: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil // review gone
+		return result, nil // review gone
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return result, errShareUnauthorized
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("remote comments returned status %d", resp.StatusCode)
+		return result, fmt.Errorf("remote comments returned status %d", resp.StatusCode)
 	}
 
 	var all []webComment
 	if err := json.NewDecoder(resp.Body).Decode(&all); err != nil {
-		return nil, fmt.Errorf("decoding remote comments: %w", err)
+		return result, fmt.Errorf("decoding remote comments: %w", err)
 	}
 
-	var newOnes []webComment
 	for _, wc := range all {
-		if wc.ExternalID != "" && localIDs[wc.ExternalID] {
-			continue // already have this locally by ID
+		if dropDuplicateWebComment(wc, localIDs, localFingerprints, localFingerprintIDs, result.ReplyUpdates) {
+			continue
 		}
-		if wc.ExternalID == "" {
-			fp := fmt.Sprintf("%s|%s|%d|%d", wc.Body, wc.FilePath, wc.StartLine, wc.EndLine)
-			if localFingerprints[fp] {
-				continue // web-authored comment already imported
-			}
-		}
-		newOnes = append(newOnes, wc)
+		result.NewComments = append(result.NewComments, wc)
 	}
-	return newOnes, nil
+	return result, nil
+}
+
+// dropDuplicateWebComment returns true if wc is already represented locally
+// (by external_id or fingerprint match) and therefore should not be appended
+// to NewComments. Any new replies on the duplicate are recorded in updates.
+func dropDuplicateWebComment(
+	wc webComment,
+	localIDs map[string]bool,
+	localFingerprints map[string]bool,
+	localFingerprintIDs map[string]string,
+	updates map[string][]webReply,
+) bool {
+	if wc.ExternalID != "" && localIDs[wc.ExternalID] {
+		if len(wc.Replies) > 0 {
+			updates[wc.ExternalID] = wc.Replies
+		}
+		return true
+	}
+	if wc.ExternalID != "" {
+		return false
+	}
+	fp := fmt.Sprintf("%s|%s|%d|%d", wc.Body, wc.FilePath, wc.StartLine, wc.EndLine)
+	if !localFingerprints[fp] {
+		return false
+	}
+	if localID, ok := localFingerprintIDs[fp]; ok && len(wc.Replies) > 0 {
+		updates[localID] = wc.Replies
+	}
+	return true
 }
 
 // upsertResult holds the response from an upsert (PUT) to crit-web.
@@ -402,6 +543,9 @@ func upsertShareToWeb(cfg CritJSON, files []shareFile, comments []shareComment, 
 		"comments":     comments,
 		"review_round": cfg.ReviewRound,
 	}
+	if len(cfg.CliArgs) > 0 {
+		payload["cli_args"] = cfg.CliArgs
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -423,7 +567,7 @@ func upsertShareToWeb(cfg CritJSON, files []shareFile, comments []shareComment, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return result, fmt.Errorf("crit-web rejected the request — check your auth_token in config")
+		return result, errShareUnauthorized
 	}
 	if resp.StatusCode >= 400 {
 		return result, fmt.Errorf("upsert failed with status %d", resp.StatusCode)
@@ -508,7 +652,14 @@ func highestWebIndex(cj CritJSON) int {
 
 // mergeWebComments adds web-reviewer comments into the review file under their respective
 // files or into review_comments for review-level (scope:"review") comments.
-func mergeWebComments(critPath string, newComments []webComment) error {
+// It also merges reply updates for existing comments identified by external_id.
+// Pass nil for replyUpdates to skip reply merging.
+//
+// When the active focus is a range mode (probed from a running daemon, or
+// inferred from the on-disk ActiveDiffScope), imported comments are stamped
+// with HeadSHA + DiffScope=layer so they pass visibleInFocus in range view.
+// See spec §E "Write path — `mergeWebComments`".
+func mergeWebComments(critPath string, newComments []webComment, replyUpdates map[string][]webReply) error {
 	data, err := os.ReadFile(critPath)
 	if err != nil {
 		return err
@@ -525,21 +676,33 @@ func mergeWebComments(critPath string, newComments []webComment) error {
 	// even if earlier ones were deleted from the review file.
 	webCount := highestWebIndex(cj)
 
+	scope := resolvePullScope("", &cj)
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, wc := range newComments {
 		webCount++
-		c := Comment{
+		var replies []Reply
+		for _, wr := range wc.Replies {
+			replies = append(replies, Reply{
+				Body:   wr.Body,
+				Author: wr.AuthorDisplayName,
+				UserID: wr.UserID,
+			})
+		}
+		c := stampWithFocus(Comment{
 			ID:          fmt.Sprintf("web-%d", webCount),
 			StartLine:   wc.StartLine,
 			EndLine:     wc.EndLine,
 			Body:        wc.Body,
 			Quote:       wc.Quote,
 			Author:      wc.AuthorDisplayName,
+			UserID:      wc.UserID,
 			Scope:       wc.Scope,
 			ReviewRound: wc.ReviewRound,
+			Replies:     replies,
 			CreatedAt:   now,
 			UpdatedAt:   now,
-		}
+		}, scope.asFocus())
 		if wc.Scope == "review" {
 			cj.ReviewComments = append(cj.ReviewComments, c)
 		} else {
@@ -549,8 +712,44 @@ func mergeWebComments(critPath string, newComments []webComment) error {
 		}
 	}
 
+	// Merge reply updates for existing comments (matched by external_id).
+	if len(replyUpdates) > 0 {
+		for filePath, cf := range cj.Files {
+			for i := range cf.Comments {
+				if webReplies, ok := replyUpdates[cf.Comments[i].ID]; ok {
+					cf.Comments[i] = mergeRepliesIntoComment(cf.Comments[i], webReplies)
+				}
+			}
+			cj.Files[filePath] = cf
+		}
+		for i := range cj.ReviewComments {
+			if webReplies, ok := replyUpdates[cj.ReviewComments[i].ID]; ok {
+				cj.ReviewComments[i] = mergeRepliesIntoComment(cj.ReviewComments[i], webReplies)
+			}
+		}
+	}
+
 	cj.UpdatedAt = now
 	return saveCritJSON(critPath, cj)
+}
+
+// mergeRepliesIntoComment merges web replies into a comment, deduplicating by body.
+func mergeRepliesIntoComment(c Comment, webReplies []webReply) Comment {
+	existing := make(map[string]bool)
+	for _, r := range c.Replies {
+		existing[r.Body] = true
+	}
+	for _, wr := range webReplies {
+		if existing[wr.Body] {
+			continue
+		}
+		c.Replies = append(c.Replies, Reply{
+			Body:   wr.Body,
+			Author: wr.AuthorDisplayName,
+			UserID: wr.UserID,
+		})
+	}
+	return c
 }
 
 // updateShareState writes LastShareHash and ReviewRound back to the review file.

@@ -1,6 +1,10 @@
-# Copy node_modules from primary worktree (install once, reuse everywhere)
-[[pre-start]]
-root-deps = "cp -R {{ primary_worktree_path }}/node_modules {{ worktree_path }}/node_modules"
+# Trust mise.toml before the worktree's shell auto-loads mise — otherwise
+# the shell entry triggers a mise parse error and aborts subsequent hooks.
+[pre-start]
+mise-trust = "mise trust ."
 
-[[pre-start]]
-e2e-deps = "cp -R {{ primary_worktree_path }}/e2e/node_modules {{ worktree_path }}/e2e/node_modules"
+# Copy gitignored files (node_modules, caches, .env, etc.) from the primary
+# worktree so new worktrees skip cold-start installs. Replaces hand-rolled
+# `cp -R` of node_modules — copy-ignored handles all gitignored paths.
+[post-start]
+copy = "wt step copy-ignored"

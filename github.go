@@ -2,16 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +29,9 @@ type ghComment struct {
 	User      struct {
 		Login string `json:"login"`
 	} `json:"user"`
+	// Note: GitHub's /pulls/.../comments REST endpoint returns only `login`
+	// per user. We resolve the display name lazily via /users/{login} —
+	// see userNameCache.
 	CreatedAt   string `json:"created_at"`
 	InReplyToID int64  `json:"in_reply_to_id"`
 }
@@ -76,29 +82,106 @@ type PRInfo struct {
 	ChangedFiles int    `json:"changedFiles"`
 	AuthorLogin  string `json:"authorLogin"`
 	CreatedAt    string `json:"createdAt"`
+
+	// SHA pins from `gh pr view`. Populated by C5 fetchPRByNumber.
+	BaseRefOid        string `json:"baseRefOid,omitempty"`
+	HeadRefOid        string `json:"headRefOid,omitempty"`
+	HeadRepoURL       string `json:"headRepoURL,omitempty"`       // fork URL when IsCrossRepository
+	IsCrossRepository bool   `json:"isCrossRepository,omitempty"` // PR head is on a fork
 }
 
 // prAuthor is used to unmarshal the nested author field from gh output.
+// Name is GitHub's optional display name; we prefer it over Login when set.
 type prAuthor struct {
 	Login string `json:"login"`
+	Name  string `json:"name"`
+}
+
+// prHeadRepo carries the URL of the PR head's source repo. For cross-repo
+// PRs (forks), this is the contributor's fork; for same-repo PRs it equals
+// the base repo.
+type prHeadRepo struct {
+	URL string `json:"url"`
+}
+
+// displayName returns name when set, falling back to login. Used to convert
+// GitHub-imported author identities into the friendlier display string we
+// pass through to crit-web.
+func displayName(login, name string) string {
+	if strings.TrimSpace(name) != "" {
+		return name
+	}
+	return login
+}
+
+// userNameCache memoizes login → display-name lookups for the duration of a
+// single `crit pull`. The /pulls/.../comments REST payload only returns
+// `login`, so we hit /users/{login} once per unique commenter.
+type userNameCache map[string]string
+
+// fetchGHUserName is the seam used by userNameCache.lookup to resolve a login
+// to a display name via the GitHub API. Tests override this; production code
+// uses the default that shells out to `gh api`.
+var fetchGHUserName = ghAPIUserName
+
+// ghAPIUserName shells out to `gh api users/<login>` and returns the user's
+// display name (empty string if unset).
+func ghAPIUserName(login string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "users/"+login, "--jq", ".name // \"\"").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// lookup returns the display name for a login, fetching from GitHub on cache
+// miss. On any error or missing name, returns login (always a valid fallback)
+// and caches that fallback so the warning is logged at most once per login.
+func (c userNameCache) lookup(login string) string {
+	if login == "" {
+		return ""
+	}
+	if cached, ok := c[login]; ok {
+		return cached
+	}
+	name, err := fetchGHUserName(login)
+	if err != nil {
+		log.Printf("warning: gh api users/%s: %v", login, err)
+		c[login] = login
+		return login
+	}
+	resolved := displayName(login, name)
+	c[login] = resolved
+	return resolved
 }
 
 // prInfoRaw mirrors the gh JSON output shape (author is nested).
 type prInfoRaw struct {
-	URL          string   `json:"url"`
-	Number       int      `json:"number"`
-	Title        string   `json:"title"`
-	IsDraft      bool     `json:"isDraft"`
-	State        string   `json:"state"`
-	Body         string   `json:"body"`
-	BaseRefName  string   `json:"baseRefName"`
-	HeadRefName  string   `json:"headRefName"`
-	Additions    int      `json:"additions"`
-	Deletions    int      `json:"deletions"`
-	ChangedFiles int      `json:"changedFiles"`
-	Author       prAuthor `json:"author"`
-	CreatedAt    string   `json:"createdAt"`
+	URL               string     `json:"url"`
+	Number            int        `json:"number"`
+	Title             string     `json:"title"`
+	IsDraft           bool       `json:"isDraft"`
+	State             string     `json:"state"`
+	Body              string     `json:"body"`
+	BaseRefName       string     `json:"baseRefName"`
+	HeadRefName       string     `json:"headRefName"`
+	BaseRefOid        string     `json:"baseRefOid"`
+	HeadRefOid        string     `json:"headRefOid"`
+	IsCrossRepository bool       `json:"isCrossRepository"`
+	HeadRepository    prHeadRepo `json:"headRepository"`
+	Additions         int        `json:"additions"`
+	Deletions         int        `json:"deletions"`
+	ChangedFiles      int        `json:"changedFiles"`
+	Author            prAuthor   `json:"author"`
+	CreatedAt         string     `json:"createdAt"`
 }
+
+// prJSONFields is the comma-separated `--json` field list passed to
+// `gh pr view`. Shared between detectPRInfo and fetchPRByNumber so we extract
+// the same shape regardless of which entry point we used.
+const prJSONFields = "number,url,title,isDraft,state,body,baseRefName,headRefName,baseRefOid,headRefOid,isCrossRepository,headRepository,additions,deletions,changedFiles,author,createdAt"
 
 // detectPRInfo returns PR metadata for the current branch.
 // Returns nil if gh is unavailable, no PR exists, or the PR is merged/closed
@@ -107,33 +190,264 @@ func detectPRInfo() *PRInfo {
 	if err := requireGH(); err != nil {
 		return nil
 	}
-	out, err := exec.Command("gh", "pr", "view", "--json",
-		"number,url,title,isDraft,state,body,baseRefName,headRefName,additions,deletions,changedFiles,author,createdAt").Output()
+	out, err := exec.Command("gh", "pr", "view", "--json", prJSONFields).Output()
 	if err != nil {
 		return nil
 	}
-	var raw prInfoRaw
-	if err := json.Unmarshal(out, &raw); err != nil {
+	info, err := parsePRViewJSON(out)
+	if err != nil {
 		return nil
 	}
-	if raw.URL == "" || raw.State == "MERGED" || raw.State == "CLOSED" {
+	if info.URL == "" || info.State == "MERGED" || info.State == "CLOSED" {
 		return nil
+	}
+	return info
+}
+
+// parsePRViewJSON decodes `gh pr view --json` output into a PRInfo. Factored
+// out so tests can drive it with fixture bytes without invoking gh.
+func parsePRViewJSON(b []byte) (*PRInfo, error) {
+	var raw prInfoRaw
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("parsing gh pr view: %w", err)
 	}
 	return &PRInfo{
-		URL:          raw.URL,
-		Number:       raw.Number,
-		Title:        raw.Title,
-		IsDraft:      raw.IsDraft,
-		State:        raw.State,
-		Body:         raw.Body,
-		BaseRefName:  raw.BaseRefName,
-		HeadRefName:  raw.HeadRefName,
-		Additions:    raw.Additions,
-		Deletions:    raw.Deletions,
-		ChangedFiles: raw.ChangedFiles,
-		AuthorLogin:  raw.Author.Login,
-		CreatedAt:    raw.CreatedAt,
+		URL:               raw.URL,
+		Number:            raw.Number,
+		Title:             raw.Title,
+		IsDraft:           raw.IsDraft,
+		State:             raw.State,
+		Body:              raw.Body,
+		BaseRefName:       raw.BaseRefName,
+		HeadRefName:       raw.HeadRefName,
+		BaseRefOid:        raw.BaseRefOid,
+		HeadRefOid:        raw.HeadRefOid,
+		HeadRepoURL:       raw.HeadRepository.URL,
+		IsCrossRepository: raw.IsCrossRepository,
+		Additions:         raw.Additions,
+		Deletions:         raw.Deletions,
+		ChangedFiles:      raw.ChangedFiles,
+		AuthorLogin:       displayName(raw.Author.Login, raw.Author.Name),
+		CreatedAt:         raw.CreatedAt,
+	}, nil
+}
+
+// fetchPRByNumberFn is the live function that hits `gh`. Indirected through a
+// package var so tests can stub it without a real gh dependency. Tests that
+// swap this should also reset prMetaCache (see withFetchPRByNumber) or the
+// new stub will be shadowed by a previous test's cached PRInfo.
+var fetchPRByNumberFn = fetchPRByNumberReal
+
+// fetchPRByNumber resolves a PR by explicit number using `gh pr view <num>`,
+// memoized for the daemon's lifetime via prMetaCache so repeated focus
+// switches return instantly. Unlike detectPRInfo, this does not filter
+// MERGED/CLOSED — a user explicitly asking to review --pr <num> can review a
+// merged PR (the comment-anchoring rules still apply because the head SHA is
+// fixed). The cache is invalidated by invalidatePRCache after force-push
+// detection (Session.SetFocus) and `crit pull`.
+func fetchPRByNumber(num int) (*PRInfo, error) {
+	return prMetaCache.get(num)
+}
+
+func fetchPRByNumberReal(num int) (*PRInfo, error) {
+	if err := requireGH(); err != nil {
+		return nil, err
 	}
+	out, err := exec.Command("gh", "pr", "view", strconv.Itoa(num), "--json", prJSONFields).Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr view %d: %w", num, err)
+	}
+	return parsePRViewJSON(out)
+}
+
+// PRSummary is the lightweight shape returned for the picker's "Other PRs"
+// section. Distinct from PRInfo so we don't pay the cost of fetching body etc.
+type PRSummary struct {
+	Number      int    `json:"number"`
+	Title       string `json:"title"`
+	URL         string `json:"url"`
+	HeadRefName string `json:"headRefName"`
+	HeadRefOid  string `json:"headRefOid"`
+	BaseRefName string `json:"baseRefName"`
+	IsDraft     bool   `json:"isDraft"`
+}
+
+// fetchOpenPRs lists open PRs visible to the current gh auth. Capped at 100
+// (gh's max page size).
+func fetchOpenPRs() ([]PRSummary, error) {
+	return fetchOpenPRsCtx(context.Background())
+}
+
+// fetchOpenPRsCtx is the context-aware variant — the warm-prime path
+// passes the daemon's shutdown ctx so a Ctrl+C during boot terminates
+// the in-flight gh subprocess instead of orphaning it.
+func fetchOpenPRsCtx(ctx context.Context) ([]PRSummary, error) {
+	if err := requireGH(); err != nil {
+		return nil, err
+	}
+	out, err := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--state", "open",
+		"--limit", "100",
+		"--json", "number,title,url,headRefName,headRefOid,baseRefName,isDraft",
+	).Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr list: %w", err)
+	}
+	return parsePRListJSON(out)
+}
+
+// parsePRListJSON decodes `gh pr list --json` output. Factored for testing.
+func parsePRListJSON(b []byte) ([]PRSummary, error) {
+	var prs []PRSummary
+	if err := json.Unmarshal(b, &prs); err != nil {
+		return nil, fmt.Errorf("parsing gh pr list: %w", err)
+	}
+	return prs, nil
+}
+
+// prListCache caches `gh pr list` results for 60 seconds. The picker may be
+// opened/closed multiple times; gh on big orgs can take 3-5s.
+type prListCache struct {
+	mu      sync.Mutex
+	fetched time.Time
+	data    []PRSummary
+}
+
+// get returns cached PR data, refreshing if older than 60s.
+func (c *prListCache) get() ([]PRSummary, error) {
+	return c.getCtx(context.Background())
+}
+
+// getCtx is the context-aware variant. The warm-prime path on daemon
+// boot passes the daemon's shutdown context so the in-flight gh
+// subprocess gets killed on Ctrl+C rather than orphaned.
+func (c *prListCache) getCtx(ctx context.Context) ([]PRSummary, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if time.Since(c.fetched) < 60*time.Second && c.data != nil {
+		return c.data, nil
+	}
+	data, err := fetchOpenPRsCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.data = data
+	c.fetched = time.Now()
+	return data, nil
+}
+
+// IsStackedPR reports whether the PR's base branch is something other than
+// the repo's default branch — the heuristic for "is this stacked?".
+//
+// Returns false when defaultBranch is empty (e.g. detached HEAD, missing
+// remote): without a known default we can't classify, so degrade safely
+// to "not stacked" rather than reporting every PR as stacked.
+func IsStackedPR(info *PRInfo, vcs VCS) bool {
+	if info == nil || vcs == nil {
+		return false
+	}
+	def := vcs.DefaultBranch()
+	if def == "" {
+		return false
+	}
+	return info.BaseRefName != def
+}
+
+// ensureSHAFetched ensures sha is reachable in the local object store,
+// attempting auto-fetch from origin (and forkURL when set) when missing.
+// forkURL may be "" — same-repo PRs and CLI --range pass through with empty.
+func ensureSHAFetched(vcs VCS, sha, repoRoot, forkURL string) error {
+	if vcs == nil {
+		return nil
+	}
+	if vcs.HasObject(sha, repoRoot) {
+		return nil
+	}
+	if vcs.Name() == "sl" {
+		return ensureSHAFetchedSapling(vcs, sha, repoRoot, forkURL)
+	}
+	if vcs.Name() != "git" {
+		return fmt.Errorf("commit %s not present locally (auto-fetch not supported for vcs=%q)", sha, vcs.Name())
+	}
+
+	// First attempt: origin. Suffices for same-repo PRs.
+	if err := tryGitFetch(repoRoot, "origin", sha); err == nil &&
+		vcs.HasObject(sha, repoRoot) {
+		return nil
+	}
+
+	// Second attempt: fork URL, if known.
+	if forkURL != "" {
+		if err := tryGitFetch(repoRoot, forkURL, sha); err == nil &&
+			vcs.HasObject(sha, repoRoot) {
+			return nil
+		}
+		return fmt.Errorf("commit %s not present locally; tried origin and fork %s — manual fetch required", sha, forkURL)
+	}
+	return fmt.Errorf("commit %s not present locally; manual fetch required (run `git fetch <remote> %s`)", sha, sha)
+}
+
+// ensureSHAFetchedSapling tries `sl pull -r <sha>` first, then falls back to
+// `git fetch origin <sha>` when the repo has both .sl and .git
+// (sapling-on-git). Sapling-on-git stores objects in the underlying git repo,
+// so a git fetch populates them and `sl` will see them on the next HasObject.
+//
+// forkURL is the cross-repo HEAD repository URL when the PR comes from a
+// fork. For sapling-on-git we attempt `git fetch <forkURL> <sha>` as a third
+// step. Pure sapling has no clean cross-repo fetch primitive that takes an
+// arbitrary URL on the command line — `sl pull <url>` only works when the
+// remote is configured — so we surface a clear error telling the user to
+// configure the fork as a path/remote and re-run.
+func ensureSHAFetchedSapling(vcs VCS, sha, repoRoot, forkURL string) error {
+	if err := trySLPull(repoRoot, sha); err == nil &&
+		vcs.HasObject(sha, repoRoot) {
+		return nil
+	}
+	if hasGitDirAt(repoRoot) {
+		if err := tryGitFetch(repoRoot, "origin", sha); err == nil &&
+			vcs.HasObject(sha, repoRoot) {
+			return nil
+		}
+		if forkURL != "" {
+			if err := tryGitFetch(repoRoot, forkURL, sha); err == nil &&
+				vcs.HasObject(sha, repoRoot) {
+				return nil
+			}
+			return fmt.Errorf("commit %s not present locally; tried `sl pull -r %s`, `git fetch origin %s`, and `git fetch %s %s` — manual fetch required", sha, sha, sha, forkURL, sha)
+		}
+	}
+	if forkURL != "" {
+		// Pure sapling, fork PR. We can't drive a cross-repo fetch by URL,
+		// so explain what the user needs to do.
+		return fmt.Errorf("commit %s not present locally; PR head is on fork %s. Pure sapling can't fetch by URL — run `sl pull %s` (configure the fork as a path first if needed) and re-run", sha, forkURL, forkURL)
+	}
+	return fmt.Errorf("commit %s not present locally; tried `sl pull -r %s` and `git fetch origin %s` — run `sl pull` manually with the right source", sha, sha, sha)
+}
+
+// tryGitFetch shells `git fetch <remote> <sha>` with a 30s timeout. Local git
+// ops are normally context-free in this codebase; `git fetch` is the network
+// path and warrants a timeout.
+func tryGitFetch(repoRoot, remote, sha string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "fetch", remote, sha)
+	cmd.Dir = repoRoot
+	return cmd.Run()
+}
+
+// trySLPull shells `sl pull -r <sha>` with a 30s timeout.
+func trySLPull(repoRoot, sha string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sl", "pull", "-r", sha)
+	cmd.Dir = repoRoot
+	return cmd.Run()
+}
+
+// hasGitDirAt reports whether repoRoot has a .git/ directory. Cheap stat.
+func hasGitDirAt(repoRoot string) bool {
+	info, err := os.Stat(filepath.Join(repoRoot, ".git"))
+	return err == nil && info.IsDir()
 }
 
 // fetchPRComments fetches all review comments for a PR.
@@ -297,7 +611,7 @@ func separateRootsAndReplies(ghComments []ghComment) ([]ghComment, map[int64][]g
 }
 
 // appendNewGHReplies adds non-duplicate replies to an existing comment, returning how many were added.
-func appendNewGHReplies(comments []Comment, ci int, childReplies []ghComment) int {
+func appendNewGHReplies(comments []Comment, ci int, childReplies []ghComment, names userNameCache) int {
 	added := 0
 	for _, r := range childReplies {
 		if isDuplicateGHReply(comments[ci].Replies, r.ID) {
@@ -306,7 +620,7 @@ func appendNewGHReplies(comments []Comment, ci int, childReplies []ghComment) in
 		comments[ci].Replies = append(comments[ci].Replies, Reply{
 			ID:        randomReplyID(),
 			Body:      r.Body,
-			Author:    r.User.Login,
+			Author:    names.lookup(r.User.Login),
 			CreatedAt: r.CreatedAt,
 			GitHubID:  r.ID,
 		})
@@ -316,7 +630,9 @@ func appendNewGHReplies(comments []Comment, ci int, childReplies []ghComment) in
 }
 
 // mergeRootComment handles a single root ghComment: either deduplicates or creates it.
-func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment, now string) int {
+// scope stamps the imported comment's HeadSHA + DiffScope when called from a range-mode
+// pull. Empty scope leaves the legacy working-tree fields unset.
+func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment, now string, names userNameCache, scope inheritedScope) int {
 	cf, ok := cj.Files[gc.Path]
 	if !ok {
 		cf = CritJSONFile{Status: "modified", Comments: []Comment{}}
@@ -327,12 +643,14 @@ func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment
 		startLine = gc.Line
 	}
 
-	if isDuplicateGHComment(cf.Comments, gc.ID, gc.User.Login, startLine, gc.Line, gc.Body) {
+	authorName := names.lookup(gc.User.Login)
+
+	if isDuplicateGHComment(cf.Comments, gc.ID, authorName, startLine, gc.Line, gc.Body) {
 		added := 0
 		if childReplies, hasReplies := replyMap[gc.ID]; hasReplies {
 			for ci, c := range cf.Comments {
 				if c.GitHubID == gc.ID {
-					added = appendNewGHReplies(cf.Comments, ci, childReplies)
+					added = appendNewGHReplies(cf.Comments, ci, childReplies, names)
 					break
 				}
 			}
@@ -342,11 +660,11 @@ func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment
 	}
 
 	commentID := randomCommentID()
-	comment := Comment{
+	comment := stampWithFocus(Comment{
 		ID: commentID, StartLine: startLine, EndLine: gc.Line,
-		Body: gc.Body, Author: gc.User.Login, CreatedAt: gc.CreatedAt,
+		Body: gc.Body, Author: authorName, CreatedAt: gc.CreatedAt,
 		UpdatedAt: now, GitHubID: gc.ID,
-	}
+	}, scope.asFocus())
 
 	added := 0
 	if childReplies, hasReplies := replyMap[gc.ID]; hasReplies {
@@ -354,7 +672,7 @@ func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment
 			comment.Replies = append(comment.Replies, Reply{
 				ID:        randomReplyID(),
 				Body:      r.Body,
-				Author:    r.User.Login,
+				Author:    names.lookup(r.User.Login),
 				CreatedAt: r.CreatedAt,
 				GitHubID:  r.ID,
 			})
@@ -368,7 +686,7 @@ func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment
 }
 
 // mergeOrphanReplies processes replies whose parent was already in cj from a previous pull.
-func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]ghComment) int {
+func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]ghComment, names userNameCache) int {
 	rootIDs := make(map[int64]struct{}, len(roots))
 	for _, gc := range roots {
 		rootIDs[gc.ID] = struct{}{}
@@ -384,7 +702,7 @@ func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]gh
 			continue
 		}
 		cf := cj.Files[filePath]
-		added += appendNewGHReplies(cf.Comments, ci, childReplies)
+		added += appendNewGHReplies(cf.Comments, ci, childReplies, names)
 		cj.Files[filePath] = cf
 	}
 	return added
@@ -395,6 +713,22 @@ func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]gh
 // Handles threading: root comments become top-level Comments, replies become Reply entries.
 // Deduplicates by GitHubID (preferred) or author+lines+body to prevent duplicates from repeated pulls.
 func mergeGHComments(cj *CritJSON, ghComments []ghComment) int {
+	return mergeGHCommentsScoped(cj, ghComments, inheritedScope{})
+}
+
+// mergeGHCommentsScoped is mergeGHComments with optional HeadSHA + DiffScope
+// stamping for range-mode pulls. scope.DiffScope == "" matches legacy
+// working-tree behavior. See spec §E "Write path — `crit pull` import path".
+func mergeGHCommentsScoped(cj *CritJSON, ghComments []ghComment, scope inheritedScope) int {
+	return mergeGHCommentsWithNames(cj, ghComments, make(userNameCache), scope)
+}
+
+// mergeGHCommentsWithNames is the form of mergeGHComments that lets callers
+// supply a pre-populated cache. Production uses mergeGHComments (fresh
+// cache, lazy /users/{login} lookups). Tests can pre-populate to assert on
+// resolved display names without going to the network. scope stamps
+// HeadSHA + DiffScope on newly imported root comments (no-op when empty).
+func mergeGHCommentsWithNames(cj *CritJSON, ghComments []ghComment, names userNameCache, scope inheritedScope) int {
 	now := time.Now().UTC().Format(time.RFC3339)
 	cj.UpdatedAt = now
 
@@ -402,9 +736,9 @@ func mergeGHComments(cj *CritJSON, ghComments []ghComment) int {
 
 	added := 0
 	for _, gc := range roots {
-		added += mergeRootComment(cj, gc, replyMap, now)
+		added += mergeRootComment(cj, gc, replyMap, now, names, scope)
 	}
-	added += mergeOrphanReplies(cj, roots, replyMap)
+	added += mergeOrphanReplies(cj, roots, replyMap, names)
 
 	return added
 }
@@ -749,7 +1083,7 @@ func loadCritJSON(critPath string) (CritJSON, error) {
 		cfg := LoadConfig(filepath.Dir(critPath))
 		base := cfg.BaseBranch
 		if base == "" {
-			base = DefaultBranch()
+			base = defaultBaseRef()
 		}
 		baseRef, _ := MergeBase(base)
 		cj = CritJSON{
@@ -779,7 +1113,14 @@ func saveCritJSON(critPath string, cj CritJSON) error {
 }
 
 // appendComment adds a comment to the CritJSON struct in memory. Does not write to disk.
-func appendComment(cj *CritJSON, filePath string, startLine, endLine int, body, author string) {
+// Defers to appendCommentScoped with no scope inheritance.
+func appendComment(cj *CritJSON, filePath string, startLine, endLine int, body, author, userID string) {
+	appendCommentScoped(cj, filePath, startLine, endLine, body, author, userID, inheritedScope{})
+}
+
+// appendCommentScoped is appendComment with HeadSHA / DiffScope stamping.
+// scope.DiffScope == "" produces today's working-tree behavior.
+func appendCommentScoped(cj *CritJSON, filePath string, startLine, endLine int, body, author, userID string, scope inheritedScope) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	cj.UpdatedAt = now
 
@@ -794,16 +1135,18 @@ func appendComment(cj *CritJSON, filePath string, startLine, endLine int, body, 
 	// Populate anchor from the file on disk.
 	anchor := readAnchorFromDisk(filePath, startLine, endLine)
 
-	cf.Comments = append(cf.Comments, Comment{
+	c := stampWithFocus(Comment{
 		ID:        randomCommentID(),
 		StartLine: startLine,
 		EndLine:   endLine,
 		Body:      body,
 		Anchor:    anchor,
 		Author:    author,
+		UserID:    userID,
 		CreatedAt: now,
 		UpdatedAt: now,
-	})
+	}, scope.asFocus())
+	cf.Comments = append(cf.Comments, c)
 	cj.Files[filePath] = cf
 }
 
@@ -820,7 +1163,7 @@ func readAnchorFromDisk(filePath string, startLine, endLine int) string {
 // appendReply adds a reply to an existing comment in the CritJSON struct in memory.
 // Returns an error if the comment ID is not found or is ambiguous across files.
 // Searches both file comments and review_comments.
-func appendReply(cj *CritJSON, commentID, body, author string, resolve bool, filterPath string) error {
+func appendReply(cj *CritJSON, commentID, body, author, userID string, resolve bool, filterPath string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	cj.UpdatedAt = now
 
@@ -831,6 +1174,7 @@ func appendReply(cj *CritJSON, commentID, body, author string, resolve bool, fil
 				ID:        randomReplyID(),
 				Body:      body,
 				Author:    author,
+				UserID:    userID,
 				CreatedAt: now,
 			}
 			cj.ReviewComments[i].Replies = append(cj.ReviewComments[i].Replies, reply)
@@ -858,6 +1202,7 @@ func appendReply(cj *CritJSON, commentID, body, author string, resolve bool, fil
 						ID:        randomReplyID(),
 						Body:      body,
 						Author:    author,
+						UserID:    userID,
 						CreatedAt: now,
 					}
 					cf.Comments[i].Replies = append(cf.Comments[i].Replies, reply)
@@ -888,7 +1233,17 @@ func appendReply(cj *CritJSON, commentID, body, author string, resolve bool, fil
 // Creates the review file if it doesn't exist. Appends to existing comments if it does.
 // Works in both git repos and plain directories (file mode).
 // outputDir overrides the default location (repo root or CWD) when non-empty.
-func addCommentToCritJSON(filePath string, startLine, endLine int, body string, author string, outputDir string) error {
+// userID is documented to support callers that pass an authenticated user; tests
+// pass "" because they don't need that path. The lint exception keeps the signature
+// stable for the API.
+//
+//nolint:unparam // userID is part of the public contract; tests don't exercise it
+func addCommentToCritJSON(filePath string, startLine, endLine int, body string, author, userID string, outputDir string) error {
+	return addCommentToCritJSONScoped(filePath, startLine, endLine, body, author, userID, outputDir, inheritedScope{})
+}
+
+// addCommentToCritJSONScoped is addCommentToCritJSON with scope stamping.
+func addCommentToCritJSONScoped(filePath string, startLine, endLine int, body, author, userID, outputDir string, scope inheritedScope) error {
 	critPath, err := resolveReviewPath(outputDir)
 	if err != nil {
 		return err
@@ -904,13 +1259,13 @@ func addCommentToCritJSON(filePath string, startLine, endLine int, body string, 
 		return err
 	}
 
-	appendComment(&cj, cleaned, startLine, endLine, body, author)
+	appendCommentScoped(&cj, cleaned, startLine, endLine, body, author, userID, scope)
 	return saveCritJSON(critPath, cj)
 }
 
 // addReplyToCritJSON adds a reply to an existing comment in the review file.
 // It searches all files for the comment ID. If resolve is true, it also marks the comment as resolved.
-func addReplyToCritJSON(commentID, body, author string, resolve bool, outputDir string, filterPath string) error {
+func addReplyToCritJSON(commentID, body, author, userID string, resolve bool, outputDir string, filterPath string) error {
 	critPath, err := resolveReviewPath(outputDir)
 	if err != nil {
 		return err
@@ -921,7 +1276,7 @@ func addReplyToCritJSON(commentID, body, author string, resolve bool, outputDir 
 		return err
 	}
 
-	if err := appendReply(&cj, commentID, body, author, resolve, filterPath); err != nil {
+	if err := appendReply(&cj, commentID, body, author, userID, resolve, filterPath); err != nil {
 		// Only fall back to scanning when the comment genuinely wasn't found.
 		// Don't fall back for ambiguity errors ("found in multiple files").
 		if strings.Contains(err.Error(), "not found") {
@@ -930,7 +1285,7 @@ func addReplyToCritJSON(commentID, body, author string, resolve bool, outputDir 
 				if loadErr != nil {
 					return err // return original error
 				}
-				if replyErr := appendReply(&altCJ, commentID, body, author, resolve, filterPath); replyErr != nil {
+				if replyErr := appendReply(&altCJ, commentID, body, author, userID, resolve, filterPath); replyErr != nil {
 					return err // return original error
 				}
 				fmt.Fprintf(os.Stderr, "Note: comment %s found in %s (not the resolved review file)\n", commentID, filepath.Base(altPath))
@@ -951,6 +1306,9 @@ func findReviewFileByCommentID(commentID string, excludePath string) (string, er
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("comment %q not found in any review file", commentID)
+		}
 		return "", err
 	}
 
@@ -1070,10 +1428,10 @@ func (e *BulkCommentEntry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// bulkAddCommentsToCritJSON applies multiple comments and replies in a single load-save cycle.
-// globalAuthor is used when an entry doesn't specify its own author.
-// outputDir overrides the review file location (empty = centralized storage).
-func processBulkEntry(cj *CritJSON, i int, e BulkCommentEntry, globalAuthor string) error {
+// processBulkEntry routes a single bulk comment entry to the appropriate
+// authoring helper. globalAuthor is used when an entry doesn't specify its own
+// author. scope is stamped on every authored comment (empty = today's behavior).
+func processBulkEntry(cj *CritJSON, i int, e BulkCommentEntry, globalAuthor, globalUserID string, scope inheritedScope) error {
 	if e.Body == "" {
 		return fmt.Errorf("entry %d: body is required", i)
 	}
@@ -1082,33 +1440,36 @@ func processBulkEntry(cj *CritJSON, i int, e BulkCommentEntry, globalAuthor stri
 	if author == "" {
 		author = globalAuthor
 	}
+	// UserID always comes from the local config — entry-level override would
+	// be a spoof vector. The CLI never trusts a payload-supplied user_id.
+	userID := globalUserID
 
 	if e.ReplyTo != "" {
-		if err := appendReply(cj, e.ReplyTo, e.Body, author, e.Resolve, e.File); err != nil {
+		if err := appendReply(cj, e.ReplyTo, e.Body, author, userID, e.Resolve, e.File); err != nil {
 			return fmt.Errorf("entry %d: %w", i, err)
 		}
 		return nil
 	}
 
 	if e.Scope == "review" || (e.File == "" && e.Path == "" && e.Line <= 0 && e.LineSpec == "") {
-		return processBulkReviewEntry(cj, i, e, author)
+		return processBulkReviewEntry(cj, i, e, author, userID, scope)
 	}
 
-	return processBulkFileOrLineEntry(cj, i, e, author)
+	return processBulkFileOrLineEntry(cj, i, e, author, userID, scope)
 }
 
-func processBulkReviewEntry(cj *CritJSON, i int, e BulkCommentEntry, author string) error {
+func processBulkReviewEntry(cj *CritJSON, i int, e BulkCommentEntry, author, userID string, scope inheritedScope) error {
 	if e.Line > 0 || e.LineSpec != "" {
 		return fmt.Errorf("entry %d: file is required for new comments", i)
 	}
 	if e.Scope != "review" && (e.File != "" || e.Path != "") {
 		return fmt.Errorf("entry %d: file is required for new comments", i)
 	}
-	appendReviewComment(cj, e.Body, author)
+	appendReviewCommentScoped(cj, e.Body, author, userID, scope)
 	return nil
 }
 
-func processBulkFileOrLineEntry(cj *CritJSON, i int, e BulkCommentEntry, author string) error {
+func processBulkFileOrLineEntry(cj *CritJSON, i int, e BulkCommentEntry, author, userID string, scope inheritedScope) error {
 	filePath := e.File
 	if filePath == "" {
 		filePath = e.Path
@@ -1123,22 +1484,22 @@ func processBulkFileOrLineEntry(cj *CritJSON, i int, e BulkCommentEntry, author 
 	}
 
 	if e.Scope == "file" {
-		appendFileComment(cj, cleaned, e.Body, author)
+		appendFileCommentScoped(cj, cleaned, e.Body, author, userID, scope)
 		return nil
 	}
 
 	if e.Line <= 0 && e.LineSpec == "" {
 		if e.Path != "" && e.File == "" {
-			appendFileComment(cj, cleaned, e.Body, author)
+			appendFileCommentScoped(cj, cleaned, e.Body, author, userID, scope)
 			return nil
 		}
 		return fmt.Errorf("entry %d: line must be > 0", i)
 	}
 
-	return processBulkLineComment(cj, i, e, cleaned, author)
+	return processBulkLineComment(cj, i, e, cleaned, author, userID, scope)
 }
 
-func processBulkLineComment(cj *CritJSON, i int, e BulkCommentEntry, cleaned, author string) error {
+func processBulkLineComment(cj *CritJSON, i int, e BulkCommentEntry, cleaned, author, userID string, scope inheritedScope) error {
 	startLine := e.Line
 	endLine := e.EndLine
 
@@ -1157,7 +1518,7 @@ func processBulkLineComment(cj *CritJSON, i int, e BulkCommentEntry, cleaned, au
 		endLine = startLine
 	}
 
-	appendComment(cj, cleaned, startLine, endLine, e.Body, author)
+	appendCommentScoped(cj, cleaned, startLine, endLine, e.Body, author, userID, scope)
 	return nil
 }
 
@@ -1180,32 +1541,143 @@ func parseLineSpec(spec string) (start, end int, err error) {
 	return n, n, nil
 }
 
-func bulkAddCommentsToCritJSON(entries []BulkCommentEntry, globalAuthor string, outputDir string) error {
+//nolint:unparam // globalUserID is part of the public contract; tests don't exercise it
+func bulkAddCommentsToCritJSON(entries []BulkCommentEntry, globalAuthor, globalUserID string, outputDir string) error {
+	return bulkAddCommentsToCritJSONScoped(entries, globalAuthor, globalUserID, outputDir, inheritedScope{})
+}
+
+// bulkAddCommentsToCritJSONScoped is bulkAddCommentsToCritJSON with scope stamping
+// applied to every entry.
+//
+// Target resolution: a bulk call always writes to a single review file. If any
+// entry uses reply_to and none of the referenced IDs live in the cwd-resolved
+// primary file, the entire bulk is redirected to the alt file that contains
+// them. New comments in the same bulk ride along. If reply IDs split across
+// multiple review files (or some land in primary and others elsewhere), the
+// call is rejected — callers should split into per-file bulks.
+func bulkAddCommentsToCritJSONScoped(entries []BulkCommentEntry, globalAuthor, globalUserID string, outputDir string, scope inheritedScope) error {
 	if len(entries) == 0 {
 		return fmt.Errorf("no comment entries provided")
 	}
 
-	critPath, err := resolveReviewPath(outputDir)
+	primaryPath, err := resolveReviewPath(outputDir)
 	if err != nil {
 		return err
 	}
 
-	cj, err := loadCritJSON(critPath)
+	primary, err := loadCritJSON(primaryPath)
+	if err != nil {
+		return err
+	}
+
+	targetPath, targetCJ, redirected, err := resolveBulkTarget(entries, primaryPath, primary)
 	if err != nil {
 		return err
 	}
 
 	for i, e := range entries {
-		if err := processBulkEntry(&cj, i, e, globalAuthor); err != nil {
+		if err := processBulkEntry(&targetCJ, i, e, globalAuthor, globalUserID, scope); err != nil {
 			return err
 		}
 	}
 
-	return saveCritJSON(critPath, cj)
+	if err := saveCritJSON(targetPath, targetCJ); err != nil {
+		return err
+	}
+	if redirected {
+		fmt.Fprintf(os.Stderr, "Note: replies routed to %s (not the cwd-resolved review file)\n", filepath.Base(targetPath))
+	}
+	return nil
+}
+
+// resolveBulkTarget picks the single review file that this bulk call should
+// write to. Returns the path, the loaded CritJSON to mutate, and whether the
+// target differs from the cwd-resolved primary.
+func resolveBulkTarget(entries []BulkCommentEntry, primaryPath string, primary CritJSON) (string, CritJSON, bool, error) {
+	var replyIDs []string
+	seen := map[string]bool{}
+	for _, e := range entries {
+		if e.ReplyTo == "" || seen[e.ReplyTo] {
+			continue
+		}
+		seen[e.ReplyTo] = true
+		replyIDs = append(replyIDs, e.ReplyTo)
+	}
+
+	if len(replyIDs) == 0 {
+		return primaryPath, primary, false, nil
+	}
+
+	var inPrimary, missing []string
+	for _, id := range replyIDs {
+		if cjContainsCommentID(&primary, id) {
+			inPrimary = append(inPrimary, id)
+		} else {
+			missing = append(missing, id)
+		}
+	}
+
+	if len(missing) == 0 {
+		return primaryPath, primary, false, nil
+	}
+	if len(inPrimary) > 0 {
+		return "", CritJSON{}, false, fmt.Errorf(
+			"bulk targets multiple review files: %v exist in %s, but %v do not — split into per-file bulks",
+			inPrimary, filepath.Base(primaryPath), missing,
+		)
+	}
+
+	// None in primary — every reply ID must live in the same alt file.
+	var altPath string
+	for _, id := range missing {
+		path, err := findReviewFileByCommentID(id, primaryPath)
+		if err != nil {
+			return "", CritJSON{}, false, fmt.Errorf("reply target %s: %w", id, err)
+		}
+		if altPath == "" {
+			altPath = path
+			continue
+		}
+		if path != altPath {
+			return "", CritJSON{}, false, fmt.Errorf(
+				"bulk targets multiple review files: %s in %s, %s in %s — split into per-file bulks",
+				missing[0], filepath.Base(altPath), id, filepath.Base(path),
+			)
+		}
+	}
+
+	altCJ, err := loadCritJSON(altPath)
+	if err != nil {
+		return "", CritJSON{}, false, fmt.Errorf("load %s: %w", filepath.Base(altPath), err)
+	}
+	return altPath, altCJ, true, nil
+}
+
+// cjContainsCommentID reports whether the given comment ID exists in the
+// in-memory CritJSON, across review-level and per-file comments.
+func cjContainsCommentID(cj *CritJSON, id string) bool {
+	for _, c := range cj.ReviewComments {
+		if c.ID == id {
+			return true
+		}
+	}
+	for _, cf := range cj.Files {
+		for _, c := range cf.Comments {
+			if c.ID == id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // addReviewCommentToCritJSON adds a review-level comment to the review file.
-func addReviewCommentToCritJSON(body, author, outputDir string) error {
+func addReviewCommentToCritJSON(body, author, userID, outputDir string) error {
+	return addReviewCommentToCritJSONScoped(body, author, userID, outputDir, inheritedScope{})
+}
+
+// addReviewCommentToCritJSONScoped is addReviewCommentToCritJSON with scope stamping.
+func addReviewCommentToCritJSONScoped(body, author, userID, outputDir string, scope inheritedScope) error {
 	critPath, err := resolveReviewPath(outputDir)
 	if err != nil {
 		return err
@@ -1216,12 +1688,17 @@ func addReviewCommentToCritJSON(body, author, outputDir string) error {
 		return err
 	}
 
-	appendReviewComment(&cj, body, author)
+	appendReviewCommentScoped(&cj, body, author, userID, scope)
 	return saveCritJSON(critPath, cj)
 }
 
 // addFileCommentToCritJSON adds a file-level comment to the review file.
-func addFileCommentToCritJSON(filePath, body, author, outputDir string) error {
+func addFileCommentToCritJSON(filePath, body, author, userID, outputDir string) error {
+	return addFileCommentToCritJSONScoped(filePath, body, author, userID, outputDir, inheritedScope{})
+}
+
+// addFileCommentToCritJSONScoped is addFileCommentToCritJSON with scope stamping.
+func addFileCommentToCritJSONScoped(filePath, body, author, userID, outputDir string, scope inheritedScope) error {
 	critPath, err := resolveReviewPath(outputDir)
 	if err != nil {
 		return err
@@ -1237,27 +1714,41 @@ func addFileCommentToCritJSON(filePath, body, author, outputDir string) error {
 		return err
 	}
 
-	appendFileComment(&cj, cleaned, body, author)
+	appendFileCommentScoped(&cj, cleaned, body, author, userID, scope)
 	return saveCritJSON(critPath, cj)
 }
 
 // appendReviewComment adds a review-level comment to the CritJSON struct in memory.
-func appendReviewComment(cj *CritJSON, body, author string) {
+// Defers to appendReviewCommentScoped with no scope inheritance.
+func appendReviewComment(cj *CritJSON, body, author, userID string) {
+	appendReviewCommentScoped(cj, body, author, userID, inheritedScope{})
+}
+
+// appendReviewCommentScoped stamps DiffScope/HeadSHA from scope.
+func appendReviewCommentScoped(cj *CritJSON, body, author, userID string, scope inheritedScope) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	cj.UpdatedAt = now
 
-	cj.ReviewComments = append(cj.ReviewComments, Comment{
+	c := stampWithFocus(Comment{
 		ID:        randomReviewCommentID(),
 		Body:      body,
 		Author:    author,
+		UserID:    userID,
 		Scope:     "review",
 		CreatedAt: now,
 		UpdatedAt: now,
-	})
+	}, scope.asFocus())
+	cj.ReviewComments = append(cj.ReviewComments, c)
 }
 
 // appendFileComment adds a file-level comment (scope: "file", lines: 0) to the CritJSON struct in memory.
-func appendFileComment(cj *CritJSON, filePath, body, author string) {
+// Defers to appendFileCommentScoped with no scope inheritance.
+func appendFileComment(cj *CritJSON, filePath, body, author, userID string) {
+	appendFileCommentScoped(cj, filePath, body, author, userID, inheritedScope{})
+}
+
+// appendFileCommentScoped stamps DiffScope/HeadSHA from scope.
+func appendFileCommentScoped(cj *CritJSON, filePath, body, author, userID string, scope inheritedScope) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	cj.UpdatedAt = now
 
@@ -1269,13 +1760,15 @@ func appendFileComment(cj *CritJSON, filePath, body, author string) {
 		}
 	}
 
-	cf.Comments = append(cf.Comments, Comment{
+	c := stampWithFocus(Comment{
 		ID:        randomCommentID(),
 		Body:      body,
 		Author:    author,
+		UserID:    userID,
 		Scope:     "file",
 		CreatedAt: now,
 		UpdatedAt: now,
-	})
+	}, scope.asFocus())
+	cf.Comments = append(cf.Comments, c)
 	cj.Files[filePath] = cf
 }

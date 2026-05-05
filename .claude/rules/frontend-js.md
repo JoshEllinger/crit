@@ -15,6 +15,12 @@ paths:
 - Reset ALL navigation/UI state when context changes (scope change, session reload, comment delete).
 - When implementing UI state logic that counts comments, account for ALL comment types (file-scoped AND review-level).
 
+## Persisted Settings (cookies, not localStorage)
+- Use cookies for any setting that should persist across `crit` invocations. Crit defaults to a random port (`port=0`), and localStorage is scoped per origin (scheme + host + **port**), so localStorage settings reset every run. Cookies are host-scoped and survive port changes.
+- Persisted settings live in a single `crit-settings` JSON cookie via `getSetting(key, fallback)` / `setSetting(key, value)`. The exception is `crit-templates`, which stays in its own cookie because it's user-defined and can be longer.
+- localStorage is fine for transient per-session data (e.g., `crit-draft-*` autosave keys that are review-specific anyway).
+- Before adding persistence to a setting, ask whether it should be sticky. Transient view state (active filter, sort order on a list) usually shouldn't be — users coming back to a new review with "resolved-only" active would miss new open comments. Persist preferences (theme, width, hide-resolved), not transient views.
+
 ## Error Handling
 - Always check `response.ok` after `fetch()` calls. Throw on unexpected statuses.
 - Every async operation must have error recovery that restores interactivity (re-attach listeners, undo optimistic UI).
