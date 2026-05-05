@@ -711,8 +711,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.NoOpen {
 		t.Error("NoOpen should be false")
 	}
-	if cfg.ShareURL != "https://crit.md" {
-		t.Errorf("ShareURL = %q, want https://crit.md", cfg.ShareURL)
+	if cfg.ShareURL != "" {
+		t.Errorf("ShareURL = %q, want empty", cfg.ShareURL)
 	}
 	if !cfg.CleanupOnApprove {
 		t.Error("CleanupOnApprove should be true")

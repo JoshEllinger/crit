@@ -57,7 +57,7 @@ func defaultConfig() generatedConfig {
 	return generatedConfig{
 		Port:       0,
 		NoOpen:     false,
-		ShareURL:   "https://crit.md",
+		ShareURL:   "",
 		Quiet:      false,
 		Output:     "",
 		Author:     "",
