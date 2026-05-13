@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRIT_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 GIT_PORT="${CRIT_TEST_PORT:-3123}"
 FILE_PORT="${CRIT_TEST_FILE_PORT:-3124}"
 SINGLE_PORT="${CRIT_TEST_SINGLE_PORT:-3125}"
@@ -16,13 +18,13 @@ if [ -n "${CRIT_BIN:-}" ] && [ -f "$CRIT_BIN" ]; then
 else
   BIN_DIR=$(mktemp -d)
   trap 'rm -rf "$BIN_DIR"' EXIT
-  export CRIT_BIN="$BIN_DIR/crit"
+  export CRIT_BIN="$BIN_DIR/$(e2e_bin_name)"
   (cd "$CRIT_SRC" && go build -o "$CRIT_BIN" .)
 fi
 
 # Kill any stale processes on our test ports before starting fresh
 for port in "$GIT_PORT" "$FILE_PORT" "$SINGLE_PORT" "$NOGIT_PORT" "$MULTI_PORT" "$RANGE_PORT"; do
-  lsof -ti tcp:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
+  e2e_kill_port "$port"
 done
 
 # Start both fixture servers in parallel
@@ -43,6 +45,9 @@ RANGE_PID=$!
 cleanup() {
   kill "$GIT_PID" "$FILE_PID" "$SINGLE_PID" "$NOGIT_PID" "$MULTI_PID" "$RANGE_PID" 2>/dev/null || true
   wait "$GIT_PID" "$FILE_PID" "$SINGLE_PID" "$NOGIT_PID" "$MULTI_PID" "$RANGE_PID" 2>/dev/null || true
+  # On Git Bash `kill <bash-pid>` doesn't reap the spawned crit.exe child;
+  # taskkill /T flushes the whole tree.
+  e2e_kill_stray_crit
   rm -rf "${BIN_DIR:-}"
 }
 trap cleanup EXIT
@@ -85,8 +90,9 @@ if [ $# -eq 0 ]; then
     name=$(basename "$f" .log)
     if grep -q "failed" "$f"; then
       echo "=== $name (FAILED) ==="
-      # Show the failure details (last 30 lines captures errors + summary)
-      tail -30 "$f"
+      # Dump the full project log on failure so CI shows every error message
+      # (a 30-line tail buries per-test errors when many tests fail).
+      cat "$f"
     else
       echo "=== $name ==="
       tail -5 "$f"

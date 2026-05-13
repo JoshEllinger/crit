@@ -138,14 +138,14 @@
     </div>
     <div class="file-tree-body" id="fileTreeBody"></div>
   </div>
-  <div class="sidebar-resize-handle" id="fileTreeResizer" aria-hidden="true"></div>
+  <div class="sidebar-resize-handle" id="fileTreeResizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize file tree" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div>
   <div class="main-content">
     <div id="reviewConversation" class="review-conversation" hidden></div>
     <div id="filesContainer">
       <div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>
     </div>
   </div>
-  <div class="sidebar-resize-handle" id="commentsPanelResizer" aria-hidden="true"></div>
+  <div class="sidebar-resize-handle" id="commentsPanelResizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize comments panel" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div>
   <div class="comments-panel comments-panel-hidden" id="commentsPanel">
     <div class="comments-panel-header">
       <div class="comments-panel-header-row1">
@@ -174,8 +174,12 @@
 </div>
 
 <div class="waiting-overlay" id="waitingOverlay" role="dialog" aria-modal="true" aria-labelledby="waitingHeading">
-  <div class="waiting-dialog">
+  <div class="waiting-dialog" id="waitingDialog">
     <div class="waiting-spinner" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+    <svg class="success-mark" viewBox="0 0 64 64" aria-hidden="true">
+      <circle class="success-mark-ring" cx="32" cy="32" r="28"/>
+      <path class="success-mark-check" d="M19 33 L28 42 L45 23"/>
+    </svg>
     <h3 id="waitingHeading">Review Complete</h3>
     <p id="waitingMessage"></p>
     <p class="waiting-edits" id="waitingEdits"></p>

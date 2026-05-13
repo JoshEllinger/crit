@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,9 +65,10 @@ func computeShareHash(files []shareFile, comments []shareComment) string {
 // Status values: "added", "modified", "deleted", "renamed", "removed".
 // "removed" means the file is orphaned (no longer in the review but has comments).
 type shareFile struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
-	Status  string `json:"status,omitempty"`
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	Status    string `json:"status,omitempty"`
+	Generated bool   `json:"generated,omitempty"`
 }
 
 // shareReply represents a reply to include in the shared review.
@@ -93,16 +95,27 @@ type shareComment struct {
 	Resolved    bool         `json:"resolved,omitempty"`
 }
 
-// buildSharePayload constructs the JSON payload for POST /api/reviews.
-func buildSharePayload(files []shareFile, comments []shareComment, reviewRound int, cliArgs []string) map[string]any {
-	fileList := make([]map[string]any, len(files))
+// shareFileEntries serializes shareFile values into the JSON-friendly maps
+// used by both POST and PUT payloads. Keeping a single helper prevents the
+// two sites from drifting out of sync as new optional fields land.
+func shareFileEntries(files []shareFile) []map[string]any {
+	entries := make([]map[string]any, len(files))
 	for i, f := range files {
 		entry := map[string]any{"path": f.Path, "content": f.Content}
 		if f.Status != "" {
 			entry["status"] = f.Status
 		}
-		fileList[i] = entry
+		if f.Generated {
+			entry["generated"] = true
+		}
+		entries[i] = entry
 	}
+	return entries
+}
+
+// buildSharePayload constructs the JSON payload for POST /api/reviews.
+func buildSharePayload(files []shareFile, comments []shareComment, reviewRound int, cliArgs []string) map[string]any {
+	fileList := shareFileEntries(files)
 	if comments == nil {
 		comments = []shareComment{}
 	}
@@ -194,7 +207,7 @@ func shareFilesToWeb(files []shareFile, comments []shareComment, shareURL string
 // A missing file is treated as "no args"; other read or unmarshal errors are
 // logged to stderr so they don't silently disappear.
 func loadCliArgsFromReviewFile(critPath string) []string {
-	data, err := os.ReadFile(critPath)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "warning: failed to load cli_args from review file: %v\n", err)
@@ -269,7 +282,15 @@ func loadCommentsForShare(critPath string, filePaths []string, fallbackAuthor st
 // includeResolved and setExternalID flags. The filePath and scope fields are
 // set by the caller based on context. fallbackAuthor is used when c.Author is
 // empty (typically cfg.Author).
-func commentToShareComment(c Comment, filePath, scope, fallbackAuthor string, includeResolved, setExternalID bool) shareComment {
+//
+// critPath is the v4 review identity (folder); it's used to locate the
+// attachments dir so any attachments/<uuid>.<ext> markdown references in
+// the body (or its replies) get rewritten to data: URIs before the share
+// payload leaves the host. crit-web has no asset endpoint, so this
+// inlining is the only way pasted screenshots survive a share. Passing
+// "" disables inlining (used in unit tests that don't write attachments
+// to disk).
+func commentToShareComment(c Comment, filePath, scope, fallbackAuthor, critPath string, includeResolved, setExternalID bool) shareComment {
 	author := c.Author
 	if author == "" {
 		author = fallbackAuthor
@@ -278,7 +299,7 @@ func commentToShareComment(c Comment, filePath, scope, fallbackAuthor string, in
 		File:      filePath,
 		StartLine: c.StartLine,
 		EndLine:   c.EndLine,
-		Body:      c.Body,
+		Body:      inlineAttachmentsAsDataURIs(critPath, c.Body),
 		Quote:     c.Quote,
 		Author:    author,
 		UserID:    c.UserID,
@@ -298,7 +319,7 @@ func commentToShareComment(c Comment, filePath, scope, fallbackAuthor string, in
 		if ra == "" {
 			ra = fallbackAuthor
 		}
-		sr := shareReply{Body: r.Body, Author: ra, UserID: r.UserID}
+		sr := shareReply{Body: inlineAttachmentsAsDataURIs(critPath, r.Body), Author: ra, UserID: r.UserID}
 		if setExternalID {
 			sr.ExternalID = r.ID
 		}
@@ -313,7 +334,7 @@ func commentToShareComment(c Comment, filePath, scope, fallbackAuthor string, in
 // from the local comment ID for round-trip tracking. fallbackAuthor fills missing
 // Author fields (typically cfg.Author).
 func loadCommentsFromCritJSON(critPath string, filePaths []string, includeResolved, setExternalID bool, fallbackAuthor string) ([]shareComment, int) {
-	data, err := os.ReadFile(critPath)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		return nil, 1
 	}
@@ -342,14 +363,14 @@ func loadCommentsFromCritJSON(critPath string, filePaths []string, includeResolv
 				continue
 			}
 			scope := c.Scope
-			comments = append(comments, commentToShareComment(c, filePath, scope, fallbackAuthor, includeResolved, setExternalID))
+			comments = append(comments, commentToShareComment(c, filePath, scope, fallbackAuthor, critPath, includeResolved, setExternalID))
 		}
 	}
 	for _, c := range cj.ReviewComments {
 		if !includeResolved && c.Resolved {
 			continue
 		}
-		comments = append(comments, commentToShareComment(c, "", "review", fallbackAuthor, includeResolved, setExternalID))
+		comments = append(comments, commentToShareComment(c, "", "review", fallbackAuthor, critPath, includeResolved, setExternalID))
 	}
 	return comments, round
 }
@@ -373,6 +394,7 @@ type webComment struct {
 	EndLine           int        `json:"end_line"`
 	ReviewRound       int        `json:"review_round"`
 	Resolved          bool       `json:"resolved"`
+	ResolvedRound     int        `json:"resolved_round"`
 	ExternalID        string     `json:"external_id"`
 	AuthorDisplayName string     `json:"author_display_name"`
 	AuthorIdentity    string     `json:"author_identity"`
@@ -380,14 +402,6 @@ type webComment struct {
 	Quote             string     `json:"quote"`
 	Scope             string     `json:"scope"`
 	Replies           []webReply `json:"replies"`
-}
-
-// buildLocalFingerprints returns a set of body+file+line fingerprints for all
-// local comments. Used to deduplicate web-authored comments (which have no
-// ExternalID) on repeated shares.
-func buildLocalFingerprints(cj CritJSON) map[string]bool {
-	fps, _ := buildLocalFingerprintIndex(cj)
-	return fps
 }
 
 // buildLocalFingerprintIndex returns both the fingerprint set and a map from
@@ -528,14 +542,7 @@ func upsertShareToWeb(cfg CritJSON, files []shareFile, comments []shareComment, 
 	}
 	apiURL := u.Scheme + "://" + u.Host + "/api/reviews/" + token
 
-	fileList := make([]map[string]any, len(files))
-	for i, f := range files {
-		entry := map[string]any{"path": f.Path, "content": f.Content}
-		if f.Status != "" {
-			entry["status"] = f.Status
-		}
-		fileList[i] = entry
-	}
+	fileList := shareFileEntries(files)
 
 	payload := map[string]any{
 		"delete_token": cfg.DeleteToken,
@@ -590,23 +597,30 @@ func upsertShareToWeb(cfg CritJSON, files []shareFile, comments []shareComment, 
 	return result, nil
 }
 
-// loadExistingShareCfg returns the full CritJSON if a matching share exists (same file scope).
-func loadExistingShareCfg(critPath string, paths []string) (CritJSON, bool) {
-	data, err := os.ReadFile(critPath)
+// loadExistingShareCfg returns the full CritJSON if a matching share exists
+// (same file scope). The bool is true only when an existing share is found.
+// A missing review file is reported as (zero, false, nil) so callers can fall
+// back to creating a new share. Parse errors and other I/O errors are surfaced
+// so callers can refuse to clobber a corrupted file.
+func loadExistingShareCfg(critPath string, paths []string) (CritJSON, bool, error) {
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
-		return CritJSON{}, false
+		if errors.Is(err, fs.ErrNotExist) {
+			return CritJSON{}, false, nil
+		}
+		return CritJSON{}, false, fmt.Errorf("reading review file %q: %w", critPath, err)
 	}
 	var cj CritJSON
 	if err := json.Unmarshal(data, &cj); err != nil {
-		return CritJSON{}, false
+		return CritJSON{}, false, fmt.Errorf("parsing review file %q: %w", critPath, err)
 	}
 	if cj.ShareURL == "" {
-		return CritJSON{}, false
+		return CritJSON{}, false, nil
 	}
 	if cj.ShareScope != "" && cj.ShareScope != shareScope(paths) {
-		return CritJSON{}, false
+		return CritJSON{}, false, nil
 	}
-	return cj, true
+	return cj, true, nil
 }
 
 // buildLocalIDSet collects all local comment IDs across all files and review comments.
@@ -660,7 +674,7 @@ func highestWebIndex(cj CritJSON) int {
 // with HeadSHA + DiffScope=layer so they pass visibleInFocus in range view.
 // See spec §E "Write path — `mergeWebComments`".
 func mergeWebComments(critPath string, newComments []webComment, replyUpdates map[string][]webReply) error {
-	data, err := os.ReadFile(critPath)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		return err
 	}
@@ -676,7 +690,7 @@ func mergeWebComments(critPath string, newComments []webComment, replyUpdates ma
 	// even if earlier ones were deleted from the review file.
 	webCount := highestWebIndex(cj)
 
-	scope := resolvePullScope("", &cj)
+	scope := resolvePullScope(&cj)
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, wc := range newComments {
@@ -754,7 +768,7 @@ func mergeRepliesIntoComment(c Comment, webReplies []webReply) Comment {
 
 // updateShareState writes LastShareHash and ReviewRound back to the review file.
 func updateShareState(critPath string, hash string, reviewRound int) error {
-	data, err := os.ReadFile(critPath)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		return err
 	}
@@ -772,7 +786,7 @@ func updateShareState(critPath string, hash string, reviewRound int) error {
 // preserving any existing content.
 func persistShareState(critPath string, shareURL string, deleteToken string, scope string) error {
 	var cj CritJSON
-	if data, err := os.ReadFile(critPath); err == nil {
+	if data, err := readFileShared(reviewPathsFor(critPath).Review); err == nil {
 		_ = json.Unmarshal(data, &cj)
 	}
 	if cj.Files == nil {
@@ -790,7 +804,7 @@ func persistShareState(critPath string, shareURL string, deleteToken string, sco
 // hash from the review file. It is the single source of truth for "undo share
 // metadata" — used by both the unpublish CLI path and tests.
 func clearShareState(critPath string) error {
-	data, err := os.ReadFile(critPath)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		return nil //nolint:nilerr // no review file means nothing to clear
 	}
@@ -815,7 +829,7 @@ func loadShareConfig() Config {
 		cfgDir, _ = vcs.RepoRoot()
 	}
 	if cfgDir == "" {
-		cfgDir, _ = os.Getwd()
+		cfgDir = mustGetwd()
 	}
 	return LoadConfig(cfgDir)
 }

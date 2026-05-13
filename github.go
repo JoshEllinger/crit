@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +20,15 @@ import (
 	"sync"
 	"time"
 )
+
+// bodyHashAtPush returns a short stable digest of a comment body. We use
+// the first 16 hex chars (64 bits) of SHA-256 — collision risk is
+// negligible at single-PR scale (≤50 comments) and keeps review files
+// small for downstream agent consumption.
+func bodyHashAtPush(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:8]) // 8 bytes → 16 hex chars
+}
 
 // ghComment represents a GitHub PR review comment from the API.
 type ghComment struct {
@@ -34,6 +46,42 @@ type ghComment struct {
 	// see userNameCache.
 	CreatedAt   string `json:"created_at"`
 	InReplyToID int64  `json:"in_reply_to_id"`
+}
+
+// errGHAuthFailed signals that a `gh api` call returned HTTP 401. Callers
+// in the push loop check this with errors.Is to distinguish a token
+// rotation / expiration from generic transport failures: when it appears
+// the rest of the push must abort because every subsequent gh call would
+// fail the same way, and surface a clear "run gh auth refresh" message
+// instead of a vague per-request error spam.
+var errGHAuthFailed = errors.New("gh auth failed (HTTP 401)")
+
+// isGHAuthFailure reports whether `gh api` output (stdout+stderr or the
+// --include status block) indicates an HTTP 401. gh surfaces 401 in two
+// canonical line-anchored shapes: a stderr error line that begins with
+// "gh: HTTP 401" and the HTTP status line in the --include block that
+// begins with "HTTP/1.1 401" / "HTTP/2 401" / "HTTP/2.0 401".
+//
+// We deliberately do NOT match bare "HTTP 401" or "Bad credentials"
+// substrings: they false-trigger when an echoed request body or quoted
+// error text happens to mention either phrase (e.g. a comment body that
+// contains "got HTTP 401 from upstream"). Anchoring to line start keeps
+// detection tied to gh's own framing.
+func isGHAuthFailure(out []byte) bool {
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "gh: HTTP 401") {
+			return true
+		}
+		if strings.HasPrefix(line, "HTTP/1.1 401") ||
+			strings.HasPrefix(line, "HTTP/2 401") ||
+			strings.HasPrefix(line, "HTTP/2.0 401") {
+			return true
+		}
+	}
+	return false
 }
 
 // requireGH checks that the gh CLI is installed and authenticated.
@@ -366,6 +414,9 @@ func ensureSHAFetched(vcs VCS, sha, repoRoot, forkURL string) error {
 	if vcs.Name() == "sl" {
 		return ensureSHAFetchedSapling(vcs, sha, repoRoot, forkURL)
 	}
+	if vcs.Name() == "jj" {
+		return ensureSHAFetchedJJ(vcs, sha, repoRoot, forkURL)
+	}
 	if vcs.Name() != "git" {
 		return fmt.Errorf("commit %s not present locally (auto-fetch not supported for vcs=%q)", sha, vcs.Name())
 	}
@@ -385,6 +436,28 @@ func ensureSHAFetched(vcs VCS, sha, repoRoot, forkURL string) error {
 		return fmt.Errorf("commit %s not present locally; tried origin and fork %s — manual fetch required", sha, forkURL)
 	}
 	return fmt.Errorf("commit %s not present locally; manual fetch required (run `git fetch <remote> %s`)", sha, sha)
+}
+
+// ensureSHAFetchedJJ falls back to git fetch for colocated JJ/Git repos. Pure
+// JJ repos do not expose a stable command for fetching an arbitrary commit id
+// from an arbitrary URL, so range/PR focus reports a clear manual-fetch error.
+func ensureSHAFetchedJJ(vcs VCS, sha, repoRoot, forkURL string) error {
+	if hasGitDirAt(repoRoot) {
+		if err := tryGitFetch(repoRoot, "origin", sha); err == nil && vcs.HasObject(sha, repoRoot) {
+			return nil
+		}
+		if forkURL != "" {
+			if err := tryGitFetch(repoRoot, forkURL, sha); err == nil && vcs.HasObject(sha, repoRoot) {
+				return nil
+			}
+			return fmt.Errorf("commit %s not present locally; tried `git fetch origin %s` and `git fetch %s %s` for colocated JJ repo — manual fetch required", sha, sha, forkURL, sha)
+		}
+		return fmt.Errorf("commit %s not present locally; manual fetch required (run `git fetch <remote> %s` in the colocated JJ repo)", sha, sha)
+	}
+	if forkURL != "" {
+		return fmt.Errorf("commit %s not present locally; PR head is on fork %s. Pure JJ auto-fetch is not supported — fetch it manually and re-run", sha, forkURL)
+	}
+	return fmt.Errorf("commit %s not present locally; pure JJ auto-fetch is not supported — fetch it manually and re-run", sha)
 }
 
 // ensureSHAFetchedSapling tries `sl pull -r <sha>` first, then falls back to
@@ -550,6 +623,138 @@ func fetchPRCommentsWithoutSlurp(prNumber int) ([]ghComment, error) {
 	}
 }
 
+// fetchCurrentRepoOwnerName returns (owner, repo) for the current working
+// directory's GitHub repo via `gh repo view`. Used by GraphQL queries which,
+// unlike REST, don't honor the `{owner}/{repo}` placeholder substitution
+// that gh applies to REST endpoints.
+func fetchCurrentRepoOwnerName() (string, string, error) {
+	out, err := exec.Command("gh", "repo", "view", "--json", "owner,name").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("resolving current repo: %w", err)
+	}
+	var resp struct {
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return "", "", fmt.Errorf("parsing current repo: %w", err)
+	}
+	if resp.Owner.Login == "" || resp.Name == "" {
+		return "", "", fmt.Errorf("gh repo view returned empty owner/name: %s", string(out))
+	}
+	return resp.Owner.Login, resp.Name, nil
+}
+
+// fetchPRThreadResolved returns a map databaseID -> isResolved for every
+// review-thread comment on the PR, gathered from the reviewThreads GraphQL
+// edge. Threads carry the resolved bit only at the thread level, not on the
+// individual REST /pulls/{n}/comments rows — so this is the only path that
+// surfaces "reviewer clicked Resolve on github.com" to `crit pull`. See #453.
+//
+// Pagination: GitHub caps reviewThreads at 100 nodes and comments-per-thread
+// at 100. We page on the outer connection; very large discussions
+// (>100 threads or >100 replies in one thread) are still rare enough at
+// crit's scale that the inner cap is acceptable. If we ever hit it, the
+// merge logic degrades gracefully — only the unseen replies miss the
+// resolved bit, the root still gets it.
+func fetchPRThreadResolved(prNumber int) (map[int64]bool, error) {
+	owner, name, err := fetchCurrentRepoOwnerName()
+	if err != nil {
+		return nil, err
+	}
+	resolved := make(map[int64]bool)
+	cursor := ""
+	for {
+		page, nextCursor, err := fetchPRThreadResolvedPage(owner, name, prNumber, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for id, r := range page {
+			resolved[id] = r
+		}
+		if nextCursor == "" {
+			return resolved, nil
+		}
+		cursor = nextCursor
+	}
+}
+
+// graphqlThreadResp is the typed shape of the reviewThreads GraphQL response.
+type graphqlThreadResp struct {
+	Data struct {
+		Repository struct {
+			PullRequest struct {
+				ReviewThreads struct {
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+					Nodes []struct {
+						IsResolved bool `json:"isResolved"`
+						Comments   struct {
+							Nodes []struct {
+								DatabaseID int64 `json:"databaseId"`
+							} `json:"nodes"`
+						} `json:"comments"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	} `json:"data"`
+}
+
+// fetchPRThreadResolvedPage fetches one page of review threads and returns
+// (databaseID -> isResolved, nextCursor, error). nextCursor is "" when no
+// more pages are available.
+func fetchPRThreadResolvedPage(owner, name string, prNumber int, cursor string) (map[int64]bool, string, error) {
+	const query = `query($owner:String!,$name:String!,$pr:Int!,$after:String){
+  repository(owner:$owner, name:$name){
+    pullRequest(number:$pr){
+      reviewThreads(first:100, after:$after){
+        pageInfo{ hasNextPage endCursor }
+        nodes{
+          isResolved
+          comments(first:100){ nodes{ databaseId } }
+        }
+      }
+    }
+  }
+}`
+	args := []string{"api", "graphql",
+		"-f", "owner=" + owner,
+		"-f", "name=" + name,
+		"-F", fmt.Sprintf("pr=%d", prNumber),
+		"-f", "query=" + query,
+	}
+	if cursor != "" {
+		args = append(args, "-f", "after="+cursor)
+	}
+	out, err := exec.Command("gh", args...).Output()
+	if err != nil {
+		return nil, "", fmt.Errorf("fetching PR review threads: %w", err)
+	}
+	var resp graphqlThreadResp
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, "", fmt.Errorf("parsing PR review threads: %w", err)
+	}
+	page := make(map[int64]bool)
+	for _, n := range resp.Data.Repository.PullRequest.ReviewThreads.Nodes {
+		for _, c := range n.Comments.Nodes {
+			if c.DatabaseID == 0 {
+				continue
+			}
+			page[c.DatabaseID] = n.IsResolved
+		}
+	}
+	next := ""
+	if resp.Data.Repository.PullRequest.ReviewThreads.PageInfo.HasNextPage {
+		next = resp.Data.Repository.PullRequest.ReviewThreads.PageInfo.EndCursor
+	}
+	return page, next, nil
+}
+
 // isDuplicateGHComment checks if a GitHub comment already exists in the comment list.
 // If ghID is non-zero, matches by GitHubID. Otherwise falls back to author+lines+body.
 func isDuplicateGHComment(comments []Comment, ghID int64, author string, startLine, endLine int, body string) bool {
@@ -611,28 +816,74 @@ func separateRootsAndReplies(ghComments []ghComment) ([]ghComment, map[int64][]g
 }
 
 // appendNewGHReplies adds non-duplicate replies to an existing comment, returning how many were added.
-func appendNewGHReplies(comments []Comment, ci int, childReplies []ghComment, names userNameCache) int {
+// Replies whose GitHubID is in pendingDeletes are skipped — the user has
+// already deleted them locally and the next push will issue DELETE; importing
+// them now would resurrect the row under a fresh ID and mask the pending intent.
+func appendNewGHReplies(comments []Comment, ci int, childReplies []ghComment, names userNameCache, pendingDeletes map[int64]bool) int {
 	added := 0
 	for _, r := range childReplies {
 		if isDuplicateGHReply(comments[ci].Replies, r.ID) {
 			continue
 		}
+		if pendingDeletes[r.ID] {
+			continue
+		}
 		comments[ci].Replies = append(comments[ci].Replies, Reply{
-			ID:        randomReplyID(),
-			Body:      r.Body,
-			Author:    names.lookup(r.User.Login),
-			CreatedAt: r.CreatedAt,
-			GitHubID:  r.ID,
+			ID:                 randomReplyID(),
+			Body:               r.Body,
+			Author:             names.lookup(r.User.Login),
+			CreatedAt:          r.CreatedAt,
+			GitHubID:           r.ID,
+			LastPushedBodyHash: bodyHashAtPush(r.Body),
 		})
 		added++
 	}
 	return added
 }
 
+// updateDuplicateRoot applies thread-resolved updates and merges new replies
+// onto a root comment that already exists locally (matched by GitHubID).
+// Returns the number of meaningful changes (new replies + at most one for a
+// resolution flip) so runPull's added==0 short-circuit correctly persists.
+func updateDuplicateRoot(
+	cj *CritJSON, cf *CritJSONFile, gc ghComment, replyMap map[int64][]ghComment,
+	names userNameCache, pendingDeletes map[int64]bool,
+	hasRemote, remoteResolved bool, now string,
+) int {
+	added := 0
+	for ci, c := range cf.Comments {
+		if c.GitHubID != gc.ID {
+			continue
+		}
+		if hasRemote && remoteResolved && !c.Resolved {
+			cf.Comments[ci].Resolved = true
+			cf.Comments[ci].ResolvedRound = cj.ReviewRound
+			cf.Comments[ci].UpdatedAt = now
+			added++
+		}
+		if childReplies, hasReplies := replyMap[gc.ID]; hasReplies {
+			added += appendNewGHReplies(cf.Comments, ci, childReplies, names, pendingDeletes)
+		}
+		break
+	}
+	return added
+}
+
 // mergeRootComment handles a single root ghComment: either deduplicates or creates it.
 // scope stamps the imported comment's HeadSHA + DiffScope when called from a range-mode
-// pull. Empty scope leaves the legacy working-tree fields unset.
-func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment, now string, names userNameCache, scope inheritedScope) int {
+// pull. Empty scope leaves the legacy working-tree fields unset. threadResolved
+// is the databaseID -> isResolved map from the reviewThreads GraphQL edge;
+// when present, the root's Resolved bit is updated asymmetrically:
+//
+//   - Remote resolved + local unresolved -> set Resolved=true, ResolvedRound=cj.ReviewRound
+//   - Remote unresolved + local resolved -> KEEP local resolved (don't clobber)
+//   - Both same -> no-op
+//
+// The asymmetry mirrors the existing pull semantics for Body (dedup matches
+// existing comments and never overwrites local edits): a local user may have
+// resolved a thread via crit / crit-web independently of github.com, and
+// `crit pull` should not undo that.
+func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment, now string, names userNameCache, scope inheritedScope, pendingDeletes map[int64]bool, threadResolved map[int64]bool) int {
 	cf, ok := cj.Files[gc.Path]
 	if !ok {
 		cf = CritJSONFile{Status: "modified", Comments: []Comment{}}
@@ -645,17 +896,18 @@ func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment
 
 	authorName := names.lookup(gc.User.Login)
 
+	// Pending-delete-locally takes priority over import: the user has signaled
+	// intent to DELETE this remote comment on the next push. Re-importing
+	// would resurrect it under a fresh local ID and mask the pending intent.
+	if pendingDeletes[gc.ID] {
+		return 0
+	}
+
+	remoteResolved, hasRemote := threadResolvedForRoot(gc.ID, replyMap[gc.ID], threadResolved)
+
 	if isDuplicateGHComment(cf.Comments, gc.ID, authorName, startLine, gc.Line, gc.Body) {
-		added := 0
-		if childReplies, hasReplies := replyMap[gc.ID]; hasReplies {
-			for ci, c := range cf.Comments {
-				if c.GitHubID == gc.ID {
-					added = appendNewGHReplies(cf.Comments, ci, childReplies, names)
-					break
-				}
-			}
-			cj.Files[gc.Path] = cf
-		}
+		added := updateDuplicateRoot(cj, &cf, gc, replyMap, names, pendingDeletes, hasRemote, remoteResolved, now)
+		cj.Files[gc.Path] = cf
 		return added
 	}
 
@@ -663,18 +915,26 @@ func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment
 	comment := stampWithFocus(Comment{
 		ID: commentID, StartLine: startLine, EndLine: gc.Line,
 		Body: gc.Body, Author: authorName, CreatedAt: gc.CreatedAt,
-		UpdatedAt: now, GitHubID: gc.ID,
+		UpdatedAt: now, GitHubID: gc.ID, LastPushedBodyHash: bodyHashAtPush(gc.Body),
 	}, scope.asFocus())
+	if hasRemote && remoteResolved {
+		comment.Resolved = true
+		comment.ResolvedRound = cj.ReviewRound
+	}
 
 	added := 0
 	if childReplies, hasReplies := replyMap[gc.ID]; hasReplies {
 		for _, r := range childReplies {
+			if pendingDeletes[r.ID] {
+				continue
+			}
 			comment.Replies = append(comment.Replies, Reply{
-				ID:        randomReplyID(),
-				Body:      r.Body,
-				Author:    names.lookup(r.User.Login),
-				CreatedAt: r.CreatedAt,
-				GitHubID:  r.ID,
+				ID:                 randomReplyID(),
+				Body:               r.Body,
+				Author:             names.lookup(r.User.Login),
+				CreatedAt:          r.CreatedAt,
+				GitHubID:           r.ID,
+				LastPushedBodyHash: bodyHashAtPush(r.Body),
 			})
 			added++
 		}
@@ -686,7 +946,7 @@ func mergeRootComment(cj *CritJSON, gc ghComment, replyMap map[int64][]ghComment
 }
 
 // mergeOrphanReplies processes replies whose parent was already in cj from a previous pull.
-func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]ghComment, names userNameCache) int {
+func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]ghComment, names userNameCache, pendingDeletes map[int64]bool) int {
 	rootIDs := make(map[int64]struct{}, len(roots))
 	for _, gc := range roots {
 		rootIDs[gc.ID] = struct{}{}
@@ -702,7 +962,7 @@ func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]gh
 			continue
 		}
 		cf := cj.Files[filePath]
-		added += appendNewGHReplies(cf.Comments, ci, childReplies, names)
+		added += appendNewGHReplies(cf.Comments, ci, childReplies, names, pendingDeletes)
 		cj.Files[filePath] = cf
 	}
 	return added
@@ -713,14 +973,16 @@ func mergeOrphanReplies(cj *CritJSON, roots []ghComment, replyMap map[int64][]gh
 // Handles threading: root comments become top-level Comments, replies become Reply entries.
 // Deduplicates by GitHubID (preferred) or author+lines+body to prevent duplicates from repeated pulls.
 func mergeGHComments(cj *CritJSON, ghComments []ghComment) int {
-	return mergeGHCommentsScoped(cj, ghComments, inheritedScope{})
+	return mergeGHCommentsScoped(cj, ghComments, inheritedScope{}, nil)
 }
 
 // mergeGHCommentsScoped is mergeGHComments with optional HeadSHA + DiffScope
 // stamping for range-mode pulls. scope.DiffScope == "" matches legacy
-// working-tree behavior. See spec §E "Write path — `crit pull` import path".
-func mergeGHCommentsScoped(cj *CritJSON, ghComments []ghComment, scope inheritedScope) int {
-	return mergeGHCommentsWithNames(cj, ghComments, make(userNameCache), scope)
+// working-tree behavior. threadResolved (databaseID -> isResolved) is
+// applied to root comments to mirror github.com thread-resolution state.
+// See spec §E "Write path — `crit pull` import path".
+func mergeGHCommentsScoped(cj *CritJSON, ghComments []ghComment, scope inheritedScope, threadResolved map[int64]bool) int {
+	return mergeGHCommentsWithNames(cj, ghComments, make(userNameCache), scope, threadResolved)
 }
 
 // mergeGHCommentsWithNames is the form of mergeGHComments that lets callers
@@ -728,122 +990,49 @@ func mergeGHCommentsScoped(cj *CritJSON, ghComments []ghComment, scope inherited
 // cache, lazy /users/{login} lookups). Tests can pre-populate to assert on
 // resolved display names without going to the network. scope stamps
 // HeadSHA + DiffScope on newly imported root comments (no-op when empty).
-func mergeGHCommentsWithNames(cj *CritJSON, ghComments []ghComment, names userNameCache, scope inheritedScope) int {
+// threadResolved propagates the thread-level isResolved bit from the
+// GraphQL reviewThreads edge onto the local root comment's Resolved /
+// ResolvedRound — see threadResolvedForRoot for the asymmetric merge.
+func mergeGHCommentsWithNames(cj *CritJSON, ghComments []ghComment, names userNameCache, scope inheritedScope, threadResolved map[int64]bool) int {
 	now := time.Now().UTC().Format(time.RFC3339)
 	cj.UpdatedAt = now
 
 	roots, replyMap := separateRootsAndReplies(ghComments)
 
+	pendingDeletes := make(map[int64]bool, len(cj.PendingGitHubDeletes))
+	for _, id := range cj.PendingGitHubDeletes {
+		pendingDeletes[id] = true
+	}
+
 	added := 0
 	for _, gc := range roots {
-		added += mergeRootComment(cj, gc, replyMap, now, names, scope)
+		added += mergeRootComment(cj, gc, replyMap, now, names, scope, pendingDeletes, threadResolved)
 	}
-	added += mergeOrphanReplies(cj, roots, replyMap, names)
+	added += mergeOrphanReplies(cj, roots, replyMap, names, pendingDeletes)
 
 	return added
 }
 
-// resolveReviewPath returns the full path to the review file for the current context.
-// Resolution order:
-//  1. If outputDir is set, return outputDir/.crit.json (explicit override)
-//  2. Check daemon registry for running sessions matching this cwd
-//  3. If one daemon matches, use its ReviewPath
-//  4. If multiple daemons match, use the one matching current branch
-//  5. If no daemon found, compute the centralized path: ~/.crit/reviews/<key>.json
-func resolveReviewPath(outputDir string) (string, error) {
-	if outputDir != "" {
-		abs, err := filepath.Abs(outputDir)
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(abs, ".crit.json"), nil
+// threadResolvedForRoot returns the resolved state to apply to a root
+// comment given the thread map. A thread carries one isResolved bit shared
+// across the root and every reply; this looks the bit up via the root's
+// own databaseID first, falling back to any reply's databaseID for the
+// same thread. Returns (resolved, present): present is false when neither
+// the root nor any reply appears in the map (e.g. comment is not part of
+// a tracked review thread, or the GraphQL fetch was skipped).
+func threadResolvedForRoot(rootID int64, replies []ghComment, threadResolved map[int64]bool) (bool, bool) {
+	if threadResolved == nil {
+		return false, false
 	}
-
-	cwd, err := resolvedCWD()
-	if err != nil {
-		return "", err
+	if r, ok := threadResolved[rootID]; ok {
+		return r, true
 	}
-
-	if path := resolveReviewPathFromDaemon(cwd); path != "" {
-		return path, nil
-	}
-
-	// No daemon — compute centralized path.
-	branch := ""
-	if vcs := DetectVCS(""); vcs != nil {
-		branch = vcs.CurrentBranch()
-	}
-	key := sessionKey(cwd, branch, nil)
-	path, err := reviewFilePath(key)
-	if err != nil {
-		return "", err
-	}
-
-	return path, nil
-}
-
-// resolveReviewPathFromDaemon checks the daemon registry for a running session
-// and returns its review path. Tries exact CWD match first, then falls back to
-// matching by git repo root (handles subdirectory mismatch — e.g. daemon started
-// from repo/api but crit comment run from repo/).
-func resolveReviewPathFromDaemon(cwd string) string {
-	sessions, _ := listSessionsForCWD(cwd)
-	if path := pickReviewPath(sessions); path != "" {
-		return path
-	}
-
-	// Fallback: match by VCS repo root.
-	if len(sessions) == 0 {
-		vcs := DetectVCS("")
-		if vcs == nil {
-			return ""
-		}
-		if repoRoot, err := vcs.RepoRoot(); err == nil && repoRoot != cwd {
-			repoSessions, _ := listSessionsForRepoRoot(repoRoot)
-			if path := pickReviewPath(repoSessions); path != "" {
-				return path
-			}
+	for _, rc := range replies {
+		if r, ok := threadResolved[rc.ID]; ok {
+			return r, true
 		}
 	}
-	return ""
-}
-
-// pickReviewPath selects a review path from a list of sessions.
-// Returns the path if exactly one session has one, or defers to branch matching for multiple.
-func pickReviewPath(sessions []sessionEntry) string {
-	if len(sessions) == 1 && sessions[0].ReviewPath != "" {
-		return sessions[0].ReviewPath
-	}
-	if len(sessions) > 1 {
-		return resolveReviewPathFromSessions(sessions)
-	}
-	return ""
-}
-
-// resolveReviewPathFromSessions picks the best ReviewPath from multiple daemon sessions.
-// Tries current branch first, then falls back to the first session with a ReviewPath.
-func resolveReviewPathFromSessions(sessions []sessionEntry) string {
-	branch := CurrentBranch()
-	for _, s := range sessions {
-		if s.Branch == branch && s.ReviewPath != "" {
-			return s.ReviewPath
-		}
-	}
-	for _, s := range sessions {
-		if s.ReviewPath != "" {
-			return s.ReviewPath
-		}
-	}
-	return ""
-}
-
-// writeCritJSON resolves the review path and writes a CritJSON via saveCritJSON.
-func writeCritJSON(cj CritJSON, outputDir string) error {
-	path, err := resolveReviewPath(outputDir)
-	if err != nil {
-		return err
-	}
-	return saveCritJSON(path, cj)
+	return false, false
 }
 
 // ghReplyForPush represents a reply that needs to be posted to GitHub.
@@ -854,7 +1043,13 @@ type ghReplyForPush struct {
 
 // collectNewRepliesForPush finds replies that haven't been pushed to GitHub yet.
 // A reply needs pushing if its GitHubID is 0 (local-only) and its parent Comment has a GitHubID (on GitHub).
-func collectNewRepliesForPush(cf CritJSONFile) []ghReplyForPush {
+//
+// rewrite handles image markdown in reply bodies — see bucketsToGHComments.
+// nil falls back to the strip rewriter.
+func collectNewRepliesForPush(cf CritJSONFile, rewrite bodyRewriter) []ghReplyForPush {
+	if rewrite == nil {
+		rewrite = stripBodyRewriter
+	}
 	var replies []ghReplyForPush
 	for _, c := range cf.Comments {
 		if c.GitHubID == 0 {
@@ -864,12 +1059,140 @@ func collectNewRepliesForPush(cf CritJSONFile) []ghReplyForPush {
 			if r.GitHubID == 0 {
 				replies = append(replies, ghReplyForPush{
 					ParentGHID: c.GitHubID,
-					Body:       r.Body,
+					Body:       rewrite(r.Body),
 				})
 			}
 		}
 	}
 	return replies
+}
+
+// ghEditForPush represents one already-pushed comment or reply whose local
+// body has diverged from its recorded push-time hash and therefore needs a
+// PATCH.
+//
+// Path is empty for replies (replies are addressed by GitHubID alone in the
+// GitHub API). For comments it carries the file path so the review file can
+// be updated by location after a successful PATCH.
+type ghEditForPush struct {
+	GitHubID int64
+	Path     string // file path for root comments; empty for replies
+	Body     string
+	IsReply  bool
+}
+
+// collectEditedForPush returns root comments and replies whose local Body
+// differs from the digest recorded at the last push and therefore need a
+// PATCH.
+//
+// A record with GitHubID != 0 and empty LastPushedBodyHash is enqueued: the
+// remote ID exists but we never recorded what we pushed, so the local body
+// is canonical and should be PATCHed up. After a successful PATCH the hash
+// is stamped, future pushes are no-ops.
+//
+// Resolved comments are skipped (they're not pushable in the new-comment
+// path either; consistent treatment for edits).
+func collectEditedForPush(cj CritJSON) []ghEditForPush {
+	var out []ghEditForPush
+	paths := make([]string, 0, len(cj.Files))
+	for p := range cj.Files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		cf := cj.Files[path]
+		for _, c := range cf.Comments {
+			if c.Resolved {
+				continue
+			}
+			if c.GitHubID != 0 && c.LastPushedBodyHash != bodyHashAtPush(c.Body) {
+				out = append(out, ghEditForPush{
+					GitHubID: c.GitHubID,
+					Path:     path,
+					Body:     c.Body,
+				})
+			}
+			for _, r := range c.Replies {
+				if r.GitHubID != 0 && r.LastPushedBodyHash != bodyHashAtPush(r.Body) {
+					out = append(out, ghEditForPush{
+						GitHubID: r.GitHubID,
+						Body:     r.Body,
+						IsReply:  true,
+					})
+				}
+			}
+		}
+	}
+	return out
+}
+
+// patchGHComment edits the body of an existing PR review comment via the
+// GitHub API. Works for both root comments and replies — they share the same
+// /pulls/comments/{id} endpoint.
+func patchGHComment(ghID int64, body string) error {
+	payload, err := json.Marshal(map[string]any{"body": body})
+	if err != nil {
+		return fmt.Errorf("marshal patch: %w", err)
+	}
+	cmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/comments/%d", ghID),
+		"--method", "PATCH",
+		"--input", "-",
+	)
+	cmd.Stdin = bytes.NewReader(payload)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if isGHAuthFailure(output) {
+			return fmt.Errorf("gh api patch: %s: %w", strings.TrimSpace(string(output)), errGHAuthFailed)
+		}
+		return fmt.Errorf("gh api patch: %s: %w", string(output), err)
+	}
+	return nil
+}
+
+// updateCritJSONWithEditedBodies stamps LastPushedBodyHash on records that
+// were successfully PATCHed in this push. edited is the slice that was queued
+// for PATCH; succeeded is the subset whose PATCH returned cleanly.
+//
+// Match key for both roots and replies is the GitHubID — it's stable and
+// unique across the review file.
+func updateCritJSONWithEditedBodies(critPath string, succeeded []ghEditForPush) error {
+	if len(succeeded) == 0 {
+		return nil
+	}
+	successByID := make(map[int64]string, len(succeeded))
+	for _, e := range succeeded {
+		successByID[e.GitHubID] = e.Body
+	}
+
+	data, err := readFileShared(critPath)
+	if err != nil {
+		return err
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		return err
+	}
+	for path, cf := range cj.Files {
+		for i, c := range cf.Comments {
+			if body, ok := successByID[c.GitHubID]; ok && c.GitHubID != 0 {
+				cf.Comments[i].Body = body
+				cf.Comments[i].LastPushedBodyHash = bodyHashAtPush(body)
+			}
+			for j, r := range c.Replies {
+				if body, ok := successByID[r.GitHubID]; ok && r.GitHubID != 0 {
+					cf.Comments[i].Replies[j].Body = body
+					cf.Comments[i].Replies[j].LastPushedBodyHash = bodyHashAtPush(body)
+				}
+			}
+		}
+		cj.Files[path] = cf
+	}
+	out, err := json.MarshalIndent(cj, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(critPath, append(out, '\n'), 0644)
 }
 
 // postGHReply posts a reply to an existing GitHub PR review comment.
@@ -890,6 +1213,9 @@ func postGHReply(prNumber int, parentGHID int64, body string) (int64, error) {
 	cmd.Stdin = bytes.NewReader(payload)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if isGHAuthFailure(output) {
+			return 0, fmt.Errorf("gh api: %s: %w", strings.TrimSpace(string(output)), errGHAuthFailed)
+		}
 		return 0, fmt.Errorf("gh api: %s: %w", string(output), err)
 	}
 	var resp struct {
@@ -917,7 +1243,7 @@ func critJSONToGHComments(cj CritJSON) []map[string]any {
 				"path": path,
 				"line": c.EndLine,
 				"side": "RIGHT",
-				"body": c.Body,
+				"body": stripBodyRewriter(c.Body),
 			}
 			if c.StartLine != c.EndLine {
 				comment["start_line"] = c.StartLine
@@ -976,6 +1302,10 @@ func createGHReview(prNumber int, comments []map[string]any, message string, eve
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		combined := append(append([]byte{}, stdout.Bytes()...), stderr.Bytes()...)
+		if isGHAuthFailure(combined) {
+			return nil, fmt.Errorf("creating review: %s: %w", strings.TrimSpace(stderr.String()), errGHAuthFailed)
+		}
 		if stderr.Len() > 0 {
 			return nil, fmt.Errorf("creating review: %s", strings.TrimSpace(stderr.String()))
 		}
@@ -1026,7 +1356,7 @@ type replyKey struct {
 // commentIDs maps "path:endLine" -> GitHubID for root comments.
 // replyIDs maps replyKey -> GitHubID for replies.
 func updateCritJSONWithGitHubIDs(critPath string, commentIDs map[string]int64, replyIDs map[replyKey]int64) error {
-	data, err := os.ReadFile(critPath)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		return err
 	}
@@ -1041,6 +1371,7 @@ func updateCritJSONWithGitHubIDs(critPath string, commentIDs map[string]int64, r
 				key := fmt.Sprintf("%s:%d", path, c.EndLine)
 				if id, ok := commentIDs[key]; ok {
 					cf.Comments[i].GitHubID = id
+					cf.Comments[i].LastPushedBodyHash = bodyHashAtPush(cf.Comments[i].Body)
 				}
 			}
 			for j, r := range c.Replies {
@@ -1048,6 +1379,7 @@ func updateCritJSONWithGitHubIDs(critPath string, commentIDs map[string]int64, r
 					rk := replyKey{ParentGHID: cf.Comments[i].GitHubID, BodyPrefix: truncateStr(r.Body, 60)}
 					if id, ok := replyIDs[rk]; ok {
 						cf.Comments[i].Replies[j].GitHubID = id
+						cf.Comments[i].Replies[j].LastPushedBodyHash = bodyHashAtPush(cf.Comments[i].Replies[j].Body)
 					}
 				}
 			}
@@ -1059,7 +1391,113 @@ func updateCritJSONWithGitHubIDs(critPath string, commentIDs map[string]int64, r
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(critPath, append(out, '\n'), 0644)
+	return atomicWriteFile(reviewPathsFor(critPath).Review, append(out, '\n'), 0644)
+}
+
+// collectDeletesForPush returns the snapshot of pending GitHub DELETE
+// intents recorded against this review file. The returned slice is a copy
+// so the caller can safely mutate or iterate while updating cj concurrently.
+func collectDeletesForPush(cj CritJSON) []int64 {
+	if len(cj.PendingGitHubDeletes) == 0 {
+		return nil
+	}
+	out := make([]int64, len(cj.PendingGitHubDeletes))
+	copy(out, cj.PendingGitHubDeletes)
+	return out
+}
+
+// deleteGHComment issues DELETE on a GitHub PR review comment. The endpoint
+// works for both root comments and replies — they share /pulls/comments/{id}.
+//
+// Returns the HTTP status code and an error. A 200 (or 204) is success;
+// 404 is treated as success by the caller (the remote comment is already
+// gone). 403 means the authenticated user is not the author and GitHub
+// won't let us delete; the caller drops the tombstone anyway because
+// retrying is futile.
+func deleteGHComment(ghID int64) (int, error) {
+	// `gh api --include` writes the response headers (incl. status line) to
+	// stdout so we can extract the status. On non-2xx gh exits non-zero, so
+	// we read CombinedOutput and parse regardless.
+	cmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/comments/%d", ghID),
+		"--method", "DELETE",
+		"--include",
+	)
+	output, runErr := cmd.CombinedOutput()
+	status := parseGHIncludeStatus(output)
+	if status >= 200 && status < 300 {
+		return status, nil
+	}
+	if status == 404 || status == 403 {
+		// Caller decides how to handle these; surface the status without
+		// treating the gh non-zero exit as a fatal error.
+		return status, nil
+	}
+	if status == 401 || isGHAuthFailure(output) {
+		return status, fmt.Errorf("gh api delete: %s: %w", strings.TrimSpace(string(output)), errGHAuthFailed)
+	}
+	if runErr != nil {
+		return status, fmt.Errorf("gh api delete: %s: %w", strings.TrimSpace(string(output)), runErr)
+	}
+	return status, fmt.Errorf("gh api delete: unexpected status %d: %s", status, strings.TrimSpace(string(output)))
+}
+
+// parseGHIncludeStatus extracts the HTTP status code from `gh api --include`
+// output. The first line is "HTTP/2 204" or similar. Returns 0 if it can't
+// be parsed.
+func parseGHIncludeStatus(out []byte) int {
+	line := string(out)
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	fields := strings.Fields(line)
+	for _, f := range fields {
+		if n, err := strconv.Atoi(f); err == nil && n >= 100 && n < 600 {
+			return n
+		}
+	}
+	return 0
+}
+
+// updateCritJSONAfterDeletes removes drained GitHub IDs from
+// PendingGitHubDeletes on disk. IDs not in `drained` (DELETE failed or was
+// not attempted) remain in the list so the next push retries them.
+func updateCritJSONAfterDeletes(critPath string, drained []int64) error {
+	if len(drained) == 0 {
+		return nil
+	}
+	drainedSet := make(map[int64]struct{}, len(drained))
+	for _, id := range drained {
+		drainedSet[id] = struct{}{}
+	}
+
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
+	if err != nil {
+		return err
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		return err
+	}
+
+	kept := make([]int64, 0, len(cj.PendingGitHubDeletes))
+	for _, id := range cj.PendingGitHubDeletes {
+		if _, drained := drainedSet[id]; drained {
+			continue
+		}
+		kept = append(kept, id)
+	}
+	if len(kept) == 0 {
+		cj.PendingGitHubDeletes = nil
+	} else {
+		cj.PendingGitHubDeletes = kept
+	}
+
+	out, err := json.MarshalIndent(cj, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(reviewPathsFor(critPath).Review, append(out, '\n'), 0644)
 }
 
 // truncateStr returns the first n runes of s, or all of s if shorter.
@@ -1069,706 +1507,4 @@ func truncateStr(s string, n int) string {
 		return s
 	}
 	return string(r[:n])
-}
-
-// loadCritJSON reads the review file from disk, or returns a fresh CritJSON if the file doesn't exist.
-func loadCritJSON(critPath string) (CritJSON, error) {
-	var cj CritJSON
-	if data, err := os.ReadFile(critPath); err == nil {
-		if err := json.Unmarshal(data, &cj); err != nil {
-			return cj, fmt.Errorf("invalid existing review file: %w", err)
-		}
-	} else if os.IsNotExist(err) {
-		branch := CurrentBranch()
-		cfg := LoadConfig(filepath.Dir(critPath))
-		base := cfg.BaseBranch
-		if base == "" {
-			base = defaultBaseRef()
-		}
-		baseRef, _ := MergeBase(base)
-		cj = CritJSON{
-			Branch:      branch,
-			BaseRef:     baseRef,
-			ReviewRound: 1,
-			Files:       make(map[string]CritJSONFile),
-		}
-	} else {
-		return cj, fmt.Errorf("reading review file: %w", err)
-	}
-	return cj, nil
-}
-
-// saveCritJSON writes the CritJSON struct to disk with pretty-printed JSON
-// and a trailing newline. Uses atomic writes to prevent corruption.
-func saveCritJSON(critPath string, cj CritJSON) error {
-	data, err := json.MarshalIndent(cj, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling review file: %w", err)
-	}
-	// Ensure parent directory exists (centralized path may not exist yet).
-	if err := os.MkdirAll(filepath.Dir(critPath), 0700); err != nil {
-		return fmt.Errorf("creating review directory: %w", err)
-	}
-	return atomicWriteFile(critPath, append(data, '\n'), 0644)
-}
-
-// appendComment adds a comment to the CritJSON struct in memory. Does not write to disk.
-// Defers to appendCommentScoped with no scope inheritance.
-func appendComment(cj *CritJSON, filePath string, startLine, endLine int, body, author, userID string) {
-	appendCommentScoped(cj, filePath, startLine, endLine, body, author, userID, inheritedScope{})
-}
-
-// appendCommentScoped is appendComment with HeadSHA / DiffScope stamping.
-// scope.DiffScope == "" produces today's working-tree behavior.
-func appendCommentScoped(cj *CritJSON, filePath string, startLine, endLine int, body, author, userID string, scope inheritedScope) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	cj.UpdatedAt = now
-
-	cf, ok := cj.Files[filePath]
-	if !ok {
-		cf = CritJSONFile{
-			Status:   "modified",
-			Comments: []Comment{},
-		}
-	}
-
-	// Populate anchor from the file on disk.
-	anchor := readAnchorFromDisk(filePath, startLine, endLine)
-
-	c := stampWithFocus(Comment{
-		ID:        randomCommentID(),
-		StartLine: startLine,
-		EndLine:   endLine,
-		Body:      body,
-		Anchor:    anchor,
-		Author:    author,
-		UserID:    userID,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}, scope.asFocus())
-	cf.Comments = append(cf.Comments, c)
-	cj.Files[filePath] = cf
-}
-
-// readAnchorFromDisk reads the file from disk and extracts lines startLine..endLine
-// as the anchor text. Returns empty string on any error or if the file is not found.
-func readAnchorFromDisk(filePath string, startLine, endLine int) string {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return ""
-	}
-	return extractAnchor(string(data), startLine, endLine)
-}
-
-// appendReply adds a reply to an existing comment in the CritJSON struct in memory.
-// Returns an error if the comment ID is not found or is ambiguous across files.
-// Searches both file comments and review_comments.
-func appendReply(cj *CritJSON, commentID, body, author, userID string, resolve bool, filterPath string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	cj.UpdatedAt = now
-
-	// Check all review comments (not just those starting with "r" — web-fetched ones use "web-N").
-	for i, c := range cj.ReviewComments {
-		if c.ID == commentID {
-			reply := Reply{
-				ID:        randomReplyID(),
-				Body:      body,
-				Author:    author,
-				UserID:    userID,
-				CreatedAt: now,
-			}
-			cj.ReviewComments[i].Replies = append(cj.ReviewComments[i].Replies, reply)
-			cj.ReviewComments[i].UpdatedAt = now
-			if resolve {
-				cj.ReviewComments[i].Resolved = true
-			}
-			return nil
-		}
-	}
-
-	// Search file comments
-	var found bool
-	var foundPaths []string
-	for filePath, cf := range cj.Files {
-		if filterPath != "" && filePath != filterPath {
-			continue
-		}
-		for i, c := range cf.Comments {
-			if c.ID == commentID {
-				foundPaths = append(foundPaths, filePath)
-				if !found {
-					found = true
-					reply := Reply{
-						ID:        randomReplyID(),
-						Body:      body,
-						Author:    author,
-						UserID:    userID,
-						CreatedAt: now,
-					}
-					cf.Comments[i].Replies = append(cf.Comments[i].Replies, reply)
-					cf.Comments[i].UpdatedAt = now
-					if resolve {
-						cf.Comments[i].Resolved = true
-					}
-					cj.Files[filePath] = cf
-				}
-			}
-		}
-	}
-
-	if len(foundPaths) > 1 {
-		return fmt.Errorf("comment %q found in multiple files (%s); use --path <file> to disambiguate",
-			commentID, strings.Join(foundPaths, ", "))
-	}
-	if !found {
-		if filterPath != "" {
-			return fmt.Errorf("comment %q not found in file %q in review file", commentID, filterPath)
-		}
-		return fmt.Errorf("comment %q not found in review file", commentID)
-	}
-	return nil
-}
-
-// addCommentToCritJSON appends a comment to the review file for the given file and line range.
-// Creates the review file if it doesn't exist. Appends to existing comments if it does.
-// Works in both git repos and plain directories (file mode).
-// outputDir overrides the default location (repo root or CWD) when non-empty.
-// userID is documented to support callers that pass an authenticated user; tests
-// pass "" because they don't need that path. The lint exception keeps the signature
-// stable for the API.
-//
-//nolint:unparam // userID is part of the public contract; tests don't exercise it
-func addCommentToCritJSON(filePath string, startLine, endLine int, body string, author, userID string, outputDir string) error {
-	return addCommentToCritJSONScoped(filePath, startLine, endLine, body, author, userID, outputDir, inheritedScope{})
-}
-
-// addCommentToCritJSONScoped is addCommentToCritJSON with scope stamping.
-func addCommentToCritJSONScoped(filePath string, startLine, endLine int, body, author, userID, outputDir string, scope inheritedScope) error {
-	critPath, err := resolveReviewPath(outputDir)
-	if err != nil {
-		return err
-	}
-
-	cleaned := filepath.Clean(filePath)
-	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
-		return fmt.Errorf("path %q must be relative and within the repository", filePath)
-	}
-
-	cj, err := loadCritJSON(critPath)
-	if err != nil {
-		return err
-	}
-
-	appendCommentScoped(&cj, cleaned, startLine, endLine, body, author, userID, scope)
-	return saveCritJSON(critPath, cj)
-}
-
-// addReplyToCritJSON adds a reply to an existing comment in the review file.
-// It searches all files for the comment ID. If resolve is true, it also marks the comment as resolved.
-func addReplyToCritJSON(commentID, body, author, userID string, resolve bool, outputDir string, filterPath string) error {
-	critPath, err := resolveReviewPath(outputDir)
-	if err != nil {
-		return err
-	}
-
-	cj, err := loadCritJSON(critPath)
-	if err != nil {
-		return err
-	}
-
-	if err := appendReply(&cj, commentID, body, author, userID, resolve, filterPath); err != nil {
-		// Only fall back to scanning when the comment genuinely wasn't found.
-		// Don't fall back for ambiguity errors ("found in multiple files").
-		if strings.Contains(err.Error(), "not found") {
-			if altPath, err2 := findReviewFileByCommentID(commentID, critPath); err2 == nil {
-				altCJ, loadErr := loadCritJSON(altPath)
-				if loadErr != nil {
-					return err // return original error
-				}
-				if replyErr := appendReply(&altCJ, commentID, body, author, userID, resolve, filterPath); replyErr != nil {
-					return err // return original error
-				}
-				fmt.Fprintf(os.Stderr, "Note: comment %s found in %s (not the resolved review file)\n", commentID, filepath.Base(altPath))
-				return saveCritJSON(altPath, altCJ)
-			}
-		}
-		return err
-	}
-	return saveCritJSON(critPath, cj)
-}
-
-// findReviewFileByCommentID scans all review files in ~/.crit/reviews/ for the given
-// comment ID, skipping excludePath. Returns the path if found in exactly one file.
-func findReviewFileByCommentID(commentID string, excludePath string) (string, error) {
-	dir, err := reviewsDir()
-	if err != nil {
-		return "", err
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("comment %q not found in any review file", commentID)
-		}
-		return "", err
-	}
-
-	var matchPath string
-	for _, de := range entries {
-		if !strings.HasSuffix(de.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(dir, de.Name())
-		if path == excludePath {
-			continue
-		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			continue
-		}
-		if reviewFileContainsComment(data, commentID) {
-			if matchPath != "" {
-				return "", fmt.Errorf("comment %q found in multiple review files", commentID)
-			}
-			matchPath = path
-		}
-	}
-	if matchPath == "" {
-		return "", fmt.Errorf("comment %q not found in any review file", commentID)
-	}
-	return matchPath, nil
-}
-
-// reviewFileContainsComment does a quick check if a review JSON file contains
-// a comment with the given ID. Uses string search first as a fast path to
-// avoid parsing files that definitely don't contain the ID.
-func reviewFileContainsComment(data []byte, commentID string) bool {
-	// Fast path: if the ID string doesn't appear at all, skip JSON parsing.
-	if !bytes.Contains(data, []byte(commentID)) {
-		return false
-	}
-	var cj CritJSON
-	if err := json.Unmarshal(data, &cj); err != nil {
-		return false
-	}
-	for _, c := range cj.ReviewComments {
-		if c.ID == commentID {
-			return true
-		}
-	}
-	for _, cf := range cj.Files {
-		for _, c := range cf.Comments {
-			if c.ID == commentID {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// clearCritJSON removes the review file from the resolved path or outputDir.
-func clearCritJSON(outputDir string) error {
-	critPath, err := resolveReviewPath(outputDir)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(critPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-// BulkCommentEntry represents one entry in a bulk comment JSON array.
-// Supports review-level, file-level, line-level comments, and replies.
-type BulkCommentEntry struct {
-	// New comment fields
-	File     string `json:"file,omitempty"`
-	Path     string `json:"path,omitempty"`     // alias for File
-	Line     int    `json:"-"`                  // parsed from "line" (int or string like "45-47")
-	LineSpec string `json:"-"`                  // string line spec like "45-47" (from "line" field)
-	EndLine  int    `json:"end_line,omitempty"` // defaults to Line if omitted
-	Body     string `json:"body"`
-	Author   string `json:"author,omitempty"` // overrides per-entry; falls back to global
-	Scope    string `json:"scope,omitempty"`  // "review", "file", or "" (inferred)
-
-	// Reply fields
-	ReplyTo string `json:"reply_to,omitempty"`
-	Resolve bool   `json:"resolve,omitempty"`
-}
-
-// UnmarshalJSON implements custom JSON unmarshaling for BulkCommentEntry
-// to handle the "line" field being either an int (42) or a string ("45-47").
-func (e *BulkCommentEntry) UnmarshalJSON(data []byte) error {
-	// Use an alias to avoid infinite recursion
-	type Alias BulkCommentEntry
-	aux := &struct {
-		Line json.RawMessage `json:"line,omitempty"`
-		*Alias
-	}{
-		Alias: (*Alias)(e),
-	}
-
-	if err := json.Unmarshal(data, aux); err != nil {
-		return err
-	}
-
-	if len(aux.Line) > 0 {
-		// Try int first
-		var lineInt int
-		if err := json.Unmarshal(aux.Line, &lineInt); err == nil {
-			e.Line = lineInt
-			return nil
-		}
-		// Try string
-		var lineStr string
-		if err := json.Unmarshal(aux.Line, &lineStr); err == nil {
-			e.LineSpec = lineStr
-			return nil
-		}
-	}
-	return nil
-}
-
-// processBulkEntry routes a single bulk comment entry to the appropriate
-// authoring helper. globalAuthor is used when an entry doesn't specify its own
-// author. scope is stamped on every authored comment (empty = today's behavior).
-func processBulkEntry(cj *CritJSON, i int, e BulkCommentEntry, globalAuthor, globalUserID string, scope inheritedScope) error {
-	if e.Body == "" {
-		return fmt.Errorf("entry %d: body is required", i)
-	}
-
-	author := e.Author
-	if author == "" {
-		author = globalAuthor
-	}
-	// UserID always comes from the local config — entry-level override would
-	// be a spoof vector. The CLI never trusts a payload-supplied user_id.
-	userID := globalUserID
-
-	if e.ReplyTo != "" {
-		if err := appendReply(cj, e.ReplyTo, e.Body, author, userID, e.Resolve, e.File); err != nil {
-			return fmt.Errorf("entry %d: %w", i, err)
-		}
-		return nil
-	}
-
-	if e.Scope == "review" || (e.File == "" && e.Path == "" && e.Line <= 0 && e.LineSpec == "") {
-		return processBulkReviewEntry(cj, i, e, author, userID, scope)
-	}
-
-	return processBulkFileOrLineEntry(cj, i, e, author, userID, scope)
-}
-
-func processBulkReviewEntry(cj *CritJSON, i int, e BulkCommentEntry, author, userID string, scope inheritedScope) error {
-	if e.Line > 0 || e.LineSpec != "" {
-		return fmt.Errorf("entry %d: file is required for new comments", i)
-	}
-	if e.Scope != "review" && (e.File != "" || e.Path != "") {
-		return fmt.Errorf("entry %d: file is required for new comments", i)
-	}
-	appendReviewCommentScoped(cj, e.Body, author, userID, scope)
-	return nil
-}
-
-func processBulkFileOrLineEntry(cj *CritJSON, i int, e BulkCommentEntry, author, userID string, scope inheritedScope) error {
-	filePath := e.File
-	if filePath == "" {
-		filePath = e.Path
-	}
-	if filePath == "" {
-		return fmt.Errorf("entry %d: file is required for new comments", i)
-	}
-
-	cleaned := filepath.Clean(filePath)
-	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
-		return fmt.Errorf("entry %d: path %q must be relative and within the repository", i, filePath)
-	}
-
-	if e.Scope == "file" {
-		appendFileCommentScoped(cj, cleaned, e.Body, author, userID, scope)
-		return nil
-	}
-
-	if e.Line <= 0 && e.LineSpec == "" {
-		if e.Path != "" && e.File == "" {
-			appendFileCommentScoped(cj, cleaned, e.Body, author, userID, scope)
-			return nil
-		}
-		return fmt.Errorf("entry %d: line must be > 0", i)
-	}
-
-	return processBulkLineComment(cj, i, e, cleaned, author, userID, scope)
-}
-
-func processBulkLineComment(cj *CritJSON, i int, e BulkCommentEntry, cleaned, author, userID string, scope inheritedScope) error {
-	startLine := e.Line
-	endLine := e.EndLine
-
-	if e.LineSpec != "" && startLine == 0 {
-		var err error
-		startLine, endLine, err = parseLineSpec(e.LineSpec)
-		if err != nil {
-			return fmt.Errorf("entry %d: invalid line spec %q", i, e.LineSpec)
-		}
-	}
-
-	if startLine <= 0 {
-		return fmt.Errorf("entry %d: line must be > 0", i)
-	}
-	if endLine == 0 {
-		endLine = startLine
-	}
-
-	appendCommentScoped(cj, cleaned, startLine, endLine, e.Body, author, userID, scope)
-	return nil
-}
-
-func parseLineSpec(spec string) (start, end int, err error) {
-	if dashIdx := strings.Index(spec, "-"); dashIdx >= 0 {
-		s, err1 := strconv.Atoi(spec[:dashIdx])
-		e, err2 := strconv.Atoi(spec[dashIdx+1:])
-		if err1 != nil || err2 != nil {
-			if err1 != nil {
-				return 0, 0, err1
-			}
-			return 0, 0, err2
-		}
-		return s, e, nil
-	}
-	n, err := strconv.Atoi(spec)
-	if err != nil {
-		return 0, 0, err
-	}
-	return n, n, nil
-}
-
-//nolint:unparam // globalUserID is part of the public contract; tests don't exercise it
-func bulkAddCommentsToCritJSON(entries []BulkCommentEntry, globalAuthor, globalUserID string, outputDir string) error {
-	return bulkAddCommentsToCritJSONScoped(entries, globalAuthor, globalUserID, outputDir, inheritedScope{})
-}
-
-// bulkAddCommentsToCritJSONScoped is bulkAddCommentsToCritJSON with scope stamping
-// applied to every entry.
-//
-// Target resolution: a bulk call always writes to a single review file. If any
-// entry uses reply_to and none of the referenced IDs live in the cwd-resolved
-// primary file, the entire bulk is redirected to the alt file that contains
-// them. New comments in the same bulk ride along. If reply IDs split across
-// multiple review files (or some land in primary and others elsewhere), the
-// call is rejected — callers should split into per-file bulks.
-func bulkAddCommentsToCritJSONScoped(entries []BulkCommentEntry, globalAuthor, globalUserID string, outputDir string, scope inheritedScope) error {
-	if len(entries) == 0 {
-		return fmt.Errorf("no comment entries provided")
-	}
-
-	primaryPath, err := resolveReviewPath(outputDir)
-	if err != nil {
-		return err
-	}
-
-	primary, err := loadCritJSON(primaryPath)
-	if err != nil {
-		return err
-	}
-
-	targetPath, targetCJ, redirected, err := resolveBulkTarget(entries, primaryPath, primary)
-	if err != nil {
-		return err
-	}
-
-	for i, e := range entries {
-		if err := processBulkEntry(&targetCJ, i, e, globalAuthor, globalUserID, scope); err != nil {
-			return err
-		}
-	}
-
-	if err := saveCritJSON(targetPath, targetCJ); err != nil {
-		return err
-	}
-	if redirected {
-		fmt.Fprintf(os.Stderr, "Note: replies routed to %s (not the cwd-resolved review file)\n", filepath.Base(targetPath))
-	}
-	return nil
-}
-
-// resolveBulkTarget picks the single review file that this bulk call should
-// write to. Returns the path, the loaded CritJSON to mutate, and whether the
-// target differs from the cwd-resolved primary.
-func resolveBulkTarget(entries []BulkCommentEntry, primaryPath string, primary CritJSON) (string, CritJSON, bool, error) {
-	var replyIDs []string
-	seen := map[string]bool{}
-	for _, e := range entries {
-		if e.ReplyTo == "" || seen[e.ReplyTo] {
-			continue
-		}
-		seen[e.ReplyTo] = true
-		replyIDs = append(replyIDs, e.ReplyTo)
-	}
-
-	if len(replyIDs) == 0 {
-		return primaryPath, primary, false, nil
-	}
-
-	var inPrimary, missing []string
-	for _, id := range replyIDs {
-		if cjContainsCommentID(&primary, id) {
-			inPrimary = append(inPrimary, id)
-		} else {
-			missing = append(missing, id)
-		}
-	}
-
-	if len(missing) == 0 {
-		return primaryPath, primary, false, nil
-	}
-	if len(inPrimary) > 0 {
-		return "", CritJSON{}, false, fmt.Errorf(
-			"bulk targets multiple review files: %v exist in %s, but %v do not — split into per-file bulks",
-			inPrimary, filepath.Base(primaryPath), missing,
-		)
-	}
-
-	// None in primary — every reply ID must live in the same alt file.
-	var altPath string
-	for _, id := range missing {
-		path, err := findReviewFileByCommentID(id, primaryPath)
-		if err != nil {
-			return "", CritJSON{}, false, fmt.Errorf("reply target %s: %w", id, err)
-		}
-		if altPath == "" {
-			altPath = path
-			continue
-		}
-		if path != altPath {
-			return "", CritJSON{}, false, fmt.Errorf(
-				"bulk targets multiple review files: %s in %s, %s in %s — split into per-file bulks",
-				missing[0], filepath.Base(altPath), id, filepath.Base(path),
-			)
-		}
-	}
-
-	altCJ, err := loadCritJSON(altPath)
-	if err != nil {
-		return "", CritJSON{}, false, fmt.Errorf("load %s: %w", filepath.Base(altPath), err)
-	}
-	return altPath, altCJ, true, nil
-}
-
-// cjContainsCommentID reports whether the given comment ID exists in the
-// in-memory CritJSON, across review-level and per-file comments.
-func cjContainsCommentID(cj *CritJSON, id string) bool {
-	for _, c := range cj.ReviewComments {
-		if c.ID == id {
-			return true
-		}
-	}
-	for _, cf := range cj.Files {
-		for _, c := range cf.Comments {
-			if c.ID == id {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// addReviewCommentToCritJSON adds a review-level comment to the review file.
-func addReviewCommentToCritJSON(body, author, userID, outputDir string) error {
-	return addReviewCommentToCritJSONScoped(body, author, userID, outputDir, inheritedScope{})
-}
-
-// addReviewCommentToCritJSONScoped is addReviewCommentToCritJSON with scope stamping.
-func addReviewCommentToCritJSONScoped(body, author, userID, outputDir string, scope inheritedScope) error {
-	critPath, err := resolveReviewPath(outputDir)
-	if err != nil {
-		return err
-	}
-
-	cj, err := loadCritJSON(critPath)
-	if err != nil {
-		return err
-	}
-
-	appendReviewCommentScoped(&cj, body, author, userID, scope)
-	return saveCritJSON(critPath, cj)
-}
-
-// addFileCommentToCritJSON adds a file-level comment to the review file.
-func addFileCommentToCritJSON(filePath, body, author, userID, outputDir string) error {
-	return addFileCommentToCritJSONScoped(filePath, body, author, userID, outputDir, inheritedScope{})
-}
-
-// addFileCommentToCritJSONScoped is addFileCommentToCritJSON with scope stamping.
-func addFileCommentToCritJSONScoped(filePath, body, author, userID, outputDir string, scope inheritedScope) error {
-	critPath, err := resolveReviewPath(outputDir)
-	if err != nil {
-		return err
-	}
-
-	cleaned := filepath.Clean(filePath)
-	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
-		return fmt.Errorf("path %q must be relative and within the repository", filePath)
-	}
-
-	cj, err := loadCritJSON(critPath)
-	if err != nil {
-		return err
-	}
-
-	appendFileCommentScoped(&cj, cleaned, body, author, userID, scope)
-	return saveCritJSON(critPath, cj)
-}
-
-// appendReviewComment adds a review-level comment to the CritJSON struct in memory.
-// Defers to appendReviewCommentScoped with no scope inheritance.
-func appendReviewComment(cj *CritJSON, body, author, userID string) {
-	appendReviewCommentScoped(cj, body, author, userID, inheritedScope{})
-}
-
-// appendReviewCommentScoped stamps DiffScope/HeadSHA from scope.
-func appendReviewCommentScoped(cj *CritJSON, body, author, userID string, scope inheritedScope) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	cj.UpdatedAt = now
-
-	c := stampWithFocus(Comment{
-		ID:        randomReviewCommentID(),
-		Body:      body,
-		Author:    author,
-		UserID:    userID,
-		Scope:     "review",
-		CreatedAt: now,
-		UpdatedAt: now,
-	}, scope.asFocus())
-	cj.ReviewComments = append(cj.ReviewComments, c)
-}
-
-// appendFileComment adds a file-level comment (scope: "file", lines: 0) to the CritJSON struct in memory.
-// Defers to appendFileCommentScoped with no scope inheritance.
-func appendFileComment(cj *CritJSON, filePath, body, author, userID string) {
-	appendFileCommentScoped(cj, filePath, body, author, userID, inheritedScope{})
-}
-
-// appendFileCommentScoped stamps DiffScope/HeadSHA from scope.
-func appendFileCommentScoped(cj *CritJSON, filePath, body, author, userID string, scope inheritedScope) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	cj.UpdatedAt = now
-
-	cf, ok := cj.Files[filePath]
-	if !ok {
-		cf = CritJSONFile{
-			Status:   "modified",
-			Comments: []Comment{},
-		}
-	}
-
-	c := stampWithFocus(Comment{
-		ID:        randomCommentID(),
-		Body:      body,
-		Author:    author,
-		UserID:    userID,
-		Scope:     "file",
-		CreatedAt: now,
-		UpdatedAt: now,
-	}, scope.asFocus())
-	cf.Comments = append(cf.Comments, c)
-	cj.Files[filePath] = cf
 }

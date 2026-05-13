@@ -4,8 +4,11 @@ set -euo pipefail
 PORT="${1:-3128}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRIT_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
-DIR=$(mktemp -d)
-BIN_DIR=$(mktemp -d)
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
+# Resolve symlinks / convert MSYS-style paths to native Windows paths.
+DIR=$(e2e_native_tempdir)
+BIN_DIR=$(e2e_native_tempdir)
 trap 'rm -rf "$DIR" "$BIN_DIR" "${FAKE_HOME:-}"' EXIT
 
 cd "$DIR"
@@ -55,7 +58,7 @@ git checkout -q feat-c
 
 # Build crit binary outside the repo (skip if CRIT_BIN is set).
 if [ -z "${CRIT_BIN:-}" ]; then
-  CRIT_BIN="$BIN_DIR/crit"
+  CRIT_BIN="$BIN_DIR/$(e2e_bin_name)"
   if command -v mise >/dev/null 2>&1; then
     (cd "$CRIT_SRC" && mise exec -- go build -o "$CRIT_BIN" .)
   else
@@ -63,18 +66,21 @@ if [ -z "${CRIT_BIN:-}" ]; then
   fi
 fi
 
-# Isolate from the user's ~/.crit.config.json.
-FAKE_HOME=$(mktemp -d)
-export HOME="$FAKE_HOME"
+# Isolate from the user's ~/.crit.config.json (and USERPROFILE on Windows).
+FAKE_HOME=$(e2e_native_tempdir)
+e2e_export_fake_home "$FAKE_HOME"
 
 # Write fixture state for E2E tests.
-echo "CRIT_BIN=$CRIT_BIN" > "/tmp/crit-e2e-state-$PORT"
-echo "CRIT_FIXTURE_DIR=$DIR" >> "/tmp/crit-e2e-state-$PORT"
-echo "FAKE_HOME=$FAKE_HOME" >> "/tmp/crit-e2e-state-$PORT"
-echo "RANGE_BASE=$A_SHA" >> "/tmp/crit-e2e-state-$PORT"
-echo "RANGE_HEAD=$B_SHA" >> "/tmp/crit-e2e-state-$PORT"
-echo "RANGE_DEFAULT=$MAIN_SHA" >> "/tmp/crit-e2e-state-$PORT"
-echo "RANGE_HEAD_AFTER=$D_SHA" >> "/tmp/crit-e2e-state-$PORT"
+STATE_FILE="$(e2e_state_file "$PORT")"
+{
+  echo "CRIT_BIN=$CRIT_BIN"
+  echo "CRIT_FIXTURE_DIR=$DIR"
+  echo "FAKE_HOME=$FAKE_HOME"
+  echo "RANGE_BASE=$A_SHA"
+  echo "RANGE_HEAD=$B_SHA"
+  echo "RANGE_DEFAULT=$MAIN_SHA"
+  echo "RANGE_HEAD_AFTER=$D_SHA"
+} > "$STATE_FILE"
 
 # Boot crit in range mode A..B.
 exec "$CRIT_BIN" _serve --no-open --port "$PORT" --range "$A_SHA..$B_SHA"

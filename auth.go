@@ -87,13 +87,9 @@ func runAuthLogin(args []string) {
 		os.Exit(1)
 	}
 
-	if err := saveAuthToken(token.AccessToken); err != nil {
-		fmt.Fprintf(os.Stderr, "Error saving token: %v\n", err)
+	if err := saveAuthSession(token); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving credentials: %v\n", err)
 		os.Exit(1)
-	}
-
-	if err := saveAuthIdentity(token); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to persist auth identity: %v\n", err)
 	}
 
 	// If the server didn't return a user_id (older crit-web), fetch it now via
@@ -283,12 +279,11 @@ func clearSpinner(dots int) {
 	}
 }
 
-// saveAuthIdentity persists the user identity fields from a token response
-// to the global config. All three fields (auth_user_id, auth_user_name,
-// auth_user_email) are rewritten together so a stale value from a previous
-// account cannot survive a re-login: missing fields in the response remove
-// the corresponding key from disk rather than leaving it untouched.
-func saveAuthIdentity(token tokenResponse) error {
+// saveAuthSession persists the bearer token and identity fields as one
+// atomic write so a crash mid-login cannot leave a token paired with stale
+// identity from a prior account. Empty fields delete the corresponding key
+// rather than leaving stale values behind.
+func saveAuthSession(token tokenResponse) error {
 	return saveGlobalConfig(func(m map[string]json.RawMessage) error {
 		writeOrDelete := func(key, value string) {
 			if value == "" {
@@ -298,29 +293,10 @@ func saveAuthIdentity(token tokenResponse) error {
 			raw, _ := json.Marshal(value)
 			m[key] = raw
 		}
+		writeOrDelete("auth_token", token.AccessToken)
 		writeOrDelete("auth_user_id", token.UserID)
 		writeOrDelete("auth_user_name", token.UserName)
 		writeOrDelete("auth_user_email", token.UserEmail)
-		return nil
-	})
-}
-
-// saveAuthToken writes the auth_token to the global config file.
-func saveAuthToken(token string) error {
-	return saveGlobalConfig(func(m map[string]json.RawMessage) error {
-		raw, err := json.Marshal(token)
-		if err != nil {
-			return err
-		}
-		m["auth_token"] = raw
-		return nil
-	})
-}
-
-// removeAuthToken removes auth_token from the global config file.
-func removeAuthToken() error {
-	return saveGlobalConfig(func(m map[string]json.RawMessage) error {
-		delete(m, "auth_token")
 		return nil
 	})
 }

@@ -73,6 +73,98 @@ func TestGetSession(t *testing.T) {
 	}
 }
 
+func TestHostCheck(t *testing.T) {
+	tests := []struct {
+		name       string
+		listenHost string
+		reqHost    string
+		wantCode   int
+	}{
+		// No listenHost set (test/default): all requests pass through.
+		{"no listen host, no req host", "", "", 200},
+		{"no listen host, evil.com", "", "evil.com", 200},
+
+		// listenHost is loopback: only loopback Host headers allowed.
+		{"loopback listen, localhost", "127.0.0.1", "localhost:3000", 200},
+		{"loopback listen, 127.0.0.1", "127.0.0.1", "127.0.0.1:3000", 200},
+		{"loopback listen, ::1 with port", "127.0.0.1", "[::1]:3000", 200},
+		{"loopback listen, ::1 bare", "127.0.0.1", "[::1]", 200},
+		{"loopback listen, evil.com", "127.0.0.1", "evil.com", 403},
+		{"loopback listen, evil.com no port", "127.0.0.1", "evil.com:80", 403},
+
+		// listenHost is non-loopback (user opted into LAN exposure): no check.
+		{"lan listen, evil.com", "0.0.0.0", "evil.com", 200},
+		{"lan listen, localhost", "0.0.0.0", "localhost:3000", 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newTestServer(t)
+			s.SetListenHost(tt.listenHost)
+			req := httptest.NewRequest("GET", "/api/session", nil)
+			if tt.reqHost != "" {
+				req.Host = tt.reqHost
+			}
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, req)
+			if w.Code != tt.wantCode {
+				t.Errorf("status = %d, want %d", w.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestIsLoopbackHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"localhost", true},
+		{"127.0.0.1", true},
+		{"::1", true},
+		{"127.0.0.2", true},
+		{"0.0.0.0", false},
+		{"evil.com", false},
+		{"192.168.1.1", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isLoopbackHost(tt.host); got != tt.want {
+			t.Errorf("isLoopbackHost(%q) = %v, want %v", tt.host, got, tt.want)
+		}
+	}
+}
+
+// TestHostCheckDefaultWiring verifies that the default host resolution ("127.0.0.1")
+// arms the DNS-rebinding guard. This catches regressions where the SetListenHost
+// call is dropped from the production wiring path.
+func TestHostCheckDefaultWiring(t *testing.T) {
+	// Simulate the production path: no --host flag, no CRIT_HOST env, default config.
+	// resolveHost("", "127.0.0.1") is what applyConfigDefaults produces.
+	effectiveHost := resolveHost("", "127.0.0.1")
+	if !isLoopbackHost(effectiveHost) {
+		t.Fatalf("default host %q is not loopback — guard would not be armed", effectiveHost)
+	}
+
+	s, _ := newTestServer(t)
+	s.SetListenHost(effectiveHost)
+
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	req.Host = "evil.com"
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 403 {
+		t.Errorf("default wiring: Host: evil.com got status %d, want 403", w.Code)
+	}
+
+	req2 := httptest.NewRequest("GET", "/api/session", nil)
+	req2.Host = "localhost:3000"
+	w2 := httptest.NewRecorder()
+	s.ServeHTTP(w2, req2)
+	if w2.Code != 200 {
+		t.Errorf("default wiring: Host: localhost:3000 got status %d, want 200", w2.Code)
+	}
+}
+
 func TestGetSession_MethodNotAllowed(t *testing.T) {
 	s, _ := newTestServer(t)
 	req := httptest.NewRequest("POST", "/api/session", nil)
@@ -541,7 +633,8 @@ func TestReviewCycle_NextCommand(t *testing.T) {
 		{"single file", []string{"plan.md"}, "crit plan.md"},
 		{"multiple files", []string{"a.md", "b.go"}, "crit a.md b.go"},
 		{"arg with space gets quoted", []string{"my plan.md"}, `crit 'my plan.md'`},
-		{"flag-style arg passes through", []string{"--pr", "42"}, "crit --pr 42"},
+		// Note: cliArgs holds positional file args only at runtime; this case exercises shellQuoteArg formatting, not a real call shape.
+		{"unknown leading-dash arg formats verbatim", []string{"--pr", "42"}, "crit --pr 42"},
 		{"non-ASCII arg passes through", []string{"résumé.md"}, "crit résumé.md"},
 		{"single quote in arg is escaped", []string{"it's.md"}, `crit 'it'\''s.md'`},
 	}
@@ -1393,8 +1486,8 @@ func TestGetFile_NotInSession_NotOnDisk(t *testing.T) {
 func TestGetFilesList(t *testing.T) {
 	dir := initTestRepo(t)
 	writeFile(t, filepath.Join(dir, "src/main.go"), "package main")
-	runGit(t, dir, "add", ".")
-	runGit(t, dir, "commit", "-m", "add file")
+	gitT(t, dir, "add", ".")
+	gitT(t, dir, "commit", "-m", "add file")
 
 	session := &Session{
 		Mode:          "git",
@@ -1456,8 +1549,8 @@ func TestGetFilesList_RespectsIgnorePatterns(t *testing.T) {
 	dir := initTestRepo(t)
 	writeFile(t, filepath.Join(dir, "main.go"), "package main")
 	writeFile(t, filepath.Join(dir, "debug.log"), "log data")
-	runGit(t, dir, "add", ".")
-	runGit(t, dir, "commit", "-m", "add files")
+	gitT(t, dir, "add", ".")
+	gitT(t, dir, "commit", "-m", "add files")
 
 	session := &Session{
 		Mode:           "git",
@@ -2475,10 +2568,10 @@ func TestHandleCommits_MethodNotAllowed(t *testing.T) {
 func TestHandleCommits_GitMode(t *testing.T) {
 	dir := initTestRepo(t)
 	// Create a feature branch with a commit.
-	runGit(t, dir, "checkout", "-b", "feature")
+	gitT(t, dir, "checkout", "-b", "feature")
 	writeFile(t, filepath.Join(dir, "new.go"), "package main")
-	runGit(t, dir, "add", "new.go")
-	runGit(t, dir, "commit", "-m", "add new file")
+	gitT(t, dir, "add", "new.go")
+	gitT(t, dir, "commit", "-m", "add new file")
 
 	session := &Session{
 		Mode:        "git",
@@ -3432,10 +3525,10 @@ func TestHandleConfig_WithAuthToken(t *testing.T) {
 
 func TestHandleSession_WithScope(t *testing.T) {
 	dir := initTestRepo(t)
-	runGit(t, dir, "checkout", "-b", "feature")
+	gitT(t, dir, "checkout", "-b", "feature")
 	writeFile(t, filepath.Join(dir, "new.go"), "package main\n")
-	runGit(t, dir, "add", "new.go")
-	runGit(t, dir, "commit", "-m", "add new file")
+	gitT(t, dir, "add", "new.go")
+	gitT(t, dir, "commit", "-m", "add new file")
 
 	session := &Session{
 		Mode:        "git",
@@ -3552,11 +3645,11 @@ func TestHandleFile_MethodNotAllowed(t *testing.T) {
 
 func TestHandleSession_WithCommit(t *testing.T) {
 	dir := initTestRepo(t)
-	runGit(t, dir, "checkout", "-b", "feature")
+	gitT(t, dir, "checkout", "-b", "feature")
 	writeFile(t, filepath.Join(dir, "new.go"), "package main\n")
-	runGit(t, dir, "add", "new.go")
-	runGit(t, dir, "commit", "-m", "add new file")
-	sha := runGit(t, dir, "rev-parse", "HEAD")
+	gitT(t, dir, "add", "new.go")
+	gitT(t, dir, "commit", "-m", "add new file")
+	sha := gitT(t, dir, "rev-parse", "HEAD")
 
 	session := &Session{
 		Mode:        "git",
@@ -3673,5 +3766,126 @@ func TestEvents_SafariCompat(t *testing.T) {
 	}
 	if string(heartbeat) != ":\n\n" {
 		t.Errorf("heartbeat frame = %q, want %q", heartbeat, ":\n\n")
+	}
+}
+
+func TestHandleShareConsent_OK(t *testing.T) {
+	setHome(t, t.TempDir())
+	s, _ := newTestServer(t)
+
+	req := httptest.NewRequest("POST", "/api/share-consent", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	s.authMu.RLock()
+	got := s.cfg.ShareConsented
+	s.authMu.RUnlock()
+	if !got {
+		t.Errorf("s.cfg.ShareConsented = false, want true")
+	}
+}
+
+func TestHandleShareConsent_MethodNotAllowed(t *testing.T) {
+	setHome(t, t.TempDir())
+	s, _ := newTestServer(t)
+
+	req := httptest.NewRequest("GET", "/api/share-consent", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestHandleShare_ConsentRequired(t *testing.T) {
+	setHome(t, t.TempDir())
+	s, _ := newTestServer(t)
+	s.shareURL = defaultShareURL
+	s.authMu.Lock()
+	s.cfg.ShareConsented = false
+	s.authMu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/share", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d, body = %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+}
+
+func TestConsentNeeded_AlreadyConsented(t *testing.T) {
+	setHome(t, t.TempDir())
+	s, _ := newTestServer(t)
+	s.shareURL = defaultShareURL
+	s.authMu.Lock()
+	s.cfg.ShareConsented = true
+	s.authMu.Unlock()
+
+	if s.consentNeeded() {
+		t.Error("consentNeeded() = true, want false when already consented")
+	}
+}
+
+func TestConsentNeeded_CustomShareURL(t *testing.T) {
+	setHome(t, t.TempDir())
+	s, _ := newTestServer(t)
+	s.shareURL = "https://custom.example.com"
+	s.authMu.Lock()
+	s.cfg.ShareConsented = false
+	s.authMu.Unlock()
+
+	if s.consentNeeded() {
+		t.Error("consentNeeded() = true, want false for non-default share URL")
+	}
+}
+
+func TestConsentNeeded_GlobalConfigConsented(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	s, _ := newTestServer(t)
+	s.shareURL = defaultShareURL
+	s.authMu.Lock()
+	s.cfg.ShareConsented = false
+	s.authMu.Unlock()
+
+	// Write consent to the global config as the CLI would.
+	if err := saveGlobalConfig(func(m map[string]json.RawMessage) error {
+		m["share_consented"] = json.RawMessage("true")
+		return nil
+	}); err != nil {
+		t.Fatalf("saveGlobalConfig: %v", err)
+	}
+
+	if s.consentNeeded() {
+		t.Error("consentNeeded() = true, want false when global config has ShareConsented=true")
+	}
+	s.authMu.RLock()
+	got := s.cfg.ShareConsented
+	s.authMu.RUnlock()
+	if !got {
+		t.Error("s.cfg.ShareConsented not updated after disk re-read")
+	}
+}
+
+func TestHandleShareConsent_SaveFails(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	// Place a directory at ~/.crit.config.json so file writes fail on all platforms.
+	if err := os.Mkdir(filepath.Join(home, ".crit.config.json"), 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	s, _ := newTestServer(t)
+
+	req := httptest.NewRequest("POST", "/api/share-consent", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d, body = %s", w.Code, http.StatusInternalServerError, w.Body.String())
 	}
 }

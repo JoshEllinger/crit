@@ -9,10 +9,10 @@ import (
 )
 
 // VCS abstracts version control operations so crit can support multiple backends
-// (git, Sapling, etc.). Each method corresponds to an existing package-level
-// function in git.go; the interface lets callers work with any VCS uniformly.
+// (git, Sapling, Jujutsu, etc.). Each method corresponds to an existing
+// package-level function in git.go; the interface lets callers work with any VCS uniformly.
 type VCS interface {
-	// Name returns the VCS identifier ("git", "sl", etc.).
+	// Name returns the VCS identifier ("git", "sl", "jj", etc.).
 	Name() string
 
 	// RepoRoot returns the absolute path to the repository root.
@@ -122,10 +122,10 @@ type VCS interface {
 }
 
 // DetectVCS returns the appropriate VCS backend for the current directory.
-// If vcsOverride is set ("git", "sl", or "sapling"), that backend is preferred
-// but falls back to git if the requested backend isn't available.
-// Otherwise, auto-detection checks for .sl/ first (Sapling on git repos has both),
-// then falls back to git. Returns nil if no VCS is detected.
+// If vcsOverride is set ("git", "sl"/"sapling", or "jj"), that backend is
+// preferred but falls back to git if the requested backend isn't available.
+// Otherwise, auto-detection checks for .jj/ first, then .sl/ (Sapling on git
+// repos has both), then falls back to git. Returns nil if no VCS is detected.
 func DetectVCS(vcsOverride string) VCS {
 	switch vcsOverride {
 	case "git":
@@ -139,9 +139,25 @@ func DetectVCS(vcsOverride string) VCS {
 			return &GitVCS{}
 		}
 		return nil
+	case "jj", "jujutsu":
+		if _, err := exec.LookPath("jj"); err == nil {
+			return &JJVCS{}
+		}
+		fmt.Fprintf(os.Stderr, "Warning: vcs=%q requested but jj not in PATH, falling back to git\n", vcsOverride)
+		if IsGitRepo() {
+			return &GitVCS{}
+		}
+		return nil
 	}
 
-	// Auto-detect: check for .sl/ first since Sapling repos on top of git have both.
+	// Auto-detect: check for .jj/ first since colocated JJ repos also have .git/.
+	if hasJJDir() {
+		if _, err := exec.LookPath("jj"); err == nil {
+			return &JJVCS{}
+		}
+	}
+
+	// Check for .sl/ before git since Sapling repos on top of git have both.
 	if hasSLDir() {
 		if _, err := exec.LookPath("sl"); err == nil {
 			return &SaplingVCS{}
@@ -158,6 +174,30 @@ func DetectVCS(vcsOverride string) VCS {
 	}
 
 	return nil
+}
+
+// hasJJDir checks whether a .jj/ directory exists at or above the current directory.
+func hasJJDir() bool {
+	dir, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	return hasJJDirFrom(dir)
+}
+
+// hasJJDirFrom checks whether a .jj/ directory exists at or above the given directory.
+func hasJJDirFrom(dir string) bool {
+	for {
+		if info, err := os.Stat(filepath.Join(dir, ".jj")); err == nil && info.IsDir() {
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return false
 }
 
 // hasSLDir checks whether a .sl/ directory exists at or above the current directory.

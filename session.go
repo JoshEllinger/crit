@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,12 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// ErrNoChangedFiles is returned by detectVCSChanges when the working tree and
+// branch contain no changes against the base ref (or all changes are filtered
+// out by ignore patterns). Callers can detect this via errors.Is to surface a
+// user-friendly message instead of a generic init failure.
+var ErrNoChangedFiles = errors.New("no changed files detected (after applying ignore patterns)")
 
 // lazyFileThreshold is the maximum number of files to eagerly load
 // content and diffs for. Files beyond this threshold are loaded on demand
@@ -50,31 +57,61 @@ type Reply struct {
 	Author    string `json:"author,omitempty"`
 	UserID    string `json:"user_id,omitempty"`
 	CreatedAt string `json:"created_at"`
-	GitHubID  int64  `json:"github_id,omitempty"`
+	// ReviewRound is the review round during which this reply was authored.
+	// Used by the per-round timeline to scope reply visibility independently
+	// of the parent comment. Legacy replies (no field set) are treated as
+	// belonging to the parent's ReviewRound — see commentsAtOrBeforeRound.
+	ReviewRound int `json:"review_round,omitempty"`
+	// ResolvedRound is the review round during which this reply was resolved
+	// (mirrors Comment.ResolvedRound). Currently set only via the parent
+	// comment's resolve transitions; reserved for future per-reply resolution.
+	ResolvedRound int   `json:"resolved_round,omitempty"`
+	GitHubID      int64 `json:"github_id,omitempty"`
+
+	// LastPushedBodyHash is a short stable digest of Body at the time of
+	// the most recent successful push (POST or PATCH) to GitHub. Used by
+	// `crit push` to detect locally-edited replies that need a PATCH.
+	// Empty means "not yet pushed" — divergence detection treats hash("")
+	// as the prior value, so a record with GitHubID != 0 and empty hash
+	// will PATCH on next push (the local body is canonical).
+	LastPushedBodyHash string `json:"last_pushed_body_hash,omitempty"`
 }
 
 // Comment represents a single inline review comment.
 type Comment struct {
-	ID             string  `json:"id"`
-	StartLine      int     `json:"start_line"`
-	EndLine        int     `json:"end_line"`
-	Side           string  `json:"side,omitempty"`
-	Body           string  `json:"body"`
-	Quote          string  `json:"quote,omitempty"`
-	QuoteOffset    *int    `json:"quote_offset,omitempty"`
-	Anchor         string  `json:"anchor,omitempty"`
-	Drifted        bool    `json:"drifted,omitempty"`
-	Author         string  `json:"author,omitempty"`
-	UserID         string  `json:"user_id,omitempty"`
-	Scope          string  `json:"scope,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	Resolved       bool    `json:"resolved,omitempty"`
+	ID          string `json:"id"`
+	StartLine   int    `json:"start_line"`
+	EndLine     int    `json:"end_line"`
+	Side        string `json:"side,omitempty"`
+	Body        string `json:"body"`
+	Quote       string `json:"quote,omitempty"`
+	QuoteOffset *int   `json:"quote_offset,omitempty"`
+	Anchor      string `json:"anchor,omitempty"`
+	Drifted     bool   `json:"drifted,omitempty"`
+	Author      string `json:"author,omitempty"`
+	UserID      string `json:"user_id,omitempty"`
+	Scope       string `json:"scope,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+	Resolved    bool   `json:"resolved,omitempty"`
+	// ResolvedRound is the review round during which Resolved transitioned
+	// false -> true. Cleared to 0 when Resolved transitions back to false.
+	// Legacy comments lacking this field are treated as zero on read; the
+	// timeline visibility filter falls back to round 1 for legacy resolved
+	// comments (see commentsAtOrBeforeRound docs).
+	ResolvedRound  int     `json:"resolved_round,omitempty"`
 	Live           bool    `json:"live,omitempty"`
 	CarriedForward bool    `json:"carried_forward,omitempty"`
 	ReviewRound    int     `json:"review_round,omitempty"`
 	Replies        []Reply `json:"replies,omitempty"`
 	GitHubID       int64   `json:"github_id,omitempty"`
+
+	// LastPushedBodyHash is a short stable digest of Body at the time of
+	// the most recent successful push (POST or PATCH) to GitHub. Used by
+	// `crit push` to detect locally-edited comments that need a PATCH.
+	// Empty means "not yet pushed" — a record with GitHubID != 0 and empty
+	// hash will PATCH on next push (the local body is canonical).
+	LastPushedBodyHash string `json:"last_pushed_body_hash,omitempty"`
 
 	// HeadSHA is the head SHA of the focus when this comment was authored.
 	// Empty for working-tree comments and for pre-feature comments.
@@ -130,6 +167,10 @@ type FileEntry struct {
 	// Orphaned: file has comments in the review file but is no longer in the session's
 	// file list (e.g., added on branch then deleted). No content or diff available.
 	Orphaned bool `json:"-"`
+
+	// Generated: file is marked linguist-generated in the repo's top-level
+	// .gitattributes. The frontend renders these collapsed by default.
+	Generated bool `json:"-"`
 }
 
 // ensureLoaded loads content and diff hunks for a lazy file on first access.
@@ -185,138 +226,6 @@ func (fe *FileEntry) loadDiff(ctx context.Context, repoRoot, baseRef string, vcs
 	}
 }
 
-// FocusKind tags which arm of Focus is populated.
-type FocusKind string
-
-const (
-	// FocusWorkingTree is the default — diff working tree against base ref.
-	FocusWorkingTree FocusKind = "working_tree"
-	// FocusRange diffs a fixed (BaseSHA, HeadSHA) range, used by --pr / --range.
-	FocusRange FocusKind = "range"
-)
-
-// DiffScope selects which range to diff in FocusRange mode.
-//
-//	layer      — BaseSHA..HeadSHA  (what GitHub shows for the PR)
-//	full_stack — DefaultSHA..HeadSHA (cumulative from default branch)
-//
-// Empty string is the implicit "no scope" used by FocusWorkingTree comments
-// authored before this feature shipped.
-type DiffScope string
-
-const (
-	// DiffScopeLayer is the per-PR layer (BaseSHA..HeadSHA).
-	DiffScopeLayer DiffScope = "layer"
-	// DiffScopeFullStack is the cumulative diff from the default branch.
-	DiffScopeFullStack DiffScope = "full_stack"
-)
-
-// Focus is what the session is currently showing. Exactly one arm is meaningful
-// per Kind; the other fields are zero. No interface — keep it serializable for
-// /api/session, comparable, and trivially copyable.
-type Focus struct {
-	Kind FocusKind `json:"kind"`
-
-	// FocusWorkingTree fields.
-	BaseRef        string `json:"base_ref,omitempty"`
-	BaseBranchName string `json:"base_branch_name,omitempty"`
-
-	// FocusRange fields. All optional except BaseSHA + HeadSHA.
-	PRNumber    int       `json:"pr_number,omitempty"`
-	PRURL       string    `json:"pr_url,omitempty"`
-	Label       string    `json:"label,omitempty"`
-	BaseSHA     string    `json:"base_sha,omitempty"`
-	HeadSHA     string    `json:"head_sha,omitempty"`
-	DefaultSHA  string    `json:"default_sha,omitempty"`
-	ForkURL     string    `json:"fork_url,omitempty"`
-	BaseRefName string    `json:"base_ref_name,omitempty"`
-	HeadRefName string    `json:"head_ref_name,omitempty"`
-	DiffScope   DiffScope `json:"diff_scope,omitempty"`
-	IsStacked   bool      `json:"is_stacked,omitempty"`
-}
-
-// ReadOnly reports whether comments may be added/edited in this focus.
-// v1: always false. Range mode is fully writable so users can annotate;
-// pushes to GitHub are gated separately (see runPush).
-func (f Focus) ReadOnly() bool { return false }
-
-// DiffBaseSHA returns the SHA to use as the diff base for the current scope.
-// In full-stack scope without a resolved DefaultSHA, falls back to BaseSHA;
-// callers that explicitly require full-stack must validate DefaultSHA upstream.
-func (f Focus) DiffBaseSHA() string {
-	if f.Kind != FocusRange {
-		return f.BaseRef
-	}
-	if f.DiffScope == DiffScopeFullStack && f.DefaultSHA != "" {
-		return f.DefaultSHA
-	}
-	return f.BaseSHA
-}
-
-// FullStackAvailable reports whether the full-stack scope can be selected.
-// False when DefaultSHA could not be resolved (detached HEAD, no remote, etc.).
-func (f Focus) FullStackAvailable() bool {
-	return f.Kind == FocusRange && f.DefaultSHA != ""
-}
-
-// PickerVisible reports whether the layer/full-stack picker should render.
-// Hide when the PR is not stacked (base IS the default branch), because layer
-// and full-stack would produce identical diffs.
-func (f Focus) PickerVisible() bool {
-	return f.Kind == FocusRange && f.IsStacked
-}
-
-// focusKeyFor returns the per-view key used to scope comment visibility.
-//
-//	pr:<num>                       — range focus with PR number
-//	range:<baseSHA>..<headSHA>     — range focus without PR number (full 40-char SHAs)
-//	""                             — working-tree (and unknown)
-func focusKeyFor(f Focus) string {
-	if f.Kind != FocusRange {
-		return ""
-	}
-	if f.PRNumber > 0 {
-		return fmt.Sprintf("pr:%d", f.PRNumber)
-	}
-	return fmt.Sprintf("range:%s..%s", f.BaseSHA, f.HeadSHA)
-}
-
-// visibleInFocus reports whether c should be shown in the given focus.
-// Comments belong to the *view* they were authored in, identified by
-// FocusKey. Within a range focus, the layer/full-stack DiffScope filter
-// also applies. Pure function — no I/O, no locks.
-func visibleInFocus(c Comment, f Focus) bool {
-	if c.FocusKey != focusKeyFor(f) {
-		return false
-	}
-	if f.Kind == FocusRange {
-		return c.DiffScope == string(f.DiffScope)
-	}
-	return c.DiffScope == ""
-}
-
-// stampWithFocus copies focus-derived metadata onto a freshly authored Comment.
-// No-op when Focus.Kind != FocusRange, preserving working-tree behavior.
-func stampWithFocus(c Comment, f Focus) Comment {
-	c.FocusKey = focusKeyFor(f)
-	if f.Kind == FocusRange {
-		c.HeadSHA = f.HeadSHA
-		c.DiffScope = string(f.DiffScope)
-	}
-	return c
-}
-
-// countVisibleComments returns the count of comments visible in the given focus.
-func countVisibleComments(comments []Comment, f Focus) int {
-	n := 0
-	for _, c := range comments {
-		if visibleInFocus(c, f) {
-			n++
-		}
-	}
-	return n
-}
-
 // Session is the top-level state manager for a multi-file review.
 type Session struct {
 	VCS            VCS // nil for non-VCS sessions (e.g. files mode without a repo)
@@ -333,12 +242,45 @@ type Session struct {
 	ReviewRound    int
 	IgnorePatterns []string
 
+	// generatedRules is the parsed top-level .gitattributes, loaded once per
+	// session. Used to flag files as linguist-generated so the frontend can
+	// render them collapsed by default. Read-only after construction.
+	generatedRules []generatedRule
+
 	reviewComments []Comment
+
+	// RoundSnapshots is in-memory state populated from <folder>/snapshots.json
+	// at boot. Persisted via saveSnapshotsFile; never written into review.json.
+	//
+	// Lock contract: read/write under s.mu, EXCEPT during construction
+	// (NewSessionFromFiles, before SetSession) where the caller is the only
+	// goroutine that could observe it.
+	RoundSnapshots map[string]map[int]RoundSnapshot
+
+	// sessionStarted is set (atomically) by Server.SetSession to mark the
+	// transition from constructor-time (single-goroutine) to runtime
+	// (multi-goroutine). loadCritJSON checks this flag to enforce its
+	// pre-SetSession-only contract. 0 = pre-SetSession, 1 = post-SetSession.
+	sessionStarted atomic.Uint32
 
 	// deletedCommentIDs tracks IDs of file comments deleted in-memory but not
 	// yet written to disk. Keyed by file path -> set of comment IDs. This
 	// prevents mergeFileSnapshotIntoCritJSON from re-adding them from disk.
 	deletedCommentIDs map[string]map[string]struct{}
+
+	// pendingGitHubDeletes holds GitHub comment IDs (root or reply) that the
+	// user has deleted locally and that the next `crit push` must DELETE
+	// upstream. Persisted as CritJSON.PendingGitHubDeletes; the next push
+	// drains entries as each DELETE succeeds (or returns 404 / 403).
+	pendingGitHubDeletes []int64
+
+	// lastLoadedPendingGHDeletes is the set of GitHub IDs that were on disk
+	// in PendingGitHubDeletes the last time the daemon read or wrote
+	// review.json. Used by buildCritJSON to reconcile the in-memory snapshot
+	// against the on-disk queue: an ID present in the snapshot but missing
+	// from disk AND present in this set means a separate `crit push` process
+	// drained it — it must NOT be resurrected. See BLOCKER #1.
+	lastLoadedPendingGHDeletes map[int64]struct{}
 
 	mu          sync.RWMutex
 	subscribers map[chan SSEEvent]struct{}
@@ -417,6 +359,13 @@ type CritJSON struct {
 	// ActiveDiffScope is the most recent focus diff_scope from this session.
 	// Read by `crit push` to gate full-stack pushes; "" indicates working-tree mode.
 	ActiveDiffScope string `json:"active_diff_scope,omitempty"`
+
+	// PendingGitHubDeletes holds GitHub comment IDs (root or reply — same
+	// /pulls/comments/{id} endpoint) that the user has deleted locally and
+	// that need a DELETE upstream on the next `crit push`. Drained as each
+	// DELETE succeeds (or returns 404 / 403). Survives intermediate pulls so
+	// the user's intent is not lost.
+	PendingGitHubDeletes []int64 `json:"pending_github_deletes,omitempty"`
 }
 
 // CritJSONFile is the per-file section in review files.
@@ -513,7 +462,7 @@ func detectVCSChanges(vcs VCS, root string, ignorePatterns []string) (branch, ba
 	changes = filterIgnored(changes, ignorePatterns)
 
 	if len(changes) == 0 {
-		return "", "", "", nil, fmt.Errorf("no changed files detected (after applying ignore patterns)")
+		return "", "", "", nil, ErrNoChangedFiles
 	}
 	return branch, baseRef, resolvedBase, changes, nil
 }
@@ -521,15 +470,36 @@ func detectVCSChanges(vcs VCS, root string, ignorePatterns []string) (branch, ba
 // NewSessionFromVCS creates a session by auto-detecting changed files using the given VCS backend.
 // This is the VCS-agnostic equivalent of NewSessionFromGit.
 func NewSessionFromVCS(vcs VCS, ignorePatterns []string) (*Session, error) {
+	return newGitSession(vcs, ignorePatterns, true)
+}
+
+// newGitSession is the implementation behind NewSessionFromVCS. When
+// requireChanges is false, an empty working-tree diff produces a session with
+// no files instead of returning ErrNoChangedFiles — callers that apply a
+// --pr/--range focus rebuild the file list via SetFocus, so the working-tree
+// diff is irrelevant. See issue #471.
+func newGitSession(vcs VCS, ignorePatterns []string, requireChanges bool) (*Session, error) {
 	root, err := vcs.RepoRoot()
 	if err != nil {
 		return nil, fmt.Errorf("not a %s repository: %w", vcs.Name(), err)
 	}
 
 	branch, baseRef, resolvedBase, changes, err := detectVCSChanges(vcs, root, ignorePatterns)
+	if errors.Is(err, ErrNoChangedFiles) && !requireChanges {
+		// detectVCSChanges zeroes its return values on the empty path; recover
+		// the metadata so the session reports the correct branch/base.
+		branch = vcs.CurrentBranch()
+		resolvedBase = vcs.DefaultBranch()
+		if branch != resolvedBase {
+			baseRef, _ = vcs.MergeBase(vcs.DefaultBaseRef())
+		}
+		err = nil
+	}
 	if err != nil {
 		return nil, err
 	}
+
+	genRules, _ := parseGeneratedRules(root)
 
 	s := &Session{
 		VCS:                 vcs,
@@ -540,6 +510,7 @@ func NewSessionFromVCS(vcs VCS, ignorePatterns []string) (*Session, error) {
 		RepoRoot:            root,
 		ReviewRound:         1,
 		IgnorePatterns:      ignorePatterns,
+		generatedRules:      genRules,
 		subscribers:         make(map[chan SSEEvent]struct{}),
 		roundComplete:       make(chan struct{}, 1),
 		awaitingFirstReview: true,
@@ -554,10 +525,11 @@ func NewSessionFromVCS(vcs VCS, ignorePatterns []string) (*Session, error) {
 	for i, fc := range changes {
 		absPath := filepath.Join(root, fc.Path)
 		fe := &FileEntry{
-			Path:     fc.Path,
-			AbsPath:  absPath,
-			Status:   fc.Status,
-			FileType: detectFileType(fc.Path),
+			Path:      fc.Path,
+			AbsPath:   absPath,
+			Status:    fc.Status,
+			FileType:  detectFileType(fc.Path),
+			Generated: isGenerated(fc.Path, s.generatedRules),
 		}
 
 		if len(changes) > lazyFileThreshold && i >= lazyFileThreshold {
@@ -584,11 +556,7 @@ func expandAndDedupPaths(paths []string, ignorePatterns []string) ([]string, err
 			return nil, fmt.Errorf("file not found: %s", p)
 		}
 		if info.IsDir() {
-			dirFiles, err := walkDirectory(absPath, ignorePatterns)
-			if err != nil {
-				return nil, fmt.Errorf("walking directory %s: %w", p, err)
-			}
-			expandedPaths = append(expandedPaths, dirFiles...)
+			expandedPaths = append(expandedPaths, walkDirectory(absPath, ignorePatterns)...)
 		} else {
 			expandedPaths = append(expandedPaths, absPath)
 		}
@@ -643,6 +611,8 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 		root = filepath.Dir(expandedPaths[0])
 	}
 
+	genRules, _ := parseGeneratedRules(root)
+
 	s := &Session{
 		VCS:                 vcs,
 		Mode:                "files",
@@ -652,6 +622,7 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 		RepoRoot:            root,
 		ReviewRound:         1,
 		IgnorePatterns:      ignorePatterns,
+		generatedRules:      genRules,
 		subscribers:         make(map[chan SSEEvent]struct{}),
 		roundComplete:       make(chan struct{}, 1),
 		awaitingFirstReview: true,
@@ -661,8 +632,19 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 	for _, absPath := range expandedPaths {
 		relPath := absPath
 		if root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
-				relPath = rel
+			if rel, err := filepath.Rel(root, absPath); err == nil {
+				slash := filepath.ToSlash(rel)
+				// On Windows filepath.Rel can succeed across drives /
+				// short-name boundaries with a useless ../../../... result;
+				// fall back to the absolute path in that case so downstream
+				// (git diff, picker labels) at least sees a stable string.
+				if strings.HasPrefix(slash, "../") || slash == ".." {
+					relPath = filepath.ToSlash(absPath)
+				} else {
+					// Stored in review JSON (cross-platform artefact) and used as
+					// the file key — keep separators POSIX on every host OS.
+					relPath = slash
+				}
 			}
 		}
 
@@ -672,13 +654,14 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 		}
 
 		fe := &FileEntry{
-			Path:     relPath,
-			AbsPath:  absPath,
-			Status:   "modified",
-			FileType: detectFileType(absPath),
-			Content:  string(data),
-			FileHash: fileHash(data),
-			Comments: []Comment{},
+			Path:      relPath,
+			AbsPath:   absPath,
+			Status:    "modified",
+			FileType:  detectFileType(absPath),
+			Content:   string(data),
+			FileHash:  fileHash(data),
+			Comments:  []Comment{},
+			Generated: isGenerated(relPath, s.generatedRules),
 		}
 
 		if vcs != nil {
@@ -693,57 +676,140 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 		s.Files = append(s.Files, fe)
 	}
 
+	s.captureBaselineAndPersist()
+
 	return s, nil
+}
+
+// captureBaselineAndPersist captures the R1 baseline (idempotent so resumed
+// sessions are unaffected) and best-effort writes the sidecar to disk.
+//
+// Skips the sidecar write when the identity would fall back to RepoRoot —
+// this path runs before applySessionOverrides has a chance to assign
+// ReviewFilePath / OutputDir. The first WriteFiles or round-complete will
+// re-emit the sidecar at the canonical centralized path.
+//
+// Pre-SetSession only — caller is the constructor and no concurrent readers
+// exist. See plan v4 §Lock discipline.
+func (s *Session) captureBaselineAndPersist() {
+	s.captureRoundSnapshot(s.ReviewRound)
+	if s.ReviewFilePath == "" && s.OutputDir == "" {
+		return
+	}
+	if len(s.RoundSnapshots) == 0 {
+		return
+	}
+	identity := s.critJSONPath()
+	// MIGRATION-REMOVAL: ensure folder layout up front so a stale flat
+	// review file doesn't fail the sidecar write below.
+	if err := ensureReviewFolder(identity); err != nil {
+		return
+	}
+	sidecar := reviewPathsFor(identity).Snapshots
+	if err := saveSnapshotsFile(sidecar, SnapshotsFile{
+		RoundSnapshots: cloneRoundSnapshots(s.RoundSnapshots),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: write snapshots sidecar at construction: %v\n", err)
+	}
 }
 
 // walkDirectory recursively walks a directory and returns all file paths,
 // skipping hidden directories and common non-text directories.
-func walkDirectory(dir string, ignorePatterns []string) ([]string, error) {
+//
+// Ordering: at each depth, recurse into subdirectories (alphabetical) before
+// listing files (alphabetical). This matches the "directories before files at
+// each depth" grouping users expect when passing a directory like `crit .` —
+// and the frontend now preserves backend order in files mode, so this is the
+// single source of truth for display order.
+func walkDirectory(dir string, ignorePatterns []string) []string {
 	var files []string
-	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil //nolint:nilerr // best-effort walk: skip inaccessible entries
-		}
-		name := d.Name()
+	walkDirSubsFirst(dir, dir, ignorePatterns, &files)
+	return files
+}
 
-		// Skip hidden directories and common non-text directories
-		if d.IsDir() {
-			if strings.HasPrefix(name, ".") || skipDirs[name] {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Skip hidden files
+// walkDirSubsFirst is the recursive helper for walkDirectory. It reads dir
+// (os.ReadDir returns entries sorted by name), recurses into subdirectories
+// first, then appends files. ignorePatterns are matched relative to root
+// (the original argument), not the current dir. Best-effort: inaccessible
+// directories are silently skipped.
+func walkDirSubsFirst(dir, root string, ignorePatterns []string, out *[]string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // best-effort: skip inaccessible dirs
+	}
+	var subdirs, fileEntries []os.DirEntry
+	for _, e := range entries {
+		name := e.Name()
 		if strings.HasPrefix(name, ".") {
-			return nil
+			continue
 		}
-
-		// Skip minified files
+		if e.IsDir() {
+			if skipDirs[name] {
+				continue
+			}
+			if dirIgnored(filepath.Join(dir, name), root, ignorePatterns) {
+				continue
+			}
+			subdirs = append(subdirs, e)
+			continue
+		}
 		lowerName := strings.ToLower(name)
 		if strings.HasSuffix(lowerName, ".min.js") || strings.HasSuffix(lowerName, ".min.css") {
-			return nil
+			continue
 		}
-
-		// Skip binary/non-reviewable files by extension
 		ext := strings.ToLower(filepath.Ext(name))
 		if isBinaryExtension(ext) {
-			return nil
+			continue
 		}
-
-		// Apply ignore patterns (use path relative to dir)
-		if relPath, relErr := filepath.Rel(dir, path); relErr == nil {
-			for _, pat := range ignorePatterns {
-				if matchPattern(pat, relPath) {
-					return nil
-				}
-			}
+		if fileIgnored(filepath.Join(dir, name), root, ignorePatterns) {
+			continue
 		}
+		fileEntries = append(fileEntries, e)
+	}
+	for _, d := range subdirs {
+		walkDirSubsFirst(filepath.Join(dir, d.Name()), root, ignorePatterns, out)
+	}
+	for _, f := range fileEntries {
+		*out = append(*out, filepath.Join(dir, f.Name()))
+	}
+}
 
-		files = append(files, path)
-		return nil
-	})
-	return files, err
+// fileIgnored reports whether the file at full (relative to root) matches any
+// ignore pattern. Best-effort: if the relative path can't be computed, the
+// file is not skipped.
+func fileIgnored(full, root string, ignorePatterns []string) bool {
+	relPath, err := filepath.Rel(root, full)
+	if err != nil {
+		return false
+	}
+	for _, pat := range ignorePatterns {
+		if matchPattern(pat, relPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// dirIgnored reports whether the directory at full (relative to root) matches
+// any "dir/" ignore pattern. Non-slash-suffixed patterns (e.g. bare "node_modules")
+// are intentionally skipped — they apply per-file via fileIgnored. Pruning only
+// fires for explicit trailing-slash patterns. Best-effort: if the relative path
+// can't be computed, the directory is not pruned.
+func dirIgnored(full, root string, ignorePatterns []string) bool {
+	relPath, err := filepath.Rel(root, full)
+	if err != nil {
+		return false
+	}
+	dirPath := filepath.ToSlash(relPath) + "/"
+	for _, pat := range ignorePatterns {
+		if !strings.HasSuffix(pat, "/") {
+			continue
+		}
+		if matchPattern(pat, dirPath) {
+			return true
+		}
+	}
+	return false
 }
 
 // isBinaryExtension returns true for file extensions that are typically binary.
@@ -918,7 +984,9 @@ func (s *Session) UpdateReviewComment(id, body string) (Comment, bool) {
 	return Comment{}, false
 }
 
-// DeleteReviewComment deletes a review-level comment by ID.
+// DeleteReviewComment deletes a review-level comment by ID. Review-level
+// comments are local-only (not synced to GitHub PR review comments), so a
+// straight removal is safe — there is no upstream record to tombstone.
 func (s *Session) DeleteReviewComment(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -933,12 +1001,19 @@ func (s *Session) DeleteReviewComment(id string) bool {
 }
 
 // ResolveReviewComment sets or clears the resolved flag on a review-level comment.
+// On a false -> true transition, ResolvedRound is stamped from s.ReviewRound.
+// On a true -> false transition, ResolvedRound is cleared to 0.
 func (s *Session) ResolveReviewComment(id string, resolved bool) (Comment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, c := range s.reviewComments {
 		if c.ID == id {
 			s.reviewComments[i].Resolved = resolved
+			if resolved {
+				s.reviewComments[i].ResolvedRound = s.ReviewRound
+			} else {
+				s.reviewComments[i].ResolvedRound = 0
+			}
 			s.reviewComments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 			s.scheduleWrite()
 			return s.reviewComments[i], true
@@ -955,14 +1030,16 @@ func (s *Session) AddReviewCommentReply(commentID, body, author, userID string) 
 		if c.ID == commentID {
 			now := time.Now().UTC().Format(time.RFC3339)
 			r := Reply{
-				ID:        randomReplyID(),
-				Body:      body,
-				Author:    author,
-				UserID:    userID,
-				CreatedAt: now,
+				ID:          randomReplyID(),
+				Body:        body,
+				Author:      author,
+				UserID:      userID,
+				CreatedAt:   now,
+				ReviewRound: s.ReviewRound,
 			}
 			s.reviewComments[i].Replies = append(s.reviewComments[i].Replies, r)
 			s.reviewComments[i].Resolved = false
+			s.reviewComments[i].ResolvedRound = 0
 			s.reviewComments[i].UpdatedAt = now
 			s.scheduleWrite()
 			return r, true
@@ -992,6 +1069,7 @@ func (s *Session) UpdateReviewCommentReply(commentID, replyID, body string) (Rep
 }
 
 // DeleteReviewCommentReply removes a reply from a review-level comment.
+// Review-level threads are local-only, so a straight removal is safe.
 func (s *Session) DeleteReviewCommentReply(commentID, replyID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1031,6 +1109,8 @@ func (s *Session) UpdateComment(filePath, id, body string) (Comment, bool) {
 }
 
 // SetCommentResolved sets or clears the resolved flag on a comment.
+// On a false -> true transition, ResolvedRound is stamped from s.ReviewRound.
+// On a true -> false transition, ResolvedRound is cleared to 0.
 func (s *Session) SetCommentResolved(filePath, id string, resolved bool) (Comment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1041,6 +1121,11 @@ func (s *Session) SetCommentResolved(filePath, id string, resolved bool) (Commen
 	for i, c := range f.Comments {
 		if c.ID == id {
 			f.Comments[i].Resolved = resolved
+			if resolved {
+				f.Comments[i].ResolvedRound = s.ReviewRound
+			} else {
+				f.Comments[i].ResolvedRound = 0
+			}
 			f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 			s.scheduleWrite()
 			return f.Comments[i], true
@@ -1067,7 +1152,12 @@ func (s *Session) SetCommentLive(filePath, id string) bool {
 	return false
 }
 
-// DeleteComment deletes a comment from a specific file.
+// DeleteComment deletes a comment from a specific file. The record is always
+// spliced out locally. If it has been pushed to GitHub (GitHubID != 0) the
+// GitHub ID is appended to pendingGitHubDeletes so the next `crit push` can
+// issue DELETE upstream — without that, deleting a pushed comment would leave
+// a ghost on the PR. trackDeletedComment guards against a concurrent reload
+// from disk resurrecting the just-removed entry before the next save.
 func (s *Session) DeleteComment(filePath, id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1077,6 +1167,9 @@ func (s *Session) DeleteComment(filePath, id string) bool {
 	}
 	for i, c := range f.Comments {
 		if c.ID == id {
+			if c.GitHubID != 0 {
+				s.appendPendingGHDelete(c.GitHubID)
+			}
 			f.Comments = append(f.Comments[:i], f.Comments[i+1:]...)
 			s.trackDeletedComment(filePath, id)
 			s.scheduleWrite()
@@ -1084,6 +1177,20 @@ func (s *Session) DeleteComment(filePath, id string) bool {
 		}
 	}
 	return false
+}
+
+// appendPendingGHDelete adds a GitHub comment ID to the pending-deletes list
+// if it isn't already present. Caller must hold s.mu.
+func (s *Session) appendPendingGHDelete(ghID int64) {
+	if ghID == 0 {
+		return
+	}
+	for _, existing := range s.pendingGitHubDeletes {
+		if existing == ghID {
+			return
+		}
+	}
+	s.pendingGitHubDeletes = append(s.pendingGitHubDeletes, ghID)
 }
 
 // trackDeletedComment records a file comment ID as deleted so the merge logic
@@ -1130,14 +1237,16 @@ func (s *Session) AddReply(filePath, commentID, body, author, userID string) (Re
 		if c.ID == commentID {
 			now := time.Now().UTC().Format(time.RFC3339)
 			r := Reply{
-				ID:        randomReplyID(),
-				Body:      body,
-				Author:    author,
-				UserID:    userID,
-				CreatedAt: now,
+				ID:          randomReplyID(),
+				Body:        body,
+				Author:      author,
+				UserID:      userID,
+				CreatedAt:   now,
+				ReviewRound: s.ReviewRound,
 			}
 			f.Comments[i].Replies = append(f.Comments[i].Replies, r)
 			f.Comments[i].Resolved = false
+			f.Comments[i].ResolvedRound = 0
 			f.Comments[i].UpdatedAt = now
 			s.scheduleWrite()
 			return r, true
@@ -1170,7 +1279,10 @@ func (s *Session) UpdateReply(filePath, commentID, replyID, body string) (Reply,
 	return Reply{}, false
 }
 
-// DeleteReply removes a reply from a specific comment.
+// DeleteReply removes a reply from a specific comment. Always spliced out
+// locally; replies that have been pushed (GitHubID != 0) get their GitHub ID
+// queued in pendingGitHubDeletes so the next `crit push` can DELETE them
+// upstream (replies share /pulls/comments/{id} with root comments).
 func (s *Session) DeleteReply(filePath, commentID, replyID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1182,6 +1294,9 @@ func (s *Session) DeleteReply(filePath, commentID, replyID string) bool {
 		if c.ID == commentID {
 			for j, r := range c.Replies {
 				if r.ID == replyID {
+					if r.GitHubID != 0 {
+						s.appendPendingGHDelete(r.GitHubID)
+					}
 					f.Comments[i].Replies = append(f.Comments[i].Replies[:j], f.Comments[i].Replies[j+1:]...)
 					f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 					s.scheduleWrite()
@@ -1355,13 +1470,14 @@ func (s *Session) EnsureFileEntry(path string) bool {
 	}
 
 	fe := &FileEntry{
-		Path:     path,
-		AbsPath:  absPath,
-		Status:   status,
-		FileType: detectFileType(path),
-		Content:  string(data),
-		FileHash: fileHash(data),
-		Comments: []Comment{},
+		Path:      path,
+		AbsPath:   absPath,
+		Status:    status,
+		FileType:  detectFileType(path),
+		Content:   string(data),
+		FileHash:  fileHash(data),
+		Comments:  []Comment{},
+		Generated: isGenerated(path, s.generatedRules),
 	}
 
 	// Generate diff hunks
@@ -1431,6 +1547,7 @@ func (s *Session) LoadShareFilesFromDisk() []shareFile {
 		absPath               string
 		status                string
 		orphaned              bool
+		generated             bool
 		hasUnresolvedComments bool
 	}
 	infos := make([]fileInfo, 0, len(s.Files))
@@ -1442,7 +1559,7 @@ func (s *Session) LoadShareFilesFromDisk() []shareFile {
 				break
 			}
 		}
-		infos = append(infos, fileInfo{path: f.Path, absPath: f.AbsPath, status: f.Status, orphaned: f.Orphaned, hasUnresolvedComments: hasUnresolved})
+		infos = append(infos, fileInfo{path: f.Path, absPath: f.AbsPath, status: f.Status, orphaned: f.Orphaned, generated: f.Generated, hasUnresolvedComments: hasUnresolved})
 	}
 	s.mu.RUnlock()
 
@@ -1465,7 +1582,7 @@ func (s *Session) LoadShareFilesFromDisk() []shareFile {
 		if err != nil {
 			continue // file may have been removed since session started
 		}
-		files = append(files, shareFile{Path: fi.path, Content: string(data), Status: fi.status})
+		files = append(files, shareFile{Path: fi.path, Content: string(data), Status: fi.status, Generated: fi.generated})
 	}
 	return files
 }
@@ -1581,7 +1698,9 @@ func (s *Session) ClearAllComments() {
 	// Reset all file state, drop the review file entry and orphaned phantom entries.
 	filtered := make([]*FileEntry, 0, len(s.Files))
 	for _, f := range s.Files {
-		if filepath.Base(f.Path) == ".crit.json" || f.Orphaned {
+		// Drop the v4 review folder (`.crit`) and the legacy v3 flat file
+		// (`.crit.json`) so they never appear in the file list.
+		if base := filepath.Base(f.Path); base == ".crit" || base == ".crit.json" || f.Orphaned {
 			continue
 		}
 		f.Comments = []Comment{}
@@ -1592,13 +1711,16 @@ func (s *Session) ClearAllComments() {
 	s.Files = filtered
 	s.reviewComments = nil
 	s.ReviewRound = 1
+	s.RoundSnapshots = nil // v4 lock-discipline: reset in-lock alongside ReviewRound
 	s.lastCritJSONMtime = time.Time{}
 	s.pendingWrite = false
 	s.waitingForAgent = false
 	critPath := s.critJSONPath()
 	s.mu.Unlock()
-	// Delete the review file from disk (centralized or legacy path).
-	os.Remove(critPath) //nolint:errcheck
+	// Full-folder cleanup; idempotent on missing folder.
+	if err := os.RemoveAll(critPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: removing review folder: %v\n", err)
+	}
 }
 
 // ChangeBaseBranch changes the diff base to the given branch, recomputes merge-base,
@@ -1672,11 +1794,12 @@ func (s *Session) ChangeBaseBranch(branch string) error { //nolint:gocyclo // in
 	for _, fc := range changes {
 		absPath := filepath.Join(repoRoot, fc.Path)
 		fe := &FileEntry{
-			Path:     fc.Path,
-			AbsPath:  absPath,
-			Status:   fc.Status,
-			FileType: detectFileType(fc.Path),
-			Comments: commentsByPath[fc.Path],
+			Path:      fc.Path,
+			AbsPath:   absPath,
+			Status:    fc.Status,
+			FileType:  detectFileType(fc.Path),
+			Comments:  commentsByPath[fc.Path],
+			Generated: isGenerated(fc.Path, s.generatedRules),
 		}
 		if fe.Comments == nil {
 			fe.Comments = []Comment{}
@@ -1705,817 +1828,48 @@ func (s *Session) ChangeBaseBranch(branch string) error { //nolint:gocyclo // in
 	return nil
 }
 
-// SetFocus atomically swaps the session's Focus and rebuilds the file list.
-// On any failure during rebuild or persistence, the previous Focus + Files
-// are restored in memory; disk state remains consistent because the only
-// disk write between snapshot and rollback is persistActiveDiffScope, and
-// rollback runs only when that write fails (saveCritJSON uses atomic rename,
-// so it's all-or-nothing — no torn ActiveDiffScope on disk).
-//
-// Caller is responsible for validating the request shape upstream;
-// SetFocus owns SHA validation (via ensureSHAFetched) and persistence.
-func (s *Session) SetFocus(f Focus) error {
-	if f.Kind == FocusRange &&
-		f.DiffScope == DiffScopeFullStack &&
-		f.DefaultSHA == "" {
-		return fmt.Errorf("full-stack scope requires a resolvable default branch tip")
-	}
-
-	s.mu.RLock()
-	repoRoot := s.RepoRoot
-	vcs := s.VCS
-	remoteFiles := s.RemoteFiles
-	s.mu.RUnlock()
-
-	if err := validateFocusSHAs(f, vcs, repoRoot, remoteFiles); err != nil {
-		return err
-	}
-
-	// Hold writeMu across the rest of SetFocus to serialize with the
-	// debounce-timer callback in scheduleWrite. Without this, a timer that
-	// fires after our WriteFiles() flush below — but before
-	// persistActiveDiffScope — would race the swap: it would snapshot the
-	// new Focus's (empty) Files alongside the OLD ActiveDiffScope on disk,
-	// producing a torn intermediate state where comments authored under
-	// the new view appear with the old scope label. The timer callback
-	// also takes writeMu, so blocking it here is sufficient.
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	// Cancel any pending debounce timer outright. WriteFiles below flushes
-	// in-memory state synchronously, so a deferred fire would write nothing
-	// new — but stopping it removes the chance that it sneaks in between
-	// our two locked critical sections (the swap and persistActiveDiffScope).
-	s.mu.Lock()
-	if s.writeTimer != nil {
-		s.writeTimer.Stop()
-	}
-	s.mu.Unlock()
-
-	// Flush any pending debounced WriteFiles BEFORE we replace s.Files.
-	// Without this, recent in-memory comments (authored within the last
-	// 200ms) live only in s.Files and would be lost when buildFilesForFocus
-	// returns a fresh slice with empty Comments. WriteFiles is idempotent
-	// when there's nothing pending.
-	s.WriteFiles()
-
-	// Snapshot for rollback.
-	s.mu.Lock()
-	oldFocus := s.Focus
-	oldFiles := s.Files
-	oldBaseRef := s.BaseRef
-	s.mu.Unlock()
-
-	newFiles, newBaseRef, err := s.buildFilesForFocus(f, vcs, repoRoot)
-	if err != nil {
-		return fmt.Errorf("rebuilding file list for focus: %w", err)
-	}
-
-	s.mu.Lock()
-	s.Focus = f
-	s.Files = newFiles
-	s.BaseRef = newBaseRef
-	// Stash the previous range focus when transitioning OUT of range mode so
-	// the working-tree view can offer a "Resume PR #N" affordance.
-	if oldFocus.Kind == FocusRange && f.Kind != FocusRange {
-		stash := oldFocus
-		s.LastRangeFocus = &stash
-	}
-	s.mu.Unlock()
-
-	// Switching to a *different* PR drops the old PR's cached metadata.
-	dropStaleCacheOnPRSwitch(oldFocus, f)
-
-	// Re-load on-disk comments into the freshly built in-memory file list.
-	// buildFilesForFocus / buildFilesForWorkingTree both produce empty
-	// Comments slices, so without this step the next scheduleWrite would
-	// silently overwrite the disk state (including any re-anchor work
-	// done above). loadCritJSON() walks s.Files and restores matching
-	// paths' comments.
-	s.mu.Lock()
-	s.loadCritJSON()
-	s.mu.Unlock()
-
-	if err := s.persistActiveDiffScope(string(f.DiffScope)); err != nil {
-		// Roll back in-memory state. The WriteFiles() flush at the top of
-		// SetFocus persisted the pre-swap state to disk; loadCritJSON only
-		// reads, and persistActiveDiffScope failed before mutating the file —
-		// so disk still reflects the old focus and rollback is complete.
-		// (If persistActiveDiffScope ever grows a partial-write failure mode,
-		// disk could lag in-memory by exactly one ActiveDiffScope field. That
-		// remains acceptable: the next successful focus change rewrites it,
-		// and ActiveDiffScope is metadata, not user content.)
-		s.mu.Lock()
-		s.Focus = oldFocus
-		s.Files = oldFiles
-		s.BaseRef = oldBaseRef
-		s.mu.Unlock()
-		return fmt.Errorf("persisting active diff scope: %w", err)
-	}
-
-	s.mu.Lock()
-	s.scheduleWrite()
-	s.mu.Unlock()
-
-	// Snapshot under the lock so the SSE payload reflects the same state the
-	// frontend would see on a fresh /api/session fetch — without this, the
-	// Resume PR pill never appears after a range -> working_tree switch
-	// because session.last_range_focus on the client stays at its initial
-	// (typically undefined) value.
-	s.mu.RLock()
-	lastRange := s.LastRangeFocus
-	s.mu.RUnlock()
-	payload, _ := json.Marshal(map[string]any{
-		"focus":            f,
-		"last_range_focus": lastRange,
-	})
-	s.notify(SSEEvent{Type: "focus-changed", Content: string(payload)})
-	return nil
-}
-
-// validateFocusSHAs runs ensureSHAFetched for each SHA needed by the focus.
-// No-op for working-tree focus, and also when remoteFiles is set: in --remote
-// mode file content reads go through the GitHub API, so the local-fetch step
-// is unnecessary side effects (reflog churn, fork creds).
-func validateFocusSHAs(f Focus, vcs VCS, repoRoot string, remoteFiles bool) error {
-	if f.Kind != FocusRange || remoteFiles {
-		return nil
-	}
-	if err := ensureSHAFetched(vcs, f.BaseSHA, repoRoot, ""); err != nil {
-		return err
-	}
-	if err := ensureSHAFetched(vcs, f.HeadSHA, repoRoot, f.ForkURL); err != nil {
-		return err
-	}
-	if f.DiffScope == DiffScopeFullStack && f.DefaultSHA != "" {
-		if err := ensureSHAFetched(vcs, f.DefaultSHA, repoRoot, ""); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// dropStaleCacheOnPRSwitch invalidates the previous PR's cached metadata
-// whenever SetFocus moves between two distinct, non-zero PR numbers. The next
-// time the user comes back to oldFocus.PRNumber we want fresh state in case
-// the PR was retitled, force-pushed, or the description changed.
-func dropStaleCacheOnPRSwitch(oldFocus, newFocus Focus) {
-	if oldFocus.PRNumber == 0 || newFocus.PRNumber == 0 {
-		return
-	}
-	if oldFocus.PRNumber == newFocus.PRNumber {
-		return
-	}
-	invalidatePRCache(oldFocus.PRNumber)
-}
-
-// readFileAtSHA returns file content at the given SHA. When RemoteFiles is
-// set and we're in a range focus with a parseable PR URL, it goes through
-// the GitHub API (gh api repos/.../contents/?ref=<sha>); otherwise it falls
-// through to local git. Result is memoized in s.remoteFileCache for the
-// remote path; the local path is fast enough already.
-func (s *Session) readFileAtSHA(sha, path string) ([]byte, error) {
-	if s.RemoteFiles && s.Focus.Kind == FocusRange && s.Focus.PRURL != "" {
-		return s.readFileAtSHARemote(sha, path)
-	}
-	return s.VCS.ReadFileAtSHA(sha, path, s.RepoRoot)
-}
-
-// readFileAtSHARemote fetches file content via `gh api`. Falls back to the
-// local VCS read when the PR URL is unparseable — the caller still gets a
-// best-effort result rather than a hard failure.
-func (s *Session) readFileAtSHARemote(sha, path string) ([]byte, error) {
-	cacheKey := sha + "\x00" + path
-	cache := s.ensureRemoteFileCache()
-	if v, ok := cache.Get(cacheKey); ok {
-		return v, nil
-	}
-	owner, name, ok := parseRepoFromPRURL(s.Focus.PRURL)
-	if !ok {
-		// Unparseable PRURL is rare (we built the Focus from a gh API call)
-		// but keep going — local git is still a valid path.
-		return s.VCS.ReadFileAtSHA(sha, path, s.RepoRoot)
-	}
-	data, err := fetchPRFileContent(owner, name, sha, path)
-	if err != nil {
-		return nil, err
-	}
-	cache.Put(cacheKey, data)
-	return data, nil
-}
-
-// ensureRemoteFileCache returns s.remoteFileCache, lazy-initialising it under
-// s.mu so concurrent readers (e.g. parallel buildFilesForFocus paths) don't
-// race on first allocation. Subsequent calls take a single RLock.
-func (s *Session) ensureRemoteFileCache() *bytesLRU {
-	s.mu.RLock()
-	c := s.remoteFileCache
-	s.mu.RUnlock()
-	if c != nil {
-		return c
-	}
-	s.mu.Lock()
-	if s.remoteFileCache == nil {
-		s.remoteFileCache = newBytesLRU(remoteFileCacheCap)
-	}
-	c = s.remoteFileCache
-	s.mu.Unlock()
-	return c
-}
-
-// buildFilesForFocus returns a fresh []*FileEntry and BaseRef value for the
-// given focus. Working-tree focus rebuilds from the VCS so toggling between
-// modes shows the right file list. Range focus reads files via
-// s.readFileAtSHA (which routes to gh api when --remote is set) and computes
-// diffs via vcs.FileDiffBetweenSHAs.
-//
-// Note: when s.RemoteFiles is true, only file content reads are remote.
-// FileDiffBetweenSHAs and ChangedFilesBetweenSHAs still go through local git
-// — the GitHub API has no clean equivalent for those operations.
-func (s *Session) buildFilesForFocus(f Focus, vcs VCS, repoRoot string) ([]*FileEntry, string, error) {
-	if f.Kind != FocusRange {
-		return s.buildFilesForWorkingTree(vcs, repoRoot)
-	}
-	if vcs == nil {
-		return nil, "", fmt.Errorf("range focus requires a VCS")
-	}
-	changes, err := vcs.ChangedFilesBetweenSHAs(f.DiffBaseSHA(), f.HeadSHA, repoRoot)
-	if err != nil {
-		return nil, "", err
-	}
-	out := make([]*FileEntry, 0, len(changes))
-	for _, fc := range changes {
-		fe := &FileEntry{
-			Path:     fc.Path,
-			AbsPath:  filepath.Join(repoRoot, fc.Path),
-			Status:   fc.Status,
-			FileType: detectFileType(fc.Path),
-			Comments: []Comment{},
-		}
-		if fc.Status != "deleted" {
-			data, readErr := s.readFileAtSHA(f.HeadSHA, fc.Path)
-			if readErr != nil {
-				return nil, "", fmt.Errorf("read %s at %s: %w", fc.Path, f.HeadSHA, readErr)
-			}
-			fe.Content = string(data)
-			fe.FileHash = fileHash(data)
-		}
-		if fc.Status != "added" && fc.Status != "untracked" {
-			hunks, _ := vcs.FileDiffBetweenSHAs(fc.Path, f.DiffBaseSHA(), f.HeadSHA, repoRoot)
-			fe.DiffHunks = hunks
-		} else {
-			fe.DiffHunks = FileDiffUnifiedNewFile(fe.Content)
-		}
-		out = append(out, fe)
-	}
-	return out, f.DiffBaseSHA(), nil
-}
-
-// buildFilesForWorkingTree rebuilds the file list from the VCS for the
-// working-tree focus. Mirrors the eager-load loop in NewSessionFromVCS but
-// does not mutate session state directly.
-func (s *Session) buildFilesForWorkingTree(vcs VCS, repoRoot string) ([]*FileEntry, string, error) {
-	if vcs == nil {
-		// No VCS — keep current file list (file mode).
-		s.mu.RLock()
-		files := s.Files
-		baseRef := s.BaseRef
-		s.mu.RUnlock()
-		return files, baseRef, nil
-	}
-	s.mu.RLock()
-	ignorePatterns := s.IgnorePatterns
-	branch := s.Branch
-	s.mu.RUnlock()
-	defaultBranch := vcs.DefaultBranch()
-	baseRef := ""
-	if branch != defaultBranch {
-		baseRef, _ = vcs.MergeBase(defaultBranch)
-	}
-	var changes []FileChange
-	var err error
-	if branch == defaultBranch {
-		changes, err = vcs.ChangedFilesOnDefaultInDir(repoRoot)
-	} else {
-		changes, err = vcs.ChangedFilesFromBaseInDir(baseRef, repoRoot)
-	}
-	if err != nil {
-		return nil, "", err
-	}
-	changes = filterIgnored(changes, ignorePatterns)
-	out := make([]*FileEntry, 0, len(changes))
-	for _, fc := range changes {
-		fe := &FileEntry{
-			Path:     fc.Path,
-			AbsPath:  filepath.Join(repoRoot, fc.Path),
-			Status:   fc.Status,
-			FileType: detectFileType(fc.Path),
-			Comments: []Comment{},
-		}
-		if !populateEagerFile(fe, fc, baseRef, repoRoot, vcs) {
-			continue
-		}
-		out = append(out, fe)
-	}
-	return out, baseRef, nil
-}
-
-// persistActiveDiffScope updates CritJSON.ActiveDiffScope on disk via
-// saveCritJSON. Always called on focus change — including when scope is empty
-// (working-tree), so a stale "layer" doesn't linger from a previous range
-// session and confuse the push gate.
-func (s *Session) persistActiveDiffScope(scope string) error {
-	critPath := s.critJSONPath()
-	cj, err := loadCritJSON(critPath)
-	if err != nil {
-		// File may not exist yet — fall through and create one with just the scope.
-		cj = CritJSON{Files: map[string]CritJSONFile{}}
-	}
-	cj.ActiveDiffScope = scope
-	return saveCritJSON(critPath, cj)
-}
-
-// scheduleWrite debounces writes to disk.
-func (s *Session) scheduleWrite() {
-	s.pendingWrite = true
-	if s.writeTimer != nil {
-		s.writeTimer.Stop()
-	}
-	gen := s.writeGen
-	s.writeTimer = time.AfterFunc(200*time.Millisecond, func() {
-		// Serialize debounced writes with ClearAllComments so a stale
-		// in-flight write cannot recreate the review file after we've
-		// deleted it. ClearAllComments bumps writeGen under writeMu, so
-		// once we hold the mutex the gen check reflects the final state.
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		s.mu.RLock()
-		if s.writeGen != gen {
-			s.mu.RUnlock()
-			return
-		}
-		s.mu.RUnlock()
-		s.WriteFiles()
-	})
-}
-
-// critJSONPath returns the path to the review file.
-func (s *Session) critJSONPath() string {
-	if s.OutputDir != "" {
-		return filepath.Join(s.OutputDir, ".crit.json")
-	}
-	if s.ReviewFilePath != "" {
-		return s.ReviewFilePath
-	}
-	// Fallback for tests and backwards compat
-	return filepath.Join(s.RepoRoot, ".crit.json")
-}
-
-// writeFilesSnapshot holds all session state needed to write the review file,
-// captured under lock so that disk I/O can happen without holding the lock.
-type writeFilesSnapshot struct {
-	critPath       string
-	lastMtime      time.Time
-	branch         string
-	baseRef        string
-	reviewRound    int
-	sharedURL      string
-	deleteToken    string
-	shareScope     string
-	reviewComments []Comment
-	cliArgs        []string
-	// Per-file data needed for the merge. We copy comments so the snapshot
-	// is independent of later in-memory mutations.
-	files []writeFileSnapshot
-}
-
-type writeFileSnapshot struct {
-	path       string
-	status     string
-	fileHash   string
-	comments   []Comment
-	deletedIDs map[string]struct{} // comment IDs deleted in-memory, skip during merge
-}
-
-// handleExternalDeletion checks if the review file was deleted externally and clears
-// in-memory comments if so. Returns true if the file was deleted.
-func (s *Session) handleExternalDeletion(critPath string) bool {
-	s.mu.RLock()
-	lastMtime := s.lastCritJSONMtime
-	s.mu.RUnlock()
-
-	if lastMtime.IsZero() {
-		return false
-	}
-	if _, statErr := os.Stat(critPath); !os.IsNotExist(statErr) {
-		return false
-	}
-
-	s.clearAllCommentData()
-	return true
-}
-
-// clearAllCommentData resets all in-memory comment state (file comments,
-// review comments, and ID counters) and notifies if any comments existed.
-// Caller must NOT hold s.mu.
-func (s *Session) clearAllCommentData() {
-	s.mu.Lock()
-	s.lastCritJSONMtime = time.Time{}
-	anyComments := false
-	for _, f := range s.Files {
-		if len(f.Comments) > 0 {
-			f.Comments = []Comment{}
-			anyComments = true
-		}
-	}
-	if len(s.reviewComments) > 0 {
-		anyComments = true
-	}
-	s.reviewComments = nil
-	s.deletedCommentIDs = nil
-	s.mu.Unlock()
-	if anyComments {
-		s.notify(SSEEvent{Type: "comments-changed"})
-	}
-}
-
-// buildCritJSON loads the existing review file from disk, applies the snapshot metadata,
-// and merges per-file comments.
-func buildCritJSON(snap writeFilesSnapshot) CritJSON {
-	cj := CritJSON{Files: make(map[string]CritJSONFile)}
-	if data, err := os.ReadFile(snap.critPath); err == nil {
-		if unmarshalErr := json.Unmarshal(data, &cj); unmarshalErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: corrupt review file, starting fresh: %v\n", unmarshalErr)
-		}
-		if cj.Files == nil {
-			cj.Files = make(map[string]CritJSONFile)
-		}
-	}
-	cj.Branch = snap.branch
-	cj.BaseRef = snap.baseRef
-	cj.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	cj.ReviewRound = snap.reviewRound
-	cj.ShareURL = snap.sharedURL
-	cj.DeleteToken = snap.deleteToken
-	cj.ShareScope = snap.shareScope
-	cj.ReviewComments = snap.reviewComments
-	cj.CliArgs = snap.cliArgs
-
-	for _, fs := range snap.files {
-		mergeFileSnapshotIntoCritJSON(&cj, fs)
-	}
-	return cj
-}
-
-// mergeFileSnapshotIntoCritJSON merges a single file's comments from the snapshot
-// with any disk-only comments, and updates the CritJSON.
-func mergeFileSnapshotIntoCritJSON(cj *CritJSON, fs writeFileSnapshot) {
-	diskFile, hasDisk := cj.Files[fs.path]
-
-	memIDs := make(map[string]struct{}, len(fs.comments))
-	for _, c := range fs.comments {
-		memIDs[c.ID] = struct{}{}
-	}
-
-	merged := fs.comments
-	if hasDisk {
-		for _, dc := range diskFile.Comments {
-			if _, exists := memIDs[dc.ID]; exists {
-				continue
-			}
-			// Skip comments that were explicitly deleted in-memory
-			if _, deleted := fs.deletedIDs[dc.ID]; deleted {
-				continue
-			}
-			merged = append(merged, dc)
-		}
-	}
-
-	if len(merged) == 0 {
-		delete(cj.Files, fs.path)
-		return
-	}
-
-	cj.Files[fs.path] = CritJSONFile{
-		Status:   fs.status,
-		FileHash: fs.fileHash,
-		Comments: merged,
-	}
-}
-
-func critJSONIsEmpty(cj CritJSON) bool {
-	return len(cj.Files) == 0 && len(cj.ReviewComments) == 0 &&
-		cj.ShareURL == "" && cj.DeleteToken == "" && cj.ShareScope == ""
-}
-
-// WriteFiles writes the review file to disk.
-//
-// The implementation snapshots all needed session state under RLock, then
-// releases the lock before doing any disk I/O (ReadFile, Stat, WriteFile).
-// This prevents a slow filesystem from blocking comment operations.
-//
-// Concurrency note: the debounce timer in scheduleWrite ensures that only one
-// WriteFiles call is in-flight at a time for a given generation. Between the
-// snapshot and the final WriteFile, no concurrent WriteFiles should be running
-// because scheduleWrite cancels the previous timer before arming a new one.
-func (s *Session) WriteFiles() {
-	critPath := s.critJSONPath()
-
-	if s.handleExternalDeletion(critPath) {
-		return
-	}
-
-	snap := s.snapshotForWrite(critPath)
-	cj := buildCritJSON(snap)
-
-	if critJSONIsEmpty(cj) {
-		os.Remove(snap.critPath)
-		s.mu.Lock()
-		s.lastCritJSONMtime = time.Time{}
-		s.pendingWrite = false
-		s.deletedCommentIDs = nil
-		s.mu.Unlock()
-		return
-	}
-
-	data, err := json.MarshalIndent(cj, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error marshaling review file: %v\n", err)
-		return
-	}
-	if err := atomicWriteFile(snap.critPath, data, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing review file: %v\n", err)
-		return
-	}
-	if info, err := os.Stat(snap.critPath); err == nil {
-		s.mu.Lock()
-		s.lastCritJSONMtime = info.ModTime()
-		s.pendingWrite = false
-		s.deletedCommentIDs = nil // written to disk, no longer needed
-		s.mu.Unlock()
-	}
-}
-
-// snapshotForWrite captures all session state needed by WriteFiles under RLock.
-// The returned snapshot owns its own copies of comment slices, so it is safe
-// to use after the lock is released.
-func (s *Session) snapshotForWrite(critPath string) writeFilesSnapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rc := make([]Comment, len(s.reviewComments))
-	copy(rc, s.reviewComments)
-	snap := writeFilesSnapshot{
-		critPath:       critPath,
-		lastMtime:      s.lastCritJSONMtime,
-		branch:         s.Branch,
-		baseRef:        s.BaseRef,
-		reviewRound:    s.ReviewRound,
-		sharedURL:      s.sharedURL,
-		deleteToken:    s.deleteToken,
-		shareScope:     s.shareScope,
-		reviewComments: rc,
-		cliArgs:        s.CLIArgs,
-		files:          make([]writeFileSnapshot, len(s.Files)),
-	}
-	for i, f := range s.Files {
-		comments := make([]Comment, len(f.Comments))
-		copy(comments, f.Comments)
-		var deleted map[string]struct{}
-		if ids := s.deletedCommentIDs[f.Path]; len(ids) > 0 {
-			deleted = make(map[string]struct{}, len(ids))
-			for k, v := range ids {
-				deleted[k] = v
-			}
-		}
-		snap.files[i] = writeFileSnapshot{
-			path:       f.Path,
-			status:     f.Status,
-			fileHash:   f.FileHash,
-			comments:   comments,
-			deletedIDs: deleted,
-		}
-	}
-	return snap
-}
-
-// handleCritJSONDeleted clears all in-memory comment state when the review file
-// has been deleted. Returns true unconditionally to signal the deletion.
-func (s *Session) handleCritJSONDeleted() bool {
-	s.clearAllCommentData()
-	return true
-}
-
-func (s *Session) mergeFileCommentsFromDisk(f *FileEntry, diskFile CritJSONFile) bool {
-	changed := false
-
-	memIDs := make(map[string]struct{}, len(f.Comments))
-	for _, c := range f.Comments {
-		memIDs[c.ID] = struct{}{}
-	}
-
-	for _, dc := range diskFile.Comments {
-		if _, exists := memIDs[dc.ID]; !exists {
-			f.Comments = append(f.Comments, dc)
-			changed = true
-		} else {
-			changed = s.mergeCommentRepliesAndState(f.Comments, dc) || changed
-		}
-	}
-
-	// Remove comments deleted on disk.
-	if len(diskFile.Comments) != len(f.Comments) {
-		changed = filterDeletedComments(f, diskFile.Comments) || changed
-	}
-
-	return changed
-}
-
-func (s *Session) mergeCommentRepliesAndState(comments []Comment, dc Comment) bool {
-	changed := false
-	for i, mc := range comments {
-		if mc.ID != dc.ID {
-			continue
-		}
-		memReplyIDs := make(map[string]struct{}, len(mc.Replies))
-		for _, r := range mc.Replies {
-			memReplyIDs[r.ID] = struct{}{}
-		}
-		for _, dr := range dc.Replies {
-			if _, exists := memReplyIDs[dr.ID]; !exists {
-				comments[i].Replies = append(comments[i].Replies, dr)
-				changed = true
-			}
-		}
-		if dc.Resolved != mc.Resolved {
-			comments[i].Resolved = dc.Resolved
-			changed = true
-		}
-		break
-	}
-	return changed
-}
-
-func filterDeletedComments(f *FileEntry, diskComments []Comment) bool {
-	diskIDs := make(map[string]struct{}, len(diskComments))
-	for _, dc := range diskComments {
-		diskIDs[dc.ID] = struct{}{}
-	}
-	filtered := f.Comments[:0]
-	for _, c := range f.Comments {
-		if _, exists := diskIDs[c.ID]; exists {
-			filtered = append(filtered, c)
-		}
-	}
-	if len(filtered) != len(f.Comments) {
-		f.Comments = filtered
-		return true
-	}
-	return false
-}
-
-func (s *Session) mergeReviewCommentsFromDisk(diskComments []Comment) bool {
-	changed := false
-
-	memReviewIDs := make(map[string]struct{}, len(s.reviewComments))
-	for _, c := range s.reviewComments {
-		memReviewIDs[c.ID] = struct{}{}
-	}
-	for _, dc := range diskComments {
-		if _, exists := memReviewIDs[dc.ID]; !exists {
-			s.reviewComments = append(s.reviewComments, dc)
-			changed = true
-		} else {
-			changed = s.mergeReviewCommentRepliesAndState(dc) || changed
-		}
-	}
-
-	// Remove review comments deleted on disk.
-	changed = s.filterDeletedReviewComments(diskComments) || changed
-
-	return changed
-}
-
-func (s *Session) mergeReviewCommentRepliesAndState(dc Comment) bool {
-	changed := false
-	for i, mc := range s.reviewComments {
-		if mc.ID != dc.ID {
-			continue
-		}
-		if dc.Resolved != mc.Resolved {
-			s.reviewComments[i].Resolved = dc.Resolved
-			changed = true
-		}
-		memRIDs := make(map[string]struct{}, len(mc.Replies))
-		for _, r := range mc.Replies {
-			memRIDs[r.ID] = struct{}{}
-		}
-		for _, dr := range dc.Replies {
-			if _, exists := memRIDs[dr.ID]; !exists {
-				s.reviewComments[i].Replies = append(s.reviewComments[i].Replies, dr)
-				changed = true
-			}
-		}
-		break
-	}
-	return changed
-}
-
-func (s *Session) filterDeletedReviewComments(diskComments []Comment) bool {
-	diskRIDs := make(map[string]struct{}, len(diskComments))
-	for _, dc := range diskComments {
-		diskRIDs[dc.ID] = struct{}{}
-	}
-	filtered := s.reviewComments[:0]
-	for _, c := range s.reviewComments {
-		if _, exists := diskRIDs[c.ID]; exists {
-			filtered = append(filtered, c)
-		}
-	}
-	if len(filtered) != len(s.reviewComments) {
-		s.reviewComments = filtered
-		return true
-	}
-	return false
-}
-
-func (s *Session) mergeExternalCritJSON() bool {
-	critPath := s.critJSONPath()
-
-	info, err := os.Stat(critPath)
-
-	s.mu.RLock()
-	lastMtime := s.lastCritJSONMtime
-	s.mu.RUnlock()
-
-	if err != nil {
-		if !lastMtime.IsZero() {
-			return s.handleCritJSONDeleted()
-		}
-		return false
-	}
-
-	if !lastMtime.IsZero() && info.ModTime().Equal(lastMtime) {
-		return false
-	}
-
-	s.mu.RLock()
-	pending := s.pendingWrite
-	s.mu.RUnlock()
-	if pending {
-		return false
-	}
-
-	data, err := os.ReadFile(critPath)
-	if err != nil {
-		return false
-	}
-	var cj CritJSON
-	if err := json.Unmarshal(data, &cj); err != nil {
-		return false
-	}
-
-	s.mu.Lock()
-	s.lastCritJSONMtime = info.ModTime()
-	// Disk is authoritative for external edits — clear deleted tracking
-	s.deletedCommentIDs = nil
-
-	changed := false
-
-	for _, f := range s.Files {
-		diskFile, hasDisk := cj.Files[f.Path]
-		if !hasDisk {
-			if len(f.Comments) > 0 {
-				f.Comments = []Comment{}
-				changed = true
-			}
-			continue
-		}
-		changed = s.mergeFileCommentsFromDisk(f, diskFile) || changed
-	}
-
-	changed = s.mergeReviewCommentsFromDisk(cj.ReviewComments) || changed
-	s.mu.Unlock()
-
-	if changed {
-		s.notify(SSEEvent{Type: "comments-changed"})
-	}
-
-	return changed
+// reportLoadCritJSONLockViolation surfaces a post-SetSession loadCritJSON
+// call. In production it logs to stderr and returns so the daemon stays up;
+// in dev/CI (CRIT_DEBUG set) it panics so the regression fails loudly. See
+// plan v4 §Lock discipline.
+func reportLoadCritJSONLockViolation() {
+	const msg = "BUG: Session.loadCritJSON called post-SetSession; ignoring (see plan v4 §Lock discipline)"
+	if os.Getenv("CRIT_DEBUG") != "" {
+		panic(msg)
+	}
+	fmt.Fprintln(os.Stderr, msg)
 }
 
 // loadCritJSON loads comments and share state from an existing review file.
+//
+// Lock contract: PRE-SETSESSION ONLY. Safe to call only from the constructor
+// path (NewSessionFromFiles, applySessionOverrides, etc.) before any goroutine
+// reads s.RoundSnapshots / s.reviewComments / etc. Runtime callers that hold
+// s.mu.Lock() must use loadCritJSONLocked instead. See plan v4 §Lock discipline.
+//
+// Acquires s.mu.Lock() defensively: even pre-SetSession, a prior mutation
+// (e.g. AddReviewComment in a test) may have armed scheduleWrite's debounced
+// AfterFunc, which reads s.lastCritJSONMtime under RLock from a separate
+// goroutine. Stopping the timer first short-circuits the common case; the
+// lock covers the in-flight case.
 func (s *Session) loadCritJSON() {
-	data, err := os.ReadFile(s.critJSONPath())
-	if err != nil {
+	if s.sessionStarted.Load() != 0 {
+		reportLoadCritJSONLockViolation()
 		return
 	}
-	var cj CritJSON
-	if err := json.Unmarshal(data, &cj); err != nil {
-		return
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writeTimer != nil {
+		s.writeTimer.Stop()
 	}
+	s.loadCritJSONLocked()
+}
 
-	// Only restore share state if the file set matches what was shared.
+// restoreShareStateLocked copies share-related fields from cj into the
+// session, gated by share-scope match so we don't carry over a share
+// pointer when the file set has changed since the share was created.
+// Caller must hold s.mu.Lock() (or be the constructor pre-SetSession).
+func (s *Session) restoreShareStateLocked(cj *CritJSON) {
 	if cj.ShareScope != "" {
 		paths := make([]string, 0, len(s.Files))
 		for _, f := range s.Files {
@@ -2526,28 +1880,91 @@ func (s *Session) loadCritJSON() {
 			s.deleteToken = cj.DeleteToken
 			s.shareScope = cj.ShareScope
 		}
-	} else if cj.ShareURL != "" {
+		return
+	}
+	if cj.ShareURL != "" {
 		// No scope recorded — load unconditionally.
 		s.sharedURL = cj.ShareURL
 		s.deleteToken = cj.DeleteToken
 	}
+}
+
+// restoreFileCommentsLocked copies per-file comments from cj into matching
+// FileEntry slots, defaulting empty Scope to "line" for legacy comments.
+// Caller must hold s.mu.Lock() (or be the constructor pre-SetSession).
+func (s *Session) restoreFileCommentsLocked(cj *CritJSON) {
+	for _, f := range s.Files {
+		cf, ok := cj.Files[f.Path]
+		if !ok {
+			continue
+		}
+		f.Comments = cf.Comments
+		for i := range f.Comments {
+			if f.Comments[i].Scope == "" {
+				f.Comments[i].Scope = "line"
+			}
+		}
+	}
+}
+
+// loadCritJSONLocked is the runtime variant of loadCritJSON. It performs the
+// same disk read + in-memory restore but skips the pre-SetSession guard so
+// runtime code paths can reload comments after a state change (e.g. SetFocus
+// rebuilds s.Files and needs to repopulate per-file Comments from disk).
+//
+// Lock contract: caller MUST hold s.mu.Lock() (writer lock). The function
+// mutates s.Files[*].Comments, s.reviewComments, s.ReviewRound,
+// s.sharedURL/deleteToken/shareScope, and s.lastCritJSONMtime, all of which
+// race with concurrent readers under s.mu.RLock(). The pre-SetSession path
+// (loadCritJSON) gets away without the lock because no other goroutine has
+// observed the session yet.
+func (s *Session) loadCritJSONLocked() {
+	identity := s.critJSONPath()
+
+	// Capture identity-on-entry. If ReviewFilePath / OutputDir were set
+	// BEFORE this call (the canonical resumed-session path in cli_serve),
+	// the on-disk sidecar is already authoritative and we don't need to
+	// rewrite it from in-memory state. Used downstream to skip a
+	// redundant O(N*M) clone+marshal+rename on every cold boot.
+	identityOnEntry := s.ReviewFilePath != "" || s.OutputDir != ""
+
+	// MIGRATION-REMOVAL: trigger v3->v4 folder migration on read.
+	if err := ensureReviewFolder(identity); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: review folder migration: %v\n", err)
+	}
+
+	data, err := os.ReadFile(reviewPathsFor(identity).Review)
+	if err != nil {
+		// Fall through to the sidecar load — a folder may exist with only
+		// snapshots.json (orphan-snapshots) and we still want to surface that.
+		sidecarHadData := s.loadSnapshotsFromSidecar(identity)
+		// Persist the in-memory R1 baseline that NewSessionFromFiles captured
+		// in case ReviewFilePath / OutputDir was assigned just before this
+		// call (the canonical constructor-time path).
+		//
+		// Resumed-session optimization (review W5): when the sidecar already
+		// carried snapshots and identity was set on entry, the on-disk data
+		// is authoritative — skip the redundant rewrite.
+		if identityOnEntry && sidecarHadData {
+			s.captureRoundSnapshot(s.ReviewRound)
+			return
+		}
+		s.captureBaselineAndPersist()
+		return
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		return
+	}
+
+	s.restoreShareStateLocked(&cj)
 
 	// Restore review round so the session continues from where it left off.
 	if cj.ReviewRound > s.ReviewRound {
 		s.ReviewRound = cj.ReviewRound
 	}
 
-	// Restore comments for files that match by path.
-	for _, f := range s.Files {
-		if cf, ok := cj.Files[f.Path]; ok {
-			f.Comments = cf.Comments
-			for i := range f.Comments {
-				if f.Comments[i].Scope == "" {
-					f.Comments[i].Scope = "line"
-				}
-			}
-		}
-	}
+	s.restoreFileCommentsLocked(&cj)
 
 	// Detect orphaned paths: files in the review file with comments but not in the session.
 	s.appendOrphanedFiles(cj.Files)
@@ -2555,10 +1972,57 @@ func (s *Session) loadCritJSON() {
 	// Restore review-level comments.
 	s.reviewComments = cj.ReviewComments
 
+	// Restore pending DELETE intents so they survive across daemon restarts.
+	s.pendingGitHubDeletes = cj.PendingGitHubDeletes
+	s.lastLoadedPendingGHDeletes = make(map[int64]struct{}, len(cj.PendingGitHubDeletes))
+	for _, id := range cj.PendingGitHubDeletes {
+		s.lastLoadedPendingGHDeletes[id] = struct{}{}
+	}
+
 	// Record the mtime so the first ticker tick doesn't re-process our own file.
-	if info, err := os.Stat(s.critJSONPath()); err == nil {
+	if info, err := os.Stat(reviewPathsFor(s.critJSONPath()).Review); err == nil {
 		s.lastCritJSONMtime = info.ModTime()
 	}
+
+	// Restore round snapshots from the folder sidecar.
+	sidecarHadData := s.loadSnapshotsFromSidecar(s.critJSONPath())
+
+	// If ReviewFilePath / OutputDir was assigned just before this call (the
+	// canonical constructor-time path in cli_serve), the in-memory R1 baseline
+	// captured by NewSessionFromFiles hasn't been persisted yet. Re-run the
+	// best-effort persist now that the identity is known.
+	//
+	// Optimization (review W5): for a resumed session — identity already
+	// known on entry AND the sidecar carried a non-empty snapshot map — the
+	// on-disk sidecar is authoritative and rewriting it is redundant
+	// (O(N*M) clone+marshal+rename on every cold boot). The capture itself
+	// remains idempotent so we still call captureRoundSnapshot to keep R1
+	// well-defined in memory; we just skip the disk write.
+	if identityOnEntry && sidecarHadData {
+		s.captureRoundSnapshot(s.ReviewRound)
+		return
+	}
+	s.captureBaselineAndPersist()
+}
+
+// loadSnapshotsFromSidecar restores Session.RoundSnapshots from
+// <identity>/snapshots.json. Missing file = silent empty map. Malformed = log
+// + fall through (next round-complete rewrites it). Returns true when the
+// sidecar carried at least one snapshot (i.e. this is a resumed session).
+//
+// Lock contract: pre-SetSession or under s.mu.Lock(). Mutates s.RoundSnapshots.
+func (s *Session) loadSnapshotsFromSidecar(identity string) bool {
+	sidecarPath := reviewPathsFor(identity).Snapshots
+	sf, err := loadSnapshotsFile(sidecarPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: snapshots sidecar unreadable, ignoring: %v\n", err)
+		return false
+	}
+	if len(sf.RoundSnapshots) == 0 {
+		return false
+	}
+	s.RoundSnapshots = cloneRoundSnapshots(sf.RoundSnapshots)
+	return true
 }
 
 // restoreOrphanedComments reads the review file and creates phantom FileEntry
@@ -2566,7 +2030,7 @@ func (s *Session) loadCritJSON() {
 // Safe to call multiple times — existing entries (including previous orphans) are skipped.
 // Must be called with s.mu NOT held (acquires the lock internally).
 func (s *Session) restoreOrphanedComments() {
-	data, err := os.ReadFile(s.critJSONPath())
+	data, err := os.ReadFile(reviewPathsFor(s.critJSONPath()).Review)
 	if err != nil {
 		return
 	}
@@ -2777,18 +2241,19 @@ func (s *Session) GetFileDiffSnapshot(path string) (map[string]any, bool) {
 
 // SessionInfo returns metadata about the session for the API.
 type SessionInfo struct {
-	Mode            string            `json:"mode"` // "files" or "git"
-	VCSName         string            `json:"vcs_name,omitempty"`
-	Branch          string            `json:"branch"`
-	BaseRef         string            `json:"base_ref"`
-	BaseBranchName  string            `json:"base_branch_name,omitempty"`
-	ReviewRound     int               `json:"review_round"`
-	AvailableScopes []string          `json:"available_scopes"`
-	Files           []SessionFileInfo `json:"files"`
-	ReviewComments  []Comment         `json:"review_comments"`
-	Cwd             string            `json:"cwd,omitempty"`
-	Focus           Focus             `json:"focus"`
-	LastRangeFocus  *Focus            `json:"last_range_focus,omitempty"`
+	Mode             string            `json:"mode"` // "files" or "git"
+	VCSName          string            `json:"vcs_name,omitempty"`
+	Branch           string            `json:"branch"`
+	BaseRef          string            `json:"base_ref"`
+	BaseBranchName   string            `json:"base_branch_name,omitempty"`
+	ReviewRound      int               `json:"review_round"`
+	AvailableScopes  []string          `json:"available_scopes"`
+	Files            []SessionFileInfo `json:"files"`
+	ReviewComments   []Comment         `json:"review_comments"`
+	Cwd              string            `json:"cwd,omitempty"`
+	Focus            Focus             `json:"focus"`
+	LastRangeFocus   *Focus            `json:"last_range_focus,omitempty"`
+	HiddenUnresolved int               `json:"hidden_unresolved"`
 }
 
 // SessionFileInfo is a summary of a file for the session API response.
@@ -2801,6 +2266,7 @@ type SessionFileInfo struct {
 	Deletions    int    `json:"deletions"`
 	Lazy         bool   `json:"lazy,omitempty"`
 	Orphaned     bool   `json:"orphaned,omitempty"`
+	Generated    bool   `json:"generated,omitempty"`
 }
 
 // GetSessionInfo returns a snapshot of session metadata.
@@ -2855,6 +2321,7 @@ func (s *Session) GetSessionInfo() SessionInfo {
 			CommentCount: visibleCount,
 			Lazy:         f.Lazy,
 			Orphaned:     f.Orphaned,
+			Generated:    f.Generated,
 		}
 		if f.Lazy {
 			// Use pre-computed stats from git diff --numstat
@@ -2876,329 +2343,4 @@ func (s *Session) GetSessionInfo() SessionInfo {
 		info.Files = append(info.Files, fi)
 	}
 	return info
-}
-
-// scopeCache caches the result of availableScopes to avoid running multiple
-// git commands on every /api/session request. The cache has a short TTL (2s)
-// so scope changes are picked up quickly.
-var (
-	scopeCacheMu      sync.Mutex
-	scopeCacheBaseRef string
-	scopeCacheResult  []string
-	scopeCacheExpiry  time.Time
-)
-
-const scopeCacheTTL = 2 * time.Second
-
-// cachedAvailableScopes returns availableScopes results, using a 2-second cache
-// to avoid running VCS commands on every /api/session poll.
-func cachedAvailableScopes(baseRef string, vcs VCS) []string {
-	scopeCacheMu.Lock()
-	defer scopeCacheMu.Unlock()
-
-	now := time.Now()
-	if now.Before(scopeCacheExpiry) && scopeCacheBaseRef == baseRef {
-		result := make([]string, len(scopeCacheResult))
-		copy(result, scopeCacheResult)
-		return result
-	}
-
-	scopes := availableScopes(baseRef, vcs)
-	scopeCacheBaseRef = baseRef
-	scopeCacheResult = scopes
-	scopeCacheExpiry = now.Add(scopeCacheTTL)
-
-	result := make([]string, len(scopes))
-	copy(result, scopes)
-	return result
-}
-
-// availableScopes returns the list of scopes that have files.
-// Only includes a scope if the VCS reports changes for it.
-func availableScopes(baseRef string, vcs VCS) []string {
-	scopes := []string{"all"}
-	if vcs == nil {
-		return scopes
-	}
-	if baseRef != "" {
-		if files, err := vcs.ChangedFilesScoped("branch", baseRef); err == nil && len(files) > 0 {
-			scopes = append(scopes, "branch")
-		}
-	}
-	if vcs.HasStagingArea() {
-		if files, err := vcs.ChangedFilesScoped("staged", baseRef); err == nil && len(files) > 0 {
-			scopes = append(scopes, "staged")
-		}
-		if files, err := vcs.ChangedFilesScoped("unstaged", baseRef); err == nil && len(files) > 0 {
-			scopes = append(scopes, "unstaged")
-		}
-	}
-	return scopes
-}
-
-// GetCommits returns the list of commits between the base ref and the focus's
-// upper bound. In working-tree mode the upper bound is the VCS's HEAD; in range
-// mode it's Focus.HeadSHA so the dropdown doesn't list commits past the focus.
-// Returns nil for non-VCS sessions or when no base ref is set.
-func (s *Session) GetCommits() []CommitInfo {
-	s.mu.RLock()
-	if s.Mode != "git" || s.BaseRef == "" || s.VCS == nil {
-		s.mu.RUnlock()
-		return nil
-	}
-	baseRef, repoRoot, vcs := s.BaseRef, s.RepoRoot, s.VCS
-	headRef := ""
-	if s.Focus.Kind == FocusRange && s.Focus.HeadSHA != "" {
-		headRef = s.Focus.HeadSHA
-	}
-	s.mu.RUnlock()
-	commits, err := vcs.CommitLog(baseRef, headRef, repoRoot)
-	if err != nil {
-		return nil
-	}
-	return commits
-}
-
-// scopedSessionSnapshot holds session state read under lock for scoped queries.
-type scopedSessionSnapshot struct {
-	vcs            VCS
-	baseRef        string
-	baseBranchName string
-	repoRoot       string
-	mode           string
-	branch         string
-	reviewRound    int
-	ignorePatterns []string
-	commentCounts  map[string]int
-	lazyFiles      map[string]*FileEntry
-	reviewComments []Comment
-	focus          Focus
-	lastRangeFocus *Focus
-}
-
-func (s *Session) snapshotForScoped() scopedSessionSnapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	commentCounts := make(map[string]int, len(s.Files))
-	lazyFiles := make(map[string]*FileEntry, len(s.Files))
-	for _, f := range s.Files {
-		commentCounts[f.Path] = countVisibleComments(f.Comments, s.Focus)
-		if f.Lazy {
-			lazyFiles[f.Path] = f
-		}
-	}
-	rc := make([]Comment, 0, len(s.reviewComments))
-	for _, c := range s.reviewComments {
-		if !visibleInFocus(c, s.Focus) {
-			continue
-		}
-		rc = append(rc, c)
-	}
-
-	return scopedSessionSnapshot{
-		vcs:            s.VCS,
-		baseRef:        s.BaseRef,
-		baseBranchName: s.BaseBranchName,
-		repoRoot:       s.RepoRoot,
-		mode:           s.Mode,
-		branch:         s.Branch,
-		reviewRound:    s.ReviewRound,
-		ignorePatterns: s.IgnorePatterns,
-		commentCounts:  commentCounts,
-		lazyFiles:      lazyFiles,
-		reviewComments: rc,
-		focus:          s.Focus,
-		lastRangeFocus: s.LastRangeFocus,
-	}
-}
-
-func scopedHunks(fc FileChange, scope, commit, baseRef, repoRoot string, vcs VCS) []DiffHunk {
-	if vcs == nil {
-		return nil
-	}
-	if commit != "" {
-		h, err := vcs.FileDiffForCommit(fc.Path, commit, repoRoot)
-		if err == nil {
-			return h
-		}
-		return nil
-	}
-	if fc.Status == "added" || fc.Status == "untracked" {
-		absPath := filepath.Join(repoRoot, fc.Path)
-		if data, err := os.ReadFile(absPath); err == nil {
-			return FileDiffUnifiedNewFile(string(data))
-		}
-		return nil
-	}
-	h, err := vcs.FileDiffScoped(fc.Path, scope, baseRef, repoRoot)
-	if err == nil {
-		return h
-	}
-	return nil
-}
-
-func countHunkStats(hunks []DiffHunk) (additions, deletions int) {
-	for _, h := range hunks {
-		for _, l := range h.Lines {
-			switch l.Type {
-			case "add":
-				additions++
-			case "del":
-				deletions++
-			}
-		}
-	}
-	return additions, deletions
-}
-
-// GetSessionInfoScoped returns session metadata filtered to a specific diff scope.
-// When scope is "" or in file mode (scopes only apply to git), delegates to GetSessionInfo.
-// All other scopes (including "all") run fresh git queries to pick up files added after startup.
-// When commit is non-empty, files and diffs are scoped to that single commit.
-func (s *Session) GetSessionInfoScoped(scope, commit string) SessionInfo {
-	if commit == "" && (scope == "" || scope == "all" || s.Mode == "files" || s.Mode == "plan") {
-		return s.GetSessionInfo()
-	}
-
-	snap := s.snapshotForScoped()
-
-	info := SessionInfo{
-		Mode:            snap.mode,
-		Branch:          snap.branch,
-		BaseRef:         snap.baseRef,
-		BaseBranchName:  snap.baseBranchName,
-		ReviewRound:     snap.reviewRound,
-		AvailableScopes: availableScopes(snap.baseRef, snap.vcs),
-		ReviewComments:  snap.reviewComments,
-		Focus:           snap.focus,
-		LastRangeFocus:  snap.lastRangeFocus,
-	}
-
-	if snap.vcs == nil {
-		return info
-	}
-
-	var changes []FileChange
-	var err error
-	if commit != "" {
-		changes, err = snap.vcs.ChangedFilesForCommit(commit, snap.repoRoot)
-	} else {
-		changes, err = snap.vcs.ChangedFilesScoped(scope, snap.baseRef)
-	}
-	if err != nil || len(changes) == 0 {
-		return info
-	}
-
-	changes = filterIgnored(changes, snap.ignorePatterns)
-
-	for _, fc := range changes {
-		fi := SessionFileInfo{
-			Path:         fc.Path,
-			Status:       fc.Status,
-			FileType:     detectFileType(fc.Path),
-			CommentCount: snap.commentCounts[fc.Path],
-		}
-
-		if lf, ok := snap.lazyFiles[fc.Path]; ok {
-			fi.Lazy = true
-			fi.Additions = lf.LazyAdditions
-			fi.Deletions = lf.LazyDeletions
-			info.Files = append(info.Files, fi)
-			continue
-		}
-
-		hunks := scopedHunks(fc, scope, commit, snap.baseRef, snap.repoRoot, snap.vcs)
-		fi.Additions, fi.Deletions = countHunkStats(hunks)
-		info.Files = append(info.Files, fi)
-	}
-
-	return info
-}
-
-// loadScopedFileState reads file state from the session or disk for scoped diff queries.
-func (s *Session) loadScopedFileState(path, scope string) (status, content, baseRef, repoRoot string) {
-	s.mu.RLock()
-	f := s.fileByPathLocked(path)
-	baseRef = s.BaseRef
-	repoRoot = s.RepoRoot
-	vcs := s.VCS
-	if f != nil {
-		status = f.Status
-	}
-	s.mu.RUnlock()
-
-	if f != nil {
-		if err := f.ensureLoaded(repoRoot, baseRef, vcs); err == nil {
-			s.mu.RLock()
-			content = f.Content
-			s.mu.RUnlock()
-		}
-		return status, content, baseRef, repoRoot
-	}
-
-	if repoRoot == "" {
-		return status, content, baseRef, repoRoot
-	}
-	absPath := filepath.Join(repoRoot, path)
-	if data, err := os.ReadFile(absPath); err == nil {
-		content = string(data)
-		if vcs != nil {
-			if changes, err := vcs.ChangedFilesScoped(scope, baseRef); err == nil {
-				for _, fc := range changes {
-					if fc.Path == path {
-						status = fc.Status
-						break
-					}
-				}
-			}
-		}
-	}
-	return status, content, baseRef, repoRoot
-}
-
-func computeScopedDiffHunks(path, scope, commit, status, content, baseRef, repoRoot string, vcs VCS) []DiffHunk {
-	// Pure content-based diffs don't need VCS.
-	if status == "untracked" && (scope == "unstaged" || scope == "all" || scope == "") {
-		return FileDiffUnifiedNewFile(content)
-	}
-	if status == "added" && scope != "unstaged" {
-		return FileDiffUnifiedNewFile(content)
-	}
-	if vcs == nil {
-		return nil
-	}
-	if commit != "" {
-		h, err := vcs.FileDiffForCommit(path, commit, repoRoot)
-		if err == nil {
-			return h
-		}
-		return nil
-	}
-	h, err := vcs.FileDiffScoped(path, scope, baseRef, repoRoot)
-	if err == nil {
-		return h
-	}
-	return nil
-}
-
-// GetFileDiffSnapshotScoped returns diff data for a file filtered by scope.
-// When scope is "" or in file mode (scopes only apply to git), delegates to GetFileDiffSnapshot.
-// When commit is non-empty, returns the diff for that single commit.
-func (s *Session) GetFileDiffSnapshotScoped(path, scope, commit string) (map[string]any, bool) {
-	if commit == "" && (scope == "" || scope == "all" || s.Mode == "files" || s.Mode == "plan") {
-		return s.GetFileDiffSnapshot(path)
-	}
-
-	status, content, baseRef, repoRoot := s.loadScopedFileState(path, scope)
-
-	s.mu.RLock()
-	vcs := s.VCS
-	s.mu.RUnlock()
-
-	hunks := computeScopedDiffHunks(path, scope, commit, status, content, baseRef, repoRoot, vcs)
-	if hunks == nil {
-		hunks = []DiffHunk{}
-	}
-	return map[string]any{"hunks": hunks}, true
 }

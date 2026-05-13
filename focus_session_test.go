@@ -28,7 +28,7 @@ func TestPersistActiveDiffScope_RoundTrips(t *testing.T) {
 	if err := s.persistActiveDiffScope("layer"); err != nil {
 		t.Fatal(err)
 	}
-	cj, err := loadCritJSON(filepath.Join(dir, ".crit.json"))
+	cj, err := loadCritJSON(filepath.Join(dir, ".crit"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestPersistActiveDiffScope_RoundTrips(t *testing.T) {
 	if err := s.persistActiveDiffScope(""); err != nil {
 		t.Fatal(err)
 	}
-	cj, _ = loadCritJSON(filepath.Join(dir, ".crit.json"))
+	cj, _ = loadCritJSON(filepath.Join(dir, ".crit"))
 	if cj.ActiveDiffScope != "" {
 		t.Errorf("after persist(\"\"), got %q (should be cleared)", cj.ActiveDiffScope)
 	}
@@ -133,9 +133,9 @@ func TestBucketComments_WorkingTreeKeepsAll(t *testing.T) {
 
 func TestSetFocus_Range_RebuildsFiles(t *testing.T) {
 	dir := initTestRepo(t)
-	base := runGit(t, dir, "rev-parse", "HEAD")
+	base := gitT(t, dir, "rev-parse", "HEAD")
 	commitAt(t, dir, "added.txt", "y\n", "add y")
-	head := runGit(t, dir, "rev-parse", "HEAD")
+	head := gitT(t, dir, "rev-parse", "HEAD")
 
 	s := &Session{
 		RepoRoot:      dir,
@@ -156,9 +156,97 @@ func TestSetFocus_Range_RebuildsFiles(t *testing.T) {
 	}
 
 	// On-disk ActiveDiffScope was persisted.
-	cj, _ := loadCritJSON(filepath.Join(dir, ".crit.json"))
+	cj, _ := loadCritJSON(filepath.Join(dir, ".crit"))
 	if cj.ActiveDiffScope != "layer" {
 		t.Errorf("disk ActiveDiffScope = %q, want layer", cj.ActiveDiffScope)
+	}
+}
+
+// TestSetFocus_PostSetSession_PreservesComments is a regression test for B1
+// (review). Background: loadCritJSON checks Session.sessionStarted and bails
+// out post-SetSession; SetFocus calls it at runtime to repopulate per-file
+// Comments after the file list is rebuilt. With the guard active, that
+// reload was silently a no-op so any focus change wiped on-disk comments
+// from the in-memory session — and the next scheduleWrite would persist
+// the empty slate back to disk.
+//
+// SetFocus must use the Locked variant of loadCritJSON, which skips the
+// guard because the caller already holds s.mu. This test pins that
+// behavior: after SetSession marks the session started, switching focus
+// must keep comments visible on the new file list.
+func TestSetFocus_PostSetSession_PreservesComments(t *testing.T) {
+	dir := initTestRepo(t)
+	base := gitT(t, dir, "rev-parse", "HEAD")
+	commitAt(t, dir, "added.txt", "first\nsecond\n", "add file")
+	head := gitT(t, dir, "rev-parse", "HEAD")
+
+	s := &Session{
+		RepoRoot:      dir,
+		OutputDir:     dir,
+		VCS:           &GitVCS{},
+		Branch:        "main",
+		subscribers:   make(map[chan SSEEvent]struct{}),
+		roundComplete: make(chan struct{}, 1),
+	}
+
+	// First focus: range mode. SetFocus runs the constructor-time path
+	// (sessionStarted == 0), so this populates on-disk state cleanly.
+	if err := s.SetFocus(Focus{Kind: FocusRange, BaseSHA: base, HeadSHA: head, DiffScope: DiffScopeLayer}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a comment directly on disk so the next SetFocus has something to reload.
+	identity := filepath.Join(dir, ".crit")
+	cj, err := loadCritJSON(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf := cj.Files["added.txt"]
+	cf.Comments = []Comment{{ID: "c1", Body: "seeded", StartLine: 1, EndLine: 1, Scope: "line"}}
+	if cj.Files == nil {
+		cj.Files = map[string]CritJSONFile{}
+	}
+	cj.Files["added.txt"] = cf
+	if err := saveCritJSON(identity, cj); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate Server.SetSession: flip the started flag. Any subsequent
+	// loadCritJSON via the public entry point would no-op.
+	s.sessionStarted.Store(1)
+
+	// Toggle focus. The internal reload path must use loadCritJSONLocked
+	// and pull the seeded comment back into s.Files.
+	if err := s.SetFocus(Focus{Kind: FocusRange, BaseSHA: base, HeadSHA: head, DiffScope: DiffScopeFullStack, DefaultSHA: base}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got *FileEntry
+	for _, f := range s.Files {
+		if f.Path == "added.txt" {
+			got = f
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("added.txt missing from rebuilt s.Files: %+v", s.Files)
+	}
+	if len(got.Comments) != 1 || got.Comments[0].ID != "c1" {
+		t.Errorf("comments after focus change = %+v; want one seeded comment", got.Comments)
+	}
+
+	// Drain any debounced WriteFiles scheduled by SetFocus before
+	// reading on-disk state — otherwise the debounce goroutine and the
+	// test reader race on s.Files / RoundSnapshots.
+	flushWrites(s)
+
+	// And on-disk state survived (no silent overwrite).
+	cj2, err := loadCritJSON(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs := cj2.Files["added.txt"].Comments; len(cs) != 1 || cs[0].ID != "c1" {
+		t.Errorf("disk comments after focus change = %+v; want one seeded comment", cs)
 	}
 }
 
@@ -179,9 +267,9 @@ func TestSetFocus_FullStackRequiresDefaultSHA(t *testing.T) {
 
 func TestSetFocus_WorkingTree_ClearsActiveDiffScope(t *testing.T) {
 	dir := initTestRepo(t)
-	base := runGit(t, dir, "rev-parse", "HEAD")
+	base := gitT(t, dir, "rev-parse", "HEAD")
 	commitAt(t, dir, "x.txt", "x\n", "x")
-	head := runGit(t, dir, "rev-parse", "HEAD")
+	head := gitT(t, dir, "rev-parse", "HEAD")
 
 	s := &Session{
 		RepoRoot:      dir,
@@ -195,7 +283,7 @@ func TestSetFocus_WorkingTree_ClearsActiveDiffScope(t *testing.T) {
 	if err := s.SetFocus(Focus{Kind: FocusRange, BaseSHA: base, HeadSHA: head, DiffScope: DiffScopeLayer}); err != nil {
 		t.Fatal(err)
 	}
-	cj, _ := loadCritJSON(filepath.Join(dir, ".crit.json"))
+	cj, _ := loadCritJSON(filepath.Join(dir, ".crit"))
 	if cj.ActiveDiffScope != "layer" {
 		t.Fatalf("setup: ActiveDiffScope=%q want layer", cj.ActiveDiffScope)
 	}
@@ -204,7 +292,7 @@ func TestSetFocus_WorkingTree_ClearsActiveDiffScope(t *testing.T) {
 	if err := s.SetFocus(Focus{Kind: FocusWorkingTree}); err != nil {
 		t.Fatal(err)
 	}
-	cj, _ = loadCritJSON(filepath.Join(dir, ".crit.json"))
+	cj, _ = loadCritJSON(filepath.Join(dir, ".crit"))
 	if cj.ActiveDiffScope != "" {
 		t.Errorf("on-disk ActiveDiffScope=%q want empty", cj.ActiveDiffScope)
 	}
@@ -215,9 +303,9 @@ func TestSetFocus_WorkingTree_ClearsActiveDiffScope(t *testing.T) {
 // session so the UI can render a "Resume PR" affordance.
 func TestSetFocus_RangeToWorkingTree_StashesLastRangeFocus(t *testing.T) {
 	dir := initTestRepo(t)
-	base := runGit(t, dir, "rev-parse", "HEAD")
+	base := gitT(t, dir, "rev-parse", "HEAD")
 	commitAt(t, dir, "x.txt", "x\n", "x")
-	head := runGit(t, dir, "rev-parse", "HEAD")
+	head := gitT(t, dir, "rev-parse", "HEAD")
 
 	s := &Session{
 		RepoRoot:      dir,

@@ -323,6 +323,7 @@ func carryForwardComment(old Comment, newID string, now string) Comment {
 		CreatedAt:      old.CreatedAt,
 		UpdatedAt:      now,
 		Resolved:       old.Resolved,
+		ResolvedRound:  old.ResolvedRound,
 		CarriedForward: true,
 		Live:           old.Live,
 		ReviewRound:    old.ReviewRound,
@@ -342,8 +343,24 @@ func carryForwardComment(old Comment, newID string, now string) Comment {
 func (s *Session) carryForwardAllComments() {
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, f := range s.Files {
-		// Skip if comments were already carried forward (e.g. by carryForwardComments)
-		if len(f.Comments) > 0 {
+		if len(f.PreviousComments) == 0 {
+			continue
+		}
+		// Skip if PreviousComments are already carried forward (e.g. by the
+		// LCS path in carryForwardComments). Detect via CarriedForward marker
+		// rather than `len(f.Comments) > 0`, because the latter spuriously
+		// skips files that only contain comments added between
+		// SignalRoundComplete and this handler — those are brand-new for the
+		// new round and don't satisfy carry-forward, so PreviousComments
+		// would be silently dropped.
+		alreadyCarried := false
+		for _, mc := range f.Comments {
+			if mc.CarriedForward {
+				alreadyCarried = true
+				break
+			}
+		}
+		if alreadyCarried {
 			continue
 		}
 		for _, c := range f.PreviousComments {
@@ -449,12 +466,36 @@ func (s *Session) handleRoundCompleteFiles() {
 	// Restore phantom entries for files that disappeared but have comments in the review file.
 	s.restoreOrphanedComments()
 
-	// Re-read all file contents and update hashes
+	// Re-read all file contents and update hashes.
 	// (snapshot markdown PreviousContent in case watcher hasn't polled yet)
+	//
+	// Capture the round we are about to commit BEFORE rereadFileContents and
+	// BEFORE incrementing ReviewRound. On the first round-complete after boot,
+	// ReviewRound == 1 (R1 baseline already captured at construction), so this
+	// captures R2.
 	s.mu.Lock()
+	nextRound := s.ReviewRound + 1
+	// INVARIANT: captureRoundSnapshot MUST run before rereadFileContents(true); reordering would snapshot the new on-disk content as the previous round and silently corrupt the timeline.
+	s.captureRoundSnapshot(nextRound)
+	sidecarPath := reviewPathsFor(s.critJSONPath()).Snapshots
+	sf := SnapshotsFile{RoundSnapshots: cloneRoundSnapshots(s.RoundSnapshots)}
 	s.rereadFileContents(true)
 	s.ReviewRound++
 	s.mu.Unlock()
+
+	// File I/O off the hot path. Drift between review.json and snapshots.json
+	// is benign (degrades to "no timeline available").
+	//
+	// ORDERING ASSUMPTION: sidecar writes from concurrent round-completes are
+	// serialized by the debounced round-complete handler upstream — only one
+	// round-complete is in-flight at a time, so the (clone-under-lock,
+	// release-lock, write-off-lock) sequence cannot interleave with a second
+	// captureRoundSnapshot/cloneRoundSnapshots cycle. If that upstream
+	// debounce ever changes (e.g. round-completes become parallel), move the
+	// saveSnapshotsFile call inside the s.mu.Lock() block above.
+	if err := saveSnapshotsFile(sidecarPath, sf); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: write snapshots sidecar: %v\n", err)
+	}
 
 	s.finishRoundComplete(edits)
 }
@@ -484,8 +525,8 @@ func (s *Session) emitRoundStatus(edits int) {
 // loadResolvedComments reads the review file to pick up resolved fields the agent wrote.
 func (s *Session) loadResolvedComments() {
 	critPath := s.critJSONPath()
-	info, statErr := os.Stat(critPath)
-	data, err := os.ReadFile(critPath)
+	info, statErr := os.Stat(reviewPathsFor(critPath).Review)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		// No review file — clear all PreviousComments
 		s.mu.Lock()
@@ -579,6 +620,12 @@ func verifyAndCorrectPosition(newLines []string, anchor string, lcsStart, lcsEnd
 		if candidate == anchor {
 			return lcsStart, lcsStart + anchorLen - 1, 0
 		}
+		// Edited-but-recognizable: if LCS predicts the same row and the line
+		// is still close enough to the original, treat as anchored. Avoids
+		// false drift when text was appended/trimmed/tweaked in place.
+		if anchorSimilar(candidate, anchor) {
+			return lcsStart, lcsStart + anchorLen - 1, 0
+		}
 	}
 
 	// LCS position doesn't match — search the entire file.
@@ -589,6 +636,84 @@ func verifyAndCorrectPosition(newLines []string, anchor string, lcsStart, lcsEnd
 
 	// Anchor not found anywhere — mark drifted, keep LCS position.
 	return lcsStart, lcsEnd, 1
+}
+
+// anchorSimilar reports whether candidate and anchor are close enough to
+// treat the comment as still anchored. Catches in-place edits (appended,
+// trimmed, or lightly reworded text) that exact match would flag as drifted.
+func anchorSimilar(candidate, anchor string) bool {
+	a := strings.TrimSpace(candidate)
+	b := strings.TrimSpace(anchor)
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+	// Common case: text was appended to or trimmed from the anchor line.
+	// Gate on a minimum length so trivial anchors (`}`, `return nil`) don't
+	// match any longer line that happens to contain them.
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	if minLen >= 8 && (strings.Contains(a, b) || strings.Contains(b, a)) {
+		return true
+	}
+	return levenshteinRatio(a, b) >= 0.7
+}
+
+// levenshteinRatio returns 1 - (distance / maxLen), clamped to [0, 1].
+func levenshteinRatio(a, b string) float64 {
+	ar, br := []rune(a), []rune(b)
+	la, lb := len(ar), len(br)
+	if la == 0 && lb == 0 {
+		return 1
+	}
+	maxLen := la
+	if lb > maxLen {
+		maxLen = lb
+	}
+	d := levenshtein(ar, br)
+	return 1 - float64(d)/float64(maxLen)
+}
+
+// levenshtein computes edit distance between two rune slices using a
+// rolling two-row buffer. O(la*lb) time, O(min(la,lb)) space.
+func levenshtein(a, b []rune) int {
+	if len(a) < len(b) {
+		a, b = b, a
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+	prev := make([]int, len(b)+1)
+	curr := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		curr[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			curr[j] = m
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(b)]
 }
 
 // remapLines translates old start/end line numbers through the LCS line map,
@@ -665,7 +790,24 @@ func (s *Session) carryForwardFileComments(f *FileEntry) {
 	}
 
 	s.mu.Lock()
-	f.Comments = nil // Clear before carry-forward to prevent duplicates
+	// Preserve any comments added between SignalRoundComplete (which clears
+	// f.Comments) and the watcher actually processing the signal. Such
+	// comments have IDs not present in PreviousComments (they're brand-new
+	// for this round). On Windows, slow file I/O widens that race window;
+	// without preservation, AddComment's append into the empty slice would
+	// be wiped out by the f.Comments = nil assignment below.
+	prevIDs := make(map[string]struct{}, len(prevComments))
+	for _, c := range prevComments {
+		prevIDs[c.ID] = struct{}{}
+	}
+	preserved := make([]Comment, 0, len(f.Comments))
+	for _, c := range f.Comments {
+		if _, isPrev := prevIDs[c.ID]; isPrev {
+			continue
+		}
+		preserved = append(preserved, c)
+	}
+	f.Comments = preserved
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, c := range prevComments {
 		s.trackDeletedComment(f.Path, c.ID)

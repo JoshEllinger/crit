@@ -113,6 +113,28 @@ func TestMergeConfigs(t *testing.T) {
 	}
 }
 
+func TestMergeConfigsShareConsentedFromGlobal(t *testing.T) {
+	// share_consented is global-only state. A `true` value set in the global
+	// config must survive the merge regardless of project config presence.
+	global := Config{ShareConsented: true}
+	project := Config{}
+	merged := mergeConfigs(global, project, configPresence{})
+	if !merged.ShareConsented {
+		t.Errorf("merged.ShareConsented = false, want true (global value lost)")
+	}
+}
+
+func TestMergeConfigsHostGlobalOnly(t *testing.T) {
+	// A project config must not override host — doing so would let a malicious
+	// repo disable the DNS-rebinding defense by setting host to "0.0.0.0".
+	global := Config{Host: "127.0.0.1"}
+	project := Config{Host: "0.0.0.0"}
+	merged := mergeConfigs(global, project, configPresence{})
+	if merged.Host != "127.0.0.1" {
+		t.Errorf("host = %q, want global value %q (project must not override)", merged.Host, "127.0.0.1")
+	}
+}
+
 func TestBaseBranchConfig(t *testing.T) {
 	t.Run("loadConfigFile parses base_branch", func(t *testing.T) {
 		dir := t.TempDir()
@@ -148,7 +170,7 @@ func TestBaseBranchConfig(t *testing.T) {
 
 	t.Run("LoadConfig: project base_branch wins over global", func(t *testing.T) {
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 		os.WriteFile(
 			filepath.Join(homeDir, ".crit.config.json"),
 			[]byte(`{"base_branch": "main"}`),
@@ -202,7 +224,7 @@ func TestMergeConfigsBoolOverride(t *testing.T) {
 func TestLoadConfig(t *testing.T) {
 	// Set up global config
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 	globalPath := filepath.Join(homeDir, ".crit.config.json")
 	os.WriteFile(globalPath, []byte(`{"port": 3000, "share_url": "https://global.example.com", "ignore_patterns": ["*.lock"]}`), 0644)
 
@@ -322,7 +344,7 @@ func TestConfigString(t *testing.T) {
 func TestLoadConfigRuntimeDefaults(t *testing.T) {
 	// No config files at all — runtime defaults should apply
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 	projectDir := t.TempDir()
 
 	cfg := LoadConfig(projectDir)
@@ -336,26 +358,61 @@ func TestLoadConfigRuntimeDefaults(t *testing.T) {
 }
 
 func TestLoadConfigRuntimeDefaultsOverriddenByEmptyValues(t *testing.T) {
-	// Config explicitly sets share_url to "" and ignore_patterns to [] — no defaults
+	// Project config sets ignore_patterns to [] — overrides the runtime default.
+	// share_url is global-only and cannot be suppressed via project config.
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 	projectDir := t.TempDir()
 	os.WriteFile(filepath.Join(projectDir, ".crit.config.json"),
-		[]byte(`{"share_url": "", "ignore_patterns": []}`), 0644)
+		[]byte(`{"ignore_patterns": []}`), 0644)
 
 	cfg := LoadConfig(projectDir)
+	// Fork: no runtime default for share_url — must remain empty unless globally set
 	if cfg.ShareURL != "" {
-		t.Errorf("ShareURL = %q, want empty (explicitly overridden)", cfg.ShareURL)
+		t.Errorf("ShareURL = %q, want empty (fork has no runtime default)", cfg.ShareURL)
 	}
 	if len(cfg.IgnorePatterns) != 0 {
 		t.Errorf("IgnorePatterns = %v, want empty (explicitly overridden)", cfg.IgnorePatterns)
 	}
 }
 
+func TestLoadConfigShareURLProjectIgnored(t *testing.T) {
+	// share_url in project config must be ignored — only global config may set it.
+	// Prevents a malicious repo from redirecting crit share (and the auth token)
+	// to an attacker-controlled host.
+	homeDir := t.TempDir()
+	setHome(t, homeDir)
+	os.WriteFile(filepath.Join(homeDir, ".crit.config.json"),
+		[]byte(`{"share_url": "https://trusted.example.com"}`), 0644)
+	projectDir := t.TempDir()
+	os.WriteFile(filepath.Join(projectDir, ".crit.config.json"),
+		[]byte(`{"share_url": "https://attacker.example.com"}`), 0644)
+
+	cfg := LoadConfig(projectDir)
+	if cfg.ShareURL != "https://trusted.example.com" {
+		t.Errorf("ShareURL = %q, want global value (project override must be ignored)", cfg.ShareURL)
+	}
+}
+
+func TestLoadConfigShareURLProjectCannotSuppressDefault(t *testing.T) {
+	// Fork: there is no runtime default for share_url. Project config cannot set it
+	// either way — when no global value exists, share_url stays empty.
+	homeDir := t.TempDir()
+	setHome(t, homeDir)
+	projectDir := t.TempDir()
+	os.WriteFile(filepath.Join(projectDir, ".crit.config.json"),
+		[]byte(`{"share_url": ""}`), 0644)
+
+	cfg := LoadConfig(projectDir)
+	if cfg.ShareURL != "" {
+		t.Errorf("ShareURL = %q, want empty (fork has no runtime default)", cfg.ShareURL)
+	}
+}
+
 func TestLoadConfigRuntimeDefaultsOverriddenByGlobal(t *testing.T) {
 	// Global config sets share_url — no runtime default applied
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 	os.WriteFile(filepath.Join(homeDir, ".crit.config.json"),
 		[]byte(`{"share_url": "https://custom.example.com"}`), 0644)
 	projectDir := t.TempDir()
@@ -374,13 +431,13 @@ func TestLoadConfigRuntimeDefaultsOverriddenByGlobal(t *testing.T) {
 func TestLoadConfigAuthorFallsBackToGit(t *testing.T) {
 	// Isolated HOME so no global config interferes
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 
 	// Set up a git repo with user.name configured
 	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "test@test.com")
-	runGit(t, repoDir, "config", "user.name", "Ada Lovelace")
+	gitT(t, repoDir, "init")
+	gitT(t, repoDir, "config", "user.email", "test@test.com")
+	gitT(t, repoDir, "config", "user.name", "Ada Lovelace")
 
 	// LoadConfig calls git without -C, so we must be inside the repo
 	origDir, _ := os.Getwd()
@@ -395,7 +452,7 @@ func TestLoadConfigAuthorFallsBackToGit(t *testing.T) {
 
 func TestLoadConfigAuthorFromConfig(t *testing.T) {
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 
 	projectDir := t.TempDir()
 	os.WriteFile(filepath.Join(projectDir, ".crit.config.json"), []byte(`{"author": "Grace Hopper"}`), 0644)
@@ -410,7 +467,7 @@ func TestLoadConfigSameFileNoDuplicatePatterns(t *testing.T) {
 	// When CWD is the home dir, global and project config resolve to the same file.
 	// Patterns should not be duplicated. (GitHub issue #92)
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 	os.WriteFile(filepath.Join(homeDir, ".crit.config.json"),
 		[]byte(`{"ignore_patterns": ["*.lock", "*.min.js", "*.min.css", ".crit.json"]}`), 0644)
 
@@ -429,13 +486,13 @@ func TestNewSessionFromGitWithIgnore(t *testing.T) {
 	defaultBranchOnce = sync.Once{}
 
 	// Create a feature branch with several files
-	runGit(t, dir, "checkout", "-b", "feature")
+	gitT(t, dir, "checkout", "-b", "feature")
 	writeFile(t, filepath.Join(dir, "main.go"), "package main\n")
 	writeFile(t, filepath.Join(dir, "service.pb.go"), "package main\n// generated\n")
 	writeFile(t, filepath.Join(dir, "vendor", "lib.go"), "package vendor\n")
 	writeFile(t, filepath.Join(dir, "README.md"), "# Updated\n")
-	runGit(t, dir, "add", ".")
-	runGit(t, dir, "commit", "-m", "add files")
+	gitT(t, dir, "add", ".")
+	gitT(t, dir, "commit", "-m", "add files")
 
 	// cd into the repo
 	origDir, _ := os.Getwd()
@@ -561,7 +618,7 @@ func TestNoUpdateCheckMerge(t *testing.T) {
 
 func TestSaveGlobalConfig_RoundTrip(t *testing.T) {
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 
 	// Write a key
 	err := saveGlobalConfig(func(m map[string]json.RawMessage) error {
@@ -588,7 +645,7 @@ func TestSaveGlobalConfig_RoundTrip(t *testing.T) {
 
 func TestSaveGlobalConfig_PreservesExistingKeys(t *testing.T) {
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 
 	// Write initial config manually
 	configPath := filepath.Join(homeDir, ".crit.config.json")
@@ -630,6 +687,16 @@ func TestMergeConfigs_AgentCmdProjectIgnored(t *testing.T) {
 	}
 }
 
+func TestMergeConfigs_ShareURLProjectIgnored(t *testing.T) {
+	// share_url in project config must not override global — prevents token exfiltration
+	global := Config{ShareURL: "https://crit.md"}
+	project := Config{ShareURL: "https://attacker.example.com"}
+	merged := mergeConfigs(global, project, configPresence{ShareURL: true})
+	if merged.ShareURL != "https://crit.md" {
+		t.Errorf("project share_url should be ignored, got %q", merged.ShareURL)
+	}
+}
+
 func TestMergeConfigs_IgnorePatternsUnion(t *testing.T) {
 	global := Config{IgnorePatterns: []string{"*.lock", "vendor/"}}
 	project := Config{IgnorePatterns: []string{"*.pb.go"}}
@@ -656,7 +723,7 @@ func TestMergeConfigs_IgnorePatternsUnion(t *testing.T) {
 
 func TestLoadConfig_OutputField(t *testing.T) {
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 	projectDir := t.TempDir()
 	os.WriteFile(filepath.Join(projectDir, ".crit.config.json"),
 		[]byte(`{"output": "/tmp/output"}`), 0644)
@@ -737,5 +804,26 @@ func TestDefaultConfig(t *testing.T) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(s), &m); err != nil {
 		t.Errorf("defaultConfig().String() is not valid JSON: %v", err)
+	}
+}
+
+func TestNeedsShareConsent(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      Config
+		shareURL string
+		want     bool
+	}{
+		{"default URL, not consented", Config{ShareConsented: false}, "https://crit.md", true},
+		{"default URL, already consented", Config{ShareConsented: true}, "https://crit.md", false},
+		{"self-hosted URL, not consented", Config{ShareConsented: false}, "https://my.company.com", false},
+		{"self-hosted URL, consented", Config{ShareConsented: true}, "https://my.company.com", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := needsShareConsent(tt.cfg, tt.shareURL); got != tt.want {
+				t.Errorf("needsShareConsent() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -96,9 +96,10 @@ Hard rules:
 
 ## Bulk commenting with `--json`
 
-When leaving 3+ comments, use `--json` for atomicity (single write, no partial state) and speed (one process):
+When leaving 3+ comments, use `--json` for atomicity (single write, no partial state) and speed (one process). The JSON can come from stdin or `--file <path>`:
 
 ```bash
+# stdin works for short, single-line bodies:
 echo '[
   {"body": "overall feedback", "scope": "review"},
   {"path": "session.go", "body": "restructure", "scope": "file"},
@@ -108,6 +109,19 @@ echo '[
   {"reply_to": "r_f1e2d3", "body": "Done"}
 ]' | crit comment --json --author 'OpenCode'
 ```
+
+**Prefer `--file <path>` when any body spans multiple paragraphs.** A raw newline inside a JSON `"body"` string is invalid, and shell-quoted heredocs make that easy to introduce by accident. Write the JSON to a temp file, then:
+
+```bash
+cat > /tmp/crit-bulk.json <<'EOF'
+[
+  {"file": "src/auth.go", "line": 42, "body": "Para 1.\n\nPara 2."}
+]
+EOF
+crit comment --json --file /tmp/crit-bulk.json --author 'OpenCode'
+```
+
+`--file -` is shorthand for stdin.
 
 Per-entry schema:
 
@@ -152,18 +166,6 @@ crit push [--dry-run] [--event <type>] [-m <msg>] [pr]   # Post review comments 
 Requires `gh` CLI installed and authenticated. PR number is auto-detected from the current branch.
 
 `--event` values: `comment` (default), `approve`, `request-changes`. `-m` adds a review-level body message.
-
-## Sharing
-
-```bash
-crit share <file> [file...]   # Upload and print URL
-crit share --qr <file>        # Also print QR code (terminal only)
-crit unpublish                # Remove shared review
-```
-
-- **Always relay the output** — copy the URL (and QR if used) into your response. Don't make the user dig through tool output.
-- **`--qr` is terminal-only** — skip in mobile apps, web chat UIs, or anywhere Unicode block characters won't render correctly.
-- **Unpublish uses the persisted delete token** in the review file — no extra args needed.
 
 ## Guardrails
 

@@ -4,8 +4,16 @@ set -euo pipefail
 PORT="${1:-3123}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRIT_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
-DIR=$(mktemp -d)
-BIN_DIR=$(mktemp -d)
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
+# Resolve to a native (drive-letter-prefixed) path on Git Bash. realpath
+# returns POSIX form (/tmp/...) that Go's filepath.Join silently builds
+# into a drive-less `\tmp\...` (resolved against the calling process's
+# current drive — daemon and Node test then disagree), and Node's spawn
+# cwd rejects POSIX paths with ENOENT. e2e_native_tempdir uses cygpath -m
+# so both runtimes interpret the path consistently.
+DIR=$(e2e_native_tempdir)
+BIN_DIR=$(e2e_native_tempdir)
 trap 'rm -rf "$DIR" "$BIN_DIR" "${FAKE_HOME:-}"' EXIT
 
 cd "$DIR"
@@ -60,6 +68,37 @@ func main() {
 	fmt.Println("Server starting on :8080")
 	http.ListenAndServe(":8080", nil)
 }
+GOFILE
+
+# legacy.go — initial version with a long block that will be replaced.
+# The replacement creates a hunk where the old-side line number of a deletion
+# coincides with the new-side line number of a context line further down,
+# exposing the unified comment-highlight overshoot bug.
+cat > legacy.go << 'GOFILE'
+package legacy
+
+// Header comment 1
+// Header comment 2
+// Header comment 3
+// Header comment 4
+
+func Old1() {}
+func Old2() {}
+func Old3() {}
+func Old4() {}
+func Old5() {}
+func Old6() {}
+func Old7() {}
+func Old8() {}
+func Old9() {}
+func Old10() {}
+func Old11() {}
+func Old12() {}
+
+func Keep1() {}
+func Keep2() {}
+func Keep3() {}
+func Keep4() {}
 GOFILE
 
 cat > deleted.txt << 'EOF'
@@ -256,6 +295,30 @@ GOFILE
 # Delete deleted.txt
 rm deleted.txt
 
+# Replace legacy.go's Old1..Old12 block with a small New1..New4 block.
+# This produces: del run (old 8-19), add run (new 8-11), then context line
+# `func Keep1() {}` at new line 13 — which has the same number as old 13
+# (`func Old6() {}`) inside the deletion. Used to test that comment
+# highlight on new-side line 13 stays on Keep1 only.
+cat > legacy.go << 'GOFILE'
+package legacy
+
+// Header comment 1
+// Header comment 2
+// Header comment 3
+// Header comment 4
+
+func New1() {}
+func New2() {}
+func New3() {}
+func New4() {}
+
+func Keep1() {}
+func Keep2() {}
+func Keep3() {}
+func Keep4() {}
+GOFILE
+
 # Modify routes.go to produce a multi-hunk diff with a large gap (>20 unchanged lines)
 # between hunks. This ensures spacers remain visible for testing after auto-expansion
 # and incremental diff expansion can be tested.
@@ -381,6 +444,17 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 - **Week 1**: Middleware + key model
 - **Week 2**: Validation endpoint + tests
 - **Week 3**: Dashboard UI for key management
+
+## Nested Tasks
+
+- Top alpha
+  - Nested alpha-one
+  - Nested alpha-two
+- Top beta
+  - Nested beta-one
+    - Deep beta-one-a
+  - Nested beta-two
+- Top gamma
 MDFILE
 
 # Modify routes.go: change beginning and end, leave large middle gap (>20 unchanged lines)
@@ -509,19 +583,23 @@ EOF
 
 # Build crit binary outside the repo (skip if CRIT_BIN is set)
 if [ -z "${CRIT_BIN:-}" ]; then
-  CRIT_BIN="$BIN_DIR/crit"
+  CRIT_BIN="$BIN_DIR/$(e2e_bin_name)"
   (cd "$CRIT_SRC" && go build -o "$CRIT_BIN" .)
 fi
 
 # Isolate from user's ~/.crit.config.json — use a separate HOME so config
-# files don't appear as untracked in the git fixture
-FAKE_HOME=$(mktemp -d)
-export HOME="$FAKE_HOME"
+# files don't appear as untracked in the git fixture. On Windows this also
+# overrides USERPROFILE (Go's os.UserHomeDir source on Windows).
+FAKE_HOME=$(e2e_native_tempdir)
+e2e_export_fake_home "$FAKE_HOME"
 
-# Write fixture state for E2E tests that need to run CLI commands
-echo "CRIT_BIN=$CRIT_BIN" > "/tmp/crit-e2e-state-$PORT"
-echo "CRIT_FIXTURE_DIR=$DIR" >> "/tmp/crit-e2e-state-$PORT"
-echo "FAKE_HOME=$FAKE_HOME" >> "/tmp/crit-e2e-state-$PORT"
+# Write fixture state for E2E tests that need to run CLI commands.
+STATE_FILE="$(e2e_state_file "$PORT")"
+{
+  echo "CRIT_BIN=$CRIT_BIN"
+  echo "CRIT_FIXTURE_DIR=$DIR"
+  echo "FAKE_HOME=$FAKE_HOME"
+} > "$STATE_FILE"
 
 # Configure agent_cmd for E2E testing (echo just prints stdin and exits)
 echo '{"agent_cmd": "echo"}' > "$FAKE_HOME/.crit.config.json"

@@ -15,6 +15,32 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install jj
+        run: |
+          JJ_VERSION=0.40.0
+          mkdir -p /tmp/jj-install
+          curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C /tmp/jj-install
+          sudo install /tmp/jj-install/jj /usr/local/bin/jj
+          jj --version
+
+      - name: Install sapling
+        run: |
+          SL_VERSION="0.2.20260317-201835+0234c21f"
+          SL_VERSION_ENC="${SL_VERSION//+/%2B}"
+          sudo mkdir -p /opt/sapling
+          curl -fsSL "https://github.com/facebook/sapling/releases/download/${SL_VERSION_ENC}/sapling-${SL_VERSION}-linux-x64.tar.xz" \
+            | sudo tar xJ -C /opt/sapling
+          sudo ln -sf /opt/sapling/sl /usr/local/bin/sl
+          sl --version
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: go-build-${{ runner.os }}-
+
       - name: Check gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -26,6 +52,15 @@ jobs:
 
       - name: Run go vet
         run: go vet ./...
+
+      - name: Check integration hashes are up to date
+        run: |
+          go run gen_integration_hashes.go
+          if ! git diff --exit-code -- integration_hashes_gen.go; then
+            echo "::error::integration_hashes_gen.go is out of sync with integrations/."
+            echo "::error::Run 'go run gen_integration_hashes.go' and commit the result."
+            exit 1
+          fi
 
       - name: Install and run golangci-lint
         uses: golangci/golangci-lint-action@v9
@@ -56,7 +91,7 @@ jobs:
         with:
           node-version: 22
       - name: Run frontend smoke tests
-        run: node frontend/test-markdown-patch.mjs
+        run: make test-frontend
 
   nix:
     runs-on: ubuntu-latest
@@ -77,6 +112,32 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install jj
+        run: |
+          JJ_VERSION=0.40.0
+          mkdir -p /tmp/jj-install
+          curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C /tmp/jj-install
+          sudo install /tmp/jj-install/jj /usr/local/bin/jj
+          jj --version
+
+      - name: Install sapling
+        run: |
+          SL_VERSION="0.2.20260317-201835+0234c21f"
+          SL_VERSION_ENC="${SL_VERSION//+/%2B}"
+          sudo mkdir -p /opt/sapling
+          curl -fsSL "https://github.com/facebook/sapling/releases/download/${SL_VERSION_ENC}/sapling-${SL_VERSION}-linux-x64.tar.xz" \
+            | sudo tar xJ -C /opt/sapling
+          sudo ln -sf /opt/sapling/sl /usr/local/bin/sl
+          sl --version
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: go-build-${{ runner.os }}-
+
       - name: Run tests with coverage
         run: |
           PKGS=$(go list ./... | grep -v /node_modules/)
@@ -89,6 +150,38 @@ jobs:
           flags: unit
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  unit-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # jj is intentionally not installed on Windows; JJ backend tests skip
+      # when `jj` is not on PATH. Linux coverage is provided by the unit job.
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~/AppData/Local/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: go-build-${{ runner.os }}-
+
+      - name: Run tests
+        run: go test ./...
+
+      # Some tests spawn `crit.exe` daemons that may outlive the test process
+      # by a few seconds (background goroutines, deferred file flushes). If
+      # they're still alive when actions/setup-go's post step packs the cache
+      # tar, the cache step fails because the binary is locked. Kill any
+      # leftover processes before the implicit post-cache step runs.
+      - name: Kill leftover crit daemons
+        if: always()
+        shell: cmd
+        run: taskkill /F /IM crit.exe /T 2>nul || exit /b 0
+
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -97,6 +190,13 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: go-build-${{ runner.os }}-
 
       - uses: actions/setup-node@v6
         with:
@@ -121,6 +221,7 @@ jobs:
         run: npx playwright install chromium
 
       - name: Install Playwright system dependencies
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         working-directory: e2e
         run: npx playwright install-deps chromium
 
@@ -158,3 +259,93 @@ jobs:
           name: e2e-test-results
           path: e2e/test-results/
           retention-days: 7
+
+  e2e-windows:
+    runs-on: windows-latest
+    env:
+      # Stop Git Bash from auto-converting POSIX-looking arguments to Windows
+      # paths when invoking native binaries (crit.exe, taskkill, powershell).
+      MSYS_NO_PATHCONV: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~/AppData/Local/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: go-build-${{ runner.os }}-
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install npm dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/AppData/Local/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('e2e/package-lock.json') }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: e2e
+        run: npx playwright install chromium
+
+      - name: Build crit with coverage instrumentation
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/crit-coverdir"
+          go build -cover -o crit-cover-bin.exe .
+
+      - name: Run E2E tests
+        working-directory: e2e
+        shell: bash
+        run: bash run.sh
+        env:
+          CRIT_BIN: ${{ github.workspace }}/crit-cover-bin.exe
+          GOCOVERDIR: ${{ runner.temp }}/crit-coverdir
+
+      - name: Convert E2E coverage data
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "${RUNNER_TEMP}/crit-coverdir" ] && ls "${RUNNER_TEMP}"/crit-coverdir/*.* >/dev/null 2>&1; then
+            go tool covdata textfmt -i="${RUNNER_TEMP}/crit-coverdir" -o=e2e-coverage.out
+          fi
+
+      - name: Upload E2E coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: e2e-coverage.out
+          flags: e2e
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-test-results-windows
+          path: e2e/test-results/
+          retention-days: 7
+
+      # Some tests spawn `crit.exe` daemons that may outlive the test process
+      # by a few seconds. If they're still alive when actions/setup-* post
+      # steps pack their caches, the cache step fails because the binary is
+      # locked. Kill any leftover processes before the implicit post-cache
+      # steps run. Mirrors the unit-windows job pattern.
+      - name: Kill leftover crit daemons
+        if: always()
+        shell: cmd
+        run: taskkill /F /IM crit.exe /T 2>nul || exit /b 0

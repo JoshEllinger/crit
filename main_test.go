@@ -174,6 +174,32 @@ func TestHelperProcess_ShareMissing(t *testing.T) {
 	runShare([]string{})
 }
 
+// TestInstallGeminiSettings_MalformedJSON verifies that a malformed settings.json
+// causes a non-zero exit instead of silently overwriting user data.
+func TestInstallGeminiSettings_MalformedJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(path, []byte("not json{{{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_GeminiSettingsBadJSON", "--")
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "GO_TEST_SETTINGS_PATH="+path)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected non-zero exit for malformed settings.json")
+	}
+	if !strings.Contains(string(out), "invalid JSON") {
+		t.Errorf("expected 'invalid JSON' in stderr, got: %s", out)
+	}
+}
+
+func TestHelperProcess_GeminiSettingsBadJSON(t *testing.T) {
+	if os.Getenv("GO_TEST_HELPER") != "1" {
+		return
+	}
+	installGeminiSettings(os.Getenv("GO_TEST_SETTINGS_PATH"), false)
+}
+
 // TestRunComment_FlagParsing verifies that --output and --author flags are parsed correctly.
 func TestRunComment_FlagParsing(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_CommentFlags", "--")
@@ -266,6 +292,57 @@ func TestHelperProcess_ShareOutputMissing(t *testing.T) {
 	runShare([]string{"--output"})
 }
 
+func TestPromptShareConsent(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"y\n", true},
+		{"Y\n", true},
+		{"n\n", false},
+		{"N\n", false},
+		{"\n", false},
+		{"", false},
+		{"yes\n", false},
+	}
+	for _, tt := range tests {
+		var buf strings.Builder
+		got := promptShareConsent(&buf, strings.NewReader(tt.input))
+		if got != tt.want {
+			t.Errorf("promptShareConsent(input=%q) = %v, want %v", tt.input, got, tt.want)
+		}
+		if !strings.Contains(buf.String(), "Continue?") {
+			t.Errorf("promptShareConsent did not print prompt for input=%q", tt.input)
+		}
+	}
+}
+
+// TestRunShare_ConsentDenied verifies that answering "n" to the first-time
+// consent prompt exits cleanly without sharing.
+func TestRunShare_ConsentDenied(t *testing.T) {
+	home := t.TempDir()
+	outDir := t.TempDir()
+	f := filepath.Join(t.TempDir(), "review.md")
+	if err := os.WriteFile(f, []byte("# Hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_ShareConsentDenied", "--")
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home,
+		"GO_TEST_SHARE_FILE="+f, "GO_TEST_SHARE_OUT="+outDir)
+	cmd.Stdin = strings.NewReader("n\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected zero exit when user declines consent, got: %v\n%s", err, out)
+	}
+}
+
+func TestHelperProcess_ShareConsentDenied(t *testing.T) {
+	if os.Getenv("GO_TEST_HELPER") != "1" {
+		return
+	}
+	runShare([]string{"--output", os.Getenv("GO_TEST_SHARE_OUT"), os.Getenv("GO_TEST_SHARE_FILE")})
+}
+
 // TestRunUnpublish_UnknownFlag verifies that an unknown flag prints usage and exits.
 func TestRunUnpublish_UnknownFlag(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_UnpublishBadFlag", "--")
@@ -309,11 +386,11 @@ func TestHelperProcess_CommentJSON(t *testing.T) {
 func TestRunComment_JSONFlagMixed(t *testing.T) {
 	// Step 1: Create a comment and capture its ID
 	tmp := t.TempDir()
-	err := addCommentToCritJSON("main.go", 1, 1, "comment", "TestBot", "", tmp)
+	err := addCommentToCritJSONScoped("main.go", 1, 1, "comment", "TestBot", "", tmp, inheritedScope{})
 	if err != nil {
 		t.Fatalf("setup comment: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(tmp, ".crit.json"))
+	data, err := os.ReadFile(filepath.Join(tmp, ".crit", "review.json"))
 	if err != nil {
 		t.Fatalf("read .crit.json: %v", err)
 	}
@@ -429,7 +506,7 @@ func TestResolveServerConfig_PortPrecedence(t *testing.T) {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"port": 4000}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 		t.Setenv("CRIT_PORT", "5000")
 
 		origDir, _ := os.Getwd()
@@ -452,7 +529,7 @@ func TestResolveServerConfig_PortPrecedence(t *testing.T) {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"port": 4000}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 		t.Setenv("CRIT_PORT", "5000")
 
 		origDir, _ := os.Getwd()
@@ -475,7 +552,7 @@ func TestResolveServerConfig_PortPrecedence(t *testing.T) {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"port": 4000}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 		t.Setenv("CRIT_PORT", "")
 
 		origDir, _ := os.Getwd()
@@ -497,7 +574,7 @@ func TestResolveServerConfig_PortPrecedence(t *testing.T) {
 
 		dir := t.TempDir()
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 		t.Setenv("CRIT_PORT", "")
 
 		origDir, _ := os.Getwd()
@@ -514,7 +591,7 @@ func TestResolveServerConfig_PortPrecedence(t *testing.T) {
 	})
 }
 
-func TestResolveServerConfig_ShareURLPrecedence(t *testing.T) {
+func TestResolveServerConfig_HostPrecedence(t *testing.T) {
 	orig := defaultBranchOverride
 	defer func() {
 		defaultBranchOverride = orig
@@ -526,9 +603,132 @@ func TestResolveServerConfig_ShareURLPrecedence(t *testing.T) {
 		defaultBranchOnce = sync.Once{}
 
 		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"share_url": "https://config.example.com"}`), 0644)
+		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"host": "10.0.0.1"}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
+		t.Setenv("CRIT_HOST", "10.0.0.2")
+
+		origDir, _ := os.Getwd()
+		os.Chdir(dir)
+		defer os.Chdir(origDir)
+
+		sc, err := resolveServerConfig([]string{"--host", "0.0.0.0"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sc.host != "0.0.0.0" {
+			t.Errorf("host = %q, want 0.0.0.0 (CLI flag)", sc.host)
+		}
+	})
+
+	t.Run("env var wins over config when no CLI flag", func(t *testing.T) {
+		defaultBranchOverride = ""
+		defaultBranchOnce = sync.Once{}
+
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"host": "10.0.0.1"}`), 0644)
+		homeDir := t.TempDir()
+		setHome(t, homeDir)
+		t.Setenv("CRIT_HOST", "10.0.0.2")
+
+		origDir, _ := os.Getwd()
+		os.Chdir(dir)
+		defer os.Chdir(origDir)
+
+		sc, err := resolveServerConfig([]string{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sc.host != "10.0.0.2" {
+			t.Errorf("host = %q, want 10.0.0.2 (env var)", sc.host)
+		}
+	})
+
+	t.Run("global config wins when no CLI flag or env var", func(t *testing.T) {
+		defaultBranchOverride = ""
+		defaultBranchOnce = sync.Once{}
+
+		dir := t.TempDir()
+		homeDir := t.TempDir()
+		os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"host": "10.0.0.1"}`), 0644)
+		setHome(t, homeDir)
+		t.Setenv("CRIT_HOST", "")
+
+		origDir, _ := os.Getwd()
+		os.Chdir(dir)
+		defer os.Chdir(origDir)
+
+		sc, err := resolveServerConfig([]string{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sc.host != "10.0.0.1" {
+			t.Errorf("host = %q, want 10.0.0.1 (global config)", sc.host)
+		}
+	})
+
+	t.Run("project config cannot override host", func(t *testing.T) {
+		defaultBranchOverride = ""
+		defaultBranchOnce = sync.Once{}
+
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"host": "0.0.0.0"}`), 0644)
+		homeDir := t.TempDir()
+		setHome(t, homeDir)
+		t.Setenv("CRIT_HOST", "")
+
+		origDir, _ := os.Getwd()
+		os.Chdir(dir)
+		defer os.Chdir(origDir)
+
+		sc, err := resolveServerConfig([]string{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sc.host != "127.0.0.1" {
+			t.Errorf("host = %q, want 127.0.0.1 (project config must not override host)", sc.host)
+		}
+	})
+
+	t.Run("default 127.0.0.1 when nothing set", func(t *testing.T) {
+		defaultBranchOverride = ""
+		defaultBranchOnce = sync.Once{}
+
+		dir := t.TempDir()
+		homeDir := t.TempDir()
+		setHome(t, homeDir)
+		t.Setenv("CRIT_HOST", "")
+
+		origDir, _ := os.Getwd()
+		os.Chdir(dir)
+		defer os.Chdir(origDir)
+
+		sc, err := resolveServerConfig([]string{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sc.host != "127.0.0.1" {
+			t.Errorf("host = %q, want 127.0.0.1 (default)", sc.host)
+		}
+	})
+}
+
+func TestResolveServerConfig_ShareURLPrecedence(t *testing.T) {
+	orig := defaultBranchOverride
+	defer func() {
+		defaultBranchOverride = orig
+		defaultBranchOnce = sync.Once{}
+	}()
+
+	t.Run("CLI flag wins over env and config", func(t *testing.T) {
+		defaultBranchOverride = ""
+		defaultBranchOnce = sync.Once{}
+
+		homeDir := t.TempDir()
+		setHome(t, homeDir)
+		// share_url is global-only; write to global config
+		os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"share_url": "https://config.example.com"}`), 0644)
+		dir := t.TempDir()
 		t.Setenv("CRIT_SHARE_URL", "https://env.example.com")
 
 		origDir, _ := os.Getwd()
@@ -548,10 +748,11 @@ func TestResolveServerConfig_ShareURLPrecedence(t *testing.T) {
 		defaultBranchOverride = ""
 		defaultBranchOnce = sync.Once{}
 
-		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"share_url": "https://config.example.com"}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
+		// share_url is global-only; write to global config
+		os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"share_url": "https://config.example.com"}`), 0644)
+		dir := t.TempDir()
 		t.Setenv("CRIT_SHARE_URL", "https://env.example.com")
 
 		origDir, _ := os.Getwd()
@@ -567,14 +768,15 @@ func TestResolveServerConfig_ShareURLPrecedence(t *testing.T) {
 		}
 	})
 
-	t.Run("config used when no CLI or env", func(t *testing.T) {
+	t.Run("global config used when no CLI or env", func(t *testing.T) {
 		defaultBranchOverride = ""
 		defaultBranchOnce = sync.Once{}
 
-		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"share_url": "https://config.example.com"}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
+		// share_url is global-only; project config cannot set it
+		os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"share_url": "https://config.example.com"}`), 0644)
+		dir := t.TempDir()
 		os.Unsetenv("CRIT_SHARE_URL")
 
 		origDir, _ := os.Getwd()
@@ -586,7 +788,7 @@ func TestResolveServerConfig_ShareURLPrecedence(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if sc.shareURL != "https://config.example.com" {
-			t.Errorf("shareURL = %q, want config value", sc.shareURL)
+			t.Errorf("shareURL = %q, want global config value", sc.shareURL)
 		}
 	})
 }
@@ -604,7 +806,7 @@ func TestResolveServerConfig_BoolFlags(t *testing.T) {
 
 		dir := t.TempDir()
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 
 		origDir, _ := os.Getwd()
 		os.Chdir(dir)
@@ -626,7 +828,7 @@ func TestResolveServerConfig_BoolFlags(t *testing.T) {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"no_open": true}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 
 		origDir, _ := os.Getwd()
 		os.Chdir(dir)
@@ -647,7 +849,7 @@ func TestResolveServerConfig_BoolFlags(t *testing.T) {
 
 		dir := t.TempDir()
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 
 		origDir, _ := os.Getwd()
 		os.Chdir(dir)
@@ -669,7 +871,7 @@ func TestResolveServerConfig_BoolFlags(t *testing.T) {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"ignore_patterns": ["*.lock", "vendor/"]}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 
 		origDir, _ := os.Getwd()
 		os.Chdir(dir)
@@ -697,7 +899,7 @@ func TestResolveServerConfig_FileArgs(t *testing.T) {
 
 	dir := t.TempDir()
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 
 	origDir, _ := os.Getwd()
 	os.Chdir(dir)
@@ -725,7 +927,7 @@ func TestResolveServerConfig_OutputDir(t *testing.T) {
 
 		dir := t.TempDir()
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 
 		origDir, _ := os.Getwd()
 		os.Chdir(dir)
@@ -747,7 +949,7 @@ func TestResolveServerConfig_OutputDir(t *testing.T) {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"output": "/tmp/cfg-out"}`), 0644)
 		homeDir := t.TempDir()
-		t.Setenv("HOME", homeDir)
+		setHome(t, homeDir)
 
 		origDir, _ := os.Getwd()
 		os.Chdir(dir)
@@ -853,6 +1055,127 @@ func TestFindStaleReviews(t *testing.T) {
 	}
 	if stale[0].comments != 1 {
 		t.Errorf("comments = %d, want 1", stale[0].comments)
+	}
+}
+
+func TestFindStaleReviews_FolderForm(t *testing.T) {
+	dir := t.TempDir()
+
+	// Folder-form review with stale updated_at.
+	oldTime := time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	staleFolder := filepath.Join(dir, "stalekey1")
+	if err := os.MkdirAll(staleFolder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cj := CritJSON{
+		Branch:      "old-branch",
+		UpdatedAt:   oldTime,
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"main.go": {Comments: []Comment{{ID: "c1"}}},
+		},
+	}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	if err := os.WriteFile(filepath.Join(staleFolder, "review.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Sidecar present too.
+	if err := os.WriteFile(filepath.Join(staleFolder, "snapshots.json"), []byte(`{"round_snapshots":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recent folder-form review.
+	recentFolder := filepath.Join(dir, "recentkey")
+	if err := os.MkdirAll(recentFolder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recentCJ := CritJSON{
+		Branch:      "recent-branch",
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		ReviewRound: 1,
+		Files:       map[string]CritJSONFile{},
+	}
+	recentData, _ := json.MarshalIndent(recentCJ, "", "  ")
+	if err := os.WriteFile(filepath.Join(recentFolder, "review.json"), recentData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := findStaleReviews(dir, 7)
+	if len(stale) != 1 {
+		t.Fatalf("expected 1 stale review, got %d (%+v)", len(stale), stale)
+	}
+	if stale[0].branch != "old-branch" {
+		t.Errorf("branch = %q", stale[0].branch)
+	}
+	if stale[0].comments != 1 {
+		t.Errorf("comments = %d", stale[0].comments)
+	}
+	if stale[0].path != staleFolder {
+		t.Errorf("path = %q, want folder identity %q", stale[0].path, staleFolder)
+	}
+}
+
+func TestFindStaleReviews_OrphanSnapshotsFolder(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan1")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// snapshots.json without a sibling review.json.
+	if err := os.WriteFile(filepath.Join(orphan, "snapshots.json"), []byte(`{"round_snapshots":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Age the folder mtime past the cutoff.
+	old := time.Now().Add(-60 * 24 * time.Hour)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := findStaleReviews(dir, 7)
+	if len(stale) != 1 {
+		t.Fatalf("expected orphan folder collected, got %d entries: %+v", len(stale), stale)
+	}
+	if stale[0].path != orphan {
+		t.Errorf("path = %q, want orphan folder %q", stale[0].path, orphan)
+	}
+}
+
+func TestDeleteStaleReviews_FolderForm(t *testing.T) {
+	dir := t.TempDir()
+	folder := filepath.Join(dir, "key1")
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "review.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "snapshots.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted := deleteStaleReviews([]staleReview{{key: "key1", path: folder}})
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+	if _, err := os.Stat(folder); !os.IsNotExist(err) {
+		t.Errorf("folder not removed: err=%v", err)
+	}
+}
+
+func TestCleanupOnApproval_RemovesFolderForm(t *testing.T) {
+	dir := t.TempDir()
+	identity := filepath.Join(dir, ".crit")
+	if err := saveCritJSON(identity, CritJSON{Branch: "main", Files: map[string]CritJSONFile{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSnapshotsFile(reviewPathsFor(identity).Snapshots, SnapshotsFile{RoundSnapshots: map[string]map[int]RoundSnapshot{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupOnApproval(true, identity, true)
+
+	if _, err := os.Stat(identity); !os.IsNotExist(err) {
+		t.Errorf("folder not removed: err=%v", err)
 	}
 }
 
@@ -1014,6 +1337,90 @@ func TestRunReviewClientRaw_NoReadinessDelay(t *testing.T) {
 	}
 }
 
+// TestRunReviewClientRaw_DaemonShutdownDeniesNotApproves regression-tests the
+// silent auto-approve bug: when the daemon shuts down mid-request the client
+// must return approved=false (with an explanatory prompt), never approved=true.
+// Covers two paths: the daemon answers /api/review-cycle with 503+shutdown
+// payload, and the daemon's HTTP server force-closes the connection.
+func TestRunReviewClientRaw_DaemonShutdownDeniesNotApproves(t *testing.T) {
+	t.Run("503 shutdown response", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/session":
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			case "/api/review-cycle":
+				w.WriteHeader(http.StatusServiceUnavailable)
+				json.NewEncoder(w).Encode(map[string]any{
+					"status":   "shutdown",
+					"approved": false,
+					"prompt":   "crit daemon shut down before review was finished.",
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		port := 0
+		fmt.Sscanf(ts.URL, "http://127.0.0.1:%d", &port)
+		if port == 0 {
+			fmt.Sscanf(ts.URL, "http://localhost:%d", &port)
+		}
+
+		approved, prompt := runReviewClientRaw(sessionEntry{Port: port})
+		if approved {
+			t.Fatal("expected approved=false on daemon shutdown, got true (silent auto-approve)")
+		}
+		if prompt == "" {
+			t.Fatal("expected non-empty prompt explaining shutdown, got empty")
+		}
+	})
+
+	t.Run("connection drop mid-request", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/session":
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			case "/api/review-cycle":
+				// Simulate the HTTP server force-closing the connection
+				// (what happens after httpServer.Shutdown's 2s timeout).
+				// Use Errorf (not Fatal) inside the handler goroutine —
+				// t.Fatal must be called from the test goroutine.
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					t.Errorf("ResponseWriter does not support Hijacker")
+					return
+				}
+				conn, _, err := hj.Hijack()
+				if err != nil {
+					t.Errorf("hijack failed: %v", err)
+					return
+				}
+				conn.Close()
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		port := 0
+		fmt.Sscanf(ts.URL, "http://127.0.0.1:%d", &port)
+		if port == 0 {
+			fmt.Sscanf(ts.URL, "http://localhost:%d", &port)
+		}
+
+		approved, prompt := runReviewClientRaw(sessionEntry{Port: port})
+		if approved {
+			t.Fatal("expected approved=false on connection drop, got true (silent auto-approve)")
+		}
+		if prompt == "" {
+			t.Fatal("expected non-empty prompt explaining the failure, got empty")
+		}
+	})
+}
+
 // TestFetch_PrintsReviewFilePath verifies that crit fetch prints the review
 // file path in both the "no new comments" and "fetched N comments" cases.
 func TestFetch_PrintsReviewFilePath(t *testing.T) {
@@ -1053,8 +1460,8 @@ func TestFetch_PrintsReviewFilePath(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			critPath := filepath.Join(tmpDir, ".crit.json")
-			if err := os.WriteFile(critPath, data, 0o644); err != nil {
+			critPath := filepath.Join(tmpDir, ".crit")
+			if err := os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1102,25 +1509,6 @@ func TestPlural(t *testing.T) {
 		t.Run(fmt.Sprintf("n=%d", tt.n), func(t *testing.T) {
 			if got := plural(tt.n); got != tt.want {
 				t.Errorf("plural(%d) = %q, want %q", tt.n, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPluralReply(t *testing.T) {
-	tests := []struct {
-		n    int
-		want string
-	}{
-		{0, "ies"},
-		{1, "y"},
-		{2, "ies"},
-		{5, "ies"},
-	}
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("n=%d", tt.n), func(t *testing.T) {
-			if got := pluralReply(tt.n); got != tt.want {
-				t.Errorf("pluralReply(%d) = %q, want %q", tt.n, got, tt.want)
 			}
 		})
 	}

@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -99,51 +98,15 @@ func reviewsDir() (string, error) {
 	return filepath.Join(home, ".crit", "reviews"), nil
 }
 
-// reviewFilePath returns the full path for a review data file.
+// reviewFilePath returns the v4 review identity path: a folder named <key>
+// (no extension) under ~/.crit/reviews/. The actual JSON files live inside as
+// <key>/review.json and <key>/snapshots.json — see reviewPathsFor.
 func reviewFilePath(key string) (string, error) {
 	dir, err := reviewsDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, key+".json"), nil
-}
-
-// atomicWriteFile writes data to the target path atomically using temp file + fsync + rename.
-func atomicWriteFile(target string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(target)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("creating directory %s: %w", dir, err)
-	}
-
-	tmp, err := os.CreateTemp(dir, filepath.Base(target)+"*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	if err := os.Chmod(tmpName, perm); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	if err := os.Rename(tmpName, target); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("rename temp file to target: %w", err)
-	}
-	return nil
+	return filepath.Join(dir, key), nil
 }
 
 // writeSessionFile writes a session entry to ~/.crit/sessions/<key>.json.
@@ -165,7 +128,7 @@ func readSessionFile(key string) (sessionEntry, error) {
 	if err != nil {
 		return sessionEntry{}, err
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileShared(path)
 	if err != nil {
 		return sessionEntry{}, err
 	}
@@ -214,6 +177,10 @@ func listSessionsForCWD(cwd string) ([]sessionEntry, []string) {
 	if err != nil {
 		return nil, nil
 	}
+	// Normalize on both sides so a session stored from any path style
+	// matches a probe with another style (matters on Windows where
+	// os.Getwd returns backslashes but tests/fixtures may use POSIX paths).
+	cwdSlash := filepath.ToSlash(cwd)
 	var alive []sessionEntry
 	var keys []string
 	for _, de := range dirEntries {
@@ -221,7 +188,7 @@ func listSessionsForCWD(cwd string) ([]sessionEntry, []string) {
 			continue
 		}
 		key := strings.TrimSuffix(de.Name(), ".json")
-		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		data, err := readFileShared(filepath.Join(dir, de.Name()))
 		if err != nil {
 			continue
 		}
@@ -229,7 +196,7 @@ func listSessionsForCWD(cwd string) ([]sessionEntry, []string) {
 		if err := json.Unmarshal(data, &entry); err != nil {
 			continue
 		}
-		if entry.CWD != cwd {
+		if filepath.ToSlash(entry.CWD) != cwdSlash {
 			continue
 		}
 		if isDaemonAlive(entry) {
@@ -272,7 +239,12 @@ func listSessionsForRepoRoot(repoRoot string) ([]sessionEntry, []string) {
 	if err != nil {
 		return nil, nil
 	}
-	prefix := repoRoot + string(filepath.Separator)
+	// Normalize separators on both sides — the stored CWD could have been
+	// written from any host, and on Windows os.Getwd() returns backslashes
+	// while subdirectory tests/fixtures often use forward slashes. Compare
+	// using POSIX form so the prefix check works regardless of origin.
+	repoRootSlash := filepath.ToSlash(repoRoot)
+	prefix := repoRootSlash + "/"
 	var alive []sessionEntry
 	var keys []string
 	for _, de := range dirEntries {
@@ -280,7 +252,7 @@ func listSessionsForRepoRoot(repoRoot string) ([]sessionEntry, []string) {
 			continue
 		}
 		key := strings.TrimSuffix(de.Name(), ".json")
-		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		data, err := readFileShared(filepath.Join(dir, de.Name()))
 		if err != nil {
 			continue
 		}
@@ -288,7 +260,8 @@ func listSessionsForRepoRoot(repoRoot string) ([]sessionEntry, []string) {
 		if err := json.Unmarshal(data, &entry); err != nil {
 			continue
 		}
-		if entry.CWD != repoRoot && !strings.HasPrefix(entry.CWD, prefix) {
+		entryCWD := filepath.ToSlash(entry.CWD)
+		if entryCWD != repoRootSlash && !strings.HasPrefix(entryCWD, prefix) {
 			continue
 		}
 		if isDaemonAlive(entry) {
@@ -310,13 +283,12 @@ func isDaemonAlive(s sessionEntry) bool {
 	if err != nil {
 		return false
 	}
-	// On Unix, FindProcess always succeeds. Signal 0 checks existence without signaling.
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
+	if !processExists(proc) {
 		return false
 	}
 	// HTTP health probe — ensures the port belongs to our daemon, not a reused PID.
 	// We validate the response body to guard against a non-crit process on the same port.
-	resp, err := aliveClient.Get(fmt.Sprintf("http://localhost:%d/api/health", s.Port))
+	resp, err := aliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", s.Port))
 	if err != nil {
 		return false
 	}
@@ -337,7 +309,7 @@ func isDaemonAlive(s sessionEntry) bool {
 // Uses a pointer to distinguish "field missing" (older daemon) from "false".
 // When the field is missing, assumes a browser is connected (safe default).
 func daemonHasBrowser(s sessionEntry) bool {
-	resp, err := browserClient.Get(fmt.Sprintf("http://localhost:%d/api/health", s.Port))
+	resp, err := browserClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", s.Port))
 	if err != nil {
 		return true // can't reach daemon, assume browser exists
 	}
@@ -376,7 +348,7 @@ func acquireSessionLock(key string) (*os.File, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	backoff := 100 * time.Millisecond
 	for time.Now().Before(deadline) {
-		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err = flockExclusiveNB(f)
 		if err == nil {
 			return f, nil
 		}
@@ -391,7 +363,7 @@ func acquireSessionLock(key string) (*os.File, error) {
 
 // releaseSessionLock unlocks, closes, and removes the lock file.
 func releaseSessionLock(f *os.File) {
-	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = funlock(f)
 	name := f.Name()
 	f.Close()
 	os.Remove(name)
@@ -400,6 +372,15 @@ func releaseSessionLock(f *os.File) {
 // setupDaemonCmd creates and configures the daemon child process.
 // Returns the command, readiness pipe read-end, write-end, log file, and any error.
 // The caller must close writeEnd and logFile after Start().
+//
+// Readiness is signaled via the child's stdout (an OS pipe). We deliberately
+// avoid cmd.ExtraFiles + FD 3: ExtraFiles is documented as unsupported on
+// Windows (see os/exec/exec.go), so the inherited handle is silently dropped
+// and the child's os.NewFile(3, ...) returns a stale handle whose writes go
+// nowhere. Stdout inheritance works on every supported OS, so the child reads
+// readiness via os.Stdout and the parent reads it via the pipe's read end.
+// _CRIT_READY_STDOUT=1 tells the child to treat stdout as the readiness pipe
+// (otherwise stdout is the user's terminal and we must not emit the port).
 func setupDaemonCmd(key string, args []string) (*exec.Cmd, *os.File, *os.File, *os.File, error) {
 	selfPath, err := os.Executable()
 	if err != nil {
@@ -414,7 +395,6 @@ func setupDaemonCmd(key string, args []string) (*exec.Cmd, *os.File, *os.File, *
 		return nil, nil, nil, nil, fmt.Errorf("getting working directory: %w", err)
 	}
 	cmd.Dir = cwd
-	cmd.Stdout = nil
 	cmd.Stdin = nil
 
 	logPath, err := sessionLogPath(key)
@@ -432,8 +412,8 @@ func setupDaemonCmd(key string, args []string) (*exec.Cmd, *os.File, *os.File, *
 		logFile.Close()
 		return nil, nil, nil, nil, fmt.Errorf("creating readiness pipe: %w", err)
 	}
-	cmd.ExtraFiles = []*os.File{writeEnd}
-	cmd.Env = append(os.Environ(), "_CRIT_READY_FD=3")
+	cmd.Stdout = writeEnd
+	cmd.Env = append(os.Environ(), "_CRIT_READY_STDOUT=1")
 	cmd.SysProcAttr = daemonSysProcAttr()
 
 	return cmd, readEnd, writeEnd, logFile, nil
@@ -583,15 +563,22 @@ func readDaemonLog(key string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// openReadyPipe returns the readiness pipe (FD 3) if this process was
-// spawned as a daemon with _CRIT_READY_FD=3. Returns nil otherwise.
-// The caller owns the returned file and must close it.
+// openReadyPipe returns the readiness pipe (the inherited stdout) if this
+// process was spawned as a daemon with _CRIT_READY_STDOUT=1. Returns nil
+// otherwise. The caller owns the returned file and must close it. After the
+// pipe is returned, os.Stdout is repointed at the log file (stderr) so any
+// stray writes to stdout don't corrupt the readiness handshake.
 func openReadyPipe() *os.File {
-	if os.Getenv("_CRIT_READY_FD") != "3" {
+	if os.Getenv("_CRIT_READY_STDOUT") != "1" {
 		return nil
 	}
-	os.Unsetenv("_CRIT_READY_FD")
-	return os.NewFile(3, "ready-pipe")
+	os.Unsetenv("_CRIT_READY_STDOUT")
+	pipe := os.Stdout
+	// Repoint stdout at stderr (the daemon log file) so subsequent writes
+	// to fmt.Println/log don't accidentally race the port handshake or
+	// keep the parent's read-end open after we close the pipe.
+	os.Stdout = os.Stderr
+	return pipe
 }
 
 // signalReadiness writes the port number to the readiness pipe.
@@ -617,12 +604,6 @@ func daemonFatal(pipe *os.File, format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func daemonSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{
-		Setsid: true, // new session, fully detached from controlling terminal
-	}
-}
-
 // stopDaemon stops the daemon for the given session key.
 func stopDaemon(key string) error {
 	entry, err := readSessionFile(key)
@@ -642,21 +623,20 @@ func stopDaemon(key string) error {
 		return nil //nolint:nilerr // process not found, session already cleaned up
 	}
 
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
+	if err := terminateProcess(proc); err != nil {
 		removeSessionFile(key)
 		return nil //nolint:nilerr // process already gone, cleanup is sufficient
 	}
 
-	// Poll for process exit, escalate to SIGKILL if needed
+	// Poll for process exit, escalate to Kill if still alive after the deadline.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
-			break // process is gone
+		if !processExists(proc) {
+			break
 		}
 	}
-	// Still alive? Force kill.
-	if err := proc.Signal(syscall.Signal(0)); err == nil {
+	if processExists(proc) {
 		proc.Kill()
 	}
 	removeSessionFile(key)
@@ -687,7 +667,7 @@ func cleanOrphanedSessions() {
 			continue
 		}
 		path := filepath.Join(sessDir, de.Name())
-		data, err := os.ReadFile(path)
+		data, err := readFileShared(path)
 		if err != nil {
 			continue
 		}

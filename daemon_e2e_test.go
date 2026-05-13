@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +19,26 @@ func TestDaemonLifecycle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping daemon lifecycle test in short mode")
 	}
+	if runtime.GOOS == "windows" {
+		// TODO(windows): re-evaluate now that terminateProcess uses
+		// GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) before falling back to
+		// TerminateProcess — the daemon's signal handler should now run on
+		// shutdown and let cmd.Wait return cleanly. The detached child +
+		// readiness-pipe (ExtraFiles FD 3) combo still produces
+		// subprocess-lifecycle behavior that differs from POSIX, so this
+		// suite remains skipped pending hands-on validation on a Windows
+		// runner. The runtime daemon code path is still exercised by
+		// daemon_test.go unit tests on Windows.
+		t.Skip("daemon E2E spawn/wait/kill semantics differ on Windows; covered by daemon_test.go unit tests; TODO: revisit after CTRL_BREAK shutdown lands")
+	}
 
 	// Build crit binary
 	dir := t.TempDir()
-	binary := filepath.Join(dir, "crit")
+	binaryName := "crit"
+	if runtime.GOOS == "windows" {
+		binaryName = "crit.exe"
+	}
+	binary := filepath.Join(dir, binaryName)
 	build := exec.Command("go", "build", "-o", binary, ".")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build failed: %v\n%s", err, out)
@@ -29,13 +46,13 @@ func TestDaemonLifecycle(t *testing.T) {
 
 	// Create a test repo with a file
 	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "test@test.com")
-	runGit(t, repoDir, "config", "user.name", "Test")
-	runGit(t, repoDir, "checkout", "-b", "main")
+	gitT(t, repoDir, "init")
+	gitT(t, repoDir, "config", "user.email", "test@test.com")
+	gitT(t, repoDir, "config", "user.name", "Test")
+	gitT(t, repoDir, "checkout", "-b", "main")
 	writeFile(t, filepath.Join(repoDir, "test.md"), "# Hello\n")
-	runGit(t, repoDir, "add", ".")
-	runGit(t, repoDir, "commit", "-m", "init")
+	gitT(t, repoDir, "add", ".")
+	gitT(t, repoDir, "commit", "-m", "init")
 
 	// Make a change so crit has something to review
 	writeFile(t, filepath.Join(repoDir, "test.md"), "# Hello\n\nWorld\n")
@@ -55,14 +72,25 @@ func TestDaemonLifecycle(t *testing.T) {
 	// Start daemon via _serve
 	cmd := exec.Command(binary, "_serve", "--no-open", "--port", "0")
 	cmd.Dir = repoDir
-	// Filter existing HOME so our override takes effect (first match wins)
+	// Filter existing HOME (and Windows equivalents) so our override takes
+	// effect. On Windows os.UserHomeDir reads USERPROFILE / HOMEDRIVE+HOMEPATH;
+	// without filtering them, the spawned daemon would still resolve the
+	// runner's real profile and write its session file there.
 	var env []string
 	for _, e := range os.Environ() {
-		if !strings.HasPrefix(e, "HOME=") {
-			env = append(env, e)
+		if strings.HasPrefix(e, "HOME=") {
+			continue
 		}
+		if runtime.GOOS == "windows" && (strings.HasPrefix(e, "USERPROFILE=") ||
+			strings.HasPrefix(e, "HOMEDRIVE=") || strings.HasPrefix(e, "HOMEPATH=")) {
+			continue
+		}
+		env = append(env, e)
 	}
 	env = append(env, "HOME="+homeDir)
+	if runtime.GOOS == "windows" {
+		env = append(env, "USERPROFILE="+homeDir)
+	}
 	cmd.Env = env
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
@@ -100,7 +128,7 @@ func TestDaemonLifecycle(t *testing.T) {
 	}
 
 	// Verify health endpoint
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/health", entry.Port))
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", entry.Port))
 	if err != nil {
 		t.Fatalf("health check failed: %v", err)
 	}
@@ -113,7 +141,7 @@ func TestDaemonLifecycle(t *testing.T) {
 	readyDeadline := time.Now().Add(10 * time.Second)
 	sessionReady := false
 	for time.Now().Before(readyDeadline) {
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/session", entry.Port))
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/session", entry.Port))
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
@@ -132,7 +160,7 @@ func TestDaemonLifecycle(t *testing.T) {
 	go func() {
 		client := &http.Client{Timeout: 10 * time.Second}
 		r, err := client.Post(
-			fmt.Sprintf("http://localhost:%d/api/review-cycle", entry.Port),
+			fmt.Sprintf("http://127.0.0.1:%d/api/review-cycle", entry.Port),
 			"application/json", nil,
 		)
 		if err != nil {
@@ -147,7 +175,7 @@ func TestDaemonLifecycle(t *testing.T) {
 	// Simulate user finishing review
 	time.Sleep(200 * time.Millisecond)
 	finishResp, err := http.Post(
-		fmt.Sprintf("http://localhost:%d/api/finish", entry.Port),
+		fmt.Sprintf("http://127.0.0.1:%d/api/finish", entry.Port),
 		"application/json", nil,
 	)
 	if err != nil {
