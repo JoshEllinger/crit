@@ -180,6 +180,16 @@ func topicChainSHAs(vcs VCS, repoRoot string) map[string]bool {
 		}
 		return out
 	}
+	if vcs.Name() == "jj" {
+		revs, err := jjCommandInDir(repoRoot, "log", "-r", jjTopicChainRevset(repoRoot, 0), "--no-graph", "-T", "commit_id ++ \"\\n\"")
+		if err != nil {
+			return out
+		}
+		for _, sha := range splitNonEmpty(revs) {
+			out[sha] = true
+		}
+		return out
+	}
 	// Sapling: draft() exactly captures the topic chain.
 	revs, err := slCommandInDir(repoRoot, "log", "-r", "draft() & ::.", "-T", "{node}\n")
 	if err != nil {
@@ -199,13 +209,16 @@ func commitSubjectFor(vcs VCS, repoRoot, sha string) string {
 		return ""
 	}
 	var subject string
-	if vcs.Name() == "git" {
+	switch vcs.Name() {
+	case "git":
 		out, err := runGitInDir(repoRoot, "log", "-1", "--format=%s", sha)
 		if err != nil {
 			return ""
 		}
 		subject = strings.TrimSpace(out)
-	} else {
+	case "jj":
+		subject = jjCommitSubject(repoRoot, sha)
+	default:
 		out, err := slCommandInDir(repoRoot, "log", "-r", sha, "-T", "{desc|firstline}")
 		if err != nil {
 			return ""
@@ -241,12 +254,25 @@ func assignStackBases(vcs VCS, entries []StackEntry, repoRoot string) []StackEnt
 		}
 		// Deepest: base = merge-base(default, head). Direct shell since the
 		// VCS interface only exposes MergeBase(ref-vs-HEAD).
-		if vcs.Name() == "git" {
+		switch vcs.Name() {
+		case "git":
 			out, err := runGitInDir(repoRoot, "merge-base", defaultBranch, entries[i].HeadSHA)
 			if err == nil {
 				entries[i].BaseSHA = strings.TrimSpace(out)
 			}
-		} else {
+		case "jj":
+			baseForMerge := defaultSHA
+			if baseForMerge == "" {
+				if sha, err := resolveJJRevisionToCommitID(repoRoot, defaultBranch); err == nil {
+					baseForMerge = sha
+				}
+			}
+			if baseForMerge != "" {
+				if mb, err := jjMergeBase(repoRoot, entries[i].HeadSHA, baseForMerge); err == nil {
+					entries[i].BaseSHA = strings.TrimSpace(mb)
+				}
+			}
+		default:
 			out, err := slCommandInDir(repoRoot, "log", "-r",
 				fmt.Sprintf("ancestor(%s, %s)", entries[i].HeadSHA, defaultBranch),
 				"-T", "{node}")

@@ -36,6 +36,104 @@
     return '<span class="file-ref">' + escapeHtml(path) + '</span>';
   };
 
+  // Override code_inline so backtick-wrapped comment IDs render as the same chip.
+  const defaultCodeInline = commentMd.renderer.rules.code_inline || function(tokens, idx, options, _env, self) {
+    return self.renderToken(tokens, idx, options);
+  };
+  commentMd.renderer.rules.code_inline = function(tokens, idx, options, env, self) {
+    const content = tokens[idx].content;
+    if (/^(c|r|rp)_[a-f0-9]{6,}$/.test(content)) {
+      return '<span class="comment-ref comment-ref-code" data-ref-id="' + escapeHtml(content) + '" tabindex="0" role="link">' + escapeHtml(content) + '</span>';
+    }
+    return defaultCodeInline(tokens, idx, options, env, self);
+  };
+
+  function linkifyCommentRefsInDom(el) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      // skip text inside code/pre elements and already-linked chips
+      if (node.parentNode.closest('code, pre, .comment-ref')) continue;
+      textNodes.push(node);
+    }
+    const re = /((?:c|r|rp)_[a-f0-9]{6,})/g;
+    textNodes.forEach(function(tn) {
+      if (!re.test(tn.nodeValue)) { re.lastIndex = 0; return; }
+      re.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let last = 0, m;
+      while ((m = re.exec(tn.nodeValue)) !== null) {
+        if (m.index > last) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last, m.index)));
+        const span = document.createElement('span');
+        span.className = 'comment-ref';
+        span.dataset.refId = m[1];
+        span.textContent = m[1];
+        span.tabIndex = 0;
+        span.setAttribute('role', 'link');
+        frag.appendChild(span);
+        last = m.index + m[0].length;
+      }
+      if (last < tn.nodeValue.length) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last)));
+      tn.parentNode.replaceChild(frag, tn);
+    });
+  }
+
+  // Scroll/expand/flash a comment card located anywhere in the document, given just its id.
+  // Distinct from scrollToComment(commentId, filePath) below — that one needs filePath context.
+  function scrollToCommentRef(id) {
+    const card = document.querySelector('.comment-card[data-comment-id="' + CSS.escape(id) + '"]');
+    if (!card) return;
+    // Make sure any containing <details> file section is open
+    const section = card.closest('details');
+    if (section && !section.open) section.open = true;
+    if (card.classList.contains('collapsed')) {
+      card.classList.remove('collapsed');
+      if (typeof commentCollapseOverrides !== 'undefined') commentCollapseOverrides[id] = false;
+    }
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.remove('comment-ref-flash');
+    void card.offsetWidth;
+    card.classList.add('comment-ref-flash');
+    card.addEventListener('animationend', function() {
+      card.classList.remove('comment-ref-flash');
+    }, { once: true });
+  }
+
+  document.addEventListener('click', function(e) {
+    const ref = e.target.closest && e.target.closest('.comment-ref');
+    if (!ref) return;
+    e.preventDefault();
+    scrollToCommentRef(ref.dataset.refId);
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const ref = e.target.closest && e.target.closest('.comment-ref');
+    if (!ref) return;
+    e.preventDefault();
+    scrollToCommentRef(ref.dataset.refId);
+  });
+
+  // ===== Attachment Image Src Rewrite =====
+  // Markdown stored in review.json uses canonical relative paths
+  // (`attachments/<uuid>.<ext>`) — never absolute URLs. Each render target
+  // rewrites at its own publish boundary; in the local UI that means
+  // pointing the browser at /api/attachments/<uuid>.<ext>. External URLs
+  // (https/http/data/absolute paths) pass through untouched so historical
+  // GitHub raw URLs or external image hosts still render after `crit pull`.
+  commentMd.renderer.rules.image = function(tokens, idx, options, _env, self) {
+    const token = tokens[idx];
+    const srcIdx = token.attrIndex('src');
+    if (srcIdx >= 0) {
+      const src = token.attrs[srcIdx][1];
+      if (!/^https?:\/\/|^data:|^\//.test(src) && /^attachments\//.test(src)) {
+        token.attrs[srcIdx][1] = '/api/' + src;
+      }
+    }
+    return self.renderToken(tokens, idx, options);
+  };
+
   // ===== Suggestion Diff Renderer =====
   function renderSuggestionDiff(suggestionContent, originalLines) {
     const sugLines = suggestionContent.replace(/\n$/, '').split('\n');
@@ -242,9 +340,12 @@
   let shareURL = '';
   let hostedURL = '';
   let deleteToken = '';
+  let needsShareConsent = false;
+  let authUserName = '';
   let configAuthor = '';
   let uiState = 'reviewing';
-  let waitingHasComments = false;
+  let waitingNotApproved = false;
+  let hiddenUnresolved = 0;
   let pendingUpdates = [];
   let pendingUpdatesVersion = '';
 
@@ -358,6 +459,9 @@
   let focusedFilePath = null;
   let focusedElement = null; // currently focused navigable element
   let navElements = []; // cached .kb-nav list, rebuilt on render
+  // Vim-style visual line mode (entered with V).
+  // { kind: 'markdown'|'diff', filePath, anchorStartLine, anchorEndLine, anchorSide }
+  let visualMode = null;
   let changeGroups = [];      // [{elements: [DOM], filePath: string}]
   let currentChangeIdx = -1;
 
@@ -372,8 +476,11 @@
     return Math.abs(hash) % AUTHOR_COLOR_COUNT;
   }
 
-  // Sort comparator: directories before files at each depth, then alphabetical
+  // Sort comparator: directories before files at each depth, then alphabetical.
+  // In files mode the user's CLI argument order is meaningful, so preserve it
+  // (Array.prototype.sort is stable, so returning 0 keeps original order).
   function fileSortComparator(a, b) {
+    if (session && session.mode === 'files') return 0;
     const pa = a.path.split('/'), pb = b.path.split('/');
     const min = Math.min(pa.length, pb.length);
     for (let i = 0; i < min - 1; i++) {
@@ -426,6 +533,7 @@
         additions: fi.additions || 0,
         deletions: fi.deletions || 0,
         lazy: true,
+        generated: !!fi.generated,
         diffTooLarge: false,
         diffLoaded: false,
         fileHash: '',
@@ -459,6 +567,7 @@
         deletions: 0,
         lazy: false,
         orphaned: true,
+        generated: false,
         diffTooLarge: false,
         diffLoaded: false,
         fileHash: '',
@@ -488,12 +597,13 @@
       lineBlocks: null,
       previousLineBlocks: null,
       tocItems: [],
-      collapsed: fi.status === 'deleted',
+      collapsed: fi.status === 'deleted' || fi.generated === true,
       viewMode: (session.mode === 'git') ? 'diff' : 'document',
       additions: fi.additions || 0,
       deletions: fi.deletions || 0,
       lazy: false,
       orphaned: false,
+      generated: !!fi.generated,
       fileHash: fileRes.file_hash || '',
     };
 
@@ -661,6 +771,8 @@
     shareURL = configRes.share_url || '';
     hostedURL = configRes.hosted_url || '';
     deleteToken = configRes.delete_token || '';
+    needsShareConsent = configRes.needs_consent || false;
+    authUserName = configRes.auth_user_name || '';
     configAuthor = configRes.author || '';
     agentEnabled = configRes.agent_cmd_enabled || false;
     agentName = configRes.agent_name || 'agent';
@@ -780,6 +892,7 @@
       : 'Crit — ' + (session.files || []).map(f => f.path).join(', '));
 
     files = await loadAllFileData(session.files || [], diffScope);
+    hiddenUnresolved = session.hidden_unresolved || 0;
 
     files.sort(fileSortComparator);
 
@@ -859,11 +972,12 @@
     if (!lang || !hljs.getLanguage(lang)) return null;
     try {
       const highlighted = hljs.highlight(file.content, { language: lang, ignoreIllegals: true }).value;
-      const lines = splitHighlightedCode(highlighted);
-      // Return 1-indexed: lines[1] = first line
+      const htmlLines = splitHighlightedCode(highlighted);
+      const rawLines = file.content.split('\n');
+      // Return 1-indexed: result[1] = first line
       const result = [null]; // index 0 unused
-      for (let i = 0; i < lines.length; i++) {
-        result.push(lines[i]);
+      for (let i = 0; i < htmlLines.length; i++) {
+        result.push({ html: htmlLines[i], raw: rawLines[i] });
       }
       return result;
     } catch {
@@ -873,12 +987,14 @@
 
   // Get highlighted HTML for a single diff line.
   // Uses pre-highlighted cache for new-side lines, falls back to per-line for old-side.
+  // The cache is keyed by working-tree line number, but in branch/staged/commit-pinned
+  // diffs the diff's NewNum may address a different revision. Verify the cached source
+  // line matches `content` before trusting the cache hit.
   function highlightDiffLine(content, lineNum, side, highlightCache, lang) {
-    // Try cache first (new-side lines: context and additions have NewNum mapped to file.content)
-    if (highlightCache && lineNum > 0 && side !== 'old' && highlightCache[lineNum]) {
-      return highlightCache[lineNum];
+    if (highlightCache && lineNum > 0 && side !== 'old') {
+      const entry = highlightCache[lineNum];
+      if (entry && entry.raw === content) return entry.html;
     }
-    // Fallback: highlight individual line
     if (lang && hljs.getLanguage(lang)) {
       try {
         return hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
@@ -938,8 +1054,9 @@
     for (let i = 0; i < lines.length; i++) {
       const lineNum = i + 1;
       let html;
-      if (file.highlightCache && file.highlightCache[lineNum]) {
-        html = '<code class="hljs">' + file.highlightCache[lineNum] + '</code>';
+      const cacheEntry = file.highlightCache ? file.highlightCache[lineNum] : null;
+      if (cacheEntry && cacheEntry.raw === (lines[i] || '')) {
+        html = '<code class="hljs">' + cacheEntry.html + '</code>';
       } else {
         html = '<code class="hljs">' + escapeHtml(lines[i] || '') + '</code>';
       }
@@ -1043,45 +1160,170 @@
   }
 
   // Handle a list token (bullet or ordered) — split into per-item blocks.
-  function handleListToken(tokens, i, token, md, blocks, sourceLines, coveredUpTo, blockEnd) {
+  // Recurses into nested lists so each nested item is independently commentable.
+  // Nested-item blocks are rendered with semantic nesting preserved
+  // (e.g. <ul><li><ul><li>content</li></ul></li></ul>) with outer wrappers
+  // marked .crit-list-wrapper so CSS suppresses their bullets.
+  function handleListToken(tokens, i, _token, md, blocks, sourceLines, coveredUpTo, blockEnd) {
     const listCloseIdx = findCloseToken(tokens, i);
-    const listTag = token.type === 'bullet_list_open' ? 'ul' : 'ol';
-    let j = i + 1;
 
-    while (j < listCloseIdx) {
-      if (tokens[j].type === 'list_item_open') {
-        const itemMap = tokens[j].map;
-        const itemCloseIdx = findCloseToken(tokens, j);
+    splitListInto(tokens, i, listCloseIdx, md, blocks, sourceLines, coveredUpTo, function(html) {
+      return html;
+    });
 
-        if (itemMap) {
-          addGapLineBlocks(blocks, sourceLines, coveredUpTo, itemMap[0]);
-          let effectiveEnd = itemMap[1];
-          while (effectiveEnd > itemMap[0] + 1 && sourceLines[effectiveEnd - 1].trim() === '') {
-            effectiveEnd--;
-          }
-
-          const itemTokens = tokens.slice(j, itemCloseIdx + 1);
-          const startAttr = listTag === 'ol' && tokens[j].info ? ' start="' + tokens[j].info + '"' : '';
-          const itemHtml = '<' + listTag + startAttr + '>' +
-            md.renderer.render(itemTokens, md.options, {}) +
-            '</' + listTag + '>';
-
-          blocks.push({
-            startLine: itemMap[0] + 1,
-            endLine: effectiveEnd,
-            html: itemHtml,
-            isEmpty: false
-          });
-          coveredUpTo = effectiveEnd;
-        }
-        j = itemCloseIdx + 1;
-      } else {
-        j++;
-      }
+    // After splitListInto, blocks have been pushed and coveredUpTo updated
+    // implicitly via the last block's endLine. Recompute coveredUpTo from blocks.
+    if (blocks.length > 0) {
+      coveredUpTo = Math.max(coveredUpTo, blocks[blocks.length - 1].endLine);
     }
 
     coveredUpTo = addGapLineBlocks(blocks, sourceLines, coveredUpTo, blockEnd);
     return { nextIndex: listCloseIdx + 1, coveredUpTo: coveredUpTo };
+  }
+
+  // Recursively split a list (between listOpenIdx and listCloseIdx) into blocks.
+  // `wrap(innerHtml)` wraps the innermost item HTML with any enclosing list/li
+  // chrome from outer (parent) lists, preserving semantic nesting.
+  // Pushes blocks to `blocks` and emits gap-line blocks between items.
+  // Returns the line number through which content has been emitted (last block's endLine).
+  function splitListInto(tokens, listOpenIdx, listCloseIdx, md, blocks, sourceLines, coveredUpTo, wrap) {
+    const listOpen = tokens[listOpenIdx];
+    const listTag = listOpen.type === 'bullet_list_open' ? 'ul' : 'ol';
+    let j = listOpenIdx + 1;
+
+    while (j < listCloseIdx) {
+      if (tokens[j].type !== 'list_item_open') { j++; continue; }
+      const itemOpenIdx = j;
+      const itemCloseIdx = findCloseToken(tokens, j);
+      const itemMap = tokens[itemOpenIdx].map;
+
+      if (!itemMap) { j = itemCloseIdx + 1; continue; }
+
+      addGapLineBlocks(blocks, sourceLines, coveredUpTo, itemMap[0]);
+      coveredUpTo = itemMap[0];
+
+      // Find nested lists within this item (direct children only).
+      const nestedRanges = findDirectNestedLists(tokens, itemOpenIdx, itemCloseIdx);
+
+      // For ordered lists, preserve numbering across split blocks via start=N.
+      // markdown-it stores the numeric marker on the list_item_open token's info.
+      const itemStartAttr = (listTag === 'ol' && tokens[itemOpenIdx].info)
+        ? ' start="' + tokens[itemOpenIdx].info + '"'
+        : '';
+
+      // The "lead" portion: tokens between item_open and the first nested list (or item_close).
+      const firstNested = nestedRanges.length > 0 ? nestedRanges[0] : null;
+      const leadEndTokenIdx = firstNested ? firstNested.openIdx : itemCloseIdx;
+
+      // Determine source-line range for the lead.
+      const leadStartLine = itemMap[0] + 1;
+      let leadEndLine;
+      if (firstNested) {
+        const nestedFirstMap = tokens[firstNested.openIdx].map;
+        leadEndLine = nestedFirstMap ? nestedFirstMap[0] : itemMap[1];
+      } else {
+        leadEndLine = itemMap[1];
+        // Trim trailing blank lines (markdown-it often claims a trailing blank).
+        while (leadEndLine > leadStartLine && sourceLines[leadEndLine - 1].trim() === '') {
+          leadEndLine--;
+        }
+      }
+
+      // Render lead content: re-use renderer over tokens [item_open .. leadEndTokenIdx-1] + item_close synthetic.
+      // Easiest: render the tokens between item_open+1 and leadEndTokenIdx (exclusive) as inline content,
+      // then wrap in <li>.
+      const leadInnerTokens = tokens.slice(itemOpenIdx + 1, leadEndTokenIdx);
+      const leadInnerHtml = md.renderer.render(leadInnerTokens, md.options, {});
+      const leadLiClass = tokens[itemOpenIdx].attrGet && tokens[itemOpenIdx].attrGet('class');
+      const leadLiAttr = leadLiClass ? ' class="' + escapeAttr(leadLiClass) + '"' : '';
+      const leadInnerWrapped = '<' + listTag + itemStartAttr + '>' +
+        '<li' + leadLiAttr + '>' + leadInnerHtml + '</li>' +
+        '</' + listTag + '>';
+
+      if (leadEndLine > leadStartLine - 1) {
+        blocks.push({
+          startLine: leadStartLine,
+          endLine: leadEndLine,
+          html: wrap(leadInnerWrapped),
+          isEmpty: false
+        });
+        coveredUpTo = leadEndLine;
+      }
+
+      // Recurse into each nested list. Build a wrap-fn that wraps the child HTML
+      // in this item's <listTag><li class="crit-list-wrapper">...</li></listTag>,
+      // then through the parent wrap.
+      for (let n = 0; n < nestedRanges.length; n++) {
+        const nested = nestedRanges[n];
+        const childWrap = function(innerHtml) {
+          // Outer wrappers: marker-suppressed <li> so we don't get phantom bullets.
+          return wrap(
+            '<' + listTag + ' class="crit-list-wrapper">' +
+            '<li class="crit-list-wrapper">' + innerHtml + '</li>' +
+            '</' + listTag + '>'
+          );
+        };
+        coveredUpTo = splitListInto(tokens, nested.openIdx, nested.closeIdx, md, blocks, sourceLines, coveredUpTo, childWrap);
+      }
+
+      // Trailing content after last nested list (rare): handle it as another lead-style block.
+      if (nestedRanges.length > 0) {
+        const lastNested = nestedRanges[nestedRanges.length - 1];
+        const trailStartTokenIdx = lastNested.closeIdx + 1;
+        if (trailStartTokenIdx < itemCloseIdx) {
+          // Find first mapped token for trailing source-line range.
+          const trailStartLine = coveredUpTo;
+          let trailEndLine = itemMap[1];
+          while (trailEndLine > trailStartLine && sourceLines[trailEndLine - 1].trim() === '') {
+            trailEndLine--;
+          }
+          if (trailEndLine > trailStartLine) {
+            const trailInnerTokens = tokens.slice(trailStartTokenIdx, itemCloseIdx);
+            const trailInnerHtml = md.renderer.render(trailInnerTokens, md.options, {});
+            const trailWrapped = '<' + listTag + '>' +
+              '<li>' + trailInnerHtml + '</li>' +
+              '</' + listTag + '>';
+            blocks.push({
+              startLine: trailStartLine + 1,
+              endLine: trailEndLine,
+              html: wrap(trailWrapped),
+              isEmpty: false
+            });
+            coveredUpTo = trailEndLine;
+          }
+        }
+      }
+
+      j = itemCloseIdx + 1;
+    }
+
+    return coveredUpTo;
+  }
+
+  // Find direct-child nested lists within an item (not lists nested inside paragraphs etc.).
+  // Returns array of {openIdx, closeIdx} for each direct nested list_open token.
+  function findDirectNestedLists(tokens, itemOpenIdx, itemCloseIdx) {
+    const result = [];
+    let depth = 0;
+    for (let k = itemOpenIdx + 1; k < itemCloseIdx; k++) {
+      const t = tokens[k];
+      if (t.nesting === 1) {
+        if (depth === 0 && (t.type === 'bullet_list_open' || t.type === 'ordered_list_open')) {
+          const closeIdx = findCloseToken(tokens, k);
+          result.push({ openIdx: k, closeIdx: closeIdx });
+          k = closeIdx; // skip past
+          continue;
+        }
+        depth++;
+      } else if (t.nesting === -1) {
+        if (depth > 0) depth--;
+      }
+    }
+    return result;
+  }
+
+  function escapeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
   }
 
   // Handle a table token — split into per-row blocks.
@@ -1520,8 +1762,10 @@
       container.appendChild(folder);
     }
 
-    // Render files
-    const sortedFiles = node.files.slice().sort(function(a, b) { return a.path.localeCompare(b.path); });
+    // Render files. In files mode preserve user-provided CLI order.
+    const sortedFiles = session.mode === 'files'
+      ? node.files.slice()
+      : node.files.slice().sort(function(a, b) { return a.path.localeCompare(b.path); });
     for (let fi = 0; fi < sortedFiles.length; fi++) {
       const f = sortedFiles[fi];
       const fileName = f.path.split('/').pop();
@@ -2457,7 +2701,7 @@
 
     const { commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
 
-    const changeInfo = (file.viewMode === 'document' && session.mode !== 'git') ? getChangeInfo(file) : null;
+    const changeInfo = file.viewMode === 'document' ? getChangeInfo(file) : null;
     // Build a map of afterLine -> deletion marker for quick lookup
     const deletionMarkerMap = {};
     if (changeInfo) {
@@ -3811,14 +4055,16 @@
   }
 
   // For unified diff: build a Set of visual indices that should have has-comment.
-  // This handles interleaved add/del lines correctly by using sequential position.
+  // Anchor strictly to the comment's side so unrelated lines elsewhere in the
+  // hunk that happen to share a number on the opposite side are not included.
+  // Lines between the anchored start/end are highlighted regardless of type
+  // (so deletions within a multi-line range still get highlighted).
   function buildUnifiedCommentVisualSet(hunks, comments) {
     if (!comments.length) return new Set();
-    // Flatten all hunk lines with their line numbers
     const lines = [];
     for (const hunk of hunks) {
       for (const line of hunk.Lines) {
-        lines.push({ oldNum: line.OldNum, newNum: line.NewNum });
+        lines.push({ type: line.Type, oldNum: line.OldNum, newNum: line.NewNum });
       }
     }
     const set = new Set();
@@ -3827,16 +4073,19 @@
       if (c.scope === 'file') continue;
       if (hideResolved && c.resolved) continue;
       const side = c.side || '';
+      // Only lines that *belong* to the comment's side can anchor. For new-side
+      // comments that means add/context lines (with a real NewNum); for old-side
+      // it means del/context lines (with a real OldNum).
       let startIdx = -1, endIdx = -1;
       for (let i = 0; i < lines.length; i++) {
-        // startIdx: match either OldNum or NewNum so deletions adjacent to
-        // the comment boundary are included in the visual range
-        if (startIdx === -1 && (lines[i].oldNum === c.start_line || lines[i].newNum === c.start_line)) {
-          startIdx = i;
-        }
-        // endIdx: match only the comment's side to avoid overshooting
-        const endNum = side === 'old' ? lines[i].oldNum : lines[i].newNum;
-        if (endNum === c.end_line) endIdx = i;
+        const ln = lines[i];
+        const num = side === 'old' ? ln.oldNum : ln.newNum;
+        const onSide = side === 'old'
+          ? (ln.type === 'del' || ln.type === 'context')
+          : (ln.type === 'add' || ln.type === 'context');
+        if (!onSide || !num) continue;
+        if (startIdx === -1 && num === c.start_line) startIdx = i;
+        if (num === c.end_line) endIdx = i;
       }
       if (startIdx !== -1 && endIdx !== -1) {
         for (let i = startIdx; i <= endIdx; i++) set.add(i);
@@ -3851,6 +4100,168 @@
       if (commentsMap[ln]) result.push(...commentsMap[ln]);
     }
     return result;
+  }
+
+  // ===== Visual Line Mode (vim-style) =====
+  // Anchors on the currently focused block; j/k extend the range; Esc clears it.
+  function enterVisualMode() {
+    if (!focusedElement) return false;
+    const fp = focusedElement.dataset.filePath || focusedElement.dataset.diffFilePath;
+    if (!fp) return false;
+
+    if (focusedElement.dataset.blockIndex !== undefined && focusedElement.dataset.startLine) {
+      const startLine = parseInt(focusedElement.dataset.startLine);
+      const endLine = parseInt(focusedElement.dataset.endLine);
+      visualMode = { kind: 'markdown', filePath: fp, anchorStartLine: startLine, anchorEndLine: endLine };
+      activeFilePath = fp;
+      selectionStart = startLine;
+      selectionEnd = endLine;
+      // Clear any stale unified-diff drag state so it can't bleed into render paths.
+      unifiedVisualStart = null;
+      unifiedVisualEnd = null;
+      document.body.classList.add('visual-mode');
+      refreshVisualSelectionVisuals(fp);
+      return true;
+    }
+    if (focusedElement.dataset.diffLineNum) {
+      // Split rows carry both sides — tagDiffLine on the row records whichever
+      // side existed first (left when present), but the user's intent is
+      // usually the right (new) side. Prefer right; fall back to left for
+      // deleted-only rows. Unified rows are single-side, so just read directly.
+      let lineNum, side;
+      if (focusedElement.classList.contains('diff-split-row')) {
+        const right = focusedElement.querySelector('.diff-split-side.right:not(.empty)');
+        if (right && right.dataset.diffLineNum) {
+          lineNum = parseInt(right.dataset.diffLineNum);
+          side = '';
+        } else {
+          const left = focusedElement.querySelector('.diff-split-side.left:not(.empty)');
+          if (!left || !left.dataset.diffLineNum) return false;
+          lineNum = parseInt(left.dataset.diffLineNum);
+          side = 'old';
+        }
+      } else {
+        lineNum = parseInt(focusedElement.dataset.diffLineNum);
+        side = focusedElement.dataset.diffSide || '';
+      }
+      visualMode = { kind: 'diff', filePath: fp, anchorStartLine: lineNum, anchorEndLine: lineNum, anchorSide: side };
+      activeFilePath = fp;
+      selectionStart = lineNum;
+      selectionEnd = lineNum;
+      document.body.classList.add('visual-mode');
+      refreshVisualSelectionVisuals(fp);
+      return true;
+    }
+    return false;
+  }
+
+  function exitVisualMode(clearSelection) {
+    if (!visualMode) return;
+    const fp = visualMode.filePath;
+    visualMode = null;
+    document.body.classList.remove('visual-mode');
+    if (clearSelection) {
+      selectionStart = null;
+      selectionEnd = null;
+      unifiedVisualStart = null;
+      unifiedVisualEnd = null;
+      activeFilePath = null;
+      if (fp) refreshVisualSelectionVisuals(fp);
+    }
+  }
+
+  // After j/k moves focus, extend the visual selection from the anchor to the new focus.
+  function extendVisualSelection() {
+    if (!visualMode || !focusedElement) return;
+    const fp = visualMode.kind === 'markdown'
+      ? focusedElement.dataset.filePath
+      : focusedElement.dataset.diffFilePath;
+    if (fp !== visualMode.filePath) {
+      // Crossed file boundary — exit visual mode (focus already moved by j/k).
+      exitVisualMode(true);
+      return;
+    }
+    if (visualMode.kind === 'markdown') {
+      if (focusedElement.dataset.blockIndex === undefined) return;
+      const sLine = parseInt(focusedElement.dataset.startLine);
+      const eLine = parseInt(focusedElement.dataset.endLine);
+      selectionStart = Math.min(visualMode.anchorStartLine, sLine);
+      selectionEnd = Math.max(visualMode.anchorEndLine, eLine);
+    } else {
+      // Find the line number on the anchor side. Split rows carry both sides
+      // (and the row's dataset.diffSide is whichever side was tagged first,
+      // which is unreliable for navigation), so query the child sides directly.
+      // Rows with no line on the anchor side (e.g. a deleted-only row when
+      // we anchored on the right) are skipped silently — selection stays put,
+      // visual mode stays active, focus continues moving with j/k.
+      let ln = null;
+      if (focusedElement.classList.contains('diff-split-row')) {
+        const sideSel = visualMode.anchorSide === 'old'
+          ? '.diff-split-side.left:not(.empty)'
+          : '.diff-split-side.right:not(.empty)';
+        const sideEl = focusedElement.querySelector(sideSel);
+        if (sideEl && sideEl.dataset.diffLineNum) {
+          ln = parseInt(sideEl.dataset.diffLineNum);
+        }
+      } else if (focusedElement.dataset.diffLineNum) {
+        // Unified mode — single-side per element, must match anchor.
+        const side = focusedElement.dataset.diffSide || '';
+        if (side !== visualMode.anchorSide) return;
+        ln = parseInt(focusedElement.dataset.diffLineNum);
+      }
+      if (ln === null) return;
+      selectionStart = Math.min(visualMode.anchorStartLine, ln);
+      selectionEnd = Math.max(visualMode.anchorEndLine, ln);
+    }
+    // Update .selected classes incrementally rather than re-rendering the whole
+    // file — re-rendering invalidates the focusedElement reference and trips
+    // the j/k stale-ref recovery (which can mis-resolve when blockIndex values
+    // collide across files).
+    refreshVisualSelectionVisuals(visualMode.filePath);
+  }
+
+  function refreshVisualSelectionVisuals(filePath) {
+    const section = document.getElementById('file-section-' + filePath);
+    if (!section) return;
+    const blocks = section.querySelectorAll('.line-block.kb-nav[data-file-path="' + filePath + '"]');
+    for (let i = 0; i < blocks.length; i++) {
+      const lb = blocks[i];
+      const sLine = parseInt(lb.dataset.startLine);
+      const eLine = parseInt(lb.dataset.endLine);
+      const inSel = selectionStart !== null && selectionEnd !== null
+        && sLine >= selectionStart && eLine <= selectionEnd;
+      lb.classList.toggle('selected', inSel);
+    }
+    // Split-mode diff sides: each side has its own line numbers + side tag.
+    // .selected only applies on the anchor-matching side (matches the render
+    // path in makeSplitRow, lines 3730 / 3772).
+    const splitSides = section.querySelectorAll('.diff-split-side[data-diff-file-path="' + filePath + '"]');
+    const anchorSide = visualMode && visualMode.kind === 'diff' ? visualMode.anchorSide : null;
+    for (let i = 0; i < splitSides.length; i++) {
+      const sEl = splitSides[i];
+      if (sEl.classList.contains('empty') || !sEl.dataset.diffLineNum) {
+        sEl.classList.toggle('selected', false);
+        continue;
+      }
+      const ln = parseInt(sEl.dataset.diffLineNum);
+      const side = sEl.dataset.diffSide || '';
+      const sideMatches = anchorSide === null || side === anchorSide;
+      const inSel = sideMatches && selectionStart !== null && selectionEnd !== null
+        && ln >= selectionStart && ln <= selectionEnd;
+      sEl.classList.toggle('selected', inSel);
+    }
+    // Unified-mode diff lines: single-side per element, side matches anchor.
+    const unifiedLines = section.querySelectorAll('.diff-container.unified .diff-line[data-diff-file-path="' + filePath + '"]');
+    for (let i = 0; i < unifiedLines.length; i++) {
+      const ul = unifiedLines[i];
+      if (!ul.dataset.diffLineNum) continue;
+      const ln = parseInt(ul.dataset.diffLineNum);
+      const side = ul.dataset.diffSide || '';
+      const sideMatches = anchorSide === null || side === anchorSide;
+      const inSel = sideMatches && selectionStart !== null && selectionEnd !== null
+        && ln >= selectionStart && ln <= selectionEnd;
+      ul.classList.toggle('selected', inSel);
+    }
   }
 
   // ===== Gutter Drag Selection =====
@@ -4054,71 +4465,61 @@
 
   function getLineRangeFromSelection(selection) {
     if (!selection || selection.isCollapsed || !selection.toString().trim()) return null;
+    if (selection.rangeCount === 0) return null;
+    const range = selection.getRangeAt(0);
 
-    const anchorNode = selection.anchorNode;
-    const focusNode = selection.focusNode;
-    if (!anchorNode || !focusNode) return null;
+    // Walk every commentable element and keep those the range intersects.
+    // Direction-agnostic: avoids relying on anchorNode/focusNode, which can
+    // snap to non-commentable parent containers when a selection crosses a
+    // blank-line boundary (especially in backward drags).
+    const candidates = [];
 
-    // Walk up from a node to find the nearest commentable element.
-    // Returns { filePath, startLine, endLine, blockIndex, side } or null.
-    function findLineInfo(node) {
-      const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-      if (!el) return null;
+    document.querySelectorAll('.line-block[data-file-path]').forEach(function(el) {
+      if (el.closest('.comment-form-wrapper') || el.closest('.comment-card')) return;
+      if (!range.intersectsNode(el)) return;
+      candidates.push({
+        filePath: el.dataset.filePath,
+        startLine: parseInt(el.dataset.startLine),
+        endLine: parseInt(el.dataset.endLine),
+        blockIndex: el.dataset.blockIndex !== undefined ? parseInt(el.dataset.blockIndex) : null,
+        side: undefined,
+      });
+    });
 
-      // Check if inside a comment — don't trigger on existing comment text
-      if (el.closest('.comment-form-wrapper') || el.closest('.comment-card')) return null;
+    document.querySelectorAll('[data-diff-line-num]').forEach(function(el) {
+      const ln = parseInt(el.dataset.diffLineNum);
+      if (!(ln > 0)) return;
+      if (el.closest('.comment-form-wrapper') || el.closest('.comment-card')) return;
+      if (!range.intersectsNode(el)) return;
+      candidates.push({
+        filePath: el.dataset.diffFilePath,
+        startLine: ln,
+        endLine: ln,
+        blockIndex: null,
+        side: el.dataset.diffSide || undefined,
+      });
+    });
 
-      // Check if inside non-commentable UI (header, file tree, buttons)
-      if (el.closest('.header') || el.closest('.file-tree') || el.closest('.toc-panel')) return null;
+    if (candidates.length === 0) return null;
 
-      // Try markdown line-block first
-      const lineBlock = el.closest('.line-block[data-file-path]');
-      if (lineBlock) {
-        return {
-          filePath: lineBlock.dataset.filePath,
-          startLine: parseInt(lineBlock.dataset.startLine),
-          endLine: parseInt(lineBlock.dataset.endLine),
-          blockIndex: lineBlock.dataset.blockIndex !== undefined ? parseInt(lineBlock.dataset.blockIndex) : null,
-          side: undefined
-        };
-      }
-
-      // Try diff line
-      const diffLine = el.closest('[data-diff-line-num]');
-      if (diffLine && parseInt(diffLine.dataset.diffLineNum) > 0) {
-        return {
-          filePath: diffLine.dataset.diffFilePath,
-          startLine: parseInt(diffLine.dataset.diffLineNum),
-          endLine: parseInt(diffLine.dataset.diffLineNum),
-          blockIndex: null,
-          side: diffLine.dataset.diffSide || undefined
-        };
-      }
-
-      return null;
+    // All candidates must share filePath and side. If the selection straddles
+    // multiple files or diff sides, bail out rather than guess.
+    const filePath = candidates[0].filePath;
+    const side = candidates[0].side;
+    for (let i = 1; i < candidates.length; i++) {
+      if (candidates[i].filePath !== filePath) return null;
+      if (candidates[i].side !== side) return null;
     }
 
-    const anchorInfo = findLineInfo(anchorNode);
-    const focusInfo = findLineInfo(focusNode);
-
-    if (!anchorInfo || !focusInfo) return null;
-
-    // Both ends must be in the same file
-    if (anchorInfo.filePath !== focusInfo.filePath) return null;
-
-    // For diff selections, both ends must be on the same side
-    if (anchorInfo.side !== focusInfo.side) return null;
-
-    // Compute union range
-    const startLine = Math.min(anchorInfo.startLine, focusInfo.startLine);
-    const endLine = Math.max(anchorInfo.endLine, focusInfo.endLine);
-    const filePath = anchorInfo.filePath;
-    const side = anchorInfo.side;
-
-    // Determine afterBlockIndex: use the larger blockIndex (form appears after last block in range)
+    let startLine = Infinity;
+    let endLine = -Infinity;
     let afterBlockIndex = null;
-    if (anchorInfo.blockIndex !== null && focusInfo.blockIndex !== null) {
-      afterBlockIndex = Math.max(anchorInfo.blockIndex, focusInfo.blockIndex);
+    for (const c of candidates) {
+      if (c.startLine < startLine) startLine = c.startLine;
+      if (c.endLine > endLine) endLine = c.endLine;
+      if (c.blockIndex !== null && (afterBlockIndex === null || c.blockIndex > afterBlockIndex)) {
+        afterBlockIndex = c.blockIndex;
+      }
     }
 
     return { filePath, startLine, endLine, afterBlockIndex, side };
@@ -4539,6 +4940,176 @@
     }
   }
 
+  // ===== Image Paste =====
+  // Attach a paste handler to a comment textarea so screenshots and other
+  // images on the clipboard upload via POST /api/attachments and get
+  // inserted as markdown image references at the cursor.
+  //
+  // The inserted markdown carries the *relative* path returned by the
+  // server (`attachments/<uuid>.<ext>`) — that's the canonical form stored
+  // in review.json. The local UI's render-time hook (commentMd image rule
+  // above) rewrites it to /api/attachments/... at display time.
+  //
+  // While an upload is in flight a `![uploading…](crit-pending-N)`
+  // placeholder sits at the cursor; on success it's swapped for the real
+  // markdown reference, on failure for an italic _[image upload failed]_
+  // note. The placeholder tag is suffixed with a per-textarea counter so
+  // simultaneous pastes don't collide.
+  let pendingImagePasteSeq = 0;
+  function attachImagePaste(textarea) {
+    textarea.addEventListener('paste', function(event) {
+      const clipboard = event.clipboardData;
+      if (!clipboard) return;
+      const items = clipboard.items;
+      if (!items || items.length === 0) return;
+
+      const images = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file' && item.type && item.type.indexOf('image/') === 0) {
+          const file = item.getAsFile();
+          if (file) images.push(file);
+        }
+      }
+      if (images.length === 0) return;
+
+      // We're handling images — block the default paste so the raw bytes
+      // don't get dumped as garbage text into the textarea.
+      event.preventDefault();
+      images.forEach(function(file) { uploadAndInsertImage(textarea, file); });
+    });
+  }
+
+  // attachImageDragDrop wires drag-and-drop image uploads onto a textarea.
+  // Mirrors attachImagePaste's contract: filter for image/* files, route to
+  // uploadAndInsertImage, leave non-image drags to the browser's native
+  // text-drop behavior. dragover MUST preventDefault when we want to accept
+  // the drop — without it, the drop event never fires.
+  function attachImageDragDrop(textarea) {
+    function hasFiles(event) {
+      const dt = event.dataTransfer;
+      // dataTransfer.types is a DOMStringList; "Files" indicates an OS file
+      // drag. Text-only drags (selection drags, link drags) won't include it.
+      return !!(dt && dt.types && Array.prototype.indexOf.call(dt.types, 'Files') !== -1);
+    }
+
+    textarea.addEventListener('dragenter', function(event) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      textarea.classList.add('drag-active');
+    });
+
+    textarea.addEventListener('dragover', function(event) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+      textarea.classList.add('drag-active');
+    });
+
+    textarea.addEventListener('dragleave', function(event) {
+      // Only clear when the drag truly leaves the textarea (not when crossing
+      // an internal selection boundary — textareas have no children, so we
+      // can rely on a simple class toggle without ref-counting).
+      if (event.target === textarea) {
+        textarea.classList.remove('drag-active');
+      }
+    });
+
+    textarea.addEventListener('drop', function(event) {
+      const dt = event.dataTransfer;
+      if (!dt || !dt.files || dt.files.length === 0) {
+        textarea.classList.remove('drag-active');
+        return;
+      }
+      const images = [];
+      for (let i = 0; i < dt.files.length; i++) {
+        const file = dt.files[i];
+        if (file && file.type && file.type.indexOf('image/') === 0) {
+          images.push(file);
+        }
+      }
+      if (images.length === 0) {
+        textarea.classList.remove('drag-active');
+        return;
+      }
+      // We're handling at least one image — claim the drop so the browser
+      // doesn't try to navigate to the dropped file URL.
+      event.preventDefault();
+      textarea.classList.remove('drag-active');
+      textarea.focus();
+      images.forEach(function(file) { uploadAndInsertImage(textarea, file); });
+    });
+  }
+
+  // Wires both paste and drag-drop image uploads onto a textarea. Single
+  // entry point so every comment textarea (top-level, edit, reply, reply edit)
+  // gets the same upload behavior.
+  function attachImageUploads(textarea) {
+    attachImagePaste(textarea);
+    attachImageDragDrop(textarea);
+  }
+
+  function uploadAndInsertImage(textarea, file) {
+    const seq = ++pendingImagePasteSeq;
+    const placeholder = '![uploading…](crit-pending-' + seq + ')';
+    insertAtCursor(textarea, placeholder);
+
+    const formData = new FormData();
+    // Pass the original filename explicitly so it survives any clipboard
+    // that strips it from the File object. Server sanitizes server-side.
+    formData.append('file', file, file.name || '');
+
+    fetch('/api/attachments', { method: 'POST', body: formData })
+      .then(function(res) {
+        if (!res.ok) {
+          return res.text().then(function(msg) {
+            throw new Error(msg || ('Upload failed: ' + res.status));
+          });
+        }
+        return res.json();
+      })
+      .then(function(data) {
+        if (!data || !data.url) throw new Error('Malformed upload response');
+        const alt = (data.original_filename || '').trim();
+        replaceInTextarea(textarea, placeholder, '![' + alt + '](' + data.url + ')');
+      })
+      .catch(function(err) {
+        console.error('Image paste upload failed:', err);
+        replaceInTextarea(textarea, placeholder, '_[image upload failed]_');
+      });
+  }
+
+  function insertAtCursor(textarea, text) {
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const before = textarea.value.substring(0, start);
+    const after = textarea.value.substring(end);
+    textarea.value = before + text + after;
+    const cursor = start + text.length;
+    textarea.selectionStart = textarea.selectionEnd = cursor;
+    textarea.focus();
+    // Trigger input listeners (draft autosave, etc.)
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  function replaceInTextarea(textarea, needle, replacement) {
+    const idx = textarea.value.indexOf(needle);
+    if (idx === -1) return;
+    // Preserve cursor when the placeholder is not where the user is typing.
+    const selStart = textarea.selectionStart;
+    const selEnd = textarea.selectionEnd;
+    textarea.value = textarea.value.substring(0, idx) + replacement + textarea.value.substring(idx + needle.length);
+    const delta = replacement.length - needle.length;
+    if (selStart > idx + needle.length) {
+      textarea.selectionStart = selStart + delta;
+      textarea.selectionEnd = selEnd + delta;
+    } else if (selStart >= idx) {
+      // Cursor was inside the placeholder — drop it just after the replacement.
+      textarea.selectionStart = textarea.selectionEnd = idx + replacement.length;
+    }
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
   // ===== Comment Form =====
   function createCommentFormUI(opts) {
     const formObj = opts.formObj;
@@ -4560,6 +5131,7 @@
     if (opts.initialBody) textarea.value = opts.initialBody;
 
     attachFilePicker(textarea);
+    attachImageUploads(textarea);
 
     const doSubmit = opts.onSubmit
       ? function() { opts.onSubmit(textarea.value); }
@@ -5058,6 +5630,7 @@
     const bodyEl = document.createElement('div');
     bodyEl.className = 'comment-body';
     bodyEl.innerHTML = commentMd.render(comment.body, filePath ? buildCommentEnv(comment, filePath) : undefined);
+    linkifyCommentRefsInDom(bodyEl);
 
     card.appendChild(header);
 
@@ -5254,6 +5827,7 @@
       replyBody.className = 'reply-body';
       replyBody.dataset.rawBody = reply.body;
       replyBody.innerHTML = commentMd.render(reply.body);
+      linkifyCommentRefsInDom(replyBody);
       replyEl.appendChild(replyBody);
 
       repliesContainer.appendChild(replyEl);
@@ -5944,6 +6518,7 @@
     textarea.value = currentText;
     textarea.rows = 3;
     bodyEl.replaceWith(textarea);
+    attachImageUploads(textarea);
     textarea.focus();
 
     const saveBtn = document.createElement('button');
@@ -6031,6 +6606,7 @@
     buttons.appendChild(submitBtn);
 
     attachFilePicker(textarea);
+    attachImageUploads(textarea);
 
     function expand() {
       if (form.classList.contains('expanded')) return;
@@ -6599,6 +7175,7 @@
       const descBody = document.createElement('div');
       descBody.className = 'pr-panel-description-body';
       descBody.innerHTML = commentMd.render(pr.pr_body);
+      linkifyCommentRefsInDom(descBody);
       descSection.appendChild(descBody);
 
       body.appendChild(descSection);
@@ -6626,7 +7203,7 @@
 
   function setUIState(state) {
     uiState = state;
-    if (state === 'reviewing') waitingHasComments = false;
+    if (state === 'reviewing') waitingNotApproved = false;
     const finishBtn = document.getElementById('finishBtn');
     const waitingOverlay = document.getElementById('waitingOverlay');
 
@@ -6637,6 +7214,7 @@
           if (files[fi].comments) unresolvedComments += files[fi].comments.filter(function(c) { return !c.resolved; }).length;
         }
         unresolvedComments += reviewComments.filter(function(c) { return !c.resolved; }).length;
+        unresolvedComments += hiddenUnresolved;
         finishBtn.textContent = unresolvedComments === 0 ? 'Approve' : 'Finish Review';
         finishBtn.disabled = false;
         finishBtn.classList.add('btn-primary');
@@ -6665,27 +7243,32 @@
         throw new Error('Finish review failed: HTTP ' + resp.status);
       }
       const data = await resp.json();
-      // hasComments must be false when the server says approved=true,
-      // even if a prompt is present (e.g. "All comments resolved —
-      // proceed"). Otherwise the user gets the agent-notified
-      // "waiting for updates" UX instead of the approval path.
-      const hasComments = !!data.prompt && !data.approved;
-      waitingHasComments = hasComments;
+      const approved = !!data.approved;
+      waitingNotApproved = !approved;
       const prompt = data.prompt || 'I reviewed the changes, no feedback, good to go!';
 
-      document.getElementById('waitingPrompt').textContent = prompt;
-
+      const dialog = document.getElementById('waitingDialog');
+      const headingEl = document.getElementById('waitingHeading');
+      const messageEl = document.getElementById('waitingMessage');
       const clipEl = document.getElementById('waitingClipboard');
+
+      document.getElementById('waitingPrompt').textContent = prompt;
       clipEl.textContent = 'Copy prompt';
       clipEl.classList.remove('clipboard-confirm');
 
-      if (hasComments) {
-        document.getElementById('waitingMessage').innerHTML =
+      // Replay the success-mark draw animation each time we enter approved state.
+      dialog.classList.remove('approved');
+      if (approved) {
+        void dialog.offsetWidth; // force reflow — restarts CSS animations on re-added class
+        dialog.classList.add('approved');
+        headingEl.textContent = 'Approved';
+        messageEl.textContent =
+          'Your agent has been notified \u2014 no further action needed. You can close this tab whenever you\u2019re ready.';
+      } else {
+        headingEl.textContent = 'Review Complete';
+        messageEl.innerHTML =
           'Your agent has been notified. Waiting for updates\u2026' +
           '<span class="waiting-fallback">If your agent wasn\u2019t listening, paste the prompt below.</span>';
-      } else {
-        document.getElementById('waitingMessage').textContent =
-          'You can close this browser tab, or leave it open for another round.';
       }
 
       try { await navigator.clipboard.writeText(prompt); } catch {}
@@ -6782,6 +7365,10 @@
     setUIState('reviewing');
   });
 
+  document.getElementById('waitingOverlay').addEventListener('click', function(e) {
+    if (e.target === this) setUIState('reviewing');
+  });
+
   document.getElementById('waitingClipboard').addEventListener('click', async function() {
     const prompt = document.getElementById('waitingPrompt').textContent;
     try {
@@ -6832,6 +7419,7 @@
 
         // Reload all files
         files = await loadAllFileData(session.files || [], diffScope);
+        hiddenUnresolved = session.hidden_unresolved || 0;
 
         // Restore per-file user state from previous round
         for (let fi = 0; fi < files.length; fi++) {
@@ -6891,7 +7479,7 @@
           const clipEl = document.getElementById('waitingClipboard');
           if (promptEl) promptEl.style.display = 'none';
           if (clipEl) clipEl.style.display = 'none';
-          if (waitingHasComments) {
+          if (waitingNotApproved) {
             document.getElementById('waitingMessage').textContent = 'Waiting for your agent to finish...';
           }
         }
@@ -7063,69 +7651,172 @@
     if (shareModalEl) {
       shareModalEl.remove();
       shareModalEl = null;
+      const trigger = document.getElementById('shareBtn');
+      if (trigger) trigger.focus();
     }
   }
 
-  function showShareModal() {
+  function showConsentModal() {
     closeShareModal();
-
     const overlay = document.createElement('div');
     overlay.className = 'share-overlay';
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
-    overlay.setAttribute('aria-label', 'Share review');
+    overlay.setAttribute('aria-labelledby', 'consentDialogTitle');
+    overlay.innerHTML =
+      '<div class="share-dialog share-dialog--consent">' +
+        '<h3 id="consentDialogTitle" class="share-dialog-headline">Share this review</h3>' +
+        '<p class="share-dialog-sub">Your review will be securely uploaded to crit.md. ' +
+          'You\'ll get a private link — share it with whoever you choose. ' +
+          'You won\'t be asked again after confirming.</p>' +
+        '<div class="sd-actions">' +
+          '<button class="sd-link-btn" id="consentCancelBtn">Cancel</button>' +
+          '<button class="sd-primary" id="consentShareBtn">Share →</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(overlay);
+    shareModalEl = overlay;
+    requestAnimationFrame(function() {
+      const focusBtn = overlay.querySelector('#consentShareBtn');
+      if (focusBtn) focusBtn.focus();
+    });
+
+    let consentAborted = false;
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) { consentAborted = true; closeShareModal(); } });
+    overlay.addEventListener('keydown', function(e) { if (e.key === 'Escape') { consentAborted = true; closeShareModal(); } });
+    overlay.querySelector('#consentCancelBtn').addEventListener('click', function() { consentAborted = true; closeShareModal(); });
+    overlay.querySelector('#consentShareBtn').addEventListener('click', async function() {
+      this.disabled = true;
+      try {
+        const r = await fetch('/api/share-consent', { method: 'POST' });
+        if (r.ok) {
+          needsShareConsent = false;
+          closeShareModal();
+          if (!consentAborted) {
+            const btn = document.getElementById('shareBtn');
+            if (btn) btn.click();
+          }
+        } else {
+          closeShareModal();
+          showToast('share', 'error', '<span>Failed to record consent. Please try again.</span>');
+        }
+      } catch {
+        closeShareModal();
+        showToast('share', 'error', '<span>Network error. Please try again.</span>');
+      }
+    });
+  }
+
+  function showShareModal() {
+    closeShareModal();
+    const overlay = document.createElement('div');
+    overlay.className = 'share-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'shareDialogTitle');
+
+    const isSignedIn = !!authUserName;
+    const initials = authUserName
+      ? authUserName.split(/\s+/).filter(Boolean).map(function(w) { return w[0]; }).join('').slice(0, 2).toUpperCase()
+      : '';
+
+    const nextShareBlock = isSignedIn
+      ? '<div class="share-dialog-attrib">' +
+          '<span class="share-dialog-avatar" aria-hidden="true">' + escapeHtml(initials) + '</span>' +
+          '<span>Shared as <strong>' + escapeHtml(authUserName) + '</strong></span>' +
+        '</div>'
+      : '<div class="share-dialog-next">' +
+          '<span class="share-dialog-next-eyebrow">For your next share</span>' +
+          '<p class="share-dialog-next-body">Sign in once from your terminal and every review you share ' +
+            'after that will be attributed to you and listed in your dashboard.</p>' +
+          '<div class="share-dialog-cmd">' +
+            '<span class="share-dialog-cmd-prompt" aria-hidden="true">$</span>' +
+            '<span class="share-dialog-cmd-text">crit auth login</span>' +
+            '<button class="share-dialog-cmd-copy" id="modalCopyCmd" aria-label="Copy command">' +
+              ICON_CLIPBOARD +
+            '</button>' +
+          '</div>' +
+        '</div>';
+
     overlay.innerHTML =
       '<div class="share-dialog">' +
-        '<h3><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.25 5.5l-5.5 5.5-3.5-3.5"/></svg>Review shared</h3>' +
-        '<div class="share-dialog-qr" id="modalQR"></div>' +
-        '<div class="share-dialog-url">' +
-          '<span>' + escapeHtml(hostedURL) + '</span>' +
-          '<button class="copy-icon-btn" id="modalCopyBtn" title="Copy link" aria-label="Copy link">' +
-            ICON_CLIPBOARD +
-          '</button>' +
+        '<div class="share-dialog-body">' +
+          '<div class="share-dialog-qr-col">' +
+            '<div class="share-dialog-qr" id="modalQR"></div>' +
+            '<div class="share-dialog-qr-caption">Scan to open on a phone</div>' +
+          '</div>' +
+          '<div class="share-dialog-narrative">' +
+            '<h3 id="shareDialogTitle" class="share-dialog-headline">Your review is live.</h3>' +
+            '<p class="share-dialog-sub">Anyone with the link can read it. The page works without an account.</p>' +
+            '<div class="share-dialog-url">' +
+              '<span>' + escapeHtml(hostedURL) + '</span>' +
+              '<button class="copy-icon-btn" id="modalCopyBtn" aria-label="Copy link">' +
+                ICON_CLIPBOARD +
+              '</button>' +
+            '</div>' +
+            nextShareBlock +
+          '</div>' +
         '</div>' +
-        '<div class="share-dialog-actions">' +
-          (deleteToken ? '<button class="btn btn-sm btn-danger" id="modalUnpublishBtn">Unpublish</button>' : '') +
-          '<button class="btn btn-sm" id="modalCloseBtn">Close</button>' +
+        '<div class="sd-actions">' +
+          (deleteToken ? '<button class="sd-link-btn sd-link-btn--danger" id="modalUnpublishBtn">Unpublish</button>' : '<span></span>') +
+          '<div class="sd-actions-right">' +
+            '<button class="sd-primary" id="modalCloseBtn">Done</button>' +
+          '</div>' +
         '</div>' +
       '</div>';
 
     document.body.appendChild(overlay);
     shareModalEl = overlay;
+    requestAnimationFrame(function() {
+      const closeBtn = overlay.querySelector('#modalCloseBtn');
+      if (closeBtn) closeBtn.focus();
+    });
 
-    // Fetch QR code
+    // QR code
     fetch('/api/qr?url=' + encodeURIComponent(hostedURL))
-      .then(function(r) { return r.text(); })
+      .then(function(r) { return r.ok ? r.text() : null; })
       .then(function(svg) {
         const qrEl = document.getElementById('modalQR');
-        if (qrEl) qrEl.innerHTML = svg;
+        if (qrEl && svg) qrEl.innerHTML = svg;
       })
-      .catch(function() { /* QR fetch is optional */ });
+      .catch(function() { /* QR is optional */ });
 
-    // Close on overlay background click
-    overlay.addEventListener('click', function(e) {
-      if (e.target === overlay) closeShareModal();
-    });
+    // Close on backdrop or Escape
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) closeShareModal(); });
+    overlay.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeShareModal(); });
 
-    // Close on Escape
-    overlay.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') closeShareModal();
-    });
-
-    overlay.querySelector('#modalCloseBtn').addEventListener('click', closeShareModal);
-
+    // Copy URL
     overlay.querySelector('#modalCopyBtn').addEventListener('click', function() {
-      navigator.clipboard.writeText(hostedURL).catch(function() { /* clipboard may be unavailable */ });
+      navigator.clipboard.writeText(hostedURL).catch(function() { /* best-effort */ });
       this.innerHTML = ICON_CHECK_SMALL;
       this.setAttribute('aria-label', 'Copied');
       announceCopy();
-      const copyBtn = this;
+      const btn = this;
       setTimeout(function() {
-        copyBtn.innerHTML = ICON_CLIPBOARD;
-        copyBtn.setAttribute('aria-label', 'Copy link');
+        btn.innerHTML = ICON_CLIPBOARD;
+        btn.setAttribute('aria-label', 'Copy link');
       }, 2000);
     });
 
+    // Copy command (anonymous only)
+    const copyCmdBtn = overlay.querySelector('#modalCopyCmd');
+    if (copyCmdBtn) {
+      copyCmdBtn.addEventListener('click', function() {
+        navigator.clipboard.writeText('crit auth login').catch(function() { /* best-effort */ });
+        this.innerHTML = ICON_CHECK_SMALL;
+        this.setAttribute('aria-label', 'Copied');
+        const btn = this;
+        setTimeout(function() {
+          btn.innerHTML = ICON_CLIPBOARD;
+          btn.setAttribute('aria-label', 'Copy command');
+        }, 2000);
+      });
+    }
+
+    // Done button
+    overlay.querySelector('#modalCloseBtn').addEventListener('click', closeShareModal);
+
+    // Unpublish
     if (deleteToken) {
       overlay.querySelector('#modalUnpublishBtn').addEventListener('click', showUnpublishConfirm);
     }
@@ -7134,10 +7825,10 @@
   function showUnpublishConfirm() {
     if (!shareModalEl) return;
     const dialog = shareModalEl.querySelector('.share-dialog');
+    shareModalEl.setAttribute('aria-labelledby', 'unpublishDialogTitle');
     dialog.innerHTML =
-      '<h3>Unpublish</h3>' +
       '<div class="share-dialog-confirm">' +
-        '<p>Unpublish this review?</p>' +
+        '<p id="unpublishDialogTitle">Unpublish this review?</p>' +
         '<p class="confirm-detail">The shared link will stop working. Comments added by viewers will be lost.</p>' +
         '<div class="confirm-actions">' +
           '<button class="btn btn-sm btn-danger" id="confirmUnpublishBtn">Unpublish</button>' +
@@ -7187,6 +7878,12 @@
       } else {
         showShareModal();
       }
+      return;
+    }
+
+    // First-time consent gate
+    if (needsShareConsent) {
+      showConsentModal();
       return;
     }
 
@@ -7281,7 +7978,8 @@
       }
     }
 
-    if (allItems.length === 0) {
+    // A single-heading TOC has nothing to navigate to — hide it.
+    if (allItems.length < 2) {
       hideToc();
       return;
     }
@@ -7480,6 +8178,21 @@
       handle.addEventListener('pointerup', onEnd);
       handle.addEventListener('pointercancel', onEnd);
     });
+
+    // Keyboard resize for a11y: ArrowLeft / ArrowRight nudges by 16px.
+    // For left-edge handles (comments panel) the direction flips so
+    // ArrowRight always shrinks the controlled panel — matching pointer
+    // drag semantics.
+    handle.addEventListener('keydown', function(e) {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      const dir = cfg.edge === 'left' ? -1 : 1;
+      const sign = e.key === 'ArrowRight' ? 1 : -1;
+      const current = target.getBoundingClientRect().width;
+      const w = Math.max(cfg.min, current + sign * dir * 16);
+      target.style.width = w + 'px';
+      setSetting(cfg.settingKey, Math.round(w));
+    });
   }
 
   // ===== Update Button =====
@@ -7612,8 +8325,26 @@
   });
 
   let reloadInFlight = null;
+  // Tracks the (scope, commit) the in-flight reload was started for. If a new
+  // reloadForScope() call happens with different inputs while the previous one
+  // is still running, we chain a follow-up rather than collapsing onto the
+  // stale promise — otherwise the caller awaits a fetch for the OLD scope and
+  // the new scope is never requested. Surfaced as a Windows-only e2e flake:
+  // slower file I/O made loadAllFileData() outlast the next click handler, so
+  // clicks that swapped scope returned the previous scope's in-flight promise.
+  let reloadInFlightKey = null;
   async function reloadForScope() {
-    if (reloadInFlight) return reloadInFlight;
+    const key = diffScope + '\0' + diffCommit;
+    if (reloadInFlight && reloadInFlightKey === key) return reloadInFlight;
+    if (reloadInFlight) {
+      // Different inputs — chain after the in-flight reload finishes so we
+      // don't tear down filesContainer mid-render. The previous reload's
+      // finally clears reloadInFlight; we then re-enter reloadForScope().
+      const prev = reloadInFlight;
+      const chained = prev.then(function() { return reloadForScope(); }, function() { return reloadForScope(); });
+      return chained;
+    }
+    reloadInFlightKey = key;
     reloadInFlight = (async function() {
       try {
         activeReplyForms.clear();
@@ -7643,6 +8374,7 @@
         }
 
         files = await loadAllFileData(session.files, diffScope);
+        hiddenUnresolved = session.hidden_unresolved || 0;
         files.sort(fileSortComparator);
         restoreViewedState();
         renderFileTree();
@@ -7652,6 +8384,7 @@
         updateViewedCount();
       } finally {
         reloadInFlight = null;
+        reloadInFlightKey = null;
       }
     })();
     return reloadInFlight;
@@ -8351,6 +9084,7 @@
       { label: 'Navigation', shortcuts: [
         { key: '<kbd>j</kbd>', action: 'Next block' },
         { key: '<kbd>k</kbd>', action: 'Previous block' },
+        { key: '<kbd>Shift</kbd>+<kbd>V</kbd>', action: 'Visual line mode (extend with j/k, then c to comment)' },
         { key: '<kbd>]</kbd>', action: 'Next comment' },
         { key: '<kbd>[</kbd>', action: 'Previous comment' },
         { key: '<kbd>n</kbd>', action: 'Next change', mode: 'file mode' },
@@ -8543,10 +9277,47 @@
           focusedFilePath = focusedElement.dataset.diffFilePath;
           focusedBlockIndex = null;
         }
+        if (visualMode) extendVisualSelection();
+        break;
+      }
+      case 'V': {
+        e.preventDefault();
+        if (visualMode) {
+          // Toggle off — preserve the focus on the current expansion point.
+          exitVisualMode(true);
+        } else {
+          enterVisualMode();
+        }
         break;
       }
       case 'c': {
         e.preventDefault();
+        // Visual mode: comment on the active selection.
+        if (visualMode && selectionStart !== null && selectionEnd !== null) {
+          const fp = visualMode.filePath;
+          if (visualMode.kind === 'markdown') {
+            const file = getFileByPath(fp);
+            if (file && file.lineBlocks) {
+              let lastBlockIndex = -1;
+              for (let i = 0; i < file.lineBlocks.length; i++) {
+                if (file.lineBlocks[i].startLine >= selectionStart && file.lineBlocks[i].endLine <= selectionEnd) {
+                  lastBlockIndex = i;
+                }
+              }
+              if (lastBlockIndex >= 0) {
+                visualMode = null;
+                document.body.classList.remove('visual-mode');
+                openForm({ filePath: fp, afterBlockIndex: lastBlockIndex, startLine: selectionStart, endLine: selectionEnd, editingId: null });
+              }
+            }
+          } else {
+            const side = visualMode.anchorSide;
+            visualMode = null;
+            document.body.classList.remove('visual-mode');
+            openForm({ filePath: fp, afterBlockIndex: null, startLine: selectionStart, endLine: selectionEnd, editingId: null, side: side || undefined });
+          }
+          return;
+        }
         // If text is selected, comment on the selection (with quote).
         // Otherwise fall back to the focused block.
         if (tryOpenFormFromSelection()) return;
@@ -8671,6 +9442,9 @@
         else if (activeForms.length > 0) {
           const form = activeForms[activeForms.length - 1];
           if (confirmDiscardCommentForm(form)) cancelComment(form);
+        }
+        else if (visualMode) {
+          exitVisualMode(true);
         }
         else if (selectionStart !== null) {
           const clearPath = activeFilePath;

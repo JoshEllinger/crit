@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"regexp"
@@ -251,7 +253,7 @@ var probeDaemonFocusFn = probeDaemonFocusReal
 
 // probeDaemonFocus contacts the running daemon (if any) and returns its Focus.
 // Returns nil on any failure — best-effort.
-func probeDaemonFocus(_ string) *Focus {
+func probeDaemonFocus() *Focus {
 	return probeDaemonFocusFn()
 }
 
@@ -303,7 +305,7 @@ func probeDaemonFocusReal() *Focus {
 // (nil on any error). Factored out so probeDaemonFocusReal can iterate over
 // every matching daemon without ballooning its complexity.
 func fetchSessionFocus(client *http.Client, port int) *Focus {
-	resp, err := client.Get(fmt.Sprintf("http://localhost:%d/api/session", port))
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/session", port))
 	if err != nil {
 		return nil
 	}
@@ -321,15 +323,22 @@ func fetchSessionFocus(client *http.Client, port int) *Focus {
 }
 
 // loadCritJSONForOutputDir loads the on-disk CritJSON for the given output dir
-// (or the resolved review path when outputDir is ""). Returns ok=false silently
-// on any failure — the caller falls back to "no scope inheritance".
+// (or the resolved review path when outputDir is ""). A missing review file is
+// the common case and returns ok=false silently. Parse errors and other I/O
+// errors are logged to stderr so a corrupt review file is not papered over by
+// silent fallback to "no scope inheritance".
 func loadCritJSONForOutputDir(outputDir string) (CritJSON, bool) {
 	critPath, err := resolveReviewPath(outputDir)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: cannot resolve review path: %v\n", err)
 		return CritJSON{}, false
 	}
 	cj, err := loadCritJSON(critPath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return CritJSON{}, false
+		}
+		fmt.Fprintf(os.Stderr, "Warning: cannot read review file %q: %v\n", critPath, err)
 		return CritJSON{}, false
 	}
 	return cj, true
@@ -339,7 +348,7 @@ func loadCritJSONForOutputDir(outputDir string) (CritJSON, bool) {
 // based on the --scope flag, a running daemon's Focus, and the on-disk
 // ActiveDiffScope. Order of precedence per spec §C "crit comment scope inheritance".
 func resolveCommentScope(override commentFocusOverride, outputDir string) (inheritedScope, error) {
-	daemon := probeDaemonFocus(outputDir)
+	daemon := probeDaemonFocus()
 
 	switch override {
 	case scopeOverrideWorkingTree:

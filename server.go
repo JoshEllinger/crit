@@ -10,10 +10,13 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,8 +53,24 @@ type Server struct {
 	homeDir           string
 	cfg               Config
 	reviewPath        string
-	cliArgs           []string     // args the daemon was launched with (used to print "Next round:" command)
+	cliArgs           []string     // positional file args; flags (--pr, --range, etc.) are not preserved
 	prList            *prListCache // 60s cache for picker "Other PRs"
+
+	// listenHost is the host the server is bound to (e.g. "127.0.0.1" or
+	// "0.0.0.0"). Set via SetListenHost after construction. When set to a
+	// loopback address, ServeHTTP enforces that the request Host header is
+	// also a loopback hostname, blocking DNS-rebinding attacks.
+	listenHost string
+
+	// shutdownCtx is the daemon's signal-handled context; child operations
+	// (e.g. runAgentCmd subprocesses) derive their context from this so a
+	// SIGINT/SIGTERM cancels them instead of leaking. Set via
+	// SetShutdownCtx; nil in tests, in which case a background context is used.
+	shutdownCtx context.Context
+	// bgWG tracks long-running background goroutines (e.g. agent subprocess
+	// runners) that must complete before the daemon writes the review file
+	// during shutdown. The shutdown path Wait()s on this with a timeout.
+	bgWG sync.WaitGroup
 }
 
 // NewServer creates a Server with the given session and configuration.
@@ -77,11 +96,13 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, authToken
 	mux.HandleFunc("/api/config", s.withReady(s.handleConfig))
 	mux.HandleFunc("/api/session", s.withReady(s.handleSession))
 	mux.HandleFunc("/api/share", s.withReady(s.handleShare))
+	mux.HandleFunc("/api/share-consent", s.withReady(s.handleShareConsent))
 	mux.HandleFunc("/api/share-url", s.withReady(s.handleShareURL))
 	mux.HandleFunc("/api/finish", s.withReady(s.handleFinish))
 	mux.HandleFunc("/api/events", s.withReady(s.handleEvents))
 	mux.HandleFunc("/api/wait-for-event", s.withReady(s.handleWaitForEvent))
 	mux.HandleFunc("/api/round-complete", s.withReady(s.handleRoundComplete))
+	mux.HandleFunc("/api/rounds", s.withReady(s.handleRounds))
 	mux.HandleFunc("/api/focus", s.withReady(s.handleFocus))
 	mux.HandleFunc("/api/picker", s.withReady(s.handlePicker))
 
@@ -99,6 +120,16 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, authToken
 	mux.HandleFunc("/api/file/comments", s.withReady(s.handleFileComments))
 	mux.HandleFunc("/api/comment/", s.withReady(s.handleCommentByID))
 
+	// Attachment upload (POST) and serving (GET /api/attachments/{filename}).
+	// The trailing slash form ServeMux uses means the bare /api/attachments
+	// path is matched by the same handler; we route on method + presence of
+	// a suffix so both upload and fetch live in one place. Markdown stores
+	// the relative form `attachments/<uuid>.<ext>`; the frontend rewrites
+	// to /api/attachments/<uuid>.<ext> at render time so this URL space is
+	// only ever hit through the rewrite hook (or direct curl).
+	mux.HandleFunc("/api/attachments", s.withReady(s.handleAttachments))
+	mux.HandleFunc("/api/attachments/", s.withReady(s.handleAttachments))
+
 	// Static file serving (repo files need session; embedded assets do not)
 	mux.HandleFunc("/files/", s.withReady(s.handleFiles))
 	mux.Handle("/", http.FileServer(http.FS(assets)))
@@ -107,7 +138,48 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, authToken
 	return s, nil
 }
 
+// SetListenHost records the host the server is bound to. Call once after
+// construction, before serving requests. When the host is a loopback address,
+// ServeHTTP rejects requests whose Host header is not also a loopback address,
+// preventing DNS-rebinding attacks. When the host is non-loopback (e.g.
+// "0.0.0.0"), the check is skipped — the user has explicitly opted into
+// network exposure.
+func (s *Server) SetListenHost(host string) {
+	s.listenHost = host
+}
+
+// isLoopbackHost reports whether host (no port) is a loopback address.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// checkHost returns true if the request is allowed to proceed. When the server
+// is bound to a loopback address, the request's Host header must also resolve
+// to a loopback hostname — this is the canonical DNS-rebinding defense.
+func (s *Server) checkHost(r *http.Request) bool {
+	if s.listenHost == "" || !isLoopbackHost(s.listenHost) {
+		return true
+	}
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else {
+		// SplitHostPort fails when there's no port (e.g. "Host: [::1]").
+		// Strip IPv6 brackets so ParseIP can recognise the address.
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	return isLoopbackHost(host)
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.checkHost(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -146,10 +218,59 @@ func (s *Server) withReady(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// SetShutdownCtx wires the daemon's signal-handled context into the server so
+// background goroutines can react to shutdown. Call this once during daemon
+// startup, before any handler can fire. Tests that don't run a real daemon may
+// leave it unset; effectiveCtx then falls back to context.Background().
+func (s *Server) SetShutdownCtx(ctx context.Context) {
+	s.shutdownCtx = ctx
+}
+
+// effectiveCtx returns the daemon shutdown ctx if set, otherwise a background
+// ctx. Used by background goroutines so test paths (which don't run a real
+// daemon and never call SetShutdownCtx) keep working.
+func (s *Server) effectiveCtx() context.Context {
+	if s.shutdownCtx != nil {
+		return s.shutdownCtx
+	}
+	return context.Background()
+}
+
+// WaitBackground blocks until all tracked background goroutines (currently:
+// agent subprocess runners) have returned, or until timeout elapses. Returns
+// true on clean drain, false on timeout. Called from the daemon shutdown path
+// to give in-flight agent runs a chance to post their replies before
+// session.WriteFiles() persists the final state.
+func (s *Server) WaitBackground(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.bgWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // SetSession attaches a fully initialized session and marks the server as ready.
 // Uses atomic.Pointer to ensure the session pointer is visible to all goroutines
 // immediately after store, which is critical on weakly-ordered architectures (ARM64).
+//
+// Also flips the session's sessionStarted flag so Session.loadCritJSON can
+// enforce its pre-SetSession-only lock contract (see plan v4 §Lock discipline).
+//
+// Ordering matters: sessionStarted MUST be stored BEFORE the session pointer
+// is published. After s.session.Store, withReady (and any goroutine that
+// observes the session pointer) can call session methods immediately. If
+// sessionStarted were still 0 at that moment, a code path that reaches
+// loadCritJSON would falsely believe it's pre-SetSession and skip the guard.
 func (s *Server) SetSession(session *Session) {
+	if session != nil {
+		session.sessionStarted.Store(1)
+	}
 	s.session.Store(session)
 }
 
@@ -213,6 +334,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	sess := s.session.Load()
 	resp := map[string]interface{}{
 		"share_url":         s.shareURL,
+		"needs_consent":     s.consentNeeded(),
 		"hosted_url":        sess.GetSharedURL(),
 		"delete_token":      sess.GetDeleteToken(),
 		"version":           s.currentVersion,
@@ -293,15 +415,120 @@ func (s *Server) addIntegrationStatus(resp map[string]interface{}) {
 	resp["any_integration_installed"] = len(integrations) > 0
 }
 
+// parseRoundParam extracts and validates the ?round=N query parameter.
+//
+// Returns:
+//   - (0, false, true): the parameter is absent or empty — caller should not
+//     apply any round filter (back-compat: pre-feature clients omit it).
+//   - (N, true, true):  parsed round >= 1 — caller may apply the filter.
+//   - (0, false, false): invalid — the function has already written a 400
+//     response and the caller MUST return without writing further.
+//
+// All four round-aware endpoints (/api/session, /api/file, /api/file/diff,
+// /api/file/comments, /api/comments) go through this helper so the contract
+// stays uniform: a malformed value (e.g. "abc", "-1", "0") always yields 400.
+func parseRoundParam(w http.ResponseWriter, r *http.Request) (round int, ok bool, valid bool) {
+	roundStr := r.URL.Query().Get("round")
+	if roundStr == "" {
+		return 0, false, true
+	}
+	n, err := strconv.Atoi(roundStr)
+	if err != nil || n < 1 {
+		http.Error(w, "invalid round", http.StatusBadRequest)
+		return 0, false, false
+	}
+	return n, true, true
+}
+
 // handleSession returns session metadata: mode, branch, file list with stats.
+//
+// GET /api/session[?scope=X&commit=Y&round=N]
+//
+// In files mode, ?round=N filters the file list to files that had a
+// snapshot at that round (so files added in later rounds drop out when
+// viewing an earlier point in the timeline). The round parameter is
+// ignored in git/range mode.
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	round, hasRound, valid := parseRoundParam(w, r)
+	if !valid {
+		return
+	}
 	scope := r.URL.Query().Get("scope")
 	commit := r.URL.Query().Get("commit")
-	writeJSON(w, s.session.Load().GetSessionInfoScoped(scope, commit))
+	session := s.session.Load()
+	info := session.GetSessionInfoScoped(scope, commit)
+
+	if hasRound && session != nil && session.Mode == "files" {
+		info.Files = filterFilesAtRound(session, info.Files, round)
+	}
+	writeJSON(w, info)
+}
+
+// filterFilesAtRound returns the subset of files that have a snapshot recorded
+// at the given round. Caller must not hold session.mu.
+func filterFilesAtRound(session *Session, files []SessionFileInfo, round int) []SessionFileInfo {
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	out := make([]SessionFileInfo, 0, len(files))
+	for _, f := range files {
+		byRound := session.RoundSnapshots[f.Path]
+		if byRound == nil {
+			continue
+		}
+		if _, ok := byRound[round]; !ok {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// handleShareConsent records that the user has consented to sharing with the
+// default crit.md service. Called by the browser before the first share upload.
+// POST /api/share-consent
+func (s *Server) handleShareConsent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := saveGlobalConfig(func(m map[string]json.RawMessage) error {
+		m["share_consented"] = json.RawMessage("true")
+		return nil
+	}); err != nil {
+		http.Error(w, "failed to persist consent", http.StatusInternalServerError)
+		return
+	}
+	s.authMu.Lock()
+	s.cfg.ShareConsented = true
+	s.authMu.Unlock()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// consentNeeded reports whether the user must still confirm before sharing.
+// It guards reads of s.cfg.ShareConsented under s.authMu and, if the in-memory
+// flag is false, re-checks the on-disk global config so consent granted by the
+// CLI (crit share) on a separate process is picked up by the running daemon.
+func (s *Server) consentNeeded() bool {
+	s.authMu.RLock()
+	consented := s.cfg.ShareConsented
+	s.authMu.RUnlock()
+	if consented {
+		return false
+	}
+	if s.shareURL != defaultShareURL {
+		return false
+	}
+	if globalCfg, _, err := loadConfigFile(globalConfigPath()); err == nil && globalCfg.ShareConsented {
+		s.authMu.Lock()
+		s.cfg.ShareConsented = true
+		s.authMu.Unlock()
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleShareURL(w http.ResponseWriter, r *http.Request) {
@@ -337,6 +564,10 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.shareURL == "" {
 		http.Error(w, "share_url not configured", http.StatusBadRequest)
+		return
+	}
+	if s.consentNeeded() {
+		http.Error(w, "share consent required", http.StatusForbidden)
 		return
 	}
 
@@ -384,8 +615,135 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"url": res.URL, "delete_token": res.DeleteToken})
 }
 
+// handleRounds returns the per-round timeline for files-mode sessions. In
+// git/range mode it returns 200 with an empty rounds list (the wire shape
+// stays stable so the frontend doesn't need mode-specific code paths).
+//
+// GET /api/rounds
+func (s *Server) handleRounds(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	session := s.session.Load()
+	if session == nil {
+		writeJSON(w, map[string]any{"current_round": 0, "rounds": []any{}})
+		return
+	}
+
+	type roundEntry struct {
+		N            int    `json:"n"`
+		Additions    int    `json:"additions"`
+		Deletions    int    `json:"deletions"`
+		CommentCount int    `json:"comment_count"`
+		CapturedAt   string `json:"captured_at"`
+	}
+
+	// Span current_round + rounds slice under a single RLock so a
+	// round-complete that lands between the two reads can't yield an
+	// internally inconsistent response (e.g. current=N with rounds ending at N-1).
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+
+	resp := map[string]any{
+		"current_round": session.ReviewRound,
+		"rounds":        []roundEntry{},
+	}
+
+	if session.Mode != "files" {
+		writeJSON(w, resp)
+		return
+	}
+
+	rounds := session.availableRounds()
+	if len(rounds) == 0 {
+		writeJSON(w, resp)
+		return
+	}
+
+	// Per-round comment counts (comments where review_round == n).
+	counts := make(map[int]int, len(rounds))
+	for _, f := range session.Files {
+		for _, c := range f.Comments {
+			counts[c.ReviewRound]++
+		}
+	}
+	for _, c := range session.reviewComments {
+		counts[c.ReviewRound]++
+	}
+
+	out := make([]roundEntry, 0, len(rounds))
+	for _, r := range rounds {
+		var capturedAt string
+		// Pick the EARLIEST CapturedAt across every file that snapshotted at
+		// this round — Go map iteration order is randomized, so picking "the
+		// first" produced a non-deterministic captured_at across requests.
+		// The earliest is a meaningful representative (the moment the round
+		// began capturing) and stable for any given snapshot map.
+		var earliest time.Time
+		for _, byRound := range session.RoundSnapshots {
+			rs, ok := byRound[r]
+			if !ok {
+				continue
+			}
+			if earliest.IsZero() || rs.CapturedAt.Before(earliest) {
+				earliest = rs.CapturedAt
+			}
+		}
+		if !earliest.IsZero() {
+			capturedAt = earliest.Format(time.RFC3339)
+		}
+		adds, dels := lineStatsForRound(session, r)
+		out = append(out, roundEntry{
+			N:            r,
+			Additions:    adds,
+			Deletions:    dels,
+			CommentCount: counts[r],
+			CapturedAt:   capturedAt,
+		})
+	}
+	resp["rounds"] = out
+	writeJSON(w, resp)
+}
+
+// lineStatsForRound aggregates added/removed line counts across every file
+// with a snapshot at round n, comparing against round n-1. R1 (or any round
+// where no n-1 snapshots exist) returns 0/0. Caller must hold session.mu
+// (RLock is sufficient).
+func lineStatsForRound(session *Session, n int) (int, int) {
+	if n <= 1 {
+		return 0, 0
+	}
+	var adds, dels int
+	for _, byRound := range session.RoundSnapshots {
+		curr, ok := byRound[n]
+		if !ok {
+			continue
+		}
+		prev, hasPrev := byRound[n-1]
+		if !hasPrev {
+			// New file at round n: every line counts as an addition.
+			adds += len(splitLines(curr.Content))
+			continue
+		}
+		entries := ComputeLineDiff(prev.Content, curr.Content)
+		for _, e := range entries {
+			switch e.Type {
+			case "added":
+				adds++
+			case "removed":
+				dels++
+			}
+		}
+	}
+	return adds, dels
+}
+
 // handleFile returns file content + metadata for a single file.
-// GET /api/file?path=server.go
+// GET /api/file?path=server.go[&round=N]
+//
+// In files mode, ?round=N returns the snapshot recorded for that round. In
+// git/range mode, the round parameter is ignored.
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -396,6 +754,11 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path query parameter required", http.StatusBadRequest)
 		return
 	}
+
+	if served := serveFileAtRound(w, r, s.session.Load(), path); served {
+		return
+	}
+
 	snapshot, ok := s.session.Load().GetFileSnapshot(path)
 	if !ok {
 		// File not in session (e.g. scoped view showing a file added after startup).
@@ -409,9 +772,54 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, snapshot)
 }
 
+// serveFileAtRound writes a per-round snapshot response if the request
+// includes a valid ?round=N for a files-mode session that has a snapshot for
+// (path, round). Returns served=true when it has fully written the response
+// (including 400/404). Returns served=false when the caller should fall
+// through to the working-tree code path (no round param, git/range mode, or
+// no snapshot recorded for this round).
+func serveFileAtRound(w http.ResponseWriter, r *http.Request, session *Session, path string) bool {
+	round, hasRound, valid := parseRoundParam(w, r)
+	if !valid {
+		// parseRoundParam wrote 400; signal handled.
+		return true
+	}
+	if !hasRound {
+		return false
+	}
+	if session == nil || session.Mode != "files" {
+		return false
+	}
+	session.mu.RLock()
+	rs, ok := session.roundSnapshotForFile(path, round)
+	prev, hasPrev := session.roundSnapshotForFile(path, round-1)
+	session.mu.RUnlock()
+	if !ok {
+		http.Error(w, "file_not_in_round", http.StatusNotFound)
+		return true
+	}
+	resp := map[string]any{
+		"path":     path,
+		"round":    round,
+		"content":  rs.Content,
+		"status":   rs.Status,
+		"position": rs.Position,
+	}
+	if hasPrev {
+		resp["previous_content"] = prev.Content
+	}
+	writeJSON(w, resp)
+	return true
+}
+
 // handleFileDiff returns diff hunks for a file.
 // For code files: git diff hunks. For markdown files: inter-round LCS diff.
-// GET /api/file/diff?path=server.go
+// GET /api/file/diff?path=server.go[&round=N]
+//
+// In files mode, ?round=N returns the diff between round N's snapshot and
+// round (N-1)'s snapshot. R1 is the baseline and has no previous content,
+// so the response carries empty hunks. In git/range mode, the round
+// parameter is ignored.
 func (s *Server) handleFileDiff(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -422,6 +830,11 @@ func (s *Server) handleFileDiff(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path query parameter required", http.StatusBadRequest)
 		return
 	}
+
+	if served := serveFileDiffAtRound(w, r, s.session.Load(), path); served {
+		return
+	}
+
 	scope := r.URL.Query().Get("scope")
 	commit := r.URL.Query().Get("commit")
 	snapshot, ok := s.session.Load().GetFileDiffSnapshotScoped(path, scope, commit)
@@ -432,8 +845,56 @@ func (s *Server) handleFileDiff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, snapshot)
 }
 
+// serveFileDiffAtRound writes a per-round diff response when the request
+// includes a valid ?round=N for a files-mode session. Returns served=true
+// when it has fully written the response (success or 400/404). Returns
+// served=false when the caller should fall through to the working-tree code
+// path (no round param, or git/range mode).
+func serveFileDiffAtRound(w http.ResponseWriter, r *http.Request, session *Session, path string) bool {
+	round, hasRound, valid := parseRoundParam(w, r)
+	if !valid {
+		return true
+	}
+	if !hasRound {
+		return false
+	}
+	if session == nil || session.Mode != "files" {
+		return false
+	}
+	session.mu.RLock()
+	rs, ok := session.roundSnapshotForFile(path, round)
+	prev, hasPrev := session.roundSnapshotForFile(path, round-1)
+	session.mu.RUnlock()
+	if !ok {
+		http.Error(w, "file_not_in_round", http.StatusNotFound)
+		return true
+	}
+
+	resp := map[string]any{
+		"hunks":            []DiffHunk{},
+		"previous_content": prev.Content,
+	}
+	if hasPrev && prev.Content != rs.Content {
+		entries := ComputeLineDiff(prev.Content, rs.Content)
+		hunks := DiffEntriesToHunks(entries)
+		if hunks == nil {
+			hunks = []DiffHunk{}
+		}
+		resp["hunks"] = hunks
+	}
+	writeJSON(w, resp)
+	return true
+}
+
 // handleFileComments handles GET (list) and POST (create) for file-scoped comments.
 // GET/POST /api/file/comments?path=server.go
+//
+// In files mode, ?round=N filters the GET response via commentsAtOrBeforeRound:
+// only comments authored at or before round N (and replies authored at or
+// before N) are returned. Note that the Resolved / ResolvedRound fields on
+// each returned comment reflect *current* state, not state-at-round-N — the
+// frontend uses ResolvedRound to compute round-faithful resolution itself.
+// See commentsAtOrBeforeRound for the full Stage 1 vs Stage 2 contract.
 func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
@@ -443,7 +904,14 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		round, hasRound, valid := parseRoundParam(w, r)
+		if !valid {
+			return
+		}
 		comments := s.session.Load().GetComments(path)
+		if hasRound && s.session.Load().Mode == "files" {
+			comments = commentsAtOrBeforeRound(comments, round)
+		}
 		writeJSON(w, comments)
 
 	case http.MethodPost:
@@ -776,7 +1244,14 @@ func (s *Server) handleReviewCommentReplyRoute(w http.ResponseWriter, r *http.Re
 func (s *Server) handleReviewComments(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		round, hasRound, valid := parseRoundParam(w, r)
+		if !valid {
+			return
+		}
 		comments := s.session.Load().GetReviewComments()
+		if hasRound && s.session.Load().Mode == "files" {
+			comments = commentsAtOrBeforeRound(comments, round)
+		}
 		writeJSON(w, comments)
 
 	case http.MethodPost:
@@ -930,18 +1405,30 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sess := s.session.Load()
-	sess.WriteFiles()
+	// Synchronous, serialized flush. The response includes review_file —
+	// CLI clients and the e2e suite read that path verbatim, so the file
+	// must exist on disk before we hand the path back. Bare WriteFiles
+	// races with the debounce timer (both call atomicWriteFile concurrently
+	// on the same target, which has manifested as ENOENT failures on
+	// Windows where the read-after-write window is wider).
+	if err := sess.SyncWriteFiles(); err != nil {
+		http.Error(w, fmt.Sprintf("writing review file: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	totalComments := sess.TotalCommentCount()
 	newComments := sess.NewCommentCount()
 	unresolvedComments := sess.UnresolvedCommentCount()
-	critJSON := sess.critJSONPath()
+	// In v4 the session identity is a folder (.../<key>/ or .../.crit/); the
+	// agent-facing review payload lives at <identity>/review.json. Surface the
+	// file path, not the folder, so `cat $review_file` works.
+	reviewFile := reviewPathsFor(sess.critJSONPath()).Review
 	prompt := ""
 	if totalComments > 0 && unresolvedComments > 0 {
 		if sess.Mode == "plan" {
 			// Plan mode: concise feedback for the hook workflow.
 			// Claude revises the plan text directly — no need for crit comment or review file instructions.
-			prompt = s.buildPlanFeedback(critJSON)
+			prompt = s.buildPlanFeedback(reviewFile)
 		} else {
 			prompt = fmt.Sprintf(
 				"Review comments are in %s — comments are grouped per file with start_line/end_line referencing the source. "+
@@ -951,7 +1438,7 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 					"Before acting, check each comment's replies array — if you have already replied, the reviewer may be following up conversationally rather than requesting a new code change. "+
 					"For each comment, reply explaining what you did using `crit comment --reply-to <comment-id> --author <your-name> \"<explanation>\"`. "+
 					"When done run: `%s`",
-				critJSON, sess.ReinvokeCommand())
+				reviewFile, sess.ReinvokeCommand())
 		}
 	} else if totalComments > 0 && unresolvedComments == 0 {
 		prompt = "All comments are resolved — no changes needed, please proceed."
@@ -964,7 +1451,7 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, map[string]any{
 		"status":      "finished",
-		"review_file": critJSON,
+		"review_file": reviewFile,
 		"prompt":      prompt,
 		"approved":    approved,
 	})
@@ -992,7 +1479,7 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 
 // buildPlanFeedback formats review feedback for plan mode.
 // Points to the review file and hints at crit-cli skill, without inlining every comment.
-func (s *Server) buildPlanFeedback(critJSON string) string {
+func (s *Server) buildPlanFeedback(reviewFile string) string {
 	// Extract slug from PlanDir (last path component)
 	slug := filepath.Base(s.session.Load().PlanDir)
 	return fmt.Sprintf(
@@ -1001,7 +1488,7 @@ func (s *Server) buildPlanFeedback(critJSON string) string {
 			"Each comment has a scope field: \"line\" for inline comments, \"file\" for file-level, or \"review\" for review-level comments. "+
 			"Read the file, revise the plan to address each comment. "+
 			"To reply to comments, use `crit comment --plan %s --reply-to <id> --author <your-name> \"<explanation>\"`.",
-		critJSON, slug)
+		reviewFile, slug)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -1082,10 +1569,25 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 				json.Unmarshal([]byte(event.Content), &finishData)
 				writeJSON(w, map[string]any{
 					"status":       "finished",
-					"review_file":  sess.critJSONPath(),
+					"review_file":  reviewPathsFor(sess.critJSONPath()).Review,
 					"prompt":       finishData.Prompt,
 					"approved":     finishData.Approved,
 					"next_command": buildNextCommand(s.cliArgs),
+				})
+				return
+			}
+			if event.Type == "server-shutdown" {
+				// Daemon is shutting down before the user finished reviewing.
+				// Tell the client explicitly so it can deny rather than fall
+				// through to the connection-error path and silently approve.
+				// Set Content-Type before WriteHeader — writeJSON sets it
+				// internally, but headers set after WriteHeader are dropped.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				writeJSON(w, map[string]any{
+					"status":   "shutdown",
+					"approved": false,
+					"prompt":   "crit daemon shut down before review was finished.",
 				})
 				return
 			}
@@ -1167,6 +1669,128 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// handleAttachments dispatches both attachment upload (POST /api/attachments)
+// and fetch (GET /api/attachments/{filename}). Storage lives at
+// reviewPathsFor(s.reviewPath).Attachments so the v4 clearReviewFolder pass
+// removes attachments alongside review.json on cleanup.
+func (s *Server) handleAttachments(w http.ResponseWriter, r *http.Request) {
+	if s.reviewPath == "" {
+		http.Error(w, "Attachment storage unavailable (no review path)", http.StatusServiceUnavailable)
+		return
+	}
+
+	suffix := strings.TrimPrefix(r.URL.Path, "/api/attachments")
+	suffix = strings.TrimPrefix(suffix, "/")
+
+	switch r.Method {
+	case http.MethodPost:
+		if suffix != "" {
+			http.Error(w, "POST takes no path suffix", http.StatusBadRequest)
+			return
+		}
+		s.handleAttachmentUpload(w, r)
+	case http.MethodGet:
+		if suffix == "" {
+			http.Error(w, "Filename required", http.StatusBadRequest)
+			return
+		}
+		s.handleAttachmentGet(w, r, suffix)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleAttachmentUpload accepts a single multipart form field named "file"
+// containing image bytes. Validates MIME, persists via saveAttachment, and
+// returns the *relative* URL (`attachments/<uuid>.<ext>`) the frontend
+// should embed verbatim in the comment markdown — the source of truth in
+// review.json is the relative form, with each render target rewriting at
+// its own publish boundary.
+//
+// The original_filename is sanitized server-side and returned so the
+// frontend can use it as alt text without trusting raw upload metadata.
+func (s *Server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) {
+	// Cap the entire request body. Multipart adds a small overhead beyond
+	// the raw image bytes; a generous +1MB ceiling keeps the math simple.
+	r.Body = http.MaxBytesReader(w, r.Body, maxAttachmentBytes+(1<<20))
+
+	if err := r.ParseMultipartForm(maxAttachmentBytes + (1 << 20)); err != nil {
+		http.Error(w, "Invalid multipart form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Missing 'file' field", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Read up to maxAttachmentBytes+1 so we can detect overflow distinctly
+	// from a successful read at exactly the cap.
+	buf := make([]byte, maxAttachmentBytes+1)
+	n, err := io.ReadFull(file, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		http.Error(w, "Read upload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if n > maxAttachmentBytes {
+		http.Error(w, fmt.Sprintf("Image too large (max %d bytes)", maxAttachmentBytes), http.StatusRequestEntityTooLarge)
+		return
+	}
+	data := buf[:n]
+
+	filename, err := saveAttachment(s.reviewPath, data)
+	if err != nil {
+		// MIME rejections deserve 415; everything else is 400.
+		if strings.HasPrefix(err.Error(), "unsupported image type") {
+			http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// header may be nil if FormFile is called creatively in tests; guard.
+	originalFilename := ""
+	if header != nil {
+		originalFilename = sanitizeAttachmentAltText(header.Filename)
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]string{
+		"filename":          filename,
+		"original_filename": originalFilename,
+		"url":               "attachments/" + filename,
+	})
+}
+
+// handleAttachmentGet serves a previously uploaded attachment by its UUID
+// filename. The filename regex makes path traversal impossible without the
+// caller having to look at r.URL.Path themselves.
+func (s *Server) handleAttachmentGet(w http.ResponseWriter, r *http.Request, filename string) {
+	path, mime, err := attachmentPathFor(s.reviewPath, filename)
+	if err != nil {
+		http.Error(w, "Invalid attachment filename", http.StatusBadRequest)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		http.Error(w, "Attachment not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, "Stat failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", mime)
+	// UUIDs are never reused; the bytes behind a URL never change.
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	http.ServeContent(w, r, filename, info.ModTime(), f)
 }
 
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -1414,8 +2038,14 @@ func (s *Server) handleAgentRequest(w http.ResponseWriter, r *http.Request) {
 
 	prompt := buildAgentPrompt(comment, filePath)
 
-	// Run agent command asynchronously
-	go s.runAgentCmd(prompt, comment.ID, filePath)
+	// Run agent command asynchronously. Tracked via bgWG so the daemon
+	// shutdown path can wait for the reply to be posted before WriteFiles
+	// persists the final review state.
+	s.bgWG.Add(1)
+	go func() {
+		defer s.bgWG.Done()
+		s.runAgentCmd(prompt, comment.ID, filePath)
+	}()
 
 	w.WriteHeader(http.StatusAccepted)
 	writeJSON(w, map[string]any{
@@ -1458,7 +2088,11 @@ func buildAgentPrompt(c Comment, filePath string) string {
 // If agent_cmd contains {prompt}, the placeholder is replaced with the prompt
 // as a single argument. Otherwise, the prompt is piped via stdin.
 func (s *Server) runAgentCmd(prompt string, commentID string, filePath string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Parent on the daemon shutdown ctx so SIGINT/SIGTERM kills
+	// the agent subprocess instead of orphaning it (the subprocess has its
+	// own session id via daemonSysProcAttr). Tests that don't wire a shutdown
+	// ctx fall back to context.Background() — same behavior as before.
+	ctx, cancel := context.WithTimeout(s.effectiveCtx(), 10*time.Minute)
 	defer cancel()
 
 	parts := strings.Fields(s.agentCmd)
@@ -1514,6 +2148,14 @@ func (s *Server) runAgentCmd(prompt string, commentID string, filePath string) {
 	if !ok {
 		log.Printf("agent-request %s: failed to add reply (comment not found in file %q)", commentID, filePath)
 	} else {
+		// On shutdown, skip the refresh fan-out: the SSE subscribers are gone
+		// and we're about to WriteFiles. The reply is already in the session
+		// (added by AddReply above) and will be persisted.
+		select {
+		case <-s.effectiveCtx().Done():
+			return
+		default:
+		}
 		// Re-read content (and file list/diffs in git mode) so next fetch returns updated data
 		sess.RefreshFileContent()
 		if sess.Mode == "git" {

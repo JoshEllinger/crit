@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"image/color"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -44,7 +47,7 @@ func writeCritJSONForTest(t *testing.T, dir string, cj CritJSON) {
 	if err != nil {
 		t.Fatalf("marshaling CritJSON: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644); err != nil {
+	if err := os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644); err != nil {
 		t.Fatalf("writing .crit.json: %v", err)
 	}
 }
@@ -64,7 +67,7 @@ func TestLoadCommentsForUpsert_ExcludesResolved(t *testing.T) {
 	}
 	writeCritJSONForTest(t, dir, cj)
 
-	comments, round := loadCommentsForShare(filepath.Join(dir, ".crit.json"), []string{"plan.md"}, "")
+	comments, round := loadCommentsForShare(filepath.Join(dir, ".crit"), []string{"plan.md"}, "")
 	if round != 1 {
 		t.Errorf("expected round 1, got %d", round)
 	}
@@ -93,7 +96,7 @@ func TestLoadCommentsForUpsert_SetsExternalID(t *testing.T) {
 	}
 	writeCritJSONForTest(t, dir, cj)
 
-	comments, _ := loadCommentsForShare(filepath.Join(dir, ".crit.json"), []string{"main.go"}, "")
+	comments, _ := loadCommentsForShare(filepath.Join(dir, ".crit"), []string{"main.go"}, "")
 	if len(comments) != 1 {
 		t.Fatalf("expected 1 comment, got %d", len(comments))
 	}
@@ -120,7 +123,7 @@ func TestLoadCommentsForUpsert_ReviewLevelComments(t *testing.T) {
 	}
 	writeCritJSONForTest(t, dir, cj)
 
-	comments, _ := loadCommentsForShare(filepath.Join(dir, ".crit.json"), []string{"plan.md"}, "")
+	comments, _ := loadCommentsForShare(filepath.Join(dir, ".crit"), []string{"plan.md"}, "")
 
 	// Should have 2 comments: 1 file-level + 1 unresolved review-level
 	if len(comments) != 2 {
@@ -414,10 +417,10 @@ func TestLoadCommentsForFiles(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(critJSON, "", "  ")
-	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
 
 	// Only load unresolved comments for plan.md (c1 and c2, not c3)
-	comments, round := loadCommentsForShare(filepath.Join(dir, ".crit.json"), []string{"plan.md"}, "")
+	comments, round := loadCommentsForShare(filepath.Join(dir, ".crit"), []string{"plan.md"}, "")
 	if round != 2 {
 		t.Errorf("expected round 2, got %d", round)
 	}
@@ -429,13 +432,13 @@ func TestLoadCommentsForFiles(t *testing.T) {
 	}
 
 	// Load for both files — 3 unresolved (c1, c2, c4), not 5 total
-	comments, _ = loadCommentsForShare(filepath.Join(dir, ".crit.json"), []string{"plan.md", "other.go"}, "")
+	comments, _ = loadCommentsForShare(filepath.Join(dir, ".crit"), []string{"plan.md", "other.go"}, "")
 	if len(comments) != 3 {
 		t.Fatalf("expected 3 unresolved comments, got %d", len(comments))
 	}
 
 	// Load for nonexistent file
-	comments, round = loadCommentsForShare(filepath.Join(dir, ".crit.json"), []string{"nope.md"}, "")
+	comments, round = loadCommentsForShare(filepath.Join(dir, ".crit"), []string{"nope.md"}, "")
 	if len(comments) != 0 {
 		t.Errorf("expected 0 comments, got %d", len(comments))
 	}
@@ -446,7 +449,7 @@ func TestLoadCommentsForFiles(t *testing.T) {
 
 func TestLoadCommentsForFiles_NoCritJSON(t *testing.T) {
 	dir := t.TempDir()
-	comments, round := loadCommentsForShare(filepath.Join(dir, ".crit.json"), []string{"plan.md"}, "")
+	comments, round := loadCommentsForShare(filepath.Join(dir, ".crit"), []string{"plan.md"}, "")
 	if len(comments) != 0 {
 		t.Errorf("expected 0 comments, got %d", len(comments))
 	}
@@ -459,13 +462,13 @@ func TestPersistShareState(t *testing.T) {
 	dir := t.TempDir()
 
 	// Persist to new .crit.json
-	err := persistShareState(filepath.Join(dir, ".crit.json"), "https://crit.md/r/abc", "tok_123", "")
+	err := persistShareState(filepath.Join(dir, ".crit"), "https://crit.md/r/abc", "tok_123", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// Read back and verify
-	data, _ := os.ReadFile(filepath.Join(dir, ".crit.json"))
+	data, _ := os.ReadFile(filepath.Join(dir, ".crit", "review.json"))
 	var cj CritJSON
 	json.Unmarshal(data, &cj)
 	if cj.ShareURL != "https://crit.md/r/abc" {
@@ -488,16 +491,16 @@ func TestPersistShareState_PreservesExisting(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(initial, "", "  ")
-	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
 
 	// Persist share state
-	err := persistShareState(filepath.Join(dir, ".crit.json"), "https://crit.md/r/def", "tok_456", "")
+	err := persistShareState(filepath.Join(dir, ".crit"), "https://crit.md/r/def", "tok_456", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// Read back — comments and branch should be preserved
-	data, _ = os.ReadFile(filepath.Join(dir, ".crit.json"))
+	data, _ = os.ReadFile(filepath.Join(dir, ".crit", "review.json"))
 	var cj CritJSON
 	json.Unmarshal(data, &cj)
 	if cj.ShareURL != "https://crit.md/r/def" {
@@ -591,14 +594,14 @@ func TestClearShareState(t *testing.T) {
 		Files:       map[string]CritJSONFile{"plan.md": {Comments: []Comment{{ID: "c1", Body: "test"}}}},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
 
-	err := clearShareState(filepath.Join(dir, ".crit.json"))
+	err := clearShareState(filepath.Join(dir, ".crit"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	data, _ = os.ReadFile(filepath.Join(dir, ".crit.json"))
+	data, _ = os.ReadFile(filepath.Join(dir, ".crit", "review.json"))
 	var cleared CritJSON
 	json.Unmarshal(data, &cleared)
 	if cleared.ShareURL != "" {
@@ -630,7 +633,7 @@ func TestHandleShare_Success(t *testing.T) {
 		},
 	}
 	data, _ := json.Marshal(cj)
-	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
 
 	// Mock crit-web server
 	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -703,7 +706,7 @@ func TestHandleShare_OrphanedFileIncluded(t *testing.T) {
 		},
 	}
 	data, _ := json.Marshal(cj)
-	os.WriteFile(filepath.Join(dir, ".crit.json"), data, 0644)
+	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
 
 	// Mock crit-web server that captures the payload
 	var receivedPayload map[string]any
@@ -876,7 +879,7 @@ func TestHandleShare_AlreadyShared(t *testing.T) {
 
 func TestLoadExistingShareCfg(t *testing.T) {
 	dir := t.TempDir()
-	critPath := filepath.Join(dir, ".crit.json")
+	critPath := filepath.Join(dir, ".crit")
 
 	// Review file without scope — loads unconditionally
 	cj := CritJSON{
@@ -885,9 +888,12 @@ func TestLoadExistingShareCfg(t *testing.T) {
 		Files:       map[string]CritJSONFile{},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	os.WriteFile(critPath, data, 0644)
+	os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0644)
 
-	cfg, ok := loadExistingShareCfg(critPath, []string{"anything.md"})
+	cfg, ok, err := loadExistingShareCfg(critPath, []string{"anything.md"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -901,7 +907,10 @@ func TestLoadExistingShareCfg(t *testing.T) {
 
 func TestLoadExistingShareCfg_NoCritJSON(t *testing.T) {
 	dir := t.TempDir()
-	_, ok := loadExistingShareCfg(filepath.Join(dir, ".crit.json"), []string{"plan.md"})
+	_, ok, err := loadExistingShareCfg(filepath.Join(dir, ".crit"), []string{"plan.md"})
+	if err != nil {
+		t.Fatalf("missing file should not be an error, got: %v", err)
+	}
 	if ok {
 		t.Error("expected ok=false when no .crit.json exists")
 	}
@@ -909,12 +918,15 @@ func TestLoadExistingShareCfg_NoCritJSON(t *testing.T) {
 
 func TestLoadExistingShareCfg_NoShareState(t *testing.T) {
 	dir := t.TempDir()
-	critPath := filepath.Join(dir, ".crit.json")
+	critPath := filepath.Join(dir, ".crit")
 	cj := CritJSON{Files: map[string]CritJSONFile{}}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	os.WriteFile(critPath, data, 0644)
+	os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0644)
 
-	_, ok := loadExistingShareCfg(critPath, []string{"plan.md"})
+	_, ok, err := loadExistingShareCfg(critPath, []string{"plan.md"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if ok {
 		t.Error("expected ok=false when no share URL set")
 	}
@@ -922,7 +934,7 @@ func TestLoadExistingShareCfg_NoShareState(t *testing.T) {
 
 func TestLoadExistingShareCfg_ScopeMismatch(t *testing.T) {
 	dir := t.TempDir()
-	critPath := filepath.Join(dir, ".crit.json")
+	critPath := filepath.Join(dir, ".crit")
 
 	cj := CritJSON{
 		ShareURL:    "https://crit.md/r/old",
@@ -931,16 +943,22 @@ func TestLoadExistingShareCfg_ScopeMismatch(t *testing.T) {
 		Files:       map[string]CritJSONFile{},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	os.WriteFile(critPath, data, 0644)
+	os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0644)
 
 	// Different file set — should NOT return share state
-	_, ok := loadExistingShareCfg(critPath, []string{"new-plan.md"})
+	_, ok, err := loadExistingShareCfg(critPath, []string{"new-plan.md"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if ok {
 		t.Error("expected ok=false for mismatched scope")
 	}
 
 	// Same file set — should return share state
-	cfg, ok := loadExistingShareCfg(critPath, []string{"old-plan.md"})
+	cfg, ok, err := loadExistingShareCfg(critPath, []string{"old-plan.md"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !ok {
 		t.Fatal("expected ok=true for matching scope")
 	}
@@ -952,7 +970,7 @@ func TestLoadExistingShareCfg_ScopeMismatch(t *testing.T) {
 func TestResolveShareURL(t *testing.T) {
 	// Isolate from real ~/.crit.config.json
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	setHome(t, homeDir)
 
 	tests := []struct {
 		name     string
@@ -1173,7 +1191,7 @@ func TestLoadCliArgsFromReviewFile(t *testing.T) {
 			Files:   map[string]CritJSONFile{},
 		}
 		data, _ := json.Marshal(cj)
-		os.WriteFile(critPath, data, 0644)
+		os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0644)
 
 		got := loadCliArgsFromReviewFile(critPath)
 		if len(got) != 2 || got[0] != "plan.md" || got[1] != "design.md" {
@@ -1193,7 +1211,7 @@ func TestLoadCliArgsFromReviewFile(t *testing.T) {
 		critPath := filepath.Join(dir, "review.json")
 		cj := CritJSON{Branch: "main", Files: map[string]CritJSONFile{}}
 		data, _ := json.Marshal(cj)
-		os.WriteFile(critPath, data, 0644)
+		os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0644)
 
 		got := loadCliArgsFromReviewFile(critPath)
 		if got != nil {
@@ -1549,7 +1567,7 @@ func TestCommentToShareComment(t *testing.T) {
 			Author:      "Alice",
 			ReviewRound: 2,
 		}
-		sc := commentToShareComment(c, "main.go", "line", "", false, false)
+		sc := commentToShareComment(c, "main.go", "line", "", "", false, false)
 		if sc.File != "main.go" {
 			t.Errorf("File = %q, want main.go", sc.File)
 		}
@@ -1575,7 +1593,7 @@ func TestCommentToShareComment(t *testing.T) {
 
 	t.Run("includes resolved when flag set", func(t *testing.T) {
 		c := Comment{Resolved: true}
-		sc := commentToShareComment(c, "", "", "", true, false)
+		sc := commentToShareComment(c, "", "", "", "", true, false)
 		if !sc.Resolved {
 			t.Error("expected Resolved=true when includeResolved=true")
 		}
@@ -1583,7 +1601,7 @@ func TestCommentToShareComment(t *testing.T) {
 
 	t.Run("excludes resolved when flag not set", func(t *testing.T) {
 		c := Comment{Resolved: true}
-		sc := commentToShareComment(c, "", "", "", false, false)
+		sc := commentToShareComment(c, "", "", "", "", false, false)
 		if sc.Resolved {
 			t.Error("expected Resolved=false when includeResolved=false")
 		}
@@ -1591,7 +1609,7 @@ func TestCommentToShareComment(t *testing.T) {
 
 	t.Run("sets external ID when flag set", func(t *testing.T) {
 		c := Comment{ID: "c123"}
-		sc := commentToShareComment(c, "", "", "", false, true)
+		sc := commentToShareComment(c, "", "", "", "", false, true)
 		if sc.ExternalID != "c123" {
 			t.Errorf("ExternalID = %q, want c123", sc.ExternalID)
 		}
@@ -1599,7 +1617,7 @@ func TestCommentToShareComment(t *testing.T) {
 
 	t.Run("omits external ID when flag not set", func(t *testing.T) {
 		c := Comment{ID: "c123"}
-		sc := commentToShareComment(c, "", "", "", false, false)
+		sc := commentToShareComment(c, "", "", "", "", false, false)
 		if sc.ExternalID != "" {
 			t.Errorf("ExternalID = %q, want empty", sc.ExternalID)
 		}
@@ -1613,7 +1631,7 @@ func TestCommentToShareComment(t *testing.T) {
 				{Body: "verified", Author: "Alice"},
 			},
 		}
-		sc := commentToShareComment(c, "f.md", "", "", false, false)
+		sc := commentToShareComment(c, "f.md", "", "", "", false, false)
 		if len(sc.Replies) != 2 {
 			t.Fatalf("expected 2 replies, got %d", len(sc.Replies))
 		}
@@ -1624,16 +1642,57 @@ func TestCommentToShareComment(t *testing.T) {
 
 	t.Run("review round zero omitted", func(t *testing.T) {
 		c := Comment{ReviewRound: 0}
-		sc := commentToShareComment(c, "", "", "", false, false)
+		sc := commentToShareComment(c, "", "", "", "", false, false)
 		if sc.ReviewRound != 0 {
 			t.Errorf("ReviewRound = %d, want 0 (omitted for round 0)", sc.ReviewRound)
+		}
+	})
+
+	t.Run("inlines local attachments for share when critPath set", func(t *testing.T) {
+		review := newReviewIdentity(t)
+		data := makeTestPNG(t, color.RGBA{50, 100, 150, 255})
+		filename, err := saveAttachment(review, data)
+		if err != nil {
+			t.Fatalf("seed attachment: %v", err)
+		}
+		c := Comment{
+			Body: "look: ![bug.png](attachments/" + filename + ")",
+			Replies: []Reply{
+				{Body: "yes ![](attachments/" + filename + ")"},
+			},
+		}
+		sc := commentToShareComment(c, "main.go", "line", "", review, false, false)
+		if !strings.Contains(sc.Body, "data:image/png;base64,") {
+			t.Errorf("expected inlined data URI in body, got: %q", sc.Body)
+		}
+		if strings.Contains(sc.Body, "](attachments/") {
+			t.Errorf("body still references attachments/: %q", sc.Body)
+		}
+		if !strings.Contains(sc.Body, "![bug.png](") {
+			t.Errorf("alt text dropped during inline: %q", sc.Body)
+		}
+		if len(sc.Replies) != 1 {
+			t.Fatalf("expected 1 reply, got %d", len(sc.Replies))
+		}
+		if !strings.Contains(sc.Replies[0].Body, "data:image/png;base64,") {
+			t.Errorf("reply body not inlined: %q", sc.Replies[0].Body)
+		}
+	})
+
+	t.Run("leaves attachments alone when critPath empty", func(t *testing.T) {
+		uuid, _ := randomUUID()
+		body := "![](attachments/" + uuid + ".png)"
+		c := Comment{Body: body}
+		sc := commentToShareComment(c, "f.md", "line", "", "", false, false)
+		if sc.Body != body {
+			t.Errorf("body should be untouched without critPath, got: %q", sc.Body)
 		}
 	})
 }
 
 func TestMergeWebComments(t *testing.T) {
 	dir := t.TempDir()
-	critPath := filepath.Join(dir, ".crit.json")
+	critPath := filepath.Join(dir, ".crit")
 
 	// Setup initial review file
 	cj := CritJSON{
@@ -1645,7 +1704,7 @@ func TestMergeWebComments(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	os.WriteFile(critPath, data, 0644)
+	os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0644)
 
 	// Merge new comments
 	newComments := []webComment{
@@ -1657,7 +1716,7 @@ func TestMergeWebComments(t *testing.T) {
 	}
 
 	// Read back and verify
-	data, _ = os.ReadFile(critPath)
+	data, _ = os.ReadFile(reviewPathsFor(critPath).Review)
 	var result CritJSON
 	json.Unmarshal(data, &result)
 
@@ -1689,7 +1748,7 @@ func TestBuildLocalFingerprints(t *testing.T) {
 				}},
 			},
 		}
-		fps := buildLocalFingerprints(cj)
+		fps, _ := buildLocalFingerprintIndex(cj)
 		key := "fix this|plan.md|5|10"
 		if !fps[key] {
 			t.Errorf("expected fingerprint %q in set", key)
@@ -1704,7 +1763,7 @@ func TestBuildLocalFingerprints(t *testing.T) {
 			Files:          map[string]CritJSONFile{},
 			ReviewComments: []Comment{{ID: "r1", Body: "overall note"}},
 		}
-		fps := buildLocalFingerprints(cj)
+		fps, _ := buildLocalFingerprintIndex(cj)
 		key := "overall note||0|0"
 		if !fps[key] {
 			t.Errorf("expected fingerprint %q in set", key)
@@ -1720,7 +1779,7 @@ func TestBuildLocalFingerprints(t *testing.T) {
 			},
 			ReviewComments: []Comment{{ID: "r1", Body: "looks good"}},
 		}
-		fps := buildLocalFingerprints(cj)
+		fps, _ := buildLocalFingerprintIndex(cj)
 		if len(fps) != 2 {
 			t.Errorf("expected 2 fingerprints, got %d", len(fps))
 		}
@@ -1728,7 +1787,7 @@ func TestBuildLocalFingerprints(t *testing.T) {
 
 	t.Run("empty CritJSON", func(t *testing.T) {
 		cj := CritJSON{Files: map[string]CritJSONFile{}}
-		fps := buildLocalFingerprints(cj)
+		fps, _ := buildLocalFingerprintIndex(cj)
 		if len(fps) != 0 {
 			t.Errorf("expected 0 fingerprints, got %d", len(fps))
 		}
@@ -1790,7 +1849,7 @@ func TestFetchWebComments_FingerprintMatchPreservesReplies(t *testing.T) {
 // persists reply updates onto an existing comment matched by ID.
 func TestMergeWebComments_AppliesReplyUpdates(t *testing.T) {
 	dir := t.TempDir()
-	critPath := filepath.Join(dir, ".crit.json")
+	critPath := filepath.Join(dir, ".crit")
 
 	cj := CritJSON{
 		ReviewRound: 1,
@@ -1804,7 +1863,7 @@ func TestMergeWebComments_AppliesReplyUpdates(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	if err := os.WriteFile(critPath, data, 0o644); err != nil {
+	if err := os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0o644); err != nil {
 		t.Fatalf("write crit json: %v", err)
 	}
 
@@ -1815,7 +1874,7 @@ func TestMergeWebComments_AppliesReplyUpdates(t *testing.T) {
 		t.Fatalf("mergeWebComments: %v", err)
 	}
 
-	out, _ := os.ReadFile(critPath)
+	out, _ := os.ReadFile(reviewPathsFor(critPath).Review)
 	var got CritJSON
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -1826,5 +1885,215 @@ func TestMergeWebComments_AppliesReplyUpdates(t *testing.T) {
 	}
 	if len(comments[0].Replies) != 1 || comments[0].Replies[0].Body != "thanks" {
 		t.Errorf("expected merged reply, got %+v", comments[0].Replies)
+	}
+}
+
+// TestShareReviewFiles_InlinesAttachmentsEndToEnd is a full-stack regression
+// test for the share path: starting from a real review folder on disk (v4
+// layout with review.json and attachments/<uuid>.<ext>), invoke
+// shareReviewFiles end-to-end, capture the JSON payload sent to the
+// crit-web stub, and assert that comment + reply bodies have their local
+// attachment refs rewritten to data:image/png;base64,... — and do NOT carry
+// raw `attachments/...` refs that crit-web has no way to resolve.
+//
+// This guards against future refactors that bypass commentToShareComment's
+// inlineAttachmentsAsDataURIs call (the only place rewriting happens). The
+// existing TestCommentToShareComment/inlines_local_attachments_for_share_when_critPath_set
+// covers the unit, this covers the wiring above it.
+func TestShareReviewFiles_InlinesAttachmentsEndToEnd(t *testing.T) {
+	// Build a real v4 review folder on disk.
+	review := newReviewIdentity(t)
+	png := makeTestPNG(t, color.RGBA{12, 34, 56, 255})
+	filename, err := saveAttachment(review, png)
+	if err != nil {
+		t.Fatalf("saveAttachment: %v", err)
+	}
+
+	cj := CritJSON{
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			"README.md": {
+				Comments: []Comment{
+					{
+						ID:        "c_topimg",
+						StartLine: 5,
+						EndLine:   5,
+						Body:      "look at this:\n\n![img.png](attachments/" + filename + ")",
+						Author:    "Alice",
+						Scope:     "line",
+					},
+					{
+						ID:        "c_replyimg",
+						StartLine: 7,
+						EndLine:   7,
+						Body:      "this one too",
+						Author:    "Alice",
+						Scope:     "line",
+						Replies: []Reply{
+							{ID: "rp_1", Body: "in reply:\n\n![img.png](attachments/" + filename + ")", Author: "Bob"},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := saveCritJSON(review, cj); err != nil {
+		t.Fatalf("saveCritJSON: %v", err)
+	}
+
+	var captured []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"url":"http://stub/r/x","delete_token":"tok"}`))
+	}))
+	defer srv.Close()
+
+	files := []shareFile{{Path: "README.md", Content: "stub content\n"}}
+	if _, err := shareReviewFiles(review, files, []string{"README.md"}, srv.URL, "", "Alice"); err != nil {
+		t.Fatalf("shareReviewFiles: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(captured, &payload); err != nil {
+		t.Fatalf("decode payload: %v\nbody=%q", err, string(captured))
+	}
+	commentsAny, _ := payload["comments"].([]any)
+	if len(commentsAny) != 2 {
+		t.Fatalf("expected 2 comments in payload, got %d", len(commentsAny))
+	}
+
+	for i, c := range commentsAny {
+		m := c.(map[string]any)
+		body, _ := m["body"].(string)
+		// Top-level comment body — either it had an attachment ref or it didn't.
+		if strings.Contains(body, "attachments/") {
+			t.Errorf("comment[%d] body still contains raw attachments/ ref: %q", i, truncate(body, 200))
+		}
+		hasImg := strings.Contains(body, "![")
+		if hasImg && !strings.Contains(body, "data:image/png;base64,") {
+			t.Errorf("comment[%d] has image syntax but no data URI: %q", i, truncate(body, 200))
+		}
+		replies, _ := m["replies"].([]any)
+		for j, r := range replies {
+			rm := r.(map[string]any)
+			rb, _ := rm["body"].(string)
+			if strings.Contains(rb, "attachments/") {
+				t.Errorf("comment[%d].reply[%d] body still contains raw attachments/ ref: %q", i, j, truncate(rb, 200))
+			}
+			if strings.Contains(rb, "![") && !strings.Contains(rb, "data:image/png;base64,") {
+				t.Errorf("comment[%d].reply[%d] has image syntax but no data URI: %q", i, j, truncate(rb, 200))
+			}
+		}
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// TestShareReviewFiles_PlanMode_InlinesAttachments guards the plan-mode share
+// path. In plan mode the daemon stores review.json under <planDir>/.crit/
+// (because applyPlanOverrides sets session.OutputDir = planDir, and
+// critJSONPath() returns OutputDir/.crit), and the server's attachment
+// upload writes to <srv.reviewPath>/attachments/. Both MUST resolve to the
+// same folder; if a regression reintroduces a split (e.g. by missing a
+// planDir branch when computing srv.reviewPath), the upload handler writes
+// to ~/.crit/reviews/<key>/attachments/ while share inlining looks in
+// <planDir>/.crit/attachments/ — the file isn't found, the regex match
+// returns the body unchanged, and crit-web renders [image: <alt>]
+// placeholders for what should be inlined data: URIs.
+//
+// This test pins the invariant by laying out a plan-style folder
+// (review.json + attachments/<uuid>.<ext> co-located) and asserting that
+// shareReviewFiles produces a payload with data: URIs.
+func TestShareReviewFiles_PlanMode_InlinesAttachments(t *testing.T) {
+	// Plan-style layout: review folder is <planDir>/.crit/ — review.json
+	// and attachments live there together.
+	planDir := t.TempDir()
+	critPath := filepath.Join(planDir, ".crit")
+	if err := os.MkdirAll(critPath, 0o755); err != nil {
+		t.Fatalf("mkdir critPath: %v", err)
+	}
+
+	png := makeTestPNG(t, color.RGBA{200, 50, 100, 255})
+	filename, err := saveAttachment(critPath, png)
+	if err != nil {
+		t.Fatalf("saveAttachment: %v", err)
+	}
+	// Confirm the attachment is where the inliner will look for it.
+	if _, err := os.Stat(filepath.Join(critPath, "attachments", filename)); err != nil {
+		t.Fatalf("attachment not co-located with review.json: %v", err)
+	}
+
+	planFile := "remove-readme-md-2026-05-11.md"
+	cj := CritJSON{
+		ReviewRound: 1,
+		Files: map[string]CritJSONFile{
+			planFile: {
+				Comments: []Comment{
+					{
+						ID:        "c_top",
+						StartLine: 1,
+						EndLine:   1,
+						Body:      "test image\n\n![image.png](attachments/" + filename + ")",
+						Author:    "Samuel Tissot",
+						Scope:     "line",
+						Replies: []Reply{
+							{ID: "rp_1", Body: "sub\n\n![image.png](attachments/" + filename + ")", Author: "Samuel Tissot"},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := saveCritJSON(critPath, cj); err != nil {
+		t.Fatalf("saveCritJSON: %v", err)
+	}
+
+	var captured []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"url":"http://stub/r/plan","delete_token":"tok"}`))
+	}))
+	defer srv.Close()
+
+	files := []shareFile{{Path: planFile, Content: "stub plan content\n"}}
+	if _, err := shareReviewFiles(critPath, files, []string{planFile}, srv.URL, "", "Samuel Tissot"); err != nil {
+		t.Fatalf("shareReviewFiles: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(captured, &payload); err != nil {
+		t.Fatalf("decode payload: %v\nbody=%q", err, string(captured))
+	}
+	commentsAny, _ := payload["comments"].([]any)
+	if len(commentsAny) != 1 {
+		t.Fatalf("expected 1 comment in payload, got %d", len(commentsAny))
+	}
+	m := commentsAny[0].(map[string]any)
+	body, _ := m["body"].(string)
+	if strings.Contains(body, "attachments/") {
+		t.Errorf("plan-mode comment body still contains raw attachments/ ref (inlining failed): %q", truncate(body, 200))
+	}
+	if !strings.Contains(body, "data:image/png;base64,") {
+		t.Errorf("plan-mode comment body missing data URI: %q", truncate(body, 200))
+	}
+	replies, _ := m["replies"].([]any)
+	if len(replies) != 1 {
+		t.Fatalf("expected 1 reply, got %d", len(replies))
+	}
+	rb, _ := replies[0].(map[string]any)["body"].(string)
+	if strings.Contains(rb, "attachments/") {
+		t.Errorf("plan-mode reply body still contains raw attachments/ ref (inlining failed): %q", truncate(rb, 200))
+	}
+	if !strings.Contains(rb, "data:image/png;base64,") {
+		t.Errorf("plan-mode reply body missing data URI: %q", truncate(rb, 200))
 	}
 }

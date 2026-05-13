@@ -240,7 +240,7 @@ After the first agent interaction, the comment becomes a **live thread**:
 - **Syntax highlighting.** Code blocks are highlighted and split per-line, so you can comment on individual lines inside a fence.
 - **Live file watching.** The browser reloads automatically when the source file changes.
 - **Dark/light/system theme.** Three-button pill in the header, persisted to localStorage.
-- **Local by default.** Server binds to `127.0.0.1`. Your files stay on your machine unless you explicitly share.
+- **Local by default.** Server binds to `127.0.0.1`. Your files stay on your machine unless you explicitly share. (Override with `--host` / `CRIT_HOST` / `host` config key — e.g. `0.0.0.0` to expose on your LAN. No auth, so it's an explicit opt-in.)
 - **No analytics or tracking.** Crit collects zero telemetry. No usage stats, no crash reports, no phone-home. If we ever add anonymous usage statistics in the future, they will be explicitly opt-in.
 - **Update check.** On startup, Crit makes one network request to check for a newer version and prints a notice if one is available. Set `CRIT_NO_UPDATE_CHECK=1` to disable it.
 
@@ -267,11 +267,13 @@ All keys are optional — omit any you don't need.
 | Key                    | Type     | Default                    | Description                                                                                                                                                                             |
 | ---------------------- | -------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `port`                 | int      | `0` (random)               | Port for the local server. `0` picks a random available port.                                                                                                                           |
+| `host`                 | string   | `"127.0.0.1"`              | Listen host. Set to `"0.0.0.0"` to expose the server on your LAN. There is no auth, so any non-loopback bind is an explicit opt-in.                                                     |
 | `no_open`              | bool     | `false`                    | Don't auto-open the browser when starting a review.                                                                                                                                     |
 | `share_url`            | string   | `"https://crit.md"`        | Base URL of the share service. Set to `""` to disable sharing entirely. Self-host with [`crit-web`](https://github.com/tomasz-tomczyk/crit-web).                                        |
+| `share_consented`      | bool     | `false`                    | Written automatically to `true` after you confirm the first-time share prompt. Reset to `false` to see the prompt again. Not used when `share_url` is a custom (self-hosted) URL.       |
 | `quiet`                | bool     | `false`                    | Suppress terminal status output.                                                                                                                                                        |
 | `output`               | string   | repo root or file dir      | Output directory for review files. Reviews are stored in `~/.crit/reviews/` by default.                                                                                                 |
-| `author`               | string   | `git config user.name`     | Author name shown on comments. Falls back to your git user name.                                                                                                                        |
+| `author`               | string   | VCS user name              | Author name shown on comments. Falls back to your configured VCS user name.                                                                                                            |
 | `base_branch`          | string   | auto-detected              | Base branch to diff against (e.g. `"main"`, `"develop"`). Overrides auto-detection.                                                                                                     |
 | `ignore_patterns`      | string[] | `[".crit/"]` | File patterns to exclude from git-mode file lists. Global and project patterns are merged.                                                                                              |
 | `agent_cmd`            | string   | `""`                       | Shell command for "Send to agent" (e.g. `"claude -p"`). **Global config only** — project config cannot set this for security reasons. See [Send to agent](#send-to-agent-experimental). |
@@ -279,19 +281,20 @@ All keys are optional — omit any you don't need.
 | `cleanup_on_approve`   | bool     | `true`                     | Automatically delete the review file when you approve with no unresolved comments. Set to `false` to preserve review history.                                                           |
 | `no_update_check`      | bool     | `false`                    | Don't check for new versions on startup.                                                                                                                                                |
 | `no_integration_check` | bool     | `false`                    | Skip the integration config freshness check on startup.                                                                                                                                 |
-| `vcs`                  | string   | auto-detected              | Preferred VCS backend: `"git"`, `"sl"`. When set, crit uses this VCS instead of auto-detecting. Falls back to git if the configured VCS isn't available. Can also be set via `--vcs` CLI flag (flag takes precedence over config). |
+| `vcs`                  | string   | auto-detected              | Preferred VCS backend: `"git"`, `"sl"`, or `"jj"`. When set, crit uses this VCS instead of auto-detecting. Falls back to git if the configured VCS isn't available. Can also be set via `--vcs` CLI flag (flag takes precedence over config). |
 
 ### CLI flags
 
 | Flag            | Short | Equivalent config key | Description                            |
 | --------------- | ----- | --------------------- | -------------------------------------- |
 | `--port`        | `-p`  | `port`                | Port to listen on                      |
+| `--host`        |       | `host`                | Listen host (default `127.0.0.1`)      |
 | `--no-open`     |       | `no_open`             | Don't auto-open browser                |
 | `--share-url`   |       | `share_url`           | Share service URL                      |
 | `--output`      | `-o`  | `output`              | Output directory for review files      |
 | `--quiet`       | `-q`  | `quiet`               | Suppress status output                 |
 | `--base-branch` |       | `base_branch`         | Base branch to diff against            |
-| `--vcs`         |       | `vcs`                 | VCS backend (`git` or `sl`)            |
+| `--vcs`         |       | `vcs`                 | VCS backend (`git`, `sl`, or `jj`)     |
 | `--no-ignore`   |       |                       | Temporarily bypass all ignore patterns |
 | `--version`     | `-v`  |                       | Print version and exit                 |
 
@@ -312,11 +315,24 @@ Use `--no-ignore` to temporarily bypass all patterns:
 crit --no-ignore
 ```
 
+### Collapsing generated files
+
+crit honors `linguist-generated` in a top-level `.gitattributes` file (same convention GitHub uses). Matching files appear in the review but start collapsed — expand them with the file header chevron.
+
+```gitattributes
+**/generated/** linguist-generated
+*.pb.go         linguist-generated
+bootstrap.min.css -linguist-generated
+```
+
+Unlike `ignore_patterns` (which hide files from the review entirely), this only changes the default fold state. The flag round-trips through `crit share` so shared reviews on crit-web start collapsed too.
+
 ### Environment variables
 
 | Variable                    | Description                                       |
 | --------------------------- | ------------------------------------------------- |
 | `CRIT_PORT`                 | Default port for the local server                 |
+| `CRIT_HOST`                 | Listen host (default `127.0.0.1`)                 |
 | `CRIT_SHARE_URL`            | Override the share service URL                    |
 | `CRIT_AUTH_TOKEN`           | Override the auth token (skips `crit auth login`) |
 | `CRIT_NO_UPDATE_CHECK`      | Disable the update check on startup               |
@@ -356,6 +372,12 @@ inputs.crit.url = "github:tomasz-tomczyk/crit";
 ### Download Binary
 
 Grab the latest binary for your platform from [Releases](https://github.com/tomasz-tomczyk/crit/releases).
+
+### Windows
+
+Native Windows: download `crit-windows-amd64.exe` (or `crit-windows-arm64.exe`) from [Releases](https://github.com/tomasz-tomczyk/crit/releases), rename to `crit.exe`, and place it on your `PATH`.
+
+WSL: install the Linux binary as you would on Linux (`go install`, `nix run`, or download `crit-linux-amd64` from Releases). Crit detects WSL and opens URLs in your Windows host browser via `wslview` / `powershell.exe` / `cmd.exe`.
 
 ### Docker (sandboxed agents)
 

@@ -22,6 +22,8 @@ build-linux:
 	mkdir -p dist
 	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/crit-linux-amd64 .
 	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/crit-linux-arm64 .
+	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/crit-windows-amd64.exe .
+	GOOS=windows GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o dist/crit-windows-arm64.exe .
 
 build-all: build-macos build-linux
 
@@ -34,6 +36,7 @@ test:
 
 test-frontend:
 	node frontend/test-markdown-patch.mjs
+	node frontend/test-diff-render.mjs
 
 setup-hooks:
 	git config core.hooksPath .githooks
@@ -49,6 +52,9 @@ test-share-sync-selfhosted: build
 
 e2e-share:
 	./scripts/e2e-share.sh
+
+e2e-roundtrip: build
+	./scripts/e2e-roundtrip.sh
 
 test-daemon:
 	./test/test-daemon-reuse.sh
@@ -69,4 +75,4 @@ e2e-failed:
 e2e-report:
 	cd e2e && npx playwright show-report
 
-.PHONY: build build-all generate verify-generate update-deps test test-frontend setup-hooks clean test-diff test-share-sync test-share-sync-selfhosted e2e-share test-daemon test-plan-daemon e2e e2e-failed e2e-report
+.PHONY: build build-all generate verify-generate update-deps test test-frontend setup-hooks clean test-diff test-share-sync test-share-sync-selfhosted e2e-share e2e-roundtrip test-daemon test-plan-daemon e2e e2e-failed e2e-report

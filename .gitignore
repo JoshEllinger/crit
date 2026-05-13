@@ -5,6 +5,7 @@
 # Review session files (generated at runtime)
 *.comments.json
 *.review.md
+/.crit/
 
 # Dependencies
 node_modules/
@@ -17,3 +18,4 @@ test-results/
 .codex
 .agents
 .mcp.json
+.DS_Store

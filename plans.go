@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -186,7 +185,7 @@ func acquirePlanSessionsLock(path string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening plan sessions lock: %w", err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := flockExclusive(f); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("acquiring plan sessions lock: %w", err)
 	}
@@ -195,7 +194,7 @@ func acquirePlanSessionsLock(path string) (*os.File, error) {
 
 // releasePlanSessionsLock releases the advisory lock and closes the file.
 func releasePlanSessionsLock(f *os.File) {
-	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = funlock(f)
 	f.Close()
 }
 
@@ -259,14 +258,12 @@ func savePlanSlug(sessionID, slug string) error {
 		return err
 	}
 
-	// Atomic write via temp file + rename to prevent partial writes.
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, out, 0644); err != nil {
-		return fmt.Errorf("writing plan sessions temp file: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("renaming plan sessions temp file: %w", err)
+	// Route through atomicWriteFile (atomic_write.go) so we get fsync
+	// before rename. Without fsync, a power loss between rename and the
+	// kernel flushing the data block leaves a zero-byte file on disk
+	// (the inode is renamed but the data was never written).
+	if err := atomicWriteFile(path, out, 0o644); err != nil {
+		return fmt.Errorf("writing plan sessions: %w", err)
 	}
 	return nil
 }

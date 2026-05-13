@@ -1,26 +1,19 @@
 package main
 
 import (
-	"context"
+	"bufio"
 	"embed"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	qrterminal "github.com/mdp/qrterminal/v3"
@@ -37,33 +30,6 @@ var (
 	commit  = "unknown"
 	date    = "unknown"
 )
-
-// commandDispatch maps subcommand names to handler functions.
-var commandDispatch = map[string]func([]string){
-	"help":      func([]string) { printHelp() },
-	"--help":    func([]string) { printHelp() },
-	"-h":        func([]string) { printHelp() },
-	"--version": func([]string) { printVersion() },
-	"-v":        func([]string) { printVersion() },
-	"share":     runShare,
-	"fetch":     runFetch,
-	"unpublish": runUnpublish,
-	"install":   runInstall,
-	"config":    runConfig,
-	"check":     func([]string) { runCheck() },
-	"pr":        runPR,
-	"pull":      runPull,
-	"push":      runPush,
-	"comment":   runComment,
-	"review":    runReview,
-	"plan":      runPlan,
-	"plan-hook": func([]string) { runPlanHook() },
-	"auth":      runAuth,
-	"stop":      runStop,
-	"status":    runStatus,
-	"cleanup":   runCleanup,
-	"_serve":    runServe,
-}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -135,10 +101,8 @@ func loadShareFiles(paths []string) []shareFile {
 		}
 		relPath := path
 		if filepath.IsAbs(path) {
-			if wd, err := os.Getwd(); err == nil {
-				if rel, err := filepath.Rel(wd, path); err == nil {
-					relPath = rel
-				}
+			if rel, err := filepath.Rel(mustGetwd(), path); err == nil {
+				relPath = rel
 			}
 		}
 		files = append(files, shareFile{Path: relPath, Content: string(content)})
@@ -230,6 +194,17 @@ func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL,
 	}
 }
 
+// promptShareConsent prints the first-time consent message to out and reads the
+// user's answer from in. Returns true only if the user typed "y".
+func promptShareConsent(out io.Writer, in io.Reader) bool {
+	fmt.Fprintln(out, "  Your review will be securely uploaded to crit.md.")
+	fmt.Fprintln(out, "  You'll get a private link — share it with whoever you choose.")
+	fmt.Fprintln(out, "  You won't be asked again after confirming.")
+	fmt.Fprint(out, "\n  Continue? [y/N] ")
+	answer, _ := bufio.NewReader(in).ReadString('\n')
+	return strings.TrimSpace(strings.ToLower(answer)) == "y"
+}
+
 func runShare(args []string) {
 	sf := parseShareFlags(args)
 
@@ -259,7 +234,25 @@ func runShare(args []string) {
 		sharePaths[i] = f.Path
 	}
 
-	if existingCfg, ok := loadExistingShareCfg(critPath, sharePaths); ok {
+	existingCfg, ok, err := loadExistingShareCfg(critPath, sharePaths)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	// First-time consent gate: only for the default service, only for new shares
+	if !ok && needsShareConsent(cfg, sf.svcURL) {
+		if !promptShareConsent(os.Stderr, os.Stdin) {
+			return
+		}
+		if err := saveGlobalConfig(func(m map[string]json.RawMessage) error {
+			m["share_consented"] = json.RawMessage("true")
+			return nil
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not save consent: %v\n", err)
+		}
+		cfg.ShareConsented = true
+	}
+	if ok {
 		runShareExisting(existingCfg, critPath, files, sharePaths, authToken, cfg.Author, sf.showQR)
 		return
 	}
@@ -315,7 +308,7 @@ func runFetch(args []string) {
 		os.Exit(1)
 	}
 
-	data, readErr := os.ReadFile(critPath)
+	data, readErr := readFileShared(reviewPathsFor(critPath).Review)
 	if readErr != nil {
 		fmt.Fprintln(os.Stderr, "Error: no review file found. Run `crit share` first.")
 		os.Exit(1)
@@ -346,7 +339,7 @@ func runFetch(args []string) {
 
 	if len(fetched.NewComments) == 0 && len(fetched.ReplyUpdates) == 0 {
 		fmt.Println("No new comments.")
-		fmt.Printf("Review file: %s\n", critPath)
+		fmt.Printf("Review file: %s\n", reviewPathsFor(critPath).Review)
 		return
 	}
 
@@ -363,7 +356,7 @@ func runFetch(args []string) {
 		}
 		fmt.Printf("Updated %d comment(s) with %d new reply(ies).\n", len(fetched.ReplyUpdates), replyCount)
 	}
-	fmt.Printf("Review file: %s\n", critPath)
+	fmt.Printf("Review file: %s\n", reviewPathsFor(critPath).Review)
 }
 
 func runUnpublish(args []string) {
@@ -401,7 +394,7 @@ func runUnpublish(args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	data, err := os.ReadFile(critPath)
+	data, err := readFileShared(reviewPathsFor(critPath).Review)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error: no review file found. Nothing to unpublish.")
 		os.Exit(1)
@@ -429,48 +422,6 @@ func runUnpublish(args []string) {
 	fmt.Println("Review unpublished.")
 }
 
-func runInstall(args []string) {
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: crit install <agent> [--global]")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Available agents:")
-		for _, a := range availableIntegrations() {
-			fmt.Fprintf(os.Stderr, "  %s\n", a)
-		}
-		fmt.Fprintln(os.Stderr, "  all")
-		os.Exit(1)
-	}
-
-	force := false
-	for _, arg := range args[1:] {
-		if arg == "--force" || arg == "-f" {
-			force = true
-		}
-	}
-
-	target := args[0]
-	if target == "all" {
-		cwd, _ := os.Getwd()
-		home, _ := os.UserHomeDir()
-		global := isGlobalInstall(cwd, home)
-		for _, name := range availableIntegrations() {
-			if name == "windsurf" && global {
-				fmt.Fprintln(os.Stderr, "  Skipped: windsurf (no global install supported — run from a project)")
-				continue
-			}
-			if err := installIntegration(name, force); err != nil {
-				fmt.Fprintf(os.Stderr, "  Failed: %s: %v\n", name, err)
-				continue
-			}
-		}
-		return
-	}
-	if err := installIntegration(target, force); err != nil {
-		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
-		os.Exit(1)
-	}
-}
-
 func runConfig(args []string) {
 	for _, arg := range args {
 		if arg == "--help" || arg == "-h" || arg == "help" {
@@ -487,7 +438,7 @@ func runConfig(args []string) {
 		configDir, _ = vcs.RepoRoot()
 	}
 	if configDir == "" {
-		configDir, _ = os.Getwd()
+		configDir = mustGetwd()
 	}
 	cfg := LoadConfig(configDir)
 	fmt.Print(cfg.String())
@@ -528,14 +479,59 @@ func parsePullFlags(args []string) pullFlags {
 // otherwise the on-disk ActiveDiffScope tells us a range mode is active but
 // HeadSHA is unknown. When neither indicates range mode, scope is empty
 // (legacy working-tree behavior — comments stay visible in working-tree view).
-func resolvePullScope(outputDir string, cj *CritJSON) inheritedScope {
-	if focus := probeDaemonFocus(outputDir); focus != nil && focus.Kind == FocusRange {
+func resolvePullScope(cj *CritJSON) inheritedScope {
+	if focus := probeDaemonFocus(); focus != nil && focus.Kind == FocusRange {
 		return inheritedScope{HeadSHA: focus.HeadSHA, DiffScope: "layer"}
 	}
 	if cj != nil && cj.ActiveDiffScope != "" {
 		return inheritedScope{DiffScope: "layer"}
 	}
 	return inheritedScope{}
+}
+
+// redirectReviewPathForPR detects when the cwd-resolved review file is for a
+// different branch than the explicit PR the user named (or the cwd review file
+// is missing entirely), and redirects to a review file matching the PR's head
+// branch when exactly one such file exists. Returns ok=false silently when no
+// PRInfo can be fetched, the PR's branch already matches cwd, or no unique alt
+// file exists — caller falls back to cwd path.
+//
+// When cwdBranch is empty (no cwd review file existed), the cwd-vs-PR-branch
+// early-out is skipped: there's no cwd state to false-positive against, so a
+// unique branch-matching alt file is the user's intent.
+//
+// When multiple review files match the PR's branch, this logs a Note to stderr
+// (so multi-worktree users see why the cwd file was used) and returns false.
+//
+// This mirrors PR #424's findReviewFileByCommentID fallback for `crit comment`:
+// the user's intent is encoded in the PR number, so when cwd resolves to an
+// unrelated review file we should try to honor the explicit intent first.
+func redirectReviewPathForPR(prNumber int, cwdBranch, cwdCritPath string) (string, CritJSON, bool) {
+	info, err := fetchPRByNumber(prNumber)
+	if err != nil || info == nil || info.HeadRefName == "" {
+		return "", CritJSON{}, false
+	}
+	// Skip early-out when cwdBranch is empty (no cwd review file existed) —
+	// there's no cwd state that could false-positive a match.
+	if cwdBranch != "" && info.HeadRefName == cwdBranch {
+		return "", CritJSON{}, false
+	}
+	altPath, err := findReviewFileByBranch(info.HeadRefName, cwdCritPath)
+	if err != nil {
+		if errors.Is(err, errReviewFileAmbiguousForBranch) {
+			fmt.Fprintf(os.Stderr,
+				"Note: multiple review files match branch %q; using cwd-resolved path. Pass --output to disambiguate.\n",
+				info.HeadRefName)
+		}
+		return "", CritJSON{}, false
+	}
+	altCJ, err := loadCritJSON(altPath)
+	if err != nil {
+		return "", CritJSON{}, false
+	}
+	fmt.Fprintf(os.Stderr, "Note: PR #%d targets branch %q; routing to %s (not the cwd-resolved review file)\n",
+		prNumber, info.HeadRefName, filepath.Base(altPath))
+	return altPath, altCJ, true
 }
 
 func runPull(args []string) {
@@ -563,17 +559,40 @@ func runPull(args []string) {
 		os.Exit(1)
 	}
 
+	// Thread-resolved state lives on the GraphQL reviewThreads edge, not on
+	// REST /pulls/{n}/comments. We fetch it best-effort: a GraphQL failure
+	// (token scope, transient outage) shouldn't block a comment pull. See #453.
+	threadResolved, threadErr := fetchPRThreadResolved(prNumber)
+	if threadErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch review-thread resolution state: %v\n", threadErr)
+		threadResolved = nil
+	}
+
 	critPath, err := resolveReviewPath(f.outputDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	var cj CritJSON
-	if data, readErr := os.ReadFile(critPath); readErr == nil {
+	if data, readErr := readFileShared(reviewPathsFor(critPath).Review); readErr == nil {
 		if jsonErr := json.Unmarshal(data, &cj); jsonErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: existing review file is invalid, starting fresh: %v\n", jsonErr)
 		}
 	}
+
+	// Redirect when the user passed an explicit PR number and the cwd-resolved
+	// review file is for a different branch (or doesn't exist, or unmarshalled
+	// empty above) — same class of cwd-vs-intent mismatch that PR #424 fixed
+	// for `crit comment`. cj.Branch is "" when the cwd file was missing or
+	// corrupt; the helper treats that as "no cwd state to false-positive
+	// against" and still attempts a branch-based match.
+	if f.prFlag != 0 && f.outputDir == "" {
+		if altPath, altCJ, ok := redirectReviewPathForPR(prNumber, cj.Branch, critPath); ok {
+			critPath = altPath
+			cj = altCJ
+		}
+	}
+
 	if cj.Files == nil {
 		cj.Files = make(map[string]CritJSONFile)
 		cj.Branch = CurrentBranch()
@@ -586,8 +605,8 @@ func runPull(args []string) {
 		cj.ReviewRound = 1
 	}
 
-	scope := resolvePullScope(f.outputDir, &cj)
-	added := mergeGHCommentsScoped(&cj, ghComments, scope)
+	scope := resolvePullScope(&cj)
+	added := mergeGHCommentsScoped(&cj, ghComments, scope, threadResolved)
 
 	if added == 0 {
 		fmt.Printf("No new inline comments found on PR #%d\n", prNumber)
@@ -656,24 +675,35 @@ func parsePushFlags(args []string) pushFlags {
 	return f
 }
 
-func postPushReplies(prNumber int, allReplies []ghReplyForPush) map[replyKey]int64 {
+// postPushReplies posts each reply via `gh api`. On the first auth-rotation
+// failure (HTTP 401) it aborts the rest of the batch — every subsequent
+// call would fail identically, and bailing cleanly lets the outer push
+// loop print the K-of-N recovery message. authFailed signals that to the
+// caller. replyCount is the number of replies actually accepted by GitHub
+// before the abort (or in total if no abort happened).
+func postPushReplies(prNumber int, allReplies []ghReplyForPush) (map[replyKey]int64, int, bool) {
 	replyCount := 0
 	replyIDs := make(map[replyKey]int64)
+	authFailed := false
 	for _, reply := range allReplies {
 		replyID, err := postGHReply(prNumber, reply.ParentGHID, reply.Body)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to post reply: %v\n", err)
-		} else {
-			replyCount++
-			if replyID != 0 {
-				replyIDs[replyKey{ParentGHID: reply.ParentGHID, BodyPrefix: truncateStr(reply.Body, 60)}] = replyID
+			if errors.Is(err, errGHAuthFailed) {
+				authFailed = true
+				break
 			}
+			continue
+		}
+		replyCount++
+		if replyID != 0 {
+			replyIDs[replyKey{ParentGHID: reply.ParentGHID, BodyPrefix: truncateStr(reply.Body, 60)}] = replyID
 		}
 	}
 	if replyCount > 0 {
 		fmt.Printf("Posted %d replies\n", replyCount)
 	}
-	return replyIDs
+	return replyIDs, replyCount, authFailed
 }
 
 // resolveCurrentPRHead fetches the PR's current head SHA when in range mode.
@@ -746,14 +776,38 @@ func loadPushContext(args []string) pushContext {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	data, err := os.ReadFile(critPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: no review file found. Run a crit review first.\n")
+
+	// Read the cwd-resolved file first (best-effort) so we know its branch.
+	// We tolerate "not found" here so an explicit `--pr N` from a clean
+	// checkout can still find the right file by branch via the redirect.
+	var cj CritJSON
+	cwdFileExists := true
+	data, readErr := readFileShared(reviewPathsFor(critPath).Review)
+	if readErr != nil {
+		if !os.IsNotExist(readErr) {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", readErr)
+			os.Exit(1)
+		}
+		cwdFileExists = false
+	} else if err := json.Unmarshal(data, &cj); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid review file: %v\n", err)
 		os.Exit(1)
 	}
-	var cj CritJSON
-	if err := json.Unmarshal(data, &cj); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid review file: %v\n", err)
+
+	// Redirect when the user passed an explicit PR number and the cwd-resolved
+	// review file is for a different branch (or is missing) — pushing the wrong
+	// comments to a PR is destructive, so honor the explicit intent first. Same
+	// pattern as PR #424's findReviewFileByCommentID fallback for `crit comment`.
+	if f.prFlag != 0 && f.outputDir == "" {
+		if altPath, altCJ, ok := redirectReviewPathForPR(prNumber, cj.Branch, critPath); ok {
+			critPath = altPath
+			cj = altCJ
+			cwdFileExists = true
+		}
+	}
+
+	if !cwdFileExists {
+		fmt.Fprintf(os.Stderr, "Error: no review file found. Run a crit review first.\n")
 		os.Exit(1)
 	}
 
@@ -772,68 +826,221 @@ func runPushDryRun(ctx pushContext, b pushBuckets) {
 // runPushLive performs the actual push: writes the orphan export (if any
 // orphans), posts the postable bucket via gh, and prints a summary. Replies
 // to existing GitHub comments are also posted (only for postable parents).
-func runPushLive(ctx pushContext, b pushBuckets) {
-	exportPath := ""
-	if len(b.FullStack)+len(b.Unmapped) > 0 {
-		dir, err := exportsDir()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not resolve export dir: %v\n", err)
-		} else {
-			path, werr := writeOrphanExport(ctx.prNumber, b, dir)
-			if werr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to write orphan export: %v\n", werr)
-			} else {
-				exportPath = path
-			}
+//
+// Returns the process exit code so callers (and tests) can decide what to
+// do without runPushLive itself terminating the process.
+func runPushLive(ctx pushContext, b pushBuckets) int {
+	exportPath := writePushOrphanExport(ctx, b)
+
+	rewrite := stripBodyRewriter
+
+	postable := len(b.Postable)
+	posted, postFailed, postAuthFailed, commentIDs := runPushPostReview(ctx, b, rewrite)
+
+	totalReplies := countNewReplies(ctx.cj)
+	postedReplies := 0
+	replyAuthFailed := false
+	if !postFailed && !postAuthFailed {
+		var allReplies []ghReplyForPush
+		for _, cf := range ctx.cj.Files {
+			allReplies = append(allReplies, collectNewRepliesForPush(cf, rewrite)...)
 		}
-	}
-
-	posted := 0
-	postFailed := false
-	if len(b.Postable) > 0 {
-		ghComments := bucketsToGHComments(b.Postable)
-		commentIDs, err := createGHReview(ctx.prNumber, ghComments, ctx.flags.message, ctx.event)
-		if err != nil {
-			postFailed = true
-			fmt.Fprintf(os.Stderr, "Error posting review: %v\n", err)
-		} else {
-			posted = len(ghComments)
-
-			// Replies to GitHub-anchored comments only make sense after a
-			// successful review post (so parent IDs are stable).
-			var allReplies []ghReplyForPush
-			for _, cf := range ctx.cj.Files {
-				allReplies = append(allReplies, collectNewRepliesForPush(cf)...)
-			}
-			replyIDs := postPushReplies(ctx.prNumber, allReplies)
+		var replyIDs map[replyKey]int64
+		replyIDs, postedReplies, replyAuthFailed = postPushReplies(ctx.prNumber, allReplies)
+		if len(commentIDs) > 0 || len(replyIDs) > 0 {
 			if uerr := updateCritJSONWithGitHubIDs(ctx.critPath, commentIDs, replyIDs); uerr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to update review file with GitHub IDs: %v\n", uerr)
 			}
 		}
 	}
 
-	printPushSummary(posted, len(b.FullStack)+len(b.Unmapped), exportPath)
-
-	// Exit code: only fail when gh errored AND we have no orphans to fall
-	// back on. Otherwise something useful happened (export written), so
-	// exit 0.
-	if postFailed && exportPath == "" {
-		os.Exit(1)
+	totalEdits := len(collectEditedForPush(ctx.cj))
+	patched := 0
+	editAuthFailed := false
+	if !postAuthFailed && !replyAuthFailed {
+		patched, editAuthFailed = pushEditedBodies(ctx)
 	}
+
+	totalDeletes := len(collectDeletesForPush(ctx.cj))
+	deleted := 0
+	deleteFailed := false
+	deleteAuthFailed := false
+	if !postAuthFailed && !replyAuthFailed && !editAuthFailed {
+		deleted, deleteFailed, deleteAuthFailed = pushDeletedComments(ctx)
+	}
+
+	authAborted := postAuthFailed || replyAuthFailed || editAuthFailed || deleteAuthFailed
+	if authAborted {
+		k := posted + postedReplies + patched + deleted
+		n := postable + totalReplies + totalEdits + totalDeletes
+		fmt.Fprintf(os.Stderr,
+			"Pushed %d of %d comments before auth failed. Run 'gh auth refresh' then re-run 'crit push' to post the rest.\n",
+			k, n)
+		return 1
+	}
+
+	printPushSummary(posted, patched, deleted, len(b.FullStack)+len(b.Unmapped), exportPath)
+
+	if pushShouldExitFailure(posted, patched, deleted, exportPath, postFailed, deleteFailed) {
+		return 1
+	}
+	return 0
+}
+
+// writePushOrphanExport writes the off-PR (full-stack + unmapped) bucket
+// to a side file when needed. Split out of runPushLive purely to keep
+// cyclomatic complexity inside Go Report Card limits.
+func writePushOrphanExport(ctx pushContext, b pushBuckets) string {
+	if len(b.FullStack)+len(b.Unmapped) == 0 {
+		return ""
+	}
+	dir, err := exportsDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not resolve export dir: %v\n", err)
+		return ""
+	}
+	path, werr := writeOrphanExport(ctx.prNumber, b, dir)
+	if werr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to write orphan export: %v\n", werr)
+		return ""
+	}
+	return path
+}
+
+// runPushPostReview posts the Postable bucket as a single GitHub review.
+// rewrite preprocesses each comment body before it ships (image upload+swap
+// in production; nil falls back to strip-with-placeholder).
+// Returns the count posted, whether the call failed (any reason), whether
+// the failure was specifically an auth-rotation 401, and the path-to-id
+// mapping for body-hash bookkeeping.
+func runPushPostReview(ctx pushContext, b pushBuckets, rewrite bodyRewriter) (int, bool, bool, map[string]int64) {
+	if len(b.Postable) == 0 {
+		return 0, false, false, nil
+	}
+	ghComments := bucketsToGHComments(b.Postable, rewrite)
+	ids, err := createGHReview(ctx.prNumber, ghComments, ctx.flags.message, ctx.event)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error posting review: %v\n", err)
+		return 0, true, errors.Is(err, errGHAuthFailed), nil
+	}
+	return len(ghComments), false, false, ids
+}
+
+// countNewReplies counts replies that would be sent in this push (no
+// GitHubID yet, parent already on GitHub). Mirrors collectNewRepliesForPush
+// without allocating the full slice — used purely for the K-of-N total.
+// nil rewriter is fine: the body content does not affect the count.
+func countNewReplies(cj CritJSON) int {
+	n := 0
+	for _, cf := range cj.Files {
+		n += len(collectNewRepliesForPush(cf, nil))
+	}
+	return n
+}
+
+// pushShouldExitFailure encodes the exit-code policy for `crit push`. The
+// process should fail (exit 1) only when nothing meaningful landed and at
+// least one operation failed. Failed per-ID deletes stay in
+// PendingGitHubDeletes for the next push (existing retry semantics), so a
+// partial delete failure must not mask successful posts/patches/drains.
+func pushShouldExitFailure(posted, patched, deleted int, exportPath string, postFailed, deleteFailed bool) bool {
+	anySuccess := posted > 0 || patched > 0 || deleted > 0 || exportPath != ""
+	anyFailure := postFailed || deleteFailed
+	return anyFailure && !anySuccess
 }
 
 // printPushSummary writes the one-line stdout summary describing what
 // happened. Adapts wording to the actual outcome (no orphans, no posts, etc).
-func printPushSummary(posted, orphans int, exportPath string) {
-	if posted == 0 && orphans == 0 {
+func printPushSummary(posted, patched, deleted, orphans int, exportPath string) {
+	if posted == 0 && patched == 0 && deleted == 0 && orphans == 0 {
 		fmt.Println("No comments to push.")
 		return
 	}
-	if exportPath == "" {
-		fmt.Printf("Posted %d comments.\n", posted)
-		return
+	parts := []string{fmt.Sprintf("Posted %d comments", posted)}
+	if patched > 0 {
+		parts = append(parts, fmt.Sprintf("edited %d", patched))
 	}
-	fmt.Printf("Posted %d comments. %d comments exported to %s.\n", posted, orphans, exportPath)
+	if deleted > 0 {
+		parts = append(parts, fmt.Sprintf("deleted %d", deleted))
+	}
+	line := strings.Join(parts, ", ") + "."
+	if exportPath != "" {
+		line += fmt.Sprintf(" %d comments exported to %s.", orphans, exportPath)
+	}
+	fmt.Println(line)
+}
+
+// pushEditedBodies PATCHes already-pushed comments/replies whose local body
+// diverged from the recorded push-time hash. Returns the count of records
+// successfully PATCHed and updated in the review file, plus an authFailed
+// flag when an HTTP 401 aborted the batch. Non-auth failures log to stderr
+// and are excluded from the count, so the next push will retry them.
+func pushEditedBodies(ctx pushContext) (int, bool) {
+	edits := collectEditedForPush(ctx.cj)
+	if len(edits) == 0 {
+		return 0, false
+	}
+	succeeded := make([]ghEditForPush, 0, len(edits))
+	authFailed := false
+	for _, e := range edits {
+		if err := patchGHComment(e.GitHubID, e.Body); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to edit comment %d: %v\n", e.GitHubID, err)
+			if errors.Is(err, errGHAuthFailed) {
+				authFailed = true
+				break
+			}
+			continue
+		}
+		succeeded = append(succeeded, e)
+	}
+	if uerr := updateCritJSONWithEditedBodies(ctx.critPath, succeeded); uerr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to update review file after edit push: %v\n", uerr)
+	}
+	return len(succeeded), authFailed
+}
+
+// pushDeletedComments issues DELETE for every GitHub comment ID queued in
+// PendingGitHubDeletes. Returns the count of IDs whose DELETE was drained
+// (200 / 204, plus 404 "already gone" and 403 "not the author") and whether
+// any DELETE returned an error severe enough to surface a non-zero exit.
+//
+// 403 is logged but treated as drained — the GitHub API rejects deletes by
+// non-authors, so retrying is futile and a stuck pending entry would block
+// all future pushes for this review file.
+func pushDeletedComments(ctx pushContext) (int, bool, bool) {
+	pending := collectDeletesForPush(ctx.cj)
+	if len(pending) == 0 {
+		return 0, false, false
+	}
+	drained := make([]int64, 0, len(pending))
+	failed := false
+	authFailed := false
+	for _, id := range pending {
+		status, err := deleteGHComment(id)
+		switch {
+		case err != nil && errors.Is(err, errGHAuthFailed):
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete comment %d: %v\n", id, err)
+			authFailed = true
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete comment %d: %v\n", id, err)
+			failed = true
+		case status >= 200 && status < 300, status == 404:
+			drained = append(drained, id)
+		case status == 403:
+			fmt.Fprintf(os.Stderr, "Warning: cannot delete comment %d on GitHub (403; not the author) — dropping pending delete\n", id)
+			drained = append(drained, id)
+		default:
+			fmt.Fprintf(os.Stderr, "Warning: unexpected status %d deleting comment %d\n", status, id)
+			failed = true
+		}
+		if authFailed {
+			break
+		}
+	}
+	if uerr := updateCritJSONAfterDeletes(ctx.critPath, drained); uerr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to update review file after delete push: %v\n", uerr)
+	}
+	return len(drained), failed, authFailed
 }
 
 // fullStackPushGateMessage is the user-facing error string emitted when
@@ -871,7 +1078,9 @@ func runPush(args []string) {
 		runPushDryRun(ctx, b)
 		return
 	}
-	runPushLive(ctx, b)
+	if code := runPushLive(ctx, b); code != 0 {
+		os.Exit(code)
+	}
 }
 
 type commentFlags struct {
@@ -882,6 +1091,7 @@ type commentFlags struct {
 	resolve   bool
 	path      string
 	json      bool
+	file      string
 	plan      string
 	scope     commentFocusOverride
 	args      []string
@@ -921,6 +1131,9 @@ func parseCommentFlags(args []string) commentFlags {
 			i++
 		case "--json":
 			f.json = true
+		case "--file", "-f":
+			f.file = requireFlagValue(args, i, arg)
+			i++
 		case "--scope":
 			override, err := commentScopeOverrideFromFlag(requireFlagValue(args, i, "--scope"))
 			if err != nil {
@@ -954,9 +1167,11 @@ func resolveCommentFlags(f *commentFlags) {
 	// Resolve author: --author flag > config > VCS user.name.
 	// Stamp AuthUserID alongside the author so authenticated comments
 	// carry the user identity into the share payload.
-	cfgDir, _ := os.Getwd()
+	cfgDir := mustGetwd()
 	if vcs := DetectVCS(""); vcs != nil {
-		cfgDir, _ = vcs.RepoRoot()
+		if root, err := vcs.RepoRoot(); err == nil {
+			cfgDir = root
+		}
 	}
 	cfg := LoadConfig(cfgDir)
 	if f.author == "" {
@@ -967,20 +1182,164 @@ func resolveCommentFlags(f *commentFlags) {
 	}
 }
 
+// readCommentJSONInput reads bulk-comment JSON either from the given file path
+// or from stdin. A path of "" or "-" reads stdin (POSIX convention). Errors
+// include the source path so callers can spot file vs. stdin failures quickly.
+func readCommentJSONInput(path string, stdin io.Reader) ([]byte, error) {
+	if path == "" || path == "-" {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return nil, fmt.Errorf("reading stdin: %w", err)
+		}
+		return data, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	return data, nil
+}
+
+// parseCommentJSONEntries unmarshals a bulk-comment JSON array, returning a
+// readable, located error message when the input is malformed. The source
+// label ("-" for stdin, or the file path) is included in the error so callers
+// can tell file vs. stdin failures apart.
+func parseCommentJSONEntries(data []byte, source string) ([]BulkCommentEntry, error) {
+	var entries []BulkCommentEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, formatJSONParseError(data, source, err)
+	}
+	return entries, nil
+}
+
+// formatJSONParseError builds a multi-line error describing where in the input
+// JSON parsing failed: byte offset, line/column, a snippet around the offset
+// with control characters made visible, and the original error message. The
+// source label identifies the input ("-" for stdin, otherwise a file path).
+func formatJSONParseError(data []byte, source string, err error) error {
+	label := jsonSourceLabel(source)
+	offset, hasOffset := jsonErrorOffset(err)
+	if !hasOffset {
+		return fmt.Errorf("Error parsing JSON from %s: %w", label, err)
+	}
+	line, col := lineColForOffset(data, offset)
+	snippet := jsonSnippet(data, offset)
+	return fmt.Errorf("Error parsing JSON from %s at byte %d (line %d, column %d):\n  %s\n  %w",
+		label, offset, line, col, snippet, err)
+}
+
+// jsonSourceLabel renders a human-readable label for the JSON input source.
+// Empty or "-" means stdin; anything else is treated as a file path.
+func jsonSourceLabel(source string) string {
+	if source == "" || source == "-" {
+		return "stdin"
+	}
+	return source
+}
+
+// jsonErrorOffset extracts the byte offset from json package errors that carry
+// one. Returns (0, false) if the error has no offset information.
+func jsonErrorOffset(err error) (int64, bool) {
+	var syn *json.SyntaxError
+	if errors.As(err, &syn) {
+		return syn.Offset, true
+	}
+	var typ *json.UnmarshalTypeError
+	if errors.As(err, &typ) {
+		return typ.Offset, true
+	}
+	return 0, false
+}
+
+// lineColForOffset returns 1-based line and column for the given byte offset
+// into data. Tolerates offsets at or past the end of input.
+func lineColForOffset(data []byte, offset int64) (int, int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if int(offset) > len(data) {
+		offset = int64(len(data))
+	}
+	line, col := 1, 1
+	for i := int64(0); i < offset; i++ {
+		if data[i] == '\n' {
+			line++
+			col = 1
+			continue
+		}
+		col++
+	}
+	return line, col
+}
+
+// jsonSnippet returns a single-line excerpt of data around offset with the
+// offending position marked by >>>HERE<<<. Control bytes inside the snippet
+// are rendered as their visible escape forms so e.g. a raw newline appears as
+// the two characters \n rather than wrapping the output.
+func jsonSnippet(data []byte, offset int64) string {
+	const before, after = 40, 40
+	if offset < 0 {
+		offset = 0
+	}
+	if int(offset) > len(data) {
+		offset = int64(len(data))
+	}
+	start := offset - before
+	if start < 0 {
+		start = 0
+	}
+	end := offset + after
+	if int(end) > len(data) {
+		end = int64(len(data))
+	}
+	left := visibleControl(data[start:offset])
+	right := visibleControl(data[offset:end])
+	prefix := ""
+	if start > 0 {
+		prefix = "..."
+	}
+	suffix := ""
+	if int(end) < len(data) {
+		suffix = "..."
+	}
+	return prefix + left + ">>>HERE<<<" + right + suffix
+}
+
+// visibleControl replaces unprintable control bytes (newline, carriage return,
+// tab) with their escape-sequence representation so they survive a single-line
+// terminal print.
+func visibleControl(b []byte) string {
+	var out strings.Builder
+	out.Grow(len(b))
+	for _, c := range b {
+		switch c {
+		case '\n':
+			out.WriteString(`\n`)
+		case '\r':
+			out.WriteString(`\r`)
+		case '\t':
+			out.WriteString(`\t`)
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return out.String()
+}
+
 func runCommentJSON(f commentFlags) {
 	runCommentJSONScoped(f, inheritedScope{})
 }
 
 func runCommentJSONScoped(f commentFlags, scope inheritedScope) {
-	data, err := io.ReadAll(os.Stdin)
+	data, err := readCommentJSONInput(f.file, os.Stdin)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	var entries []BulkCommentEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing JSON: %v\n", err)
+	entries, err := parseCommentJSONEntries(data, f.file)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
@@ -1003,7 +1362,11 @@ func runCommentJSONScoped(f commentFlags, scope inheritedScope) {
 		parts = append(parts, fmt.Sprintf("%d comment%s", comments, plural(comments)))
 	}
 	if replies > 0 {
-		parts = append(parts, fmt.Sprintf("%d repl%s", replies, pluralReply(replies)))
+		word := "replies"
+		if replies == 1 {
+			word = "reply"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", replies, word))
 	}
 	fmt.Printf("Added %s\n", strings.Join(parts, " and "))
 }
@@ -1038,7 +1401,8 @@ func printCommentUsage() {
 	fmt.Fprintln(os.Stderr, "       crit comment [--output <dir>] [--author <name>] <path> <body>             File-level comment")
 	fmt.Fprintln(os.Stderr, "       crit comment [--output <dir>] [--author <name>] <path>:<line[-end]> <body> Line-level comment")
 	fmt.Fprintln(os.Stderr, "       crit comment --reply-to <id> [--resolve] [--author <name>] <body>")
-	fmt.Fprintln(os.Stderr, "       crit comment --json [--author <name>] [--output <dir>]    Read comments from stdin as JSON")
+	fmt.Fprintln(os.Stderr, "       crit comment --json [--file <path>] [--author <name>] [--output <dir>]")
+	fmt.Fprintln(os.Stderr, "                                                                  Bulk add comments from JSON (stdin by default; --file <path> or --file - for stdin)")
 	fmt.Fprintln(os.Stderr, "       crit comment [--output <dir>] --clear")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Examples:")
@@ -1049,6 +1413,7 @@ func printCommentUsage() {
 	fmt.Fprintln(os.Stderr, "  crit comment --reply-to c_a3f8b2 --resolve --author 'Claude' 'Split into two functions'")
 	fmt.Fprintln(os.Stderr, "  crit comment --output /tmp/reviews main.go:42 'Fix this bug'")
 	fmt.Fprintln(os.Stderr, "  echo '[{\"file\":\"main.go\",\"line\":42,\"body\":\"Fix this\"}]' | crit comment --json --author 'Claude'")
+	fmt.Fprintln(os.Stderr, "  crit comment --json --file comments.json --author 'Claude'")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Tips:")
 	fmt.Fprintln(os.Stderr, "  Use --author to identify who left the comment (recommended for AI agents)")
@@ -1308,11 +1673,11 @@ func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry,
 
 func installDaemonSignalHandler(pid int) {
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, terminationSignals()...)
 	go func() {
 		<-sigCh
 		if proc, err := os.FindProcess(pid); err == nil {
-			proc.Signal(syscall.SIGTERM)
+			_ = terminateProcess(proc)
 		}
 		os.Exit(0)
 	}()
@@ -1321,7 +1686,7 @@ func installDaemonSignalHandler(pid int) {
 func killDaemonOnApproval(approved bool, pid int) {
 	if approved {
 		if proc, err := os.FindProcess(pid); err == nil {
-			proc.Signal(syscall.SIGTERM)
+			_ = terminateProcess(proc)
 		}
 	}
 }
@@ -1344,7 +1709,7 @@ func backgroundCleanup() {
 func deleteStaleReviewsSilent(stale []staleReview) {
 	sessDir, _ := sessionsDir()
 	for _, s := range stale {
-		if os.Remove(s.path) != nil {
+		if !removeStaleReviewPath(s.path) {
 			continue
 		}
 		if sessDir != "" {
@@ -1355,12 +1720,35 @@ func deleteStaleReviewsSilent(stale []staleReview) {
 	}
 }
 
-// cleanupOnApproval deletes the review file when the review is approved
-// and cleanup is enabled.
-func cleanupOnApproval(approved bool, reviewPath string, cleanupEnabled bool) {
-	if approved && cleanupEnabled && reviewPath != "" {
-		os.Remove(reviewPath)
+// removeStaleReviewPath removes a review identity, supporting both the v4
+// folder layout (RemoveAll) and v3 flat *.json files (Remove + sibling
+// sidecar). MIGRATION-REMOVAL: the flat-file branch can be deleted once the
+// migration shim is removed.
+func removeStaleReviewPath(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
 	}
+	if info.IsDir() {
+		return os.RemoveAll(path) == nil
+	}
+	// MIGRATION-REMOVAL: v3 flat-file fallback.
+	if err := os.Remove(path); err != nil {
+		return false
+	}
+	_ = os.Remove(path + ".snapshots.json")
+	return true
+}
+
+// cleanupOnApproval deletes the review folder (review.json, snapshots.json,
+// and any attachments) when the review is approved and cleanup is enabled.
+func cleanupOnApproval(approved bool, reviewPath string, cleanupEnabled bool) {
+	if !(approved && cleanupEnabled && reviewPath != "") {
+		return
+	}
+	// In v4 the review identity is a folder; remove it whole. The
+	// MIGRATION-REMOVAL fallback handles v3 flat reviews still on disk.
+	_ = removeStaleReviewPath(reviewPath)
 }
 
 func runPlan(args []string) {
@@ -1519,7 +1907,7 @@ func runPlanHook() {
 func waitForDaemonReady(client *http.Client, port int) (statusCode int, body []byte, err error) {
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
-		resp, reqErr := client.Get(fmt.Sprintf("http://localhost:%d/api/session", port))
+		resp, reqErr := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/session", port))
 		if reqErr != nil {
 			return 0, nil, fmt.Errorf("could not reach daemon on port %d: %w", port, reqErr)
 		}
@@ -1543,35 +1931,45 @@ func runReviewClientRaw(entry sessionEntry) (approved bool, prompt string) {
 	// Wait for the server to finish initializing before calling review-cycle.
 	if _, _, err := waitForDaemonReady(client, entry.Port); err != nil {
 		fmt.Fprintf(os.Stderr, "crit plan-hook: %v\n", err)
-		return true, ""
+		return false, "crit daemon was unreachable; plan was not reviewed."
 	}
 
 	resp, err := client.Post(
-		fmt.Sprintf("http://localhost:%d/api/review-cycle", entry.Port),
+		fmt.Sprintf("http://127.0.0.1:%d/api/review-cycle", entry.Port),
 		"application/json",
 		nil,
 	)
 	if err != nil {
+		// Daemon died (graceful shutdown, crash, or `crit stop`) while we
+		// were waiting. Deny rather than silently auto-approve — an
+		// unreachable daemon means no human signed off on the plan.
 		fmt.Fprintf(os.Stderr, "crit plan-hook: could not reach daemon: %v\n", err)
-		return true, "" // allow through on error
+		return false, "crit daemon became unreachable before review was finished."
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "crit plan-hook: daemon returned %d\n", resp.StatusCode)
-		return true, "" // allow through on infrastructure error
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return true, ""
+		fmt.Fprintf(os.Stderr, "crit plan-hook: could not read daemon response: %v\n", err)
+		return false, "crit daemon response could not be read."
+	}
+
+	// Both 200 (finish) and 503 (server-shutdown) carry a structured
+	// {approved, prompt} body. Other statuses mean infrastructure failure —
+	// deny in that case rather than allowing through.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusServiceUnavailable {
+		fmt.Fprintf(os.Stderr, "crit plan-hook: daemon returned %d\n", resp.StatusCode)
+		return false, "crit daemon returned an unexpected status."
 	}
 
 	var result struct {
 		Approved bool   `json:"approved"`
 		Prompt   string `json:"prompt"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		fmt.Fprintf(os.Stderr, "crit plan-hook: malformed daemon response: %v\n", err)
+		return false, "crit daemon returned a malformed response."
+	}
 	return result.Approved, result.Prompt
 }
 
@@ -1633,6 +2031,16 @@ func runReview(args []string) {
 			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
 		}
 	} else {
+		// Pre-flight: in default git mode (no files, no focus, no plan), surface
+		// "no changed files" up front instead of letting the daemon spawn, signal
+		// readiness, then crash on init — which leaves the user with a misleading
+		// "could not reach daemon / connection refused" error. See issue #438.
+		if len(sc.files) == 0 && sc.focus == nil && sc.planDir == "" {
+			if msg := preflightNoChangedFiles(sc); msg != "" {
+				fmt.Fprint(os.Stderr, msg)
+				os.Exit(1)
+			}
+		}
 		// Pass raw args to startDaemon — the _serve process parses them itself
 		entry, err = startDaemon(key, args)
 		if err != nil {
@@ -1695,7 +2103,7 @@ func runReviewClient(entry sessionEntry) (approved bool) {
 	}
 
 	resp, err := client.Post(
-		fmt.Sprintf("http://localhost:%d/api/review-cycle", entry.Port),
+		fmt.Sprintf("http://127.0.0.1:%d/api/review-cycle", entry.Port),
 		"application/json",
 		nil,
 	)
@@ -1805,532 +2213,17 @@ func plural(n int) string {
 	return "s"
 }
 
-func pluralReply(n int) string {
-	if n == 1 {
-		return "y"
-	}
-	return "ies"
-}
-
-// serverConfig holds the resolved configuration for running the server.
-// It combines CLI flags, environment variables, and config file settings.
-type serverConfig struct {
-	port               int
-	noOpen             bool
-	quiet              bool
-	shareURL           string
-	authToken          string
-	outputDir          string
-	author             string
-	baseBranch         string // --base-branch override for diff base
-	ignorePatterns     []string
-	files              []string // explicit file arguments (empty = git mode)
-	noIntegrationCheck bool
-	noUpdateCheck      bool
-	agentCmd           string
-	planDir            string // managed storage directory for plan mode
-	planName           string // display name for plan content
-	reviewPath         string // centralized review file path (~/.crit/reviews/<key>.json)
-	vcsOverride        string // "git", "sl"/"sapling", or "" for auto-detect
-	cfg                Config // full resolved config for the settings panel
-
-	// focus is populated by resolveFocus when --pr or --range is set;
-	// nil means "default" (working-tree, derived inside the session).
-	focus *Focus
-
-	// remoteFiles enables API-based file content reads (gh api repos/.../contents/)
-	// when in PR/range focus, bypassing the local-fetch + git show path. Diff and
-	// changed-file lists still use local git.
-	remoteFiles bool
-
-	// workingTree forces working-tree mode regardless of stack auto-detection.
-	// Set by --working-tree.
-	workingTree bool
-}
-
-// serverFlagSet holds the parsed flag values before config resolution.
-type serverFlagSet struct {
-	port        int
-	noOpen      bool
-	showVersion bool
-	shareURL    string
-	outputDir   string
-	quiet       bool
-	noIgnore    bool
-	baseBranch  string
-	vcsOverride string
-	planDir     string
-	planName    string
-	fileArgs    []string
-
-	// PR-scoped / commit-range review (issue #300).
-	prSpec    string // --pr <num|url>
-	rangeSpec string // --range <baseSHA>..<headSHA>
-	scopeSpec string // --scope layer | full-stack
-
-	// remoteFiles is the parsed --remote flag. When true, file content reads
-	// in PR/range mode go through `gh api` instead of local git.
-	remoteFiles bool
-
-	// workingTree is the parsed --working-tree flag. When true, the boot
-	// path skips stacked-PR / local-stack auto-detection.
-	workingTree bool
-}
-
-func parseServerFlags(args []string) serverFlagSet {
-	fs := flag.NewFlagSet("crit", flag.ExitOnError)
-	port := fs.Int("port", 0, "Port to listen on (default: random available port)")
-	fs.IntVar(port, "p", 0, "Port to listen on (shorthand)")
-	noOpen := fs.Bool("no-open", false, "Don't auto-open browser")
-	showVersion := fs.Bool("version", false, "Print version and exit")
-	fs.BoolVar(showVersion, "v", false, "Print version and exit (shorthand)")
-	shareURL := fs.String("share-url", "", "Base URL of hosted Crit service for sharing reviews (overrides CRIT_SHARE_URL env var)")
-	outputDir := fs.String("output", "", "Output directory for review file (default: repo root or file directory)")
-	fs.StringVar(outputDir, "o", "", "Output directory for review file (shorthand)")
-	quiet := fs.Bool("quiet", false, "Suppress status output")
-	fs.BoolVar(quiet, "q", false, "Suppress status output (shorthand)")
-	noIgnore := fs.Bool("no-ignore", false, "Disable all ignore patterns from config files")
-	baseBranch := fs.String("base-branch", "", "Base branch to diff against (overrides auto-detection)")
-	vcsFlag := fs.String("vcs", "", "VCS backend to use: git, sl/sapling (default: auto-detect)")
-	planDir := fs.String("plan-dir", "", "")
-	planName := fs.String("name", "", "")
-	prSpec := fs.String("pr", "", "Review a specific PR by number or URL (e.g. 295 or https://github.com/o/r/pull/295)")
-	rangeSpec := fs.String("range", "", "Review a commit range, base..head (e.g. abc1234..def5678)")
-	scopeSpec := fs.String("scope", "", "Diff scope when reviewing a PR: layer (default) or full-stack")
-	remoteFiles := fs.Bool("remote", false, "Read PR file content via GitHub API instead of local git (avoids `git fetch`; requires gh)")
-	workingTree := fs.Bool("working-tree", false, "Force working-tree mode (skip auto-detection of stacked PR / branch)")
-	fs.Usage = func() {
-		printHelp()
-	}
-	fs.Parse(args)
-
-	return serverFlagSet{
-		port:        *port,
-		noOpen:      *noOpen,
-		showVersion: *showVersion,
-		shareURL:    *shareURL,
-		outputDir:   *outputDir,
-		quiet:       *quiet,
-		noIgnore:    *noIgnore,
-		baseBranch:  *baseBranch,
-		vcsOverride: *vcsFlag,
-		planDir:     *planDir,
-		planName:    *planName,
-		fileArgs:    fs.Args(),
-		prSpec:      *prSpec,
-		rangeSpec:   *rangeSpec,
-		scopeSpec:   *scopeSpec,
-		remoteFiles: *remoteFiles,
-		workingTree: *workingTree,
-	}
-}
-
-func resolvePort(flagPort, cfgPort int) int {
-	if flagPort != 0 {
-		return flagPort
-	}
-	if envPort := os.Getenv("CRIT_PORT"); envPort != "" {
-		if p, err := strconv.Atoi(envPort); err == nil {
-			return p
-		}
-	}
-	return cfgPort
-}
-
-func applyConfigDefaults(sf *serverFlagSet, cfg Config) {
-	sf.port = resolvePort(sf.port, cfg.Port)
-	if !sf.noOpen && cfg.NoOpen {
-		sf.noOpen = true
-	}
-	sf.shareURL = resolveShareURL(sf.shareURL, cfg, "")
-	if !sf.quiet && cfg.Quiet {
-		sf.quiet = true
-	}
-	if sf.outputDir == "" && cfg.Output != "" {
-		sf.outputDir = cfg.Output
-	}
-	if sf.baseBranch == "" && cfg.BaseBranch != "" {
-		sf.baseBranch = cfg.BaseBranch
-	}
-	if sf.baseBranch != "" {
-		setDefaultBranchOverride(sf.baseBranch)
-	}
-}
-
-// resolveServerConfig parses flags, loads config files, and resolves the
-// final server configuration from all sources (CLI > env > config > defaults).
-// Returns nil when the command should exit early (e.g. --version).
-//
-//nolint:unparam // error return is future-proofing for config validation
-func resolveServerConfig(args []string) (*serverConfig, error) {
-	sf := parseServerFlags(args)
-
-	if sf.showVersion {
-		printVersion()
-		return nil, nil
-	}
-
-	configDir := ""
-	vcs := DetectVCS(sf.vcsOverride)
-	repoRoot := ""
-	if vcs != nil {
-		configDir, _ = vcs.RepoRoot()
-		repoRoot = configDir
-	}
-	if configDir == "" {
-		configDir, _ = os.Getwd()
-	}
-	cfg := LoadConfig(configDir)
-
-	applyConfigDefaults(&sf, cfg)
-
-	var ignorePatterns []string
-	if !sf.noIgnore {
-		ignorePatterns = cfg.IgnorePatterns
-	}
-
-	// Resolve --pr / --range / --scope into a Focus. nil = working-tree default.
-	focus, err := resolveFocus(sf.prSpec, sf.rangeSpec, sf.scopeSpec, sf.remoteFiles, vcs, repoRoot)
+// mustGetwd returns the current working directory or aborts the process with a
+// clear diagnostic. Used in CLI paths where every fallback (config dir, repo
+// root) has already failed; if we cannot read the cwd, we genuinely cannot
+// continue.
+func mustGetwd() string {
+	wd, err := os.Getwd()
 	if err != nil {
-		return nil, err
+		fmt.Fprintf(os.Stderr, "crit: unable to determine current working directory: %v\n", err)
+		os.Exit(1)
 	}
-
-	// --remote only takes effect in PR/range mode. Warn but don't fail.
-	if sf.remoteFiles && focus == nil {
-		fmt.Fprintln(os.Stderr, "Warning: --remote has no effect without --pr or --range; ignoring")
-	}
-
-	return &serverConfig{
-		port:               sf.port,
-		noOpen:             sf.noOpen,
-		quiet:              sf.quiet,
-		shareURL:           sf.shareURL,
-		authToken:          cfg.AuthToken,
-		outputDir:          sf.outputDir,
-		author:             cfg.Author,
-		baseBranch:         sf.baseBranch,
-		ignorePatterns:     ignorePatterns,
-		noIntegrationCheck: cfg.NoIntegrationCheck,
-		noUpdateCheck:      cfg.NoUpdateCheck,
-		agentCmd:           cfg.AgentCmd,
-		files:              sf.fileArgs,
-		planDir:            sf.planDir,
-		planName:           sf.planName,
-		vcsOverride:        resolveVCSOverride(sf.vcsOverride, cfg.VCS),
-		cfg:                cfg,
-		focus:              focus,
-		remoteFiles:        sf.remoteFiles,
-		workingTree:        sf.workingTree,
-	}, nil
-}
-
-// resolveVCSOverride returns the effective VCS override.
-// --vcs flag takes precedence over config "vcs" field.
-func resolveVCSOverride(flag, config string) string {
-	if flag != "" {
-		return flag
-	}
-	return config
-}
-
-func createSession(sc *serverConfig) (*Session, error) {
-	var session *Session
-	var err error
-	if len(sc.files) == 0 {
-		vcs := DetectVCS(sc.vcsOverride)
-		if vcs == nil {
-			return nil, fmt.Errorf("not in a version-controlled repository and no files specified")
-		}
-		if sc.baseBranch != "" {
-			vcs.SetDefaultBranchOverride(sc.baseBranch)
-		}
-		session, err = NewSessionFromVCS(vcs, sc.ignorePatterns)
-	} else {
-		session, err = NewSessionFromFiles(sc.files, sc.ignorePatterns)
-	}
-	if err != nil {
-		return nil, err
-	}
-	// Apply --base-branch override to the session's VCS instance. This covers
-	// files mode where resolveGitContext creates a fresh VCS that doesn't have
-	// the override yet. For Sapling, the instance-level field must be set.
-	if sc.baseBranch != "" && session.VCS != nil {
-		session.VCS.SetDefaultBranchOverride(sc.baseBranch)
-	}
-	// Set ReviewFilePath before loadCritJSON so it reads from the centralized
-	// review file.
-	if sc.reviewPath != "" {
-		session.ReviewFilePath = sc.reviewPath
-		session.loadCritJSON()
-	}
-	return session, nil
-}
-
-func applySessionOverrides(session *Session, sc *serverConfig) {
-	if sc.planDir != "" {
-		applyPlanOverrides(session, sc.planDir, sc.planName)
-		for _, f := range session.Files {
-			f.Comments = []Comment{}
-		}
-		session.reviewComments = nil
-		session.loadCritJSON()
-	}
-	if sc.outputDir != "" {
-		abs, _ := filepath.Abs(sc.outputDir)
-		session.OutputDir = abs
-	}
-	// Auto-detect stacked PR / local branch stack when no explicit focus
-	// was requested. Best-effort — any failure falls through to working-tree
-	// mode. Skipped in file mode or by --working-tree.
-	if sc.focus == nil && !sc.workingTree && len(sc.files) == 0 {
-		if detected := autoDetectStackedFocus(session.VCS, session.RepoRoot); detected != nil {
-			sc.focus = detected
-		}
-	}
-	// Apply --pr / --range focus, if requested. SetFocus rebuilds the file
-	// list from the SHA range and persists ActiveDiffScope; failure leaves
-	// the working-tree state intact and reports via stderr.
-	if sc.focus != nil {
-		// Set RemoteFiles BEFORE SetFocus so the focus rebuild's file content
-		// reads route through the API path instead of local git.
-		session.RemoteFiles = sc.remoteFiles
-		if err := session.SetFocus(*sc.focus); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to apply focus: %v\n", err)
-			return
-		}
-	}
-}
-
-func bindListener(port int) (net.Listener, error) {
-	var listener net.Listener
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		listener, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err == nil {
-			return listener, nil
-		}
-		if port == 0 {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return nil, err
-}
-
-func serveSessionKey(sc *serverConfig) string {
-	cwd, _ := resolvedCWD()
-	if sc.planDir != "" {
-		return planSessionKey(cwd, sc.planName)
-	}
-	branch := ""
-	if vcs := DetectVCS(sc.vcsOverride); vcs != nil {
-		branch = vcs.CurrentBranch()
-	}
-	return sessionKey(cwd, branch, focusKeyArgs(sc))
-}
-
-func checkStaleIntegrations(sc *serverConfig, srv *Server, cwd string) {
-	if sc.noIntegrationCheck || os.Getenv("CRIT_NO_INTEGRATION_CHECK") != "" {
-		return
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		stale := checkInstalledIntegrations(cwd, home)
-		srv.staleIntegrations = stale
-		if len(stale) > 0 {
-			go printStaleWarnings(stale)
-		}
-	}
-}
-
-func runIdleTimeoutChecker(ctx context.Context, stop context.CancelFunc, idleMu *sync.Mutex, lastActivity *time.Time) {
-	const idleTimeout = 1 * time.Hour
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			idleMu.Lock()
-			idle := time.Since(*lastActivity)
-			idleMu.Unlock()
-			if idle >= idleTimeout {
-				stop()
-				return
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func runServe(args []string) {
-	pipe := openReadyPipe()
-
-	sc, err := resolveServerConfig(args)
-	if err != nil {
-		daemonFatal(pipe, "Error: %v", err)
-	}
-	if sc == nil {
-		return
-	}
-	sc.quiet = true
-
-	listener, err := bindListener(sc.port)
-	if err != nil {
-		daemonFatal(pipe, "Error starting server: %v", err)
-	}
-	addr := listener.Addr().(*net.TCPAddr)
-
-	srv, err := NewServer(nil, frontendFS, sc.shareURL, sc.authToken, sc.author, version, addr.Port, sc.agentCmd)
-	if err != nil {
-		daemonFatal(pipe, "Error creating server: %v", err)
-	}
-
-	// Set config-dependent fields for the settings panel
-	srv.cfg = sc.cfg
-	cwd, _ := resolvedCWD()
-	srv.projectDir = cwd
-	if home, err := os.UserHomeDir(); err == nil {
-		srv.homeDir = home
-	}
-	key := serveSessionKey(sc)
-	branch := ""
-	if vcs := DetectVCS(sc.vcsOverride); vcs != nil {
-		branch = vcs.CurrentBranch()
-	}
-	if sc.outputDir != "" {
-		abs, _ := filepath.Abs(sc.outputDir)
-		sc.reviewPath = filepath.Join(abs, ".crit.json")
-	} else {
-		sc.reviewPath, _ = reviewFilePath(key)
-	}
-	srv.reviewPath = sc.reviewPath
-	srv.cliArgs = sc.files
-	if err := writeSessionFile(key, sessionEntry{
-		PID:        os.Getpid(),
-		Port:       addr.Port,
-		CWD:        cwd,
-		Args:       sc.files,
-		Branch:     branch,
-		ReviewPath: sc.reviewPath,
-		StartedAt:  time.Now().UTC().Format(time.RFC3339),
-	}); err != nil {
-		daemonFatal(pipe, "Error writing session file: %v", err)
-	}
-
-	var idleMu sync.Mutex
-	lastActivity := time.Now()
-	resetActivity := func() {
-		idleMu.Lock()
-		lastActivity = time.Now()
-		idleMu.Unlock()
-	}
-
-	httpServer := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			resetActivity()
-			srv.ServeHTTP(w, r)
-		}),
-		ReadTimeout: 15 * time.Second,
-		IdleTimeout: 60 * time.Second,
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
-
-	go func() {
-		if err := httpServer.Serve(listener); err != http.ErrServerClosed {
-			log.Printf("Server error: %v", err)
-			stop()
-		}
-	}()
-
-	signalReadiness(pipe, addr.Port)
-
-	if !sc.noOpen {
-		go openBrowser(fmt.Sprintf("http://localhost:%d", addr.Port))
-	}
-
-	// Prime the open-PR cache in the background. `gh pr list` can take
-	// 2-5s on large orgs and the picker waits on it; running this during
-	// boot means the first /api/picker call lands on a warm cache instead
-	// of paying the network cost while the user watches the page render.
-	// Best-effort — failures (no gh, no remote, file mode) are silently
-	// dropped; the picker handler still degrades gracefully. Tied to the
-	// daemon's shutdown ctx so a Ctrl+C during boot terminates the gh
-	// subprocess instead of orphaning it.
-	if srv.prList != nil {
-		go func() { _, _ = srv.prList.getCtx(ctx) }()
-	}
-
-	go runIdleTimeoutChecker(ctx, stop, &idleMu, &lastActivity)
-
-	type sessionResult struct {
-		session *Session
-		err     error
-	}
-	ch := make(chan sessionResult, 1)
-	// NOTE: On timeout, the createSession goroutine will leak until its git
-	// operations finish (no context is threaded into the git calls). This is
-	// acceptable because the timeout path sets initErr, which triggers a full
-	// server shutdown and process exit shortly after, cleaning up all goroutines.
-	go func() {
-		s, err := createSession(sc)
-		ch <- sessionResult{s, err}
-	}()
-
-	var session *Session
-	var initErr error
-	select {
-	case res := <-ch:
-		session, initErr = res.session, res.err
-	case <-time.After(2 * time.Minute):
-		initErr = fmt.Errorf("session initialization timed out after 2 minutes")
-	}
-	if initErr != nil {
-		log.Printf("Error: %v", initErr)
-		srv.SetInitErr(initErr)
-		<-ctx.Done()
-		removeSessionFile(key)
-		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = httpServer.Shutdown(shutCtx)
-		return
-	}
-	applySessionOverrides(session, sc)
-	session.CLIArgs = sc.files
-
-	checkStaleIntegrations(sc, srv, cwd)
-
-	if !sc.noUpdateCheck && os.Getenv("CRIT_NO_UPDATE_CHECK") == "" {
-		go srv.CheckForUpdates()
-	}
-	srv.SetSession(session)
-
-	if session.Mode == "git" {
-		go func() {
-			if prInfo := detectPRInfo(); prInfo != nil {
-				srv.SetPRInfo(prInfo)
-			}
-		}()
-	}
-
-	watchStop := make(chan struct{})
-	go session.Watch(watchStop)
-
-	<-ctx.Done()
-	close(watchStop)
-
-	removeSessionFile(key)
-	session.Shutdown()
-	session.WriteFiles()
-
-	if session.ReviewFilePath != "" {
-		fmt.Fprintf(os.Stderr, "Review file: %s\n", session.ReviewFilePath)
-	}
-
-	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = httpServer.Shutdown(shutCtx)
+	return wd
 }
 
 func runStatus(args []string) {
@@ -2354,12 +2247,11 @@ func runStatus(args []string) {
 		branch = vcs.CurrentBranch()
 	}
 
-	sessions, keys := listSessionsForCWD(cwd)
+	sessions, _ := listSessionsForCWD(cwd)
 	var matchedSession *sessionEntry
 	for i, s := range sessions {
 		if s.Branch == branch || (branch == "" && len(sessions) == 1) {
 			matchedSession = &sessions[i]
-			_ = keys[i]
 			break
 		}
 	}
@@ -2373,7 +2265,7 @@ func runStatus(args []string) {
 	}
 
 	revExists := false
-	if _, statErr := os.Stat(revPath); statErr == nil {
+	if _, statErr := os.Stat(reviewPathsFor(revPath).Review); statErr == nil {
 		revExists = true
 	}
 
@@ -2389,7 +2281,7 @@ func printStatusJSON(vcsName, branch, revPath string, revExists bool, session *s
 	result := map[string]interface{}{
 		"vcs":                vcsName,
 		"branch":             branch,
-		"review_file":        revPath,
+		"review_file":        reviewPathsFor(revPath).Review,
 		"review_file_exists": revExists,
 	}
 	daemon := map[string]interface{}{"running": false}
@@ -2409,7 +2301,7 @@ func printStatusJSON(vcsName, branch, revPath string, revExists bool, session *s
 }
 
 func addReviewStats(result map[string]interface{}, revPath string) {
-	data, err := os.ReadFile(revPath)
+	data, err := os.ReadFile(reviewPathsFor(revPath).Review)
 	if err != nil {
 		return
 	}
@@ -2432,7 +2324,7 @@ func printStatusHuman(vcsName, branch, revPath string, revExists bool, session *
 	if branch != "" {
 		fmt.Printf("Branch:      %s\n", branch)
 	}
-	fmt.Printf("Review file: %s\n", revPath)
+	fmt.Printf("Review file: %s\n", reviewPathsFor(revPath).Review)
 	if session != nil {
 		fmt.Printf("Daemon:      running (PID %d, port %d)\n", session.PID, session.Port)
 	} else {
@@ -2441,7 +2333,7 @@ func printStatusHuman(vcsName, branch, revPath string, revExists bool, session *
 	if !revExists {
 		return
 	}
-	data, err := os.ReadFile(revPath)
+	data, err := os.ReadFile(reviewPathsFor(revPath).Review)
 	if err != nil {
 		return
 	}
@@ -2553,10 +2445,30 @@ func findStaleReviews(revDir string, days int) []staleReview {
 
 	var stale []staleReview
 	for _, de := range entries {
-		if !strings.HasSuffix(de.Name(), ".json") {
+		name := de.Name()
+
+		if de.IsDir() {
+			// MIGRATION-REMOVAL: pre-fix early-v4 folders kept a stray .json
+			// extension on the folder name. Strip it for the session-key
+			// lookup; the standard load path will rename the folder on access.
+			key := strings.TrimSuffix(name, ".json")
+			if activeSessions[key] {
+				continue
+			}
+			if sr, ok := checkStaleReviewFolder(revDir, de, key, cutoff); ok {
+				stale = append(stale, sr)
+			}
 			continue
 		}
-		key := strings.TrimSuffix(de.Name(), ".json")
+
+		// MIGRATION-REMOVAL: legacy v3 flat *.json file. Treat as a stale
+		// candidate so cleanup wipes it (and any sibling sidecar) the next
+		// time crit runs. After the migration removal release this branch
+		// goes away.
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		key := strings.TrimSuffix(name, ".json")
 		if activeSessions[key] {
 			continue
 		}
@@ -2565,6 +2477,70 @@ func findStaleReviews(revDir string, days int) []staleReview {
 		}
 	}
 	return stale
+}
+
+// checkStaleReviewFolder evaluates a directory entry inside the reviews dir.
+// It is a v4-native staleness check for folder-form reviews. Three possible
+// outcomes:
+//
+//  1. The folder contains review.json: read it, parse UpdatedAt, fall back
+//     to file mtime if missing. Stale if the timestamp is before cutoff.
+//  2. The folder lacks review.json but contains snapshots.json: it's an
+//     orphan-snapshots folder (e.g. a crashed migration or a deleted review
+//     left behind a sidecar). Stale if folder mtime is before cutoff.
+//  3. Empty / unrecognized contents: skip.
+func checkStaleReviewFolder(revDir string, de os.DirEntry, key string, cutoff time.Time) (staleReview, bool) {
+	folder := filepath.Join(revDir, de.Name())
+	reviewPath := filepath.Join(folder, "review.json")
+
+	if data, readErr := os.ReadFile(reviewPath); readErr == nil {
+		var cj CritJSON
+		var updatedAt time.Time
+		var branch string
+		var commentCount int
+		if json.Unmarshal(data, &cj) == nil {
+			branch = cj.Branch
+			if t, parseErr := time.Parse(time.RFC3339, cj.UpdatedAt); parseErr == nil {
+				updatedAt = t
+			}
+			for _, f := range cj.Files {
+				commentCount += len(f.Comments)
+			}
+			commentCount += len(cj.ReviewComments)
+		}
+		if updatedAt.IsZero() {
+			if info, statErr := os.Stat(reviewPath); statErr == nil {
+				updatedAt = info.ModTime()
+			}
+		}
+		if !updatedAt.Before(cutoff) {
+			return staleReview{}, false
+		}
+		return staleReview{
+			key:      key,
+			path:     folder,
+			branch:   branch,
+			age:      time.Since(updatedAt),
+			comments: commentCount,
+		}, true
+	}
+
+	// review.json missing — check for orphan snapshots folder.
+	if _, err := os.Stat(filepath.Join(folder, "snapshots.json")); err != nil {
+		return staleReview{}, false
+	}
+	info, err := de.Info()
+	if err != nil {
+		return staleReview{}, false
+	}
+	if !info.ModTime().Before(cutoff) {
+		return staleReview{}, false
+	}
+	return staleReview{
+		key:  key,
+		path: folder,
+		age:  time.Since(info.ModTime()),
+	}, true
 }
 
 func buildActiveSessionSet() map[string]bool {
@@ -2634,8 +2610,8 @@ func deleteStaleReviews(stale []staleReview) int {
 	sessDir, _ := sessionsDir()
 	deleted := 0
 	for _, s := range stale {
-		if err := os.Remove(s.path); err != nil {
-			fmt.Fprintf(os.Stderr, "Error deleting %s: %v\n", s.path, err)
+		if !removeStaleReviewPath(s.path) {
+			fmt.Fprintf(os.Stderr, "Error deleting %s: directory not empty or path missing\n", s.path)
 			continue
 		}
 		deleted++
@@ -2646,467 +2622,4 @@ func deleteStaleReviews(stale []staleReview) int {
 		}
 	}
 	return deleted
-}
-
-func printHelp() {
-	fmt.Fprintf(os.Stderr, `crit — inline code review for AI agent workflows
-
-Usage:
-  crit                                       Auto-detect changed files via git
-  crit <file|dir> [...]                      Review specific files or directories
-  crit --pr <num|url>                        Review a GitHub pull request (range mode)
-  crit pr <num|url>                          Review a GitHub pull request (alias for --pr)
-  crit --range <baseSHA>..<headSHA>          Review a commit range (range mode)
-  crit stop [files...]                       Stop the daemon for current directory (and args)
-  crit stop --all                            Stop all daemons for current directory
-  crit comment <path>:<line[-end]> <body>    Add a review comment
-  crit comment --reply-to <id> [--resolve] [--author <name>] <body>  Reply to a comment
-  crit comment --json [--author <name>] [--output <dir>]    Read comments from stdin as JSON
-  crit comment --clear                       Remove all comments from the review file
-  crit share <file> [file...]                Share files to crit-web and print the URL
-  crit fetch [--output <dir>]               Fetch comments from crit-web into the review file
-  crit unpublish                             Remove a shared review from crit-web
-  crit pull [--output <dir>] [pr-number]     Fetch GitHub PR comments into the review file
-  crit push [--dry-run] [--event <type>] [-m <msg>] [-o <dir>] [pr-number]  Post review comments to a GitHub PR
-  crit plan --name <slug> <file>             Review a plan file (manages versioned copies)
-  crit plan --name <slug>                    Read plan from stdin
-  crit auth login                            Log in to crit-web via browser
-  crit auth logout                           Log out and revoke token
-  crit auth whoami                           Show current user info
-  crit install <agent> [--global]            Install integration files for an AI coding tool (--global: user-wide)
-  crit status [--json]                        Print session info (review file, daemon, comments)
-  crit cleanup [--days N] [--force]           Delete stale review files (default: 7 days)
-  crit check                                 Check if installed integrations are up to date
-  crit config [--generate]                    Show resolved configuration
-  crit help                                  Show this help message
-
-  Agents:
-    claude-code, cursor, opencode, windsurf, github-copilot, cline, all
-
-Options:
-  -p, --port <port>           Port to listen on (default: random)
-  -o, --output <dir>          Output directory for review file
-      --no-open               Don't auto-open browser
-      --no-ignore             Disable all file ignore patterns
-  -q, --quiet                 Suppress status output
-      --share-url <url>       Share service URL (e.g. https://crit.md or self-hosted)
-      --base-branch <branch>  Base branch to diff against (overrides auto-detection)
-      --working-tree          Force working-tree mode (skip auto-detection of stacked PR / branch)
-      --scope <mode>          Diff scope when reviewing a PR: layer (default) or full-stack
-      --remote                Read PR file content via GitHub API instead of local git (requires gh)
-      --qr                    Print QR code of share URL (with crit share)
-  -v, --version               Print version
-
-Environment:
-  CRIT_SHARE_URL              Override the share service URL
-  CRIT_PORT                   Override the default port
-  CRIT_NO_UPDATE_CHECK        Disable update check on startup
-  CRIT_AUTH_TOKEN              Override the auth token (skip login)
-  CRIT_NO_INTEGRATION_CHECK   Disable integration staleness check
-
-Configuration:
-  Global config:   ~/.crit.config.json
-  Project config:  .crit.config.json (in repo root)
-  agent_cmd        Shell command to send comments to an AI agent (e.g. "claude -p")
-  Run 'crit config' to see resolved configuration.
-
-Learn more: https://crit.md
-`)
-}
-
-func printConfigHelp() {
-	fmt.Fprintf(os.Stderr, `crit config — show resolved configuration
-
-Prints the merged configuration from global and project config files as JSON.
-CLI flags and environment variables are not reflected in this output.
-
-Config files:
-  ~/.crit.config.json          Global config (applies to all projects)
-  .crit.config.json            Project config (in repo root)
-
-Precedence (highest to lowest):
-  1. CLI flags / env vars
-  2. Project config
-  3. Global config
-  4. Built-in defaults
-
-Available keys:
-  port              int       Port to listen on (default: random)
-  no_open           bool      Don't auto-open browser (default: false)
-  share_url         string    Share service URL
-  quiet             bool      Suppress status output (default: false)
-  output            string    Output directory for review file
-  author            string    Your name for comments (default: git config user.name)
-  base_branch       string    Base branch to diff against (overrides auto-detection)
-  ignore_patterns        []string  Gitignore-style patterns to exclude files from review
-  no_integration_check   bool      Skip integration staleness check (default: false)
-  agent_cmd              string    Shell command to send comments to an AI agent (e.g. "claude -p")
-  auth_token             string    Authentication token for crit-web share service
-
-Note: agent_cmd and auth_token are global-only (~/.crit.config.json).
-Project-level .crit.config.json cannot override them for security reasons.
-
-Ignore pattern syntax:
-  *.lock            Match files by extension (anywhere in tree)
-  vendor/           Match all files under a directory
-  package-lock.json Match exact filename (anywhere in tree)
-  generated/*.pb.go Match with path prefix (filepath.Match syntax)
-
-Example config:
-  {
-    "port": 3456,
-    "share_url": "https://crit.md",
-    "ignore_patterns": ["*.lock", "*.min.js", "vendor/", "generated/"]
-  }
-`)
-}
-
-func printVersion() {
-	line := "crit " + version
-	var details []string
-	if date != "unknown" {
-		details = append(details, date)
-	}
-	if commit != "unknown" {
-		short := commit
-		if len(short) > 7 {
-			short = short[:7]
-		}
-		details = append(details, short)
-	}
-	if len(details) > 0 {
-		line += " (" + strings.Join(details, ", ") + ")"
-	}
-	fmt.Println(line)
-	fmt.Println("Inline code review for AI agent workflows")
-}
-
-// globalDestKind selects how an integration's globalDest is interpreted.
-type globalDestKind int
-
-const (
-	// globalDestNone means the integration has no separate global path —
-	// use dest joined to home (the default for global installs).
-	globalDestNone globalDestKind = iota
-	// globalDestRelHome: globalDest is relative to $HOME.
-	globalDestRelHome
-	// globalDestDocuments: globalDest is relative to the platform Documents
-	// directory (used by Cline).
-	globalDestDocuments
-	// globalDestAbsolute: globalDest is an absolute path used verbatim.
-	globalDestAbsolute
-)
-
-type integration struct {
-	source string // path inside integrations/ embed
-	dest   string // destination relative to cwd
-	hint   string // usage hint printed after install
-	// globalDest, when set together with a non-zero globalDestKind, overrides
-	// dest in global mode (cwd == $HOME). The kind determines how it's
-	// resolved (see globalDestKind).
-	globalDest     string
-	globalDestKind globalDestKind
-}
-
-var integrationMap = map[string][]integration{
-	"claude-code": {
-		{source: "integrations/claude-code/skills/crit/SKILL.md", dest: ".claude/skills/crit/SKILL.md", hint: "Run /crit in Claude Code to start a review loop"},
-		{source: "integrations/claude-code/skills/crit-cli/SKILL.md", dest: ".claude/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Claude Code agents when needed"},
-	},
-	"cursor": {
-		{source: "integrations/cursor/skills/crit/SKILL.md", dest: ".cursor/skills/crit/SKILL.md", hint: "Run /crit in Cursor to start a review loop"},
-		{source: "integrations/cursor/skills/crit-cli/SKILL.md", dest: ".cursor/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Cursor agents when needed"},
-	},
-	"opencode": {
-		// command stays at ~/.opencode/commands/ globally (works there)
-		{source: "integrations/opencode/crit.md", dest: ".opencode/commands/crit.md", hint: "Run /crit in OpenCode to start a review loop"},
-		// opencode does NOT read ~/.opencode/skills/ globally — redirect to ~/.agents/skills/
-		{source: "integrations/opencode/SKILL.md", dest: ".opencode/skills/crit/SKILL.md", globalDest: ".agents/skills/crit/SKILL.md", globalDestKind: globalDestRelHome, hint: "The crit skill is available to OpenCode agents when needed"},
-	},
-	"windsurf": {
-		// windsurf has no per-tool global rules dir — global install rejected in installIntegration.
-		{source: "integrations/windsurf/crit.md", dest: ".windsurf/rules/crit.md", hint: "Windsurf will suggest Crit when writing plans"},
-	},
-	"github-copilot": {
-		// Copilot does NOT read ~/.github/skills/ globally — redirect to ~/.agents/skills/
-		{source: "integrations/github-copilot/skills/crit/SKILL.md", dest: ".github/skills/crit/SKILL.md", globalDest: ".agents/skills/crit/SKILL.md", globalDestKind: globalDestRelHome, hint: "Run /crit in GitHub Copilot to start a review loop"},
-		{source: "integrations/github-copilot/skills/crit-cli/SKILL.md", dest: ".github/skills/crit-cli/SKILL.md", globalDest: ".agents/skills/crit-cli/SKILL.md", globalDestKind: globalDestRelHome, hint: "The crit-cli skill is available to GitHub Copilot agents when needed"},
-	},
-	"cline": {
-		// Cline does NOT read ~/.clinerules/ globally — redirect to platform Documents dir.
-		{source: "integrations/cline/crit.md", dest: ".clinerules/crit.md", globalDest: "Cline/Rules/crit.md", globalDestKind: globalDestDocuments, hint: "Cline will suggest Crit when writing plans"},
-	},
-	"codex": {
-		{source: "integrations/codex/skills/crit/SKILL.md", dest: ".agents/skills/crit/SKILL.md", hint: "Use $crit in Codex to start a review loop"},
-		{source: "integrations/codex/skills/crit-cli/SKILL.md", dest: ".agents/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Codex agents when needed"},
-	},
-}
-
-// availableIntegrations returns the sorted list of integration names that
-// `crit install <name>` accepts. Derived from integrationMap keys plus the
-// special-cased "aider" entry (which does not live in the map because its
-// install flow is bespoke — see installAider).
-func availableIntegrations() []string {
-	names := make([]string, 0, len(integrationMap)+1)
-	for name := range integrationMap {
-		names = append(names, name)
-	}
-	names = append(names, "aider")
-	sort.Strings(names)
-	return names
-}
-
-// isGlobalInstall reports whether the install should be treated as global
-// (user-wide) rather than project-scoped. True when cwd == $HOME.
-func isGlobalInstall(cwd, home string) bool {
-	if cwd == "" || home == "" {
-		return false
-	}
-	a, errA := filepath.Abs(cwd)
-	b, errB := filepath.Abs(home)
-	if errA != nil || errB != nil {
-		return cwd == home
-	}
-	return a == b
-}
-
-// resolveGlobalDest expands an integration's globalDest into an absolute
-// path according to its globalDestKind.
-func resolveGlobalDest(kind globalDestKind, globalDest, home string) (string, error) {
-	switch kind {
-	case globalDestAbsolute:
-		return globalDest, nil
-	case globalDestDocuments:
-		return filepath.Join(documentsDir(home), globalDest), nil
-	case globalDestRelHome, globalDestNone:
-		if filepath.IsAbs(globalDest) {
-			return globalDest, nil
-		}
-		return filepath.Join(home, globalDest), nil
-	default:
-		return "", fmt.Errorf("unknown globalDestKind %d", kind)
-	}
-}
-
-// xdgUserDirFn is the seam used by documentsDir to query xdg-user-dir.
-// Tests override this; production code uses the default that shells out.
-var xdgUserDirFn = xdgUserDir
-
-// documentsDir returns the platform Documents directory for the current user.
-//
-//	macOS:   $HOME/Documents
-//	Linux:   $(xdg-user-dir DOCUMENTS), falling back to $HOME/Documents.
-//	         If xdg-user-dir returns $HOME (its documented behavior when
-//	         user-dirs.dirs is missing), we treat that as "no answer" and
-//	         fall back to $HOME/Documents to avoid polluting the home dir.
-//	Windows: filepath.Join(home, "Documents") — the real MyDocuments folder
-//	         can differ; querying FOLDERID_Documents needs x/sys/windows.
-//	         The $USERPROFILE\Documents convention is a pragmatic default.
-func documentsDir(home string) string {
-	if runtime.GOOS == "linux" {
-		path, err := xdgUserDirFn("DOCUMENTS")
-		if err == nil && path != "" && path != home {
-			return path
-		}
-	}
-	return filepath.Join(home, "Documents")
-}
-
-// xdgUserDir shells out to the xdg-user-dir binary to query a user dir.
-// Returns ("", error) if the binary is missing or returns non-zero. The
-// returned path is whitespace-trimmed; it may equal $HOME when the spec
-// says no user-dirs.dirs entry exists — callers must handle that case.
-func xdgUserDir(name string) (string, error) {
-	out, err := exec.Command("xdg-user-dir", name).Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// installIntegration installs the named agent integration. It returns an
-// error suitable for printing to stderr; callers decide whether to exit or
-// continue (the `install all` loop continues past per-agent failures).
-func installIntegration(name string, force bool) error {
-	if name == "aider" {
-		return installAider(force)
-	}
-
-	files, ok := integrationMap[name]
-	if !ok {
-		var b strings.Builder
-		fmt.Fprintf(&b, "unknown agent: %s\n\nAvailable agents:\n", name)
-		for _, a := range availableIntegrations() {
-			fmt.Fprintf(&b, "  %s\n", a)
-		}
-		return errors.New(strings.TrimRight(b.String(), "\n"))
-	}
-
-	cwd, _ := os.Getwd()
-	home, _ := os.UserHomeDir()
-	global := isGlobalInstall(cwd, home)
-
-	if name == "windsurf" && global {
-		return errors.New("windsurf does not support a global per-tool install. " +
-			"Windsurf only loads a single ~/.codeium/windsurf/memories/global_rules.md (6k char cap), " +
-			"not a per-tool rules directory. Run `crit install windsurf` from a project directory " +
-			"instead, which writes .windsurf/rules/crit.md (workspace-scoped)")
-	}
-
-	var hints []string
-	for _, f := range files {
-		dest := destFor(f, global, home, name)
-		installOneFile(f, dest, force)
-		if f.hint != "" {
-			hints = append(hints, f.hint)
-		}
-	}
-	printUniqueHints(hints)
-	fmt.Println()
-	return nil
-}
-
-// destFor returns the destination path for an integration file, accounting
-// for global vs project install mode.
-func destFor(f integration, global bool, home, name string) string {
-	if global && f.globalDest != "" {
-		resolved, err := resolveGlobalDest(f.globalDestKind, f.globalDest, home)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error resolving global destination for %s: %v\n", name, err)
-			os.Exit(1)
-		}
-		return resolved
-	}
-	return f.dest
-}
-
-// installOneFile copies a single embedded integration file to dest, skipping
-// if it already exists (unless force is set). Exits on I/O errors.
-func installOneFile(f integration, dest string, force bool) {
-	if !force {
-		if _, err := os.Stat(dest); err == nil {
-			fmt.Printf("  Skipped:   %s (already exists, use --force to overwrite)\n", dest)
-			return
-		}
-	}
-	data, err := integrationsFS.ReadFile(f.source)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading embedded file %s: %v\n", f.source, err)
-		os.Exit(1)
-	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", filepath.Dir(dest), err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(dest, data, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", dest, err)
-		os.Exit(1)
-	}
-	fmt.Printf("  Installed: %s\n", dest)
-}
-
-// printUniqueHints prints each hint once, in the order it first appeared.
-func printUniqueHints(hints []string) {
-	seen := make(map[string]bool)
-	for _, hint := range hints {
-		if seen[hint] {
-			continue
-		}
-		seen[hint] = true
-		fmt.Printf("  %s\n", hint)
-	}
-}
-
-func openBrowser(url string) {
-	time.Sleep(200 * time.Millisecond)
-	if tryOpenBrowser(browserCommandSpecs(runtime.GOOS, url, systemIsWSL(), commandExists), runBrowserCommand) {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "Warning: could not open browser automatically; open %s manually\n", url)
-}
-
-type browserCommandSpec struct {
-	name string
-	args []string
-}
-
-func tryOpenBrowser(specs []browserCommandSpec, run func(browserCommandSpec) error) bool {
-	for _, spec := range specs {
-		if err := run(spec); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-func runBrowserCommand(spec browserCommandSpec) error {
-	return exec.Command(spec.name, spec.args...).Run()
-}
-
-func browserCommandSpecs(goos, url string, isWSL bool, hasCommand func(string) bool) []browserCommandSpec {
-	switch goos {
-	case "darwin":
-		return []browserCommandSpec{{name: "open", args: []string{url}}}
-	case "linux":
-		var specs []browserCommandSpec
-		if isWSL {
-			if hasCommand("wslview") {
-				specs = append(specs, browserCommandSpec{name: "wslview", args: []string{url}})
-			}
-			if hasCommand("powershell.exe") {
-				specs = append(specs, browserCommandSpec{
-					name: "powershell.exe",
-					args: []string{
-						"-NoProfile",
-						"-NonInteractive",
-						"-Command",
-						"Start-Process " + powershellSingleQuote(url),
-					},
-				})
-			}
-			if hasCommand("cmd.exe") {
-				specs = append(specs, browserCommandSpec{
-					name: "cmd.exe",
-					args: []string{"/c", `start "" ` + cmdDoubleQuote(url)},
-				})
-			}
-		}
-		if hasCommand("xdg-open") {
-			specs = append(specs, browserCommandSpec{name: "xdg-open", args: []string{url}})
-		}
-		return specs
-	default:
-		return nil
-	}
-}
-
-func powershellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
-func cmdDoubleQuote(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-}
-
-func systemIsWSL() bool {
-	versionData, err := os.ReadFile("/proc/version")
-	if err != nil {
-		versionData = nil
-	}
-	return looksLikeWSL(runtime.GOOS, os.Getenv("WSL_DISTRO_NAME"), os.Getenv("WSL_INTEROP"), string(versionData))
-}
-
-func looksLikeWSL(goos, distroName, interop, procVersion string) bool {
-	if goos != "linux" {
-		return false
-	}
-	if distroName != "" || interop != "" {
-		return true
-	}
-	return strings.Contains(strings.ToLower(procVersion), "microsoft")
-}
-
-func commandExists(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
 }

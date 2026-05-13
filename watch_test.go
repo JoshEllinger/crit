@@ -146,12 +146,17 @@ func TestWatchFileMtimes_ConcurrentAddDuringChange(t *testing.T) {
 // skips it, leaving only the new carried-forward copy.
 func TestCarryForwardAllComments_NoDuplicateOnDisk(t *testing.T) {
 	dir := t.TempDir()
-	reviewPath := filepath.Join(dir, "review.json")
+	// v4 folder layout: identity is a folder, review.json lives inside.
+	// Using a flat-file identity worked by accident on POSIX (write failed
+	// silently, leaving the pre-seeded flat file intact) but fails on Windows
+	// where MkdirAll on a path-component-that-is-a-file errors differently.
+	identity := filepath.Join(dir, ".crit")
+	reviewPath := filepath.Join(identity, "review.json")
 
 	s := &Session{
 		Mode:           "git",
 		RepoRoot:       dir,
-		ReviewFilePath: reviewPath,
+		ReviewFilePath: identity,
 		Files: []*FileEntry{
 			{
 				Path:     "main.go",
@@ -210,6 +215,9 @@ func TestCarryForwardAllComments_NoDuplicateOnDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(identity, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(reviewPath, data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -254,14 +262,16 @@ func TestCarryForwardAllComments_NoDuplicateOnDisk(t *testing.T) {
 
 func TestCarryForwardComments_NoDuplicateOnDisk(t *testing.T) {
 	dir := t.TempDir()
-	reviewPath := filepath.Join(dir, "review.json")
+	// v4 folder layout: identity is a folder, review.json lives inside.
+	identity := filepath.Join(dir, ".crit")
+	reviewPath := filepath.Join(identity, "review.json")
 	mdPath := filepath.Join(dir, "plan.md")
 	os.WriteFile(mdPath, []byte("# Plan\n\nStep 1\n\nStep 2\n"), 0644)
 
 	s := &Session{
 		Mode:           "files",
 		RepoRoot:       dir,
-		ReviewFilePath: reviewPath,
+		ReviewFilePath: identity,
 		Files: []*FileEntry{
 			{
 				Path:            "plan.md",
@@ -311,6 +321,9 @@ func TestCarryForwardComments_NoDuplicateOnDisk(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(oldCJ, "", "  ")
+	if err := os.MkdirAll(identity, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	os.WriteFile(reviewPath, data, 0644)
 
 	// Run markdown carry-forward.
@@ -401,10 +414,10 @@ func TestWatchGit_SkipsGitStatusWhenNotWaiting(t *testing.T) {
 	dir := initTestRepo(t)
 
 	// Create a feature branch so we have a known base
-	runGit(t, dir, "checkout", "-b", "feat")
+	gitT(t, dir, "checkout", "-b", "feat")
 	writeFile(t, filepath.Join(dir, "file.go"), "package main\n")
-	runGit(t, dir, "add", "file.go")
-	runGit(t, dir, "commit", "-m", "add file")
+	gitT(t, dir, "add", "file.go")
+	gitT(t, dir, "commit", "-m", "add file")
 
 	s := &Session{
 		Mode:        "git",
@@ -497,7 +510,7 @@ func TestRestoreOrphanedComments(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(critPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(critPath, data, 0o644); err != nil {
+	if err := os.WriteFile(mustMkdirAll(reviewPathsFor(critPath).Review), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -639,6 +652,89 @@ func TestCarryForward_AnchorDrifted(t *testing.T) {
 	carried := s.Files[0].Comments[0]
 	if !carried.Drifted {
 		t.Error("expected Drifted=true when anchor is not found")
+	}
+}
+
+func TestCarryForward_AnchorEditedInPlaceNotDrifted(t *testing.T) {
+	// Old anchor is a clean prefix of the new line — text appended in place.
+	// LCS maps the line to the same position, but exact match fails.
+	// Should be treated as anchored, not drifted.
+	dir := t.TempDir()
+	mdPath := filepath.Join(dir, "plan.md")
+	oldContent := "# Plan\n\n- Don't create a group for just 1 commit — merge it into the closest group\n"
+	newContent := "# Plan\n\n- Don't create a group for just 1 commit — merge it into the closest group (unless it's a single significant feature that warrants its own callout)\n"
+	os.WriteFile(mdPath, []byte(newContent), 0644)
+
+	s := &Session{
+		Mode:     "files",
+		RepoRoot: dir,
+		Files: []*FileEntry{
+			{
+				Path:            "plan.md",
+				AbsPath:         mdPath,
+				Status:          "modified",
+				FileType:        "markdown",
+				Content:         newContent,
+				PreviousContent: oldContent,
+				Comments:        []Comment{},
+				PreviousComments: []Comment{
+					{
+						ID:        "c_old",
+						StartLine: 3,
+						EndLine:   3,
+						Body:      "unless that commit is a single significant change/feature!",
+						Anchor:    "- Don't create a group for just 1 commit — merge it into the closest group",
+						Scope:     "line",
+						CreatedAt: "2026-01-01T00:00:00Z",
+						UpdatedAt: "2026-01-01T00:00:00Z",
+					},
+				},
+			},
+		},
+		roundComplete: make(chan struct{}, 1),
+	}
+
+	s.carryForwardComments()
+
+	if len(s.Files[0].Comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(s.Files[0].Comments))
+	}
+	carried := s.Files[0].Comments[0]
+	if carried.Drifted {
+		t.Error("expected Drifted=false when anchor was edited in place but still recognizable")
+	}
+	if carried.StartLine != 3 || carried.EndLine != 3 {
+		t.Errorf("expected line 3, got %d-%d", carried.StartLine, carried.EndLine)
+	}
+}
+
+func TestAnchorSimilar(t *testing.T) {
+	tests := []struct {
+		name      string
+		candidate string
+		anchor    string
+		want      bool
+	}{
+		{"identical", "foo bar", "foo bar", true},
+		{"trim whitespace", "  foo bar  ", "foo bar", true},
+		{"appended text", "foo bar baz qux", "foo bar baz", true},
+		{"trimmed text", "foo bar baz", "foo bar baz qux", true},
+		{"minor edit", "the quick brown fox", "the quick brn fox", true},
+		{"short anchor not trivially contained", "} else {", "}", false},
+		{"short anchor too generic", "x = foo()", "x = 1", false},
+		{"empty candidate", "", "foo bar", false},
+		{"empty anchor", "foo bar", "", false},
+		{"unrelated", "the quick brown fox", "lorem ipsum dolor", false},
+		{"heavy rewrite", "foo bar baz", "completely different text here", false},
+		{"multi-line minor edit", "line one\nline two changed", "line one\nline two", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := anchorSimilar(tt.candidate, tt.anchor); got != tt.want {
+				t.Errorf("anchorSimilar(%q, %q) = %v, want %v",
+					tt.candidate, tt.anchor, got, tt.want)
+			}
+		})
 	}
 }
 

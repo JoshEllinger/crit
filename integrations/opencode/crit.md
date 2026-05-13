@@ -78,6 +78,19 @@ echo '[
 ]' | crit comment --json --author 'OpenCode'
 ```
 
+For multi-paragraph reply bodies, prefer `crit comment --json --file <path>` — a raw newline inside a JSON `"body"` string is invalid, and shell-quoted heredocs make that easy to slip in. Write the JSON to a temp file first, then point crit at it:
+
+```bash
+cat > /tmp/replies.json <<'EOF'
+[
+  {"reply_to": "c_a1b2c3", "body": "Fixed.\n\nDetails: split helper, added null guard."}
+]
+EOF
+crit comment --json --file /tmp/replies.json --author 'OpenCode'
+```
+
+`--file -` reads stdin (same as the default).
+
 **If there are zero review comments**: inform the user no changes were requested and stop.
 
 ## Step 5: Signal completion and start next round
@@ -92,26 +105,3 @@ Tell the user: **"Changes applied. Review the diff in your browser and click Fin
 
 **Do NOT proceed until `crit` completes.** When it does, return to Step 3. If the user finishes with zero comments, the review is approved — stop the loop and proceed.
 
-## Sharing
-
-If the user asks for a URL, a shareable link, or a QR code for the review:
-
-```bash
-crit share <file>
-```
-
-**Always relay the full output to the user** — copy the URL (and QR code if `--qr` was used) directly into your response. Don't make them dig through tool output.
-
-To remove a shared review:
-
-```bash
-crit unpublish
-```
-
-### QR caveat
-
-Only use `--qr` in real terminal environments with monospace rendering. Skip it in mobile apps or web chat UIs — Unicode block characters won't render.
-
-```bash
-crit share --qr <file>
-```
