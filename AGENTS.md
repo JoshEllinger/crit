@@ -29,11 +29,28 @@ crit/
 ├── comment_cli.go       # `crit comment` headless implementation
 ├── gen_integration_hashes.go / integration_hashes_gen.go  # Build-time integration manifest
 ├── *_test.go            # Tests (testutil_test.go has shared helpers; *_integration_test.go behind build tag)
+├── live.go              # `crit live <url>` command — live-mode session bootstrap
+├── preview.go           # `crit preview <file.html>` command — preview-mode session bootstrap + content serving
+├── proxy.go             # Reverse proxy for live-mode iframe (HTML injection, redirect rewriting)
 ├── frontend/
-│   ├── index.html       # HTML shell — references style.css, theme.css, and app.js
-│   ├── app.js           # All JS (multi-file state, rendering, comments, SSE, keyboard shortcuts)
-│   ├── style.css        # Layout, diff rendering, file sections, components
+│   ├── index.html       # HTML shell — two-paradigm fork loads code-review OR live-mode scripts
+│   ├── app.js           # Code-review mode JS (file tree, rendering, comments, SSE, shortcuts)
+│   ├── live-mode.js     # Live-mode entry point (iframe chrome, pin workflow, panel)
+│   ├── live-mode.*.js   # Live-mode sub-modules (toggle, composer, panel, sse, etc.)
+│   ├── crit-agent.js    # Injected into iframe — captures DOM clicks for pin anchoring
+│   ├── agent-*.js       # Agent sub-modules (protocol, marker overlay, mutation batcher)
+│   ├── crit-shared.js   # Shared helpers (cookies, theme, image upload) — window.crit.shared
+│   ├── crit-renderer.js # ContentRenderer registry — window.crit.renderer
+│   ├── crit-sse.js      # Shared SSE client factory — window.crit.sse
+│   ├── crit-draft.js    # Draft autosave — window.crit.draft
+│   ├── crit-comment-*.js # Shared comment form, card, templates — window.crit.comment*
+│   ├── crit-icons.js    # SVG icon constants — window.crit.icons
+│   ├── crit-line-blocks.js    # buildLineBlocks, splitHighlightedCode — window.crit.lineBlocks
+│   ├── crit-diff-renderer.js  # Word-level diff computation — window.crit.diffRenderer
+│   ├── style.css        # Code-review layout, diff rendering, file sections, components
+│   ├── style-live.css   # Live-mode layout (iframe pane, panel, markers)
 │   ├── theme.css        # Color themes (light/dark/system CSS variables)
+│   ├── __tests__/       # Node.js unit tests for extracted modules (node --test)
 │   └── *.min.js         # Vendored markdown-it, highlight.js, mermaid
 ├── integrations/        # Drop-in config files for AI coding tools (claude-code, cursor, aider, etc.)
 ├── e2e/                 # Playwright E2E tests for the frontend (multi-project setup, see below)
@@ -83,6 +100,8 @@ Subcommands are dispatched via `commandDispatch` in `main.go`. Anything not in t
 crit                          # Review git changes (starts daemon, blocks for feedback)
 crit <file|dir> [...]         # Review specific files or directories (falls through to runReview)
 crit review [...]             # Explicit review invocation (same as default)
+crit live <url>               # Review a running web app in live mode (also: crit <url>)
+crit preview <file.html>      # Review a local HTML file in preview mode (also: crit <file.html>)
 crit stop [--all]             # Stop daemon(s) for current directory
 crit status [--json]          # Show review file path, daemon status, comment stats
 crit cleanup [--days N] [--force]  # Delete stale review files from ~/.crit/reviews/
@@ -99,7 +118,7 @@ crit config [--generate]      # Print resolved config (or starter template)
 crit install <agent>          # Install integration config for an AI tool
 crit auth ...                 # Auth flow for hosted crit-web (login/logout)
 crit plan [...]               # Plan-file workflow
-crit plan-hook                # Internal hook used by plan flow
+crit plan-hook [--mode claude|codex]  # Internal hook used by agent plan flows
 crit check                    # Self-check (env, git, gh availability)
 crit _serve                   # Internal: foreground server (used by daemon spawn)
 crit --version | -v           # Version
@@ -114,11 +133,12 @@ Two-level JSON config files, merged (project overrides global):
 - **Global**: `~/.crit.config.json` — user-wide defaults
 - **Project**: `.crit.config.json` in repo root — per-project overrides
 
-Config keys: `port`, `host`, `no_open`, `share_url`, `quiet`, `output`, `author`, `base_branch`, `ignore_patterns`, `agent_cmd`, `auth_token`, `auth_user_name`, `auth_user_email`, `auth_user_id`, `cleanup_on_approve`, `no_update_check`, `no_integration_check`, `vcs`.
+Config keys: `port`, `host`, `no_open`, `share_url`, `quiet`, `output`, `author`, `base_branch`, `ignore_patterns`, `agent_cmd`, `auth_token`, `auth_user_name`, `auth_user_email`, `auth_user_id`, `cleanup_on_approve`, `no_update_check`, `no_integration_check`, `vcs`, `proxy_auth`.
 
 - `base_branch` overrides auto-detected default branch (used as diff base in git mode, and by `crit pull`/`crit push`/`crit comment`)
 - `author` falls back to the configured VCS user name if not set
-- `agent_cmd`, `auth_token`, and `share_url` are **global config only**; project-level config cannot override (security — prevents malicious repos from hijacking the agent command or redirecting share requests to an attacker-controlled host)
+- `agent_cmd`, `auth_token`, `share_url`, and `proxy_auth` are **global config only**; project-level config cannot override (security — prevents malicious repos from hijacking the agent command or redirecting share requests to an attacker-controlled host)
+- `proxy_auth` (default: `false`) — when `true`, share/pull/unpublish use browser popup relay instead of direct CLI HTTP. Global-only for security.
 - `cleanup_on_approve` (default: `true`) — auto-delete review file when reviewer approves with no unresolved comments
 - `ignore_patterns` are unioned (global + project both apply); types: `*.ext`, `dir/`, `exact.file`, `path/*.ext`
 - `vcs` selects backend: `"git"` (default), `"sl"` (sapling), or `"jj"` (Jujutsu)
@@ -136,6 +156,7 @@ Requires `gh` CLI installed and authenticated.
 - `crit push --event approve` submits an approval; `--event request-changes` requests changes (default: `comment`)
 - `crit push -m 'message'` adds a review-level body message
 - PR number auto-detected from current branch, or pass explicitly: `crit pull 42`
+- Any code path that imports comments from an external source (GitHub PR, crit-web) into the local review file MUST dedup against local state first: `buildLocalIDSet` + `buildLocalFingerprintIndex` + `dropDuplicateWebComment`. This applies to direct HTTP paths AND browser relay paths. Calling `mergeWebComments` without pre-filtering causes duplicate comments on repeated pull.
 </important>
 
 <important if="you are writing, running, or modifying Playwright E2E tests in e2e/">
@@ -154,16 +175,20 @@ make e2e-report                                       # View HTML report with sc
 
 ### Projects
 
-Six Playwright projects, each with its own fixture script and port. Test naming convention determines which project runs which file:
+Eight Playwright projects. Test naming convention determines which project runs which file:
 
 | Project | Port | Fixture | Test glob |
 | --- | --- | --- | --- |
 | `git-mode` | 3123 | `setup-fixtures.sh` (git repo + feature branch) | `*.spec.ts` (excludes other suffixes) |
+| `mobile` | 3123 | `setup-fixtures.sh` (reuses git-mode fixture) at 375x812, `hasTouch: true` | `*.mobile.spec.ts` |
 | `file-mode` | 3124 | `setup-fixtures-filemode.sh` (plain files, no git) | `*.filemode.spec.ts` |
 | `single-file-mode` | 3125 | `setup-fixtures-singlefile.sh` (one markdown file) | `*.singlefile.spec.ts` |
 | `no-git-mode` | 3126 | `setup-fixtures-nogit.sh` (file mode without git) | `*.nogit.spec.ts` |
 | `multi-file-mode` | 3127 | `setup-fixtures-multifile.sh` (code + markdown files) | `*.multifile.spec.ts` |
 | `range-mode` | 3128 | `setup-fixtures-range-mode.sh` (`--range A..B` stacked git) | `*.rangemode.spec.ts` |
+| `live-mode` | 3129 | `setup-fixtures-livemode.sh` (Go upstream + crit live) | `*.livemode.spec.ts` |
+
+The `mobile` project shares the git-mode fixture port. In `run.sh` it runs strictly after `git-mode` finishes so the two don't race on shared comment state (both projects `DELETE /api/comments` in `beforeEach`).
 
 CI runs E2E on push to `main` and PRs via `.github/workflows/test.yml`. Failed test artifacts are uploaded.
 

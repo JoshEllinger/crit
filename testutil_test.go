@@ -99,6 +99,7 @@ func gitT(t *testing.T, dir string, args ...string) string {
 func setHome(t *testing.T, dir string) {
 	t.Helper()
 	t.Setenv("HOME", dir)
+	t.Setenv("CODEX_HOME", "")
 	if runtime.GOOS == "windows" {
 		t.Setenv("USERPROFILE", dir)
 		// HOMEDRIVE/HOMEPATH together form a fallback used by os.UserHomeDir.
@@ -166,5 +167,29 @@ func TestGitEnvLeakStripped(t *testing.T) {
 	gitT(t, dir, "init")
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
 		t.Fatalf(".git not created in tempdir — GIT_DIR leaked into runGit: %v", err)
+	}
+}
+
+// advanceRoundForTest mimics the post-roundComplete bump + live hook firing
+// path used by handleRoundCompleteGit / handleRoundCompleteFiles, so unit tests
+// can assert the live-only branch without spinning the full watcher.
+func advanceRoundForTest(s *Session) {
+	s.mu.Lock()
+	prev := s.ReviewRound
+	s.ReviewRound++
+	rt := s.ReviewType
+	next := s.ReviewRound
+	s.mu.Unlock()
+	if (rt == "live" || rt == "preview") && s.liveRoundStart != nil {
+		s.liveRoundStart(prev, next)
+	}
+}
+
+// fireOnLiveRoundStart invokes the installed liveRoundStart hook
+// directly. Used by SSE tests to trigger an event without driving the
+// watcher loop.
+func fireOnLiveRoundStart(s *Session, prev, next int) {
+	if s.liveRoundStart != nil {
+		s.liveRoundStart(prev, next)
 	}
 }

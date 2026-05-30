@@ -105,7 +105,16 @@
       "Read(//Users/joshuaellinger/Sites/ai-adoption-tool/**)",
       "Bash(npm test *)",
       "Bash(npm run *)",
-      "Bash(python3 -c \"import sys,json; jobs=json.load\\(sys.stdin\\)['jobs']; [print\\(j['name'], j['conclusion']\\) for j in jobs]\")"
+      "Bash(python3 -c \"import sys,json; jobs=json.load\\(sys.stdin\\)['jobs']; [print\\(j['name'], j['conclusion']\\) for j in jobs]\")",
+      "Bash(grep -q \"^\\\\.DS_Store$\" .gitignore)",
+      "Read(//private/tmp/**)",
+      "Bash(tar xzf *)",
+      "Bash(chmod +x ~/.local/bin/crit.new)",
+      "Bash(mv ~/.local/bin/crit.new ~/.local/bin/crit)",
+      "Bash(echo \"# Test plan\\\\n\\\\nThis is a smoke test.\")",
+      "Bash(~/.local/bin/crit --no-open smoke-test.md)",
+      "Bash(echo \"PID: $!\")",
+      "Read(//tmp/**)"
     ]
   }
 }

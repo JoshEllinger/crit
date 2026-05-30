@@ -16,6 +16,7 @@ type Config struct {
 	Host               string   `json:"host,omitempty"` // listen host (default 127.0.0.1)
 	NoOpen             bool     `json:"no_open,omitempty"`
 	ShareURL           string   `json:"share_url,omitempty"`
+	ProxyAuth          bool     `json:"proxy_auth,omitempty"`
 	Quiet              bool     `json:"quiet,omitempty"`
 	Output             string   `json:"output,omitempty"`
 	Author             string   `json:"author,omitempty"`
@@ -67,6 +68,7 @@ func defaultConfig() generatedConfig {
 		Host:       "127.0.0.1",
 		NoOpen:     false,
 		ShareURL:   "",
+		ProxyAuth:  false,
 		Quiet:      false,
 		Output:     "",
 		Author:     "",
@@ -91,6 +93,7 @@ type generatedConfig struct {
 	Host               string   `json:"host"`
 	NoOpen             bool     `json:"no_open"`
 	ShareURL           string   `json:"share_url"`
+	ProxyAuth          bool     `json:"proxy_auth"`
 	Quiet              bool     `json:"quiet"`
 	Output             string   `json:"output"`
 	Author             string   `json:"author"`
@@ -172,6 +175,8 @@ func mergeConfigs(global, project Config, projectPresence configPresence) Config
 	if projectPresence.NoOpen {
 		merged.NoOpen = project.NoOpen
 	}
+	// Security: proxy_auth is intentionally NOT merged from project config.
+	// It is global-only, like agent_cmd, auth_token, and share_url.
 	if projectPresence.Quiet {
 		merged.Quiet = project.Quiet
 	}
@@ -196,11 +201,12 @@ func mergeConfigs(global, project Config, projectPresence configPresence) Config
 	if projectPresence.CleanupOnApprove {
 		merged.CleanupOnApprove = project.CleanupOnApprove
 	}
-	// Security: agent_cmd, auth_token, and share_url are intentionally NOT merged
-	// from project config. They must remain global-only: agent_cmd to prevent
-	// untrusted repos from hijacking the agent command; auth_token and share_url
-	// to prevent a malicious repo's .crit.config.json from redirecting share
-	// requests (and the bearer token) to an attacker-controlled host.
+	// Security: agent_cmd, auth_token, share_url, and proxy_auth are intentionally
+	// NOT merged from project config. They must remain global-only: agent_cmd to
+	// prevent untrusted repos from hijacking the agent command; auth_token and
+	// share_url to prevent a malicious repo's .crit.config.json from redirecting
+	// share requests (and the bearer token) to an attacker-controlled host;
+	// proxy_auth to prevent a repo from silently changing the transport mode.
 	// Union ignore patterns
 	merged.IgnorePatterns = append(merged.IgnorePatterns, project.IgnorePatterns...)
 	return merged

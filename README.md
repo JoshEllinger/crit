@@ -6,20 +6,22 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/tomasz-tomczyk/crit)](https://goreportcard.com/report/github.com/tomasz-tomczyk/crit)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Reviewing agent output in a terminal is painful. You can't point at a specific line and say "change this." When your agent updates the file, you re-read the whole thing to figure out what changed.
+A browser-based review UI for AI agent output. Point at the line. Tell the agent.
 
-Crit opens your file in a browser with GitHub-style inline comments. Leave feedback, hit Finish, and your agent is notified automatically. When the agent edits, Crit shows a diff between rounds - you see exactly what it addressed.
-
-Works with Claude Code, Cursor, GitHub Copilot, Aider, Cline, Windsurf and any other agent.
-
-## Why Crit
-
-- **Browser UI, not terminal.** A persistent tab with rendered markdown and visual diffs.
-- **Single binary, zero dependencies.** `brew install` and you're done.
-- **Round-to-round diffs.** See exactly what your agent changed between iterations. See previous comments to make sure they're addressed.
-- **Works with any agent.** Not locked to one AI provider.
+Your agent just touched 14 files. In the terminal you're scrolling through diffs hoping nothing broke. Crit opens those changes in a browser — click line 47, type "this drops the refresh token", and the agent fixes it. You see exactly what changed, round by round.
 
 ![Crit review UI](images/demo-overview.png)
+
+## Four review modes
+
+Agents don't just write code. They write plans, generate HTML pages, modify running apps. Each output needs a different review surface — terminal diffs work for none of them.
+
+- **Plans & docs** — `crit plan.md` renders markdown in the browser. Comment on the section that's wrong, not the whole document.
+- **Code** — `crit` auto-detects branch changes and shows syntax-highlighted diffs. Like a PR review, but instant and local.
+- **Live** — `crit http://localhost:3000` proxies your running app into a review surface. Click the misaligned button, pin a comment to it.
+- **Preview** — `crit landing.html` renders a static HTML artifact in an iframe. Pin comments to elements, no dev server needed.
+
+Single binary. Local by default. No account, no config, no dependencies.
 
 ## Install
 
@@ -37,9 +39,7 @@ Also available via [Go, Nix, or binary download](#other-install-methods).
 
 ## Agent Integrations
 
-Crit ships with plugins and configuration files for popular AI coding tools.
-
-See [`integrations/`](integrations/) for all install methods and details.
+Works with Claude Code, Cursor, GitHub Copilot, OpenCode, Codex, Gemini, Qwen, Hermes, Windsurf, Cline, Grok, Aider, and Pi — any agent that can read a file and run a command. See [`integrations/`](integrations/) for all install methods and details.
 
 ### Plugin install (Claude Code)
 
@@ -52,9 +52,7 @@ claude plugin install crit@crit
 
 ### `/crit` command
 
-Claude Code, Cursor, OpenCode, and GitHub Copilot support a `/crit` slash command that automates the full review loop.
-
-It launches Crit, waits for your review; your agent acts on the feedback and you go back and forth until the work is approved.
+Most integrations include a `/crit` slash command that automates the full review loop. It launches Crit, waits for your review; your agent acts on the feedback and you go back and forth until the work is approved.
 
 ## Demo
 
@@ -67,24 +65,19 @@ A 2-minute walkthrough of plan review and branch review.
 The recommended way is to use `/crit` command with your agent after any piece of work - whether it wrote a plan or made some code changes. You can however, launch it in your terminal by yourself and paste the prompt when you finish to your agent.
 
 ```bash
-crit                          # auto-detect changed files in your repo
-crit plan.md                  # review a specific file
-crit plan.md api-spec.md      # review multiple files
-crit status                   # show review file path and daemon status
-crit cleanup                  # delete stale review files
+crit                              # auto-detect changed files in your repo
+crit plan.md                      # review a specific file
+crit plan.md api-spec.md          # review multiple files
+crit http://localhost:3000        # review a running dev server
+crit landing.html                 # review a static HTML file
+```
+
+```bash
+crit status                       # show review file path and daemon status
+crit cleanup                      # delete stale review files
 ```
 
 ## Features
-
-### File review
-
-Pass specific files to review them directly: `crit plan.md api-spec.md`. Markdown files render as formatted documents with per-line commenting. Code files show as syntax-highlighted source. Both support the same inline comment workflow and multi-round iteration.
-
-### Git review
-
-Run `crit` with no arguments. Crit auto-detects changed files in your repo and opens them as syntax-highlighted git diffs. A file tree on the left shows every file with its status (added, modified, deleted) and comment counts. Toggle between split and unified diff views.
-
-![Crit review for your branch](images/git-mode.png)
 
 ### Round-to-round diff
 
@@ -104,14 +97,6 @@ Click a line number to comment. Drag to select a range. Comments are rendered in
 
 ![Simple comments](images/simple-comments.gif)
 
-### Suggestion mode
-
-Select lines and use "Insert suggestion" to pre-fill the comment with the original text. Edit it to show exactly what the replacement should look like. Your agent gets a concrete before/after.
-
-### Finish review: agent notified automatically
-
-When you click "Finish Review", Crit writes the review file and notifies your agent If your agent was listening, it picks up the prompt automatically - no copy-paste needed.
-
 ### Programmatic comments
 
 AI agents can use `crit comment` to add inline review comments without opening the browser UI or constructing JSON manually:
@@ -125,10 +110,6 @@ crit comment --clear   # remove the review file
 
 Comments are appended to the review file (stored in `~/.crit/reviews/`) and created automatically if it doesn't exist. Run `crit status` to see the active review file path.
 
-### Mermaid diagrams
-
-Architecture diagrams in fenced ` ```mermaid ` blocks render inline. You can comment on the diagram source just like any other block.
-
 ### Share for Async Review
 
 Want a second opinion before handing off to the agent? Click the Share button to upload your review and get a public URL anyone can open in a browser, no install needed. Each reviewer's comments are color-coded by author. Unpublish anytime.
@@ -138,10 +119,16 @@ You can also share directly from the CLI without starting the browser UI:
 ```bash
 crit share plan.md                    # share files and print the URL
 crit share plan.md --qr               # also print a QR code in the terminal
+crit share plan.md --org acme         # share under an organization
+crit share plan.md --org acme --visibility unlisted  # org share with explicit visibility
 crit unpublish                        # remove the shared review
 ```
 
+When sharing under an org, visibility defaults to `organization` (members only). Override with `--visibility` (`organization`, `unlisted`, or `public`). The browser UI shows an org picker when you're signed in and belong to an organization.
+
 Sharing uses [crit.md](https://crit.md) by default. To self-host, deploy [`crit-web`](https://github.com/tomasz-tomczyk/crit-web) and point `CRIT_SHARE_URL` (or `--share-url`, or `share_url` in config) at your instance. Set `share_url` to `""` to disable sharing entirely.
+
+If your self-hosted `crit-web` sits behind an SSO reverse proxy that the terminal can't authenticate against, set `proxy_auth: true` in your `~/.crit.config.json` (this option is config-only and global-only — it's a property of the deployment, not a per-invocation choice, so there's no flag or env var). Browser-driven Share / Pull / Re-share / Unpublish then route through a popup window where the proxy can complete its interactive auth flow. Terminal `crit share`, `crit fetch`, and `crit unpublish` remain unavailable behind SSO — use the browser UI buttons.
 
 #### Authentication
 
@@ -241,6 +228,7 @@ After the first agent interaction, the comment becomes a **live thread**:
 - **Live file watching.** The browser reloads automatically when the source file changes.
 - **Dark/light/system theme.** Three-button pill in the header, persisted to localStorage.
 - **Local by default.** Server binds to `127.0.0.1`. Your files stay on your machine unless you explicitly share. (Override with `--host` / `CRIT_HOST` / `host` config key — e.g. `0.0.0.0` to expose on your LAN. No auth, so it's an explicit opt-in.)
+- **Collapsing generated files.** Honors `linguist-generated` in `.gitattributes` — matching files appear collapsed by default.
 - **No analytics or tracking.** Crit collects zero telemetry. No usage stats, no crash reports, no phone-home. If we ever add anonymous usage statistics in the future, they will be explicitly opt-in.
 - **Update check.** On startup, Crit makes one network request to check for a newer version and prints a notice if one is available. Set `CRIT_NO_UPDATE_CHECK=1` to disable it.
 
@@ -269,19 +257,27 @@ All keys are optional — omit any you don't need.
 | `port`                 | int      | `0` (random)               | Port for the local server. `0` picks a random available port.                                                                                                                           |
 | `host`                 | string   | `"127.0.0.1"`              | Listen host. Set to `"0.0.0.0"` to expose the server on your LAN. There is no auth, so any non-loopback bind is an explicit opt-in.                                                     |
 | `no_open`              | bool     | `false`                    | Don't auto-open the browser when starting a review.                                                                                                                                     |
-| `share_url`            | string   | `"https://crit.md"`        | Base URL of the share service. Set to `""` to disable sharing entirely. Self-host with [`crit-web`](https://github.com/tomasz-tomczyk/crit-web).                                        |
-| `share_consented`      | bool     | `false`                    | Written automatically to `true` after you confirm the first-time share prompt. Reset to `false` to see the prompt again. Not used when `share_url` is a custom (self-hosted) URL.       |
 | `quiet`                | bool     | `false`                    | Suppress terminal status output.                                                                                                                                                        |
 | `output`               | string   | repo root or file dir      | Output directory for review files. Reviews are stored in `~/.crit/reviews/` by default.                                                                                                 |
 | `author`               | string   | VCS user name              | Author name shown on comments. Falls back to your configured VCS user name.                                                                                                            |
 | `base_branch`          | string   | auto-detected              | Base branch to diff against (e.g. `"main"`, `"develop"`). Overrides auto-detection.                                                                                                     |
 | `ignore_patterns`      | string[] | `[".crit/"]` | File patterns to exclude from git-mode file lists. Global and project patterns are merged.                                                                                              |
-| `agent_cmd`            | string   | `""`                       | Shell command for "Send to agent" (e.g. `"claude -p"`). **Global config only** — project config cannot set this for security reasons. See [Send to agent](#send-to-agent-experimental). |
-| `auth_token`           | string   | `""`                       | Authentication token for crit.md. Set automatically by `crit auth login`. **Global config only.**                                                                                       |
 | `cleanup_on_approve`   | bool     | `true`                     | Automatically delete the review file when you approve with no unresolved comments. Set to `false` to preserve review history.                                                           |
 | `no_update_check`      | bool     | `false`                    | Don't check for new versions on startup.                                                                                                                                                |
 | `no_integration_check` | bool     | `false`                    | Skip the integration config freshness check on startup.                                                                                                                                 |
 | `vcs`                  | string   | auto-detected              | Preferred VCS backend: `"git"`, `"sl"`, or `"jj"`. When set, crit uses this VCS instead of auto-detecting. Falls back to git if the configured VCS isn't available. Can also be set via `--vcs` CLI flag (flag takes precedence over config). |
+
+### Global-only config keys
+
+These keys can only be set in `~/.crit.config.json` (global). Project-level `.crit.config.json` cannot override them — this prevents a malicious repository from hijacking the agent command or redirecting share requests.
+
+| Key                    | Type     | Default                    | Description                                                                                                                                                                             |
+| ---------------------- | -------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent_cmd`            | string   | `""`                       | Shell command for "Send to agent" (e.g. `"claude -p"`). See [Send to agent](#send-to-agent-experimental). |
+| `auth_token`           | string   | `""`                       | Authentication token for crit.md. Set automatically by `crit auth login`. |
+| `share_url`            | string   | `"https://crit.md"`        | Base URL of the share service. Set to `""` to disable sharing entirely. Self-host with [`crit-web`](https://github.com/tomasz-tomczyk/crit-web). |
+| `share_consented`      | bool     | `false`                    | Written automatically to `true` after you confirm the first-time share prompt. Reset to `false` to see the prompt again. Not used when `share_url` is a custom (self-hosted) URL. |
+| `proxy_auth`           | bool     | `false`                    | When `true`, share / pull / unpublish / re-share use the browser popup relay instead of the local Go server contacting crit-web directly. Use when crit-web is behind an SSO reverse proxy that the terminal cannot authenticate against. No flag or env var — this is a property of the deployment, not a per-invocation choice. |
 
 ### CLI flags
 
@@ -314,18 +310,6 @@ Use `--no-ignore` to temporarily bypass all patterns:
 ```bash
 crit --no-ignore
 ```
-
-### Collapsing generated files
-
-crit honors `linguist-generated` in a top-level `.gitattributes` file (same convention GitHub uses). Matching files appear in the review but start collapsed — expand them with the file header chevron.
-
-```gitattributes
-**/generated/** linguist-generated
-*.pb.go         linguist-generated
-bootstrap.min.css -linguist-generated
-```
-
-Unlike `ignore_patterns` (which hide files from the review entirely), this only changes the default fold state. The flag round-trips through `crit share` so shared reviews on crit-web start collapsed too.
 
 ### Environment variables
 

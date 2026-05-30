@@ -1,11 +1,16 @@
 import { defineConfig } from '@playwright/test';
+import os from 'os';
 
+const isWindows = os.platform() === 'win32';
 const GIT_PORT = process.env.CRIT_TEST_PORT || '3123';
 const FILE_PORT = process.env.CRIT_TEST_FILE_PORT || '3124';
 const SINGLE_PORT = process.env.CRIT_TEST_SINGLE_PORT || '3125';
 const NOGIT_PORT = process.env.CRIT_TEST_NOGIT_PORT || '3126';
 const MULTI_PORT = process.env.CRIT_TEST_MULTI_PORT || '3127';
 const RANGE_PORT = process.env.CRIT_TEST_RANGE_PORT || '3128';
+const LIVE_PORT = process.env.CRIT_TEST_LIVE_PORT || '3129';
+// Mobile project re-uses the git-mode fixture — no separate server needed.
+const MOBILE_PORT = GIT_PORT;
 const debug = !!process.env.E2E_DEBUG;
 
 export default defineConfig({
@@ -37,12 +42,25 @@ export default defineConfig({
   projects: [
     {
       name: 'git-mode',
-      testMatch: /^(?!.*\.(filemode|singlefile|multifile|nogit|rangemode)\.).*\.spec\.ts$/,
+      testMatch: /^(?!.*\.(filemode|singlefile|multifile|nogit|rangemode|mobile|livemode)\.).*\.spec\.ts$/,
       use: {
         browserName: 'chromium',
         baseURL: `http://localhost:${GIT_PORT}`,
       },
     },
+    // Touch emulation is a Chromium feature identical across OS — Linux
+    // coverage is sufficient, and Windows headless has reliability issues
+    // with touchscreen.tap() that cause 60s-per-test timeouts.
+    ...(!isWindows ? [{
+      name: 'mobile' as const,
+      testMatch: /\.mobile\.spec\.ts$/,
+      use: {
+        browserName: 'chromium' as const,
+        baseURL: `http://localhost:${MOBILE_PORT}`,
+        viewport: { width: 375, height: 812 },
+        hasTouch: true,
+      },
+    }] : []),
     {
       name: 'file-mode',
       testMatch: /\.filemode\.spec\.ts$/,
@@ -83,6 +101,18 @@ export default defineConfig({
       use: {
         browserName: 'chromium',
         baseURL: `http://localhost:${RANGE_PORT}`,
+      },
+    },
+    {
+      name: 'live-mode',
+      testMatch: /\.livemode\.spec\.ts$/,
+      use: {
+        browserName: 'chromium',
+        // NOTE: must be `localhost` (not 127.0.0.1) — the proxy injects the
+        // agent <script src="http://localhost:..."> tag, which the agent then
+        // uses as its postMessage targetOrigin. If the chrome page is loaded
+        // via 127.0.0.1, agent-ready postMessages get dropped (origin mismatch).
+        baseURL: `http://localhost:${LIVE_PORT}/live`,
       },
     },
   ],
@@ -128,6 +158,13 @@ export default defineConfig({
       url: `http://localhost:${RANGE_PORT}/api/session`,
       reuseExistingServer: true,
       timeout: 30_000,
+      stdout: 'pipe',
+    },
+    {
+      command: `bash setup-fixtures-livemode.sh ${LIVE_PORT}`,
+      url: `http://127.0.0.1:${LIVE_PORT}/api/session`,
+      reuseExistingServer: true,
+      timeout: 60_000,
       stdout: 'pipe',
     },
   ],

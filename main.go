@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,10 +20,10 @@ import (
 	qrterminal "github.com/mdp/qrterminal/v3"
 )
 
-//go:embed frontend/*
+//go:embed frontend/*.html frontend/*.css frontend/*.js frontend/*.png frontend/*.svg frontend/*.ico frontend/*.webmanifest
 var frontendFS embed.FS
 
-//go:embed integrations/*
+//go:embed all:integrations/*
 var integrationsFS embed.FS
 
 var (
@@ -40,14 +41,25 @@ func main() {
 		handler(os.Args[2:])
 		return
 	}
-	runReview(os.Args[1:])
+	args := os.Args[1:]
+	if looksLikeLiveArgs(args) {
+		runLive(args)
+		return
+	}
+	if looksLikePreviewArgs(args) {
+		runPreview(args)
+		return
+	}
+	runReview(args)
 }
 
 type shareFlags struct {
-	outputDir string
-	svcURL    string
-	showQR    bool
-	files     []string
+	outputDir  string
+	svcURL     string
+	showQR     bool
+	org        string
+	visibility string
+	files      []string
 }
 
 func parseShareFlags(args []string) shareFlags {
@@ -71,6 +83,20 @@ func parseShareFlags(args []string) shareFlags {
 			sf.svcURL = args[i]
 		case arg == "--qr":
 			sf.showQR = true
+		case arg == "--org":
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: --org requires a value\n")
+				os.Exit(1)
+			}
+			i++
+			sf.org = args[i]
+		case arg == "--visibility":
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: --visibility requires a value\n")
+				os.Exit(1)
+			}
+			i++
+			sf.visibility = args[i]
 		default:
 			sf.files = append(sf.files, arg)
 		}
@@ -79,7 +105,7 @@ func parseShareFlags(args []string) shareFlags {
 }
 
 func printShareUsage() {
-	fmt.Fprintln(os.Stderr, "Usage: crit share [--output <dir>] [--share-url <url>] [--qr] <file> [file...]")
+	fmt.Fprintln(os.Stderr, "Usage: crit share [--output <dir>] [--share-url <url>] [--org <slug>] [--visibility <level>] [--qr] <file> [file...]")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Shares files to crit-web and prints the review URL.")
 	fmt.Fprintln(os.Stderr, "Comments from the review file are included automatically.")
@@ -169,8 +195,8 @@ func runShareExisting(existingCfg CritJSON, critPath string, files []shareFile, 
 	printQR(result.URL, showQR)
 }
 
-func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL, authToken, fallbackAuthor string, showQR bool) {
-	res, err := shareReviewFiles(critPath, files, filePaths, svcURL, authToken, fallbackAuthor)
+func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL, authToken, fallbackAuthor, org, visibility string, showQR bool) {
+	res, err := shareReviewFiles(critPath, files, filePaths, svcURL, authToken, fallbackAuthor, org, visibility)
 	if err != nil {
 		if errors.Is(err, errShareUnauthorized) {
 			handleShareAuthError()
@@ -179,7 +205,7 @@ func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL,
 		os.Exit(1)
 	}
 
-	if err := persistShareState(critPath, res.URL, res.DeleteToken, shareScope(filePaths)); err != nil {
+	if err := persistShareState(critPath, res.URL, res.DeleteToken, shareScope(filePaths), org, "", visibility); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save share state to review file: %v\n", err)
 	}
 
@@ -205,12 +231,21 @@ func promptShareConsent(out io.Writer, in io.Reader) bool {
 	return strings.TrimSpace(strings.ToLower(answer)) == "y"
 }
 
+// promptShareURLConfirm asks the user to confirm sharing to a custom URL.
+func promptShareURLConfirm(out io.Writer, in io.Reader, shareURL string) bool {
+	fmt.Fprintf(out, "  Sharing to %s — continue? [y/N] ", shareURL)
+	answer, _ := bufio.NewReader(in).ReadString('\n')
+	return strings.TrimSpace(strings.ToLower(answer)) == "y"
+}
+
 func runShare(args []string) {
 	sf := parseShareFlags(args)
 
 	if len(sf.files) == 0 {
 		printShareUsage()
 	}
+
+	flagURL := sf.svcURL != ""
 
 	cfg := loadShareConfig()
 	sf.svcURL = resolveShareURL(sf.svcURL, cfg, defaultShareURL)
@@ -225,6 +260,10 @@ func runShare(args []string) {
 
 	critPath, err := resolveReviewPath(sf.outputDir)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if err := checkShareAllowed(critPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -252,12 +291,17 @@ func runShare(args []string) {
 		}
 		cfg.ShareConsented = true
 	}
+	if flagURL {
+		if !promptShareURLConfirm(os.Stderr, os.Stdin, sf.svcURL) {
+			return
+		}
+	}
 	if ok {
 		runShareExisting(existingCfg, critPath, files, sharePaths, authToken, cfg.Author, sf.showQR)
 		return
 	}
 
-	runShareNew(critPath, files, sharePaths, sf.svcURL, authToken, cfg.Author, sf.showQR)
+	runShareNew(critPath, files, sharePaths, sf.svcURL, authToken, cfg.Author, sf.org, sf.visibility, sf.showQR)
 }
 
 func parseFetchOutputDir(args []string) string {
@@ -362,6 +406,7 @@ func runFetch(args []string) {
 func runUnpublish(args []string) {
 	unpubOutputDir := ""
 	unpubSvcURL := ""
+	var unpubFiles []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
@@ -380,8 +425,7 @@ func runUnpublish(args []string) {
 			i++
 			unpubSvcURL = args[i]
 		default:
-			fmt.Fprintf(os.Stderr, "Usage: crit unpublish [--output <dir>] [--share-url <url>]\n")
-			os.Exit(1)
+			unpubFiles = append(unpubFiles, arg)
 		}
 	}
 
@@ -389,7 +433,7 @@ func runUnpublish(args []string) {
 	unpubSvcURL = resolveShareURL(unpubSvcURL, unpubCfg, defaultShareURL)
 	unpubAuthToken := resolveAuthToken(unpubCfg)
 
-	critPath, err := resolveReviewPath(unpubOutputDir)
+	critPath, err := resolveReviewPathWithArgs(unpubOutputDir, unpubFiles)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -534,7 +578,7 @@ func redirectReviewPathForPR(prNumber int, cwdBranch, cwdCritPath string) (strin
 	return altPath, altCJ, true
 }
 
-func runPull(args []string) {
+func runPull(args []string) { //nolint:gocyclo // CLI dispatcher: branches for arg/flag parsing, file load, scope resolution, and live-review guard
 	if err := requireGH(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -603,6 +647,11 @@ func runPull(args []string) {
 		}
 		cj.BaseRef, _ = MergeBase(base)
 		cj.ReviewRound = 1
+	}
+
+	if err := checkGitHubSyncAllowed(cj, "crit pull"); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
+		os.Exit(1)
 	}
 
 	scope := resolvePullScope(&cj)
@@ -1059,6 +1108,11 @@ func pushBlockedByFullStackScope(activeScope string) bool {
 func runPush(args []string) {
 	ctx := loadPushContext(args)
 
+	if err := checkGitHubSyncAllowed(ctx.cj, "crit push"); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
+		os.Exit(1)
+	}
+
 	// Full-stack push gate — see fullStackPushGateMessage.
 	if pushBlockedByFullStackScope(ctx.cj.ActiveDiffScope) {
 		fmt.Fprintln(os.Stderr, "Error: "+fullStackPushGateMessage)
@@ -1452,6 +1506,12 @@ func runCommentLineLevelScoped(loc string, commentArgs []string, author, userID,
 		startLine, endLine = n, n
 	}
 	body := strings.Join(commentArgs[1:], " ")
+	if critPath, err := resolveReviewPath(outputDir); err == nil {
+		if guardErr := checkCommentCLIAllowed(critPath); guardErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", guardErr)
+			os.Exit(1)
+		}
+	}
 	if err := addCommentToCritJSONScoped(filePath, startLine, endLine, body, author, userID, outputDir, scope); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -1579,8 +1639,10 @@ type planConfig struct {
 	filePath      string
 	stdinExpected bool
 	port          int
+	host          string
 	noOpen        bool
 	quiet         bool
+	shareURL      string
 }
 
 func resolvePlanConfig(args []string) planConfig {
@@ -1588,16 +1650,20 @@ func resolvePlanConfig(args []string) planConfig {
 	name := fs.String("name", "", "Plan name/slug for session identification")
 	port := fs.Int("port", 0, "Port to listen on")
 	fs.IntVar(port, "p", 0, "Port (shorthand)")
+	host := fs.String("host", "", "Host to listen on")
 	noOpen := fs.Bool("no-open", false, "Don't auto-open browser")
 	quiet := fs.Bool("quiet", false, "Suppress status output")
 	fs.BoolVar(quiet, "q", false, "Suppress status (shorthand)")
+	shareURL := fs.String("share-url", "", "Share service URL")
 	fs.Parse(args)
 
 	pc := planConfig{
-		name:   *name,
-		port:   *port,
-		noOpen: *noOpen,
-		quiet:  *quiet,
+		name:     *name,
+		port:     *port,
+		host:     *host,
+		noOpen:   *noOpen,
+		quiet:    *quiet,
+		shareURL: *shareURL,
 	}
 
 	remaining := fs.Args()
@@ -1654,9 +1720,9 @@ func resolvePlanSlug(name string, content []byte) string {
 func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry, bool) {
 	entry, alive := findAliveSession(key)
 	if alive {
-		fmt.Fprintf(os.Stderr, "Connected to crit daemon at http://localhost:%d\n", entry.Port)
+		fmt.Fprintf(os.Stderr, "Connected to crit daemon at %s\n", entry.baseURL())
 		if !noOpen && !daemonHasBrowser(entry) {
-			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
+			go openBrowser(entry.baseURL())
 		}
 		return entry, false
 	}
@@ -1667,8 +1733,32 @@ func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry,
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "Started crit daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
+	fmt.Fprintf(os.Stderr, "Started crit daemon at %s (PID %d)\n", entry.baseURL(), entry.PID)
+	hintMissingIntegrations()
 	return entry, true
+}
+
+// hintMissingIntegrations prints a suggestion when AI tools are detected but
+// no crit integration is installed. Skipped when any integration already exists
+// or when CRIT_NO_INTEGRATION_CHECK is set.
+func hintMissingIntegrations() {
+	if os.Getenv("CRIT_NO_INTEGRATION_CHECK") != "" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	hintMissingIntegrationsFor(mustGetwd(), home)
+}
+
+func hintMissingIntegrationsFor(cwd, home string) {
+	if len(installedAgents(cwd, home)) > 0 {
+		return
+	}
+	if missing := checkMissingIntegrations(cwd, home); len(missing) > 0 {
+		printMissingHints(missing)
+	}
 }
 
 func installDaemonSignalHandler(pid int) {
@@ -1774,7 +1864,14 @@ func runPlan(args []string) {
 	cwd, _ := resolvedCWD()
 	key := planSessionKey(cwd, slug)
 	currentPath := filepath.Join(storageDir, "current.md")
-	daemonArgs := buildPlanDaemonArgs(currentPath, storageDir, slug, pc.port, pc.noOpen, pc.quiet)
+	cfg := LoadConfig(cwd)
+	daemonArgs := buildPlanDaemonArgs(currentPath, storageDir, slug, commonDaemonFlags{
+		port:     resolvePort(pc.port, cfg.Port),
+		host:     resolveHost(pc.host, cfg.Host),
+		noOpen:   pc.noOpen || cfg.NoOpen,
+		quiet:    pc.quiet || cfg.Quiet,
+		shareURL: resolveShareURL(pc.shareURL, cfg, ""),
+	})
 
 	entry, weStartedDaemon := connectOrStartDaemon(key, daemonArgs, pc.noOpen)
 
@@ -1782,7 +1879,7 @@ func runPlan(args []string) {
 		installDaemonSignalHandler(entry.PID)
 	}
 
-	approved := runReviewClient(entry)
+	approved := runReviewClient(entry, key)
 	killDaemonOnApproval(approved, entry.PID)
 	cleanupOnApproval(approved, entry.ReviewPath, LoadConfig(cwd).CleanupOnApproveEnabled())
 }
@@ -1794,13 +1891,22 @@ type planHookEvent struct {
 	} `json:"tool_input"`
 }
 
-func resolveHookSlug(event planHookEvent, content []byte) string {
-	if event.SessionID != "" {
-		if existing, ok := lookupPlanSlug(event.SessionID); ok {
+type codexStopHookEvent struct {
+	SessionID            string  `json:"session_id"`
+	TurnID               string  `json:"turn_id"`
+	TranscriptPath       *string `json:"transcript_path"`
+	PermissionMode       string  `json:"permission_mode"`
+	StopHookActive       bool    `json:"stop_hook_active"`
+	LastAssistantMessage *string `json:"last_assistant_message"`
+}
+
+func resolveHookSlug(sessionID string, content []byte) string {
+	if sessionID != "" {
+		if existing, ok := lookupPlanSlug(sessionID); ok {
 			return existing
 		}
 		slug := resolveSlug(content)
-		if err := savePlanSlug(event.SessionID, slug); err != nil {
+		if err := savePlanSlug(sessionID, slug); err != nil {
 			fmt.Fprintf(os.Stderr, "crit plan-hook: warning: could not save slug mapping: %v\n", err)
 		}
 		return slug
@@ -1835,6 +1941,189 @@ func emitHookDecision(approved bool, prompt string) {
 	fmt.Println(string(out))
 }
 
+// Codex Stop hooks expose permission_mode, last_assistant_message, and
+// transcript_path, but not a structured tool_input.plan like Claude Code's
+// ExitPlanMode hook. Until Codex adds that payload, Crit uses its explicit
+// <proposed_plan> tag as the activation signal and accepts either a closed tag
+// or EOF, which matches how partial final streamed assistant messages can land
+// in the Stop hook payload/transcript.
+//
+// References:
+// - https://developers.openai.com/codex/hooks#stop
+// - https://raw.githubusercontent.com/openai/codex/main/codex-rs/hooks/schema/generated/stop.command.input.schema.json
+var proposedPlanBlockRE = regexp.MustCompile(`(?s)<proposed_plan>\s*(.*?)(?:\s*</proposed_plan>|$)`)
+
+const (
+	codexTranscriptInitialTokenBuffer = 64 * 1024
+	codexTranscriptMaxTokenSize       = 64 * 1024 * 1024
+)
+
+func extractProposedPlan(message string) (string, bool) {
+	matches := proposedPlanBlockRE.FindAllStringSubmatch(message, -1)
+	for i := len(matches) - 1; i >= 0; i-- {
+		if plan := strings.TrimSpace(matches[i][1]); plan != "" {
+			return plan, true
+		}
+	}
+	return "", false
+}
+
+func extractProposedPlanFromCodexTranscript(path, turnID string) (string, bool) {
+	if strings.TrimSpace(turnID) == "" {
+		return "", false
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "crit plan-hook --mode codex: could not read transcript %s: %v\n", path, err)
+		return "", false
+	}
+	defer file.Close()
+
+	var latestAssistantMessage string
+	inTargetTurn := false
+	scanner := newCodexTranscriptScanner(file)
+	for scanner.Scan() {
+		var line struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
+			continue
+		}
+		if line.Type == "turn_context" {
+			var payload struct {
+				TurnID string `json:"turn_id"`
+			}
+			if err := json.Unmarshal(line.Payload, &payload); err == nil {
+				inTargetTurn = payload.TurnID == turnID
+			}
+			continue
+		}
+		if !inTargetTurn || line.Type != "response_item" {
+			continue
+		}
+
+		var payload struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(line.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Type != "message" || payload.Role != "assistant" {
+			continue
+		}
+		var combined strings.Builder
+		for _, item := range payload.Content {
+			if item.Type == "output_text" {
+				combined.WriteString(item.Text)
+			}
+		}
+		latestAssistantMessage = combined.String()
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "crit plan-hook --mode codex: could not scan transcript %s: %v\n", path, err)
+	}
+	return extractProposedPlan(latestAssistantMessage)
+}
+
+func newCodexTranscriptScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	// Scanner reuses this initial token buffer for the whole transcript scan.
+	// The max is higher because Codex JSONL response_item records can contain
+	// a large assistant message on one line.
+	initialTokenBuffer := make([]byte, codexTranscriptInitialTokenBuffer)
+	scanner.Buffer(initialTokenBuffer, codexTranscriptMaxTokenSize)
+	return scanner
+}
+
+func proposedPlanFromCodexEvent(event codexStopHookEvent) (string, bool) {
+	if event.LastAssistantMessage != nil {
+		if plan, ok := extractProposedPlan(*event.LastAssistantMessage); ok {
+			return plan, true
+		}
+	}
+	if event.TranscriptPath != nil && strings.TrimSpace(*event.TranscriptPath) != "" {
+		return extractProposedPlanFromCodexTranscript(*event.TranscriptPath, event.TurnID)
+	}
+	return "", false
+}
+
+func emitCodexStopDecision(approved bool, prompt string) {
+	if approved {
+		return
+	}
+	if prompt == "" {
+		prompt = "Review comments pending — address them before proceeding."
+	}
+	out, _ := json.Marshal(map[string]any{
+		"decision": "block",
+		"reason":   prompt,
+	})
+	fmt.Println(string(out))
+}
+
+var runCodexPlanReviewHook = func(sessionID string, content []byte) {
+	runPlanReviewHook("crit plan-hook --mode codex", sessionID, content, emitCodexStopDecision)
+}
+
+func runPlanReviewHook(logPrefix, sessionID string, content []byte, emitDecision func(bool, string)) {
+	slug := resolveHookSlug(sessionID, content)
+
+	storageDir, err := planStorageDir(slug)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: error resolving storage dir: %v\n", logPrefix, err)
+		emitDecision(false, fmt.Sprintf("Crit could not prepare plan storage: %v", err))
+		return
+	}
+
+	ver, err := savePlanVersion(storageDir, content)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: error saving plan: %v\n", logPrefix, err)
+		emitDecision(false, fmt.Sprintf("Crit could not save the proposed plan: %v", err))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s: plan '%s' saved as v%03d\n", logPrefix, slug, ver)
+
+	cwd, _ := resolvedCWD()
+	key := planSessionKey(cwd, slug)
+	currentPath := filepath.Join(storageDir, "current.md")
+	daemonArgs := buildPlanDaemonArgs(currentPath, storageDir, slug, commonDaemonFlags{})
+
+	entry, alive := findAliveSession(key)
+	weStartedDaemon := false
+
+	if alive {
+		fmt.Fprintf(os.Stderr, "%s: connected to daemon at %s\n", logPrefix, entry.baseURL())
+		if !daemonHasBrowser(entry) {
+			go openBrowser(entry.baseURL())
+		}
+	} else {
+		entry, err = startDaemon(key, daemonArgs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: error starting daemon: %v\n", logPrefix, err)
+			emitDecision(false, fmt.Sprintf("Crit could not start the review UI: %v", err))
+			return
+		}
+		fmt.Fprintf(os.Stderr, "%s: started daemon at %s (PID %d)\n", logPrefix, entry.baseURL(), entry.PID)
+		weStartedDaemon = true
+	}
+
+	if weStartedDaemon {
+		installDaemonSignalHandler(entry.PID)
+	}
+
+	approved, prompt := runReviewClientRaw(entry, key)
+	killDaemonOnApproval(approved, entry.PID)
+	cleanupOnApproval(approved, entry.ReviewPath, LoadConfig(cwd).CleanupOnApproveEnabled())
+	emitDecision(approved, prompt)
+}
+
 // runPlanHook is the PermissionRequest hook handler for ExitPlanMode.
 // It reads the hook event JSON from stdin, extracts the plan content,
 // opens a crit review session, and writes a hookSpecificOutput JSON
@@ -1845,70 +2134,54 @@ func runPlanHook() {
 	var event planHookEvent
 	if err := json.NewDecoder(os.Stdin).Decode(&event); err != nil {
 		fmt.Fprintf(os.Stderr, "crit plan-hook: could not parse stdin: %v\n", err)
+		emitHookDecision(false, "Crit could not parse the plan hook input; plan was not reviewed.")
 		return
 	}
 	if strings.TrimSpace(event.ToolInput.Plan) == "" {
 		return
 	}
 
-	content := []byte(event.ToolInput.Plan)
-	slug := resolveHookSlug(event, content)
+	runPlanReviewHook("crit plan-hook", event.SessionID, []byte(event.ToolInput.Plan), emitHookDecision)
+}
 
-	storageDir, err := planStorageDir(slug)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "crit plan-hook: error resolving storage dir: %v\n", err)
+// runCodexPlanHook is the Stop hook handler for Codex proposed-plan review.
+// Codex has no ExitPlanMode permission hook, so this recovers the raw
+// proposed-plan block from the Stop payload/transcript and blocks the stop
+// when Crit returns comments.
+func runCodexPlanHook() {
+	var event codexStopHookEvent
+	if err := json.NewDecoder(os.Stdin).Decode(&event); err != nil {
+		fmt.Fprintf(os.Stderr, "crit plan-hook --mode codex: could not parse stdin: %v\n", err)
+		emitCodexStopDecision(false, "Crit could not parse the Codex hook input; plan was not reviewed.")
+		return
+	}
+	plan, ok := proposedPlanFromCodexEvent(event)
+	if !ok {
 		return
 	}
 
-	ver, err := savePlanVersion(storageDir, content)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "crit plan-hook: error saving plan: %v\n", err)
-		return
-	}
-	fmt.Fprintf(os.Stderr, "crit plan-hook: plan '%s' saved as v%03d\n", slug, ver)
-
-	cwd, _ := resolvedCWD()
-	key := planSessionKey(cwd, slug)
-	currentPath := filepath.Join(storageDir, "current.md")
-	daemonArgs := buildPlanDaemonArgs(currentPath, storageDir, slug, 0, false, false)
-
-	entry, alive := findAliveSession(key)
-	weStartedDaemon := false
-
-	if alive {
-		fmt.Fprintf(os.Stderr, "crit plan-hook: connected to daemon at http://localhost:%d\n", entry.Port)
-		if !daemonHasBrowser(entry) {
-			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
-		}
-	} else {
-		entry, err = startDaemon(key, daemonArgs)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "crit plan-hook: error starting daemon: %v\n", err)
-			return
-		}
-		fmt.Fprintf(os.Stderr, "crit plan-hook: started daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
-		weStartedDaemon = true
-	}
-
-	if weStartedDaemon {
-		installDaemonSignalHandler(entry.PID)
-	}
-
-	approved, prompt := runReviewClientRaw(entry)
-	killDaemonOnApproval(approved, entry.PID)
-	cleanupOnApproval(approved, entry.ReviewPath, LoadConfig(cwd).CleanupOnApproveEnabled())
-	emitHookDecision(approved, prompt)
+	go backgroundCleanup()
+	runCodexPlanReviewHook(event.SessionID, []byte(plan))
 }
 
 // waitForDaemonReady polls the daemon's /api/session endpoint until it stops
 // returning 503 Service Unavailable (session not yet initialized). Returns the
 // last response status code and body, or an error if the daemon is unreachable
 // or the 5-minute deadline expires.
-func waitForDaemonReady(client *http.Client, port int) (statusCode int, body []byte, err error) {
+//
+// On connection errors (e.g. "connection refused"), the daemon log is consulted
+// to surface the actual init failure instead of the misleading network error.
+func waitForDaemonReady(client *http.Client, host string, port int, sessionKey string) (statusCode int, body []byte, err error) {
+	base := fmt.Sprintf("http://%s:%d", hostForDisplay(host), port)
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
-		resp, reqErr := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/session", port))
+		resp, reqErr := client.Get(base + "/api/session")
 		if reqErr != nil {
+			if sessionKey != "" {
+				if msg := readDaemonLog(sessionKey); msg != "" {
+					return 0, nil, fmt.Errorf("%s", msg)
+				}
+			}
 			return 0, nil, fmt.Errorf("could not reach daemon on port %d: %w", port, reqErr)
 		}
 		respBody, _ := io.ReadAll(resp.Body)
@@ -1925,17 +2198,17 @@ func waitForDaemonReady(client *http.Client, port int) (statusCode int, body []b
 
 // runReviewClientRaw is like runReviewClient but returns (approved, prompt)
 // without writing to stdout — used by runPlanHook to construct hookSpecificOutput.
-func runReviewClientRaw(entry sessionEntry) (approved bool, prompt string) {
+func runReviewClientRaw(entry sessionEntry, sessionKey string) (approved bool, prompt string) {
 	client := &http.Client{Timeout: 24 * time.Hour}
 
 	// Wait for the server to finish initializing before calling review-cycle.
-	if _, _, err := waitForDaemonReady(client, entry.Port); err != nil {
+	if _, _, err := waitForDaemonReady(client, entry.Host, entry.Port, sessionKey); err != nil {
 		fmt.Fprintf(os.Stderr, "crit plan-hook: %v\n", err)
 		return false, "crit daemon was unreachable; plan was not reviewed."
 	}
 
 	resp, err := client.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/review-cycle", entry.Port),
+		entry.baseURL()+"/api/review-cycle",
 		"application/json",
 		nil,
 	)
@@ -2025,18 +2298,18 @@ func runReview(args []string) {
 	weStartedDaemon := false
 
 	if alive {
-		fmt.Fprintf(os.Stderr, "Connected to crit daemon at http://localhost:%d\n", entry.Port)
+		fmt.Fprintf(os.Stderr, "Connected to crit daemon at %s\n", entry.baseURL())
 		// Re-open browser if no browser tab is connected (user closed it)
 		if !sc.noOpen && !daemonHasBrowser(entry) {
-			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
+			go openBrowser(entry.baseURL())
 		}
 	} else {
 		// Pre-flight: in default git mode (no files, no focus, no plan), surface
-		// "no changed files" up front instead of letting the daemon spawn, signal
-		// readiness, then crash on init — which leaves the user with a misleading
-		// "could not reach daemon / connection refused" error. See issue #438.
+		// errors up front instead of letting the daemon spawn, signal readiness,
+		// then crash on init — which leaves the user with a misleading
+		// "could not reach daemon / connection refused" error. See #438, #593.
 		if len(sc.files) == 0 && sc.focus == nil && sc.planDir == "" {
-			if msg := preflightNoChangedFiles(sc); msg != "" {
+			if msg := preflightCheck(sc); msg != "" {
 				fmt.Fprint(os.Stderr, msg)
 				os.Exit(1)
 			}
@@ -2047,7 +2320,15 @@ func runReview(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Started crit daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
+		fmt.Fprintf(os.Stderr, "Started crit daemon at %s (PID %d)\n", entry.baseURL(), entry.PID)
+		if dirs := dirArgs(sc.files); len(dirs) > 0 {
+			fmt.Fprintf(os.Stderr, "\nNote: scanning %s — file paths are intended for reviewing a small set of\n"+
+				"documents or plans. To review code changes, run `crit` with no arguments\n"+
+				"on a feature branch.\n\n", strings.Join(dirs, ", "))
+		}
+		if !sc.noIntegrationCheck {
+			hintMissingIntegrations()
+		}
 		weStartedDaemon = true
 	}
 
@@ -2056,7 +2337,7 @@ func runReview(args []string) {
 		installDaemonSignalHandler(entry.PID)
 	}
 
-	approved := runReviewClient(entry)
+	approved := runReviewClient(entry, key)
 	killDaemonOnApproval(approved, entry.PID)
 	cleanupOnApproval(approved, entry.ReviewPath, LoadConfig(cwd).CleanupOnApproveEnabled())
 }
@@ -2081,11 +2362,11 @@ func readReviewCycleResponse(resp *http.Response) ([]byte, error) {
 // runReviewClient connects to a running daemon/server, blocks until the user
 // finishes reviewing, prints feedback to stdout, and returns whether the
 // review was approved (no unresolved comments).
-func runReviewClient(entry sessionEntry) (approved bool) {
+func runReviewClient(entry sessionEntry, sessionKey string) (approved bool) {
 	client := &http.Client{Timeout: 24 * time.Hour}
 
 	// Wait for the server to finish initializing before calling review-cycle.
-	statusCode, body, err := waitForDaemonReady(client, entry.Port)
+	statusCode, body, err := waitForDaemonReady(client, entry.Host, entry.Port, sessionKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -2103,7 +2384,7 @@ func runReviewClient(entry sessionEntry) (approved bool) {
 	}
 
 	resp, err := client.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/review-cycle", entry.Port),
+		entry.baseURL()+"/api/review-cycle",
 		"application/json",
 		nil,
 	)
@@ -2137,6 +2418,17 @@ func runReviewClient(entry sessionEntry) (approved bool) {
 		return result.Approved
 	}
 	return false
+}
+
+// dirArgs returns the subset of paths that are directories.
+func dirArgs(paths []string) []string {
+	var dirs []string
+	for _, p := range paths {
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			dirs = append(dirs, p)
+		}
+	}
+	return dirs
 }
 
 // TODO: runStop, runStatus, and other subcommands use DetectVCS("") for auto-detection.
@@ -2310,6 +2602,12 @@ func addReviewStats(result map[string]interface{}, revPath string) {
 		return
 	}
 	result["round"] = cj.ReviewRound
+	if cj.ReviewType != "" {
+		result["review_type"] = cj.ReviewType
+	}
+	if cj.Origin != "" {
+		result["origin"] = cj.Origin
+	}
 	unresolved, resolved := countComments(cj)
 	result["comments"] = map[string]int{
 		"unresolved": unresolved,
@@ -2340,6 +2638,12 @@ func printStatusHuman(vcsName, branch, revPath string, revExists bool, session *
 	var cj CritJSON
 	if json.Unmarshal(data, &cj) != nil {
 		return
+	}
+	if cj.ReviewType == "live" {
+		fmt.Printf("Mode:        live\n")
+		if cj.Origin != "" {
+			fmt.Printf("Origin:      %s\n", cj.Origin)
+		}
 	}
 	fmt.Printf("Round:       %d\n", cj.ReviewRound)
 	unresolved, resolved := countComments(cj)
@@ -2403,12 +2707,7 @@ func runCleanup(args []string) {
 
 	fmt.Printf("Found %d stale review file%s:\n", len(stale), plural(len(stale)))
 	for _, s := range stale {
-		ageDays := int(s.age.Hours() / 24)
-		branchInfo := ""
-		if s.branch != "" {
-			branchInfo = s.branch + ", "
-		}
-		fmt.Printf("  %s  (%s%d days old, %d comment%s)\n", s.path, branchInfo, ageDays, s.comments, plural(s.comments))
+		fmt.Printf("  %s  (%s%d days old, %d comment%s)\n", s.path, s.metaLabel(), int(s.age.Hours()/24), s.comments, plural(s.comments))
 	}
 
 	if !force {
@@ -2427,11 +2726,26 @@ func runCleanup(args []string) {
 }
 
 type staleReview struct {
-	key      string
-	path     string
-	branch   string
-	age      time.Duration
-	comments int
+	key        string
+	path       string
+	branch     string
+	reviewType string
+	origin     string
+	age        time.Duration
+	comments   int
+}
+
+func (s staleReview) metaLabel() string {
+	if s.reviewType == "live" {
+		if s.origin != "" {
+			return "live: " + s.origin + ", "
+		}
+		return "live, "
+	}
+	if s.branch != "" {
+		return s.branch + ", "
+	}
+	return ""
 }
 
 func findStaleReviews(revDir string, days int) []staleReview {
@@ -2497,9 +2811,13 @@ func checkStaleReviewFolder(revDir string, de os.DirEntry, key string, cutoff ti
 		var cj CritJSON
 		var updatedAt time.Time
 		var branch string
+		var reviewType string
+		var origin string
 		var commentCount int
 		if json.Unmarshal(data, &cj) == nil {
 			branch = cj.Branch
+			reviewType = cj.ReviewType
+			origin = cj.Origin
 			if t, parseErr := time.Parse(time.RFC3339, cj.UpdatedAt); parseErr == nil {
 				updatedAt = t
 			}
@@ -2517,11 +2835,13 @@ func checkStaleReviewFolder(revDir string, de os.DirEntry, key string, cutoff ti
 			return staleReview{}, false
 		}
 		return staleReview{
-			key:      key,
-			path:     folder,
-			branch:   branch,
-			age:      time.Since(updatedAt),
-			comments: commentCount,
+			key:        key,
+			path:       folder,
+			branch:     branch,
+			reviewType: reviewType,
+			origin:     origin,
+			age:        time.Since(updatedAt),
+			comments:   commentCount,
 		}, true
 	}
 

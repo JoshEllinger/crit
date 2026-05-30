@@ -12,7 +12,7 @@ import { dirname, resolve } from 'node:path';
 import vm from 'node:vm';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const bundlePath = resolve(__dirname, 'highlight.min.js');
+const bundlePath = resolve(__dirname, '..', 'highlight.min.js');
 const bundle = readFileSync(bundlePath, 'utf8');
 
 const sandbox = {};

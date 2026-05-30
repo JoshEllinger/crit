@@ -20,14 +20,14 @@ linters:
       - linters: [staticcheck]
         text: "QF"
       - linters: [gocyclo]
-        text: "runComment|mergeExternalCritJSON|bulkAddCommentsToCritJSONScoped|runPush|runServe"
+        text: "runComment|mergeExternalCritJSON|bulkAddCommentsToCritJSONScoped|runPush|runServe|runDesign|handleFileComments"
       - linters: [gocyclo]
         path: "_test\\.go"
       - linters: [gocyclo]
         path: "node_modules/"
       - linters: [unparam]
         path: "_test\\.go"
-      - linters: [nilerr, gocritic, errorlint, unparam]
+      - linters: [nilerr, gocritic, errorlint, unparam, govet]
         path: "node_modules/"
 
 formatters:

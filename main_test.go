@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -79,6 +81,329 @@ func TestHelperProcess_Config(t *testing.T) {
 		return
 	}
 	runConfig([]string{"--generate"})
+}
+
+func TestExtractProposedPlan(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{
+			name: "extracts multiline plan",
+			in:   "before\n<proposed_plan>\n- change auth\n</proposed_plan>\nafter",
+			want: "- change auth",
+			ok:   true,
+		},
+		{
+			name: "rejects empty plan",
+			in:   "<proposed_plan>\n</proposed_plan>",
+		},
+		{
+			name: "accepts unterminated final plan block",
+			in:   "before\n<proposed_plan>\n- change auth",
+			want: "- change auth",
+			ok:   true,
+		},
+		{
+			name: "uses latest non-empty plan block",
+			in: strings.Join([]string{
+				"<proposed_plan></proposed_plan>",
+				"<proposed_plan>\n- first\n</proposed_plan>",
+				"<proposed_plan>\n- latest\n</proposed_plan>",
+			}, "\n"),
+			want: "- latest",
+			ok:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := extractProposedPlan(tt.in)
+			if ok != tt.ok {
+				t.Fatalf("ok = %v, want %v", ok, tt.ok)
+			}
+			if got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProposedPlanFromCodexEventFallsBackToTranscript(t *testing.T) {
+	transcript := writeCodexTranscript(t,
+		codexTurnContextLine(t, "turn-1"),
+		codexAssistantMessageLine(t, "<proposed_plan>\n- old plan\n</proposed_plan>"),
+		codexTurnContextLine(t, "turn-2"),
+		codexAssistantMessageLine(t, "visible text\n<proposed_plan>\n- new plan\n</proposed_plan>"),
+	)
+	visible := "visible text"
+	got, ok := proposedPlanFromCodexEvent(codexStopHookEvent{
+		LastAssistantMessage: &visible,
+		TranscriptPath:       &transcript,
+		TurnID:               "turn-2",
+	})
+	if !ok {
+		t.Fatal("expected proposed plan from transcript")
+	}
+	if got != "- new plan" {
+		t.Fatalf("got %q, want %q", got, "- new plan")
+	}
+}
+
+func TestProposedPlanFromCodexEventUsesTaggedPlanOutsidePlanMode(t *testing.T) {
+	visible := "<proposed_plan>\n- should run\n</proposed_plan>"
+	got, ok := proposedPlanFromCodexEvent(codexStopHookEvent{
+		PermissionMode:       "default",
+		LastAssistantMessage: &visible,
+	})
+	if !ok {
+		t.Fatal("expected tagged plan outside formal plan mode")
+	}
+	if got != "- should run" {
+		t.Fatalf("got %q, want %q", got, "- should run")
+	}
+}
+
+func TestProposedPlanFromCodexEventDoesNotReuseOldTranscriptPlan(t *testing.T) {
+	transcript := writeCodexTranscript(t,
+		codexTurnContextLine(t, "turn-1"),
+		codexAssistantMessageLine(t, "<proposed_plan>\n- old plan\n</proposed_plan>"),
+		codexTurnContextLine(t, "turn-2"),
+		codexAssistantMessageLine(t, "ordinary final answer"),
+	)
+	visible := "ordinary final answer"
+	if plan, ok := proposedPlanFromCodexEvent(codexStopHookEvent{
+		LastAssistantMessage: &visible,
+		TranscriptPath:       &transcript,
+		TurnID:               "turn-2",
+	}); ok {
+		t.Fatalf("did not expect old plan to be reused, got %q", plan)
+	}
+}
+
+func TestRunCodexPlanHookReviewsTaggedPlanWhenStopHookActive(t *testing.T) {
+	prevHook := runCodexPlanReviewHook
+	t.Cleanup(func() { runCodexPlanReviewHook = prevHook })
+
+	var gotSessionID string
+	var gotContent string
+	runCodexPlanReviewHook = func(sessionID string, content []byte) {
+		gotSessionID = sessionID
+		gotContent = string(content)
+	}
+
+	visible := "<proposed_plan>\n- revised plan\n</proposed_plan>"
+	runCodexPlanHookWithInput(t, codexStopHookEvent{
+		SessionID:            "codex-session",
+		StopHookActive:       true,
+		LastAssistantMessage: &visible,
+	})
+
+	if gotSessionID != "codex-session" {
+		t.Fatalf("session id = %q, want codex-session", gotSessionID)
+	}
+	if gotContent != "- revised plan" {
+		t.Fatalf("review content = %q, want revised plan", gotContent)
+	}
+}
+
+func TestRunCodexPlanHookSkipsStopHookActiveWithoutTaggedPlan(t *testing.T) {
+	prevHook := runCodexPlanReviewHook
+	t.Cleanup(func() { runCodexPlanReviewHook = prevHook })
+
+	called := false
+	runCodexPlanReviewHook = func(string, []byte) {
+		called = true
+	}
+
+	visible := "ordinary assistant message"
+	runCodexPlanHookWithInput(t, codexStopHookEvent{
+		StopHookActive:       true,
+		LastAssistantMessage: &visible,
+	})
+
+	if called {
+		t.Fatal("did not expect review hook to run without a tagged proposed plan")
+	}
+}
+
+func TestProposedPlanFromCodexEventFallsBackToTranscriptWhenStopHookActive(t *testing.T) {
+	transcript := writeCodexTranscript(t,
+		codexTurnContextLine(t, "turn-1"),
+		codexAssistantMessageLine(t, "<proposed_plan>\n- old plan\n</proposed_plan>"),
+		codexAssistantMessageLine(t, "<proposed_plan>\n- revised plan\n</proposed_plan>"),
+	)
+	visible := "ordinary assistant message"
+	plan, ok := proposedPlanFromCodexEvent(codexStopHookEvent{
+		StopHookActive:       true,
+		LastAssistantMessage: &visible,
+		TranscriptPath:       &transcript,
+		TurnID:               "turn-1",
+	})
+	if !ok {
+		t.Fatal("expected Stop hook recursion to review transcript plan")
+	}
+	if plan != "- revised plan" {
+		t.Fatalf("got %q, want revised plan", plan)
+	}
+}
+
+func TestProposedPlanFromCodexEventDoesNotReuseSameTurnStaleTranscriptPlan(t *testing.T) {
+	transcript := writeCodexTranscript(t,
+		codexTurnContextLine(t, "turn-1"),
+		codexAssistantMessageLine(t, "<proposed_plan>\n- stale plan\n</proposed_plan>"),
+		codexAssistantMessageLine(t, "ordinary assistant message"),
+	)
+	visible := "ordinary assistant message"
+	if plan, ok := proposedPlanFromCodexEvent(codexStopHookEvent{
+		StopHookActive:       true,
+		LastAssistantMessage: &visible,
+		TranscriptPath:       &transcript,
+		TurnID:               "turn-1",
+	}); ok {
+		t.Fatalf("did not expect stale same-turn plan to be reused, got %q", plan)
+	}
+}
+
+func TestRunCodexPlanHookBlocksOnMalformedInput(t *testing.T) {
+	out := runCodexPlanHookWithRawInput(t, "{")
+	var decision struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(out), &decision); err != nil {
+		t.Fatalf("decode decision %q: %v", out, err)
+	}
+	if decision.Decision != "block" {
+		t.Fatalf("decision = %q, want block", decision.Decision)
+	}
+	if !strings.Contains(decision.Reason, "could not parse") {
+		t.Fatalf("reason = %q, want parse failure", decision.Reason)
+	}
+}
+
+func runCodexPlanHookWithInput(t *testing.T, event codexStopHookEvent) {
+	t.Helper()
+
+	prevStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = r.Close()
+	})
+	os.Stdin = r
+	if err := json.NewEncoder(w).Encode(event); err != nil {
+		t.Fatalf("encode event: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stdin writer: %v", err)
+	}
+
+	runCodexPlanHook()
+}
+
+func runCodexPlanHookWithRawInput(t *testing.T, input string) string {
+	t.Helper()
+
+	prevStdin := os.Stdin
+	prevStdout := os.Stdout
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		os.Stdout = prevStdout
+		_ = inR.Close()
+		_ = outR.Close()
+	})
+	os.Stdin = inR
+	os.Stdout = outW
+	if _, err := inW.WriteString(input); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	if err := inW.Close(); err != nil {
+		t.Fatalf("close stdin writer: %v", err)
+	}
+
+	runCodexPlanHook()
+	if err := outW.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	data, err := io.ReadAll(outR)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+type codexTranscriptFixtureLine struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+func writeCodexTranscript(t *testing.T, lines ...codexTranscriptFixtureLine) string {
+	t.Helper()
+
+	transcript := filepath.Join(t.TempDir(), "rollout.jsonl")
+	var b strings.Builder
+	for _, line := range lines {
+		data, err := json.Marshal(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(data)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(transcript, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return transcript
+}
+
+func codexTurnContextLine(t *testing.T, turnID string) codexTranscriptFixtureLine {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		TurnID string `json:"turn_id"`
+	}{TurnID: turnID})
+	if err != nil {
+		t.Fatalf("marshal turn context: %v", err)
+	}
+	return codexTranscriptFixtureLine{Type: "turn_context", Payload: payload}
+}
+
+func codexAssistantMessageLine(t *testing.T, text string) codexTranscriptFixtureLine {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		Type    string `json:"type"`
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}{
+		Type: "message",
+		Role: "assistant",
+		Content: []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{
+			{Type: "output_text", Text: text},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal assistant message: %v", err)
+	}
+	return codexTranscriptFixtureLine{Type: "response_item", Payload: payload}
 }
 
 // TestRunComment_MissingArgs verifies that runComment exits with usage when given no args.
@@ -313,6 +638,35 @@ func TestPromptShareConsent(t *testing.T) {
 		}
 		if !strings.Contains(buf.String(), "Continue?") {
 			t.Errorf("promptShareConsent did not print prompt for input=%q", tt.input)
+		}
+	}
+}
+
+func TestPromptShareURLConfirm(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"y\n", true},
+		{"Y\n", true},
+		{"n\n", false},
+		{"N\n", false},
+		{"\n", false},
+		{"", false},
+		{"yes\n", false},
+	}
+	for _, tt := range tests {
+		var buf strings.Builder
+		got := promptShareURLConfirm(&buf, strings.NewReader(tt.input), "https://example.com")
+		if got != tt.want {
+			t.Errorf("promptShareURLConfirm(input=%q) = %v, want %v", tt.input, got, tt.want)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "https://example.com") {
+			t.Errorf("promptShareURLConfirm did not print URL for input=%q, got %q", tt.input, out)
+		}
+		if !strings.Contains(out, "continue?") && !strings.Contains(out, "Continue?") {
+			t.Errorf("promptShareURLConfirm did not print prompt for input=%q, got %q", tt.input, out)
 		}
 	}
 }
@@ -1283,7 +1637,7 @@ func TestRunReviewClientRaw_WaitsForReadiness(t *testing.T) {
 	}
 
 	entry := sessionEntry{Port: port}
-	approved, _ := runReviewClientRaw(entry)
+	approved, _ := runReviewClientRaw(entry, "")
 
 	if !reviewCycleCalled.Load() {
 		t.Error("review-cycle was never called")
@@ -1323,7 +1677,7 @@ func TestRunReviewClientRaw_NoReadinessDelay(t *testing.T) {
 	}
 
 	start := time.Now()
-	approved, prompt := runReviewClientRaw(sessionEntry{Port: port})
+	approved, prompt := runReviewClientRaw(sessionEntry{Port: port}, "")
 	elapsed := time.Since(start)
 
 	if approved {
@@ -1368,7 +1722,7 @@ func TestRunReviewClientRaw_DaemonShutdownDeniesNotApproves(t *testing.T) {
 			fmt.Sscanf(ts.URL, "http://localhost:%d", &port)
 		}
 
-		approved, prompt := runReviewClientRaw(sessionEntry{Port: port})
+		approved, prompt := runReviewClientRaw(sessionEntry{Port: port}, "")
 		if approved {
 			t.Fatal("expected approved=false on daemon shutdown, got true (silent auto-approve)")
 		}
@@ -1411,12 +1765,60 @@ func TestRunReviewClientRaw_DaemonShutdownDeniesNotApproves(t *testing.T) {
 			fmt.Sscanf(ts.URL, "http://localhost:%d", &port)
 		}
 
-		approved, prompt := runReviewClientRaw(sessionEntry{Port: port})
+		approved, prompt := runReviewClientRaw(sessionEntry{Port: port}, "")
 		if approved {
 			t.Fatal("expected approved=false on connection drop, got true (silent auto-approve)")
 		}
 		if prompt == "" {
 			t.Fatal("expected non-empty prompt explaining the failure, got empty")
+		}
+	})
+}
+
+// TestWaitForDaemonReady_SurfacesDaemonLog verifies that when the daemon is
+// unreachable (e.g. crashed during init), the error message surfaces the daemon
+// log contents instead of the misleading "connection refused" network error.
+func TestWaitForDaemonReady_SurfacesDaemonLog(t *testing.T) {
+	t.Run("surfaces daemon log on connection error", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		ln.Close()
+
+		dir := t.TempDir()
+		setHome(t, dir)
+
+		sessDir := filepath.Join(dir, ".crit", "sessions")
+		os.MkdirAll(sessDir, 0700)
+		os.WriteFile(filepath.Join(sessDir, "testkey123.log"), []byte("Error: not in a git repository"), 0600)
+
+		client := &http.Client{Timeout: 1 * time.Second}
+		_, _, err = waitForDaemonReady(client, "", port, "testkey123")
+		if err == nil {
+			t.Fatal("expected error for unreachable daemon")
+		}
+		if !strings.Contains(err.Error(), "not in a git repository") {
+			t.Errorf("expected daemon log message in error, got: %v", err)
+		}
+	})
+
+	t.Run("falls back to network error when no log", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		ln.Close()
+
+		client := &http.Client{Timeout: 1 * time.Second}
+		_, _, err = waitForDaemonReady(client, "", port, "")
+		if err == nil {
+			t.Fatal("expected error for unreachable daemon")
+		}
+		if !strings.Contains(err.Error(), "could not reach daemon") {
+			t.Errorf("expected 'could not reach daemon' fallback, got: %v", err)
 		}
 	})
 }
@@ -1514,6 +1916,38 @@ func TestPlural(t *testing.T) {
 	}
 }
 
+func TestDirArgs(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "subdir")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(tmp, "file.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		paths []string
+		want  int
+	}{
+		{"empty", nil, 0},
+		{"files only", []string{file}, 0},
+		{"dirs only", []string{dir}, 1},
+		{"mixed", []string{file, dir}, 1},
+		{"nonexistent", []string{"/no/such/path"}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dirArgs(tt.paths)
+			if len(got) != tt.want {
+				t.Errorf("dirArgs(%v) returned %d dirs, want %d", tt.paths, len(got), tt.want)
+			}
+		})
+	}
+}
+
 func TestParseShareFlags(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1593,6 +2027,29 @@ func TestParseShareFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseShareFlags_OrgVisibility(t *testing.T) {
+	t.Run("--org flag", func(t *testing.T) {
+		sf := parseShareFlags([]string{"--org", "acme", "plan.md"})
+		if sf.org != "acme" {
+			t.Fatalf("expected org=acme, got %q", sf.org)
+		}
+	})
+
+	t.Run("--visibility flag", func(t *testing.T) {
+		sf := parseShareFlags([]string{"--visibility", "organization", "plan.md"})
+		if sf.visibility != "organization" {
+			t.Fatalf("expected visibility=organization, got %q", sf.visibility)
+		}
+	})
+
+	t.Run("both flags", func(t *testing.T) {
+		sf := parseShareFlags([]string{"--org", "acme", "--visibility", "unlisted", "plan.md"})
+		if sf.org != "acme" || sf.visibility != "unlisted" {
+			t.Fatalf("got org=%q vis=%q", sf.org, sf.visibility)
+		}
+	})
 }
 
 func TestLoadShareFiles(t *testing.T) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -404,6 +405,64 @@ func TestCarryForwardComment_PreservesGitHubID(t *testing.T) {
 
 	if carried.GitHubID != 12345 {
 		t.Errorf("GitHubID = %d, want 12345", carried.GitHubID)
+	}
+}
+
+// TestCarryForwardComment_PreservesResolvedRound guards round-scoped resolve
+// metadata. ResolvedRound records the round during which Resolved flipped
+// false->true and drives the timeline visibility filter; if it is dropped on
+// carry-forward, resolved comments appear at the wrong point in the timeline
+// (the legacy round-1 fallback kicks in).
+func TestCarryForwardComment_PreservesResolvedRound(t *testing.T) {
+	old := Comment{
+		ID:            "c_old",
+		StartLine:     5,
+		EndLine:       5,
+		Body:          "Looks good",
+		Author:        "reviewer",
+		Scope:         "line",
+		CreatedAt:     "2026-04-13T10:00:00Z",
+		UpdatedAt:     "2026-04-13T10:00:00Z",
+		Resolved:      true,
+		ResolvedRound: 3,
+		ReviewRound:   1,
+	}
+
+	carried := carryForwardComment(old, "c_new", "2026-04-13T11:00:00Z")
+
+	if !carried.Resolved {
+		t.Error("Resolved not preserved")
+	}
+	if carried.ResolvedRound != 3 {
+		t.Errorf("ResolvedRound = %d, want 3", carried.ResolvedRound)
+	}
+}
+
+// TestCarryForwardComment_PreservesLastPushedBodyHash guards the GitHub-sync
+// dedup hash. Without it, every already-pushed comment looks "never pushed"
+// after a round bump and `crit push` would re-PATCH (or double-post) bodies
+// that are actually unchanged.
+func TestCarryForwardComment_PreservesLastPushedBodyHash(t *testing.T) {
+	old := Comment{
+		ID:                 "c_old",
+		StartLine:          7,
+		EndLine:            7,
+		Body:               "Nit: rename",
+		Author:             "reviewer",
+		Scope:              "line",
+		CreatedAt:          "2026-04-13T10:00:00Z",
+		UpdatedAt:          "2026-04-13T10:00:00Z",
+		GitHubID:           99,
+		LastPushedBodyHash: "abc123def456",
+	}
+
+	carried := carryForwardComment(old, "c_new", "2026-04-13T11:00:00Z")
+
+	if carried.GitHubID != 99 {
+		t.Errorf("GitHubID = %d, want 99", carried.GitHubID)
+	}
+	if carried.LastPushedBodyHash != "abc123def456" {
+		t.Errorf("LastPushedBodyHash = %q, want %q", carried.LastPushedBodyHash, "abc123def456")
 	}
 }
 
@@ -1466,4 +1525,154 @@ func TestRemapLines(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOnLiveRoundStart_OnlyForLiveAndPreviewReviews(t *testing.T) {
+	called := 0
+	hook := func(int, int) { called++ }
+
+	s := &Session{ReviewType: "", ReviewRound: 1, liveRoundStart: hook}
+	advanceRoundForTest(s)
+	if called != 0 {
+		t.Fatalf("hook fired for code review (called=%d)", called)
+	}
+
+	s2 := &Session{ReviewType: "live", ReviewRound: 1, liveRoundStart: hook}
+	advanceRoundForTest(s2)
+	if called != 1 {
+		t.Fatalf("hook did not fire for live review (called=%d)", called)
+	}
+	if s2.ReviewRound != 2 {
+		t.Fatalf("ReviewRound = %d, want 2", s2.ReviewRound)
+	}
+
+	s3 := &Session{ReviewType: "preview", ReviewRound: 1, liveRoundStart: hook}
+	advanceRoundForTest(s3)
+	if called != 2 {
+		t.Fatalf("hook did not fire for preview review (called=%d)", called)
+	}
+	if s3.ReviewRound != 2 {
+		t.Fatalf("ReviewRound = %d, want 2", s3.ReviewRound)
+	}
+}
+
+// TestHandleRoundCompleteFiles_DiscoversNewFiles is the regression for the
+// bug brief: in files mode, when the agent creates a new file inside a
+// CLI-arg directory between rounds, that file must appear in the session
+// (and in the /api/session response) once the round completes — without a
+// daemon restart.
+//
+// Drives the scenario through the HTTP surface end-to-end:
+//  1. Build a session over a temp dir as the CLI arg.
+//  2. Attach a real Server and start the file watcher goroutine.
+//  3. Write a new file into the watched dir.
+//  4. POST /api/round-complete (same path the agent hits via SignalRoundComplete).
+//  5. Poll GET /api/session until the new file appears.
+func TestHandleRoundCompleteFiles_DiscoversNewFiles(t *testing.T) {
+	tmp := t.TempDir()
+	setHome(t, t.TempDir())
+
+	// Run from the temp dir so resolveGitContext() (called inside
+	// NewSessionFromFiles) doesn't pick up the surrounding crit repo's VCS,
+	// which would set RepoRoot to crit's root and turn paths like
+	// /tmp/.../existing.md into absolute-path Rel() fallbacks.
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	watched := filepath.Join(tmp, "review_target")
+	if err := os.MkdirAll(watched, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existingPath := filepath.Join(watched, "existing.md")
+	writeFile(t, existingPath, "# pre-existing\n")
+
+	session, err := NewSessionFromFiles([]string{watched}, nil)
+	if err != nil {
+		t.Fatalf("NewSessionFromFiles: %v", err)
+	}
+	session.CLIArgs = []string{watched}
+	// Pin review-file identity to the temp HOME so sidecar writes during
+	// round-complete don't litter ~/.crit during tests.
+	session.ReviewFilePath = filepath.Join(tmp, ".crit-review")
+
+	srv, err := NewServer(session, frontendFS, "", false, "", "tester", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetSession(session)
+	t.Cleanup(func() { quiesceSession(t, session) })
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go session.watchFileMtimes(stop)
+
+	// Sanity: the existing file is present before any round-complete.
+	if names := sessionFilePaths(t, srv); !containsString(names, "existing.md") {
+		t.Fatalf("pre-condition: existing.md missing from /api/session, got %v", names)
+	}
+	newFile := "new_from_agent.md"
+	if containsString(sessionFilePaths(t, srv), newFile) {
+		t.Fatalf("pre-condition: %s should not be in session before it's written", newFile)
+	}
+
+	// Agent action: create a new file inside the watched dir.
+	writeFile(t, filepath.Join(watched, newFile), "# brand new\n")
+
+	// Trigger the round-complete transition the agent uses.
+	req := httptest.NewRequest("POST", "/api/round-complete", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("/api/round-complete status = %d, want 200", w.Code)
+	}
+
+	// Round-complete runs on the watcher goroutine; poll the session API
+	// until the new file appears (or we time out). 3s is plenty — the
+	// handler is in-process file I/O, no network.
+	deadline := time.Now().Add(3 * time.Second)
+	var lastPaths []string
+	for time.Now().Before(deadline) {
+		lastPaths = sessionFilePaths(t, srv)
+		if containsString(lastPaths, newFile) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("expected %s to appear in /api/session after round-complete; got %v", newFile, lastPaths)
+}
+
+// sessionFilePaths issues GET /api/session and returns the list of file paths
+// from the response. Test helper.
+func sessionFilePaths(t *testing.T, srv *Server) []string {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("GET /api/session status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var resp SessionInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal /api/session: %v", err)
+	}
+	out := make([]string, 0, len(resp.Files))
+	for _, f := range resp.Files {
+		out = append(out, f.Path)
+	}
+	return out
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }

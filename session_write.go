@@ -49,16 +49,19 @@ func (s *Session) critJSONPath() string {
 // writeFilesSnapshot holds all session state needed to write the review file,
 // captured under lock so that disk I/O can happen without holding the lock.
 type writeFilesSnapshot struct {
-	critPath       string
-	lastMtime      time.Time
-	branch         string
-	baseRef        string
-	reviewRound    int
-	sharedURL      string
-	deleteToken    string
-	shareScope     string
-	reviewComments []Comment
-	cliArgs        []string
+	critPath        string
+	lastMtime       time.Time
+	branch          string
+	baseRef         string
+	reviewRound     int
+	sharedURL       string
+	deleteToken     string
+	shareScope      string
+	shareOrg        string
+	shareOrgName    string
+	shareVisibility string
+	reviewComments  []Comment
+	cliArgs         []string
 	// pendingGHDeletes is the snapshot of session.pendingGitHubDeletes; carried
 	// into CritJSON so the next push can drain DELETE intents that were never
 	// flushed (e.g. user deleted, then quit before pushing).
@@ -102,6 +105,13 @@ func (s *Session) handleExternalDeletion(critPath string) bool {
 // clearAllCommentData resets all in-memory comment state (file comments,
 // review comments, and ID counters) and notifies if any comments existed.
 // Caller must NOT hold s.mu.
+//
+// ReviewRound is also reset to 1: this function runs when the review file
+// is deleted out from under the daemon (`crit cleanup`, manual `rm`,
+// hosted-side unpublish). Without the reset, a long-lived daemon (idle
+// timeout 1h) keeps an in-memory ReviewRound from a prior life, and the
+// next pin authored after the disk wipe ships against that stale round —
+// surfaced in the UI as "Round #2 (or higher) on a brand-new review".
 func (s *Session) clearAllCommentData() {
 	s.mu.Lock()
 	s.lastCritJSONMtime = time.Time{}
@@ -117,6 +127,8 @@ func (s *Session) clearAllCommentData() {
 	}
 	s.reviewComments = nil
 	s.deletedCommentIDs = nil
+	s.ReviewRound = 1
+	s.RoundSnapshots = nil
 	s.mu.Unlock()
 	if anyComments {
 		s.notify(SSEEvent{Type: "comments-changed"})
@@ -142,6 +154,9 @@ func buildCritJSON(snap writeFilesSnapshot) CritJSON {
 	cj.ShareURL = snap.sharedURL
 	cj.DeleteToken = snap.deleteToken
 	cj.ShareScope = snap.shareScope
+	cj.ShareOrg = snap.shareOrg
+	cj.ShareOrgName = snap.shareOrgName
+	cj.ShareVisibility = snap.shareVisibility
 	cj.ReviewComments = snap.reviewComments
 	cj.CliArgs = snap.cliArgs
 	cj.PendingGitHubDeletes = reconcilePendingGHDeletes(
@@ -359,6 +374,9 @@ func (s *Session) snapshotForWrite(critPath string) writeFilesSnapshot {
 		sharedURL:           s.sharedURL,
 		deleteToken:         s.deleteToken,
 		shareScope:          s.shareScope,
+		shareOrg:            s.shareOrg,
+		shareOrgName:        s.shareOrgName,
+		shareVisibility:     s.shareVisibility,
 		reviewComments:      rc,
 		cliArgs:             s.CLIArgs,
 		pendingGHDeletes:    pendDeletes,

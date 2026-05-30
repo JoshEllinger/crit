@@ -77,6 +77,31 @@ type Reply struct {
 	LastPushedBodyHash string `json:"last_pushed_body_hash,omitempty"`
 }
 
+// DOMAnchor identifies a DOM element for a live-mode pin.
+// Nil on all code-review comments. The existing Comment.Anchor field
+// (a textual line-anchor string for drift correction) is unrelated and
+// is left unchanged.
+type DOMAnchor struct {
+	Pathname    string   `json:"pathname"`
+	CSSSelector string   `json:"css_selector"`
+	TagChain    []string `json:"tag_chain"`
+
+	// Cheap fallback fields for drifted-recoverable resolution.
+	AccessibleName string `json:"accessible_name,omitempty"`
+	Role           string `json:"role,omitempty"`
+	Landmark       string `json:"landmark,omitempty"`
+
+	OuterHTML string `json:"outer_html"`
+	// Screenshot was a base64-encoded JPEG previously captured at pin
+	// authoring time. Removed: capture has been visually broken for
+	// multiple iterations and the data inflated review.json without
+	// adding any value the rendered review actually used. Legacy review
+	// files containing a "screenshot" key still load: encoding/json
+	// silently ignores unknown fields by default.
+	ViewportWidth  int `json:"viewport_width"`
+	ViewportHeight int `json:"viewport_height"`
+}
+
 // Comment represents a single inline review comment.
 type Comment struct {
 	ID          string `json:"id"`
@@ -88,12 +113,17 @@ type Comment struct {
 	QuoteOffset *int   `json:"quote_offset,omitempty"`
 	Anchor      string `json:"anchor,omitempty"`
 	Drifted     bool   `json:"drifted,omitempty"`
-	Author      string `json:"author,omitempty"`
-	UserID      string `json:"user_id,omitempty"`
-	Scope       string `json:"scope,omitempty"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
-	Resolved    bool   `json:"resolved,omitempty"`
+	// DriftedOnRound is set to the review round that newly classified this pin
+	// as Drifted. Used to surface "Drifted on round N" in the live-mode side
+	// panel. Zero (omitempty) means "not stamped". Distinct from `Drifted bool`
+	// so we can show "drifted earlier" vs "drifted just now" without ambiguity.
+	DriftedOnRound int    `json:"drifted_on_round,omitempty"`
+	Author         string `json:"author,omitempty"`
+	UserID         string `json:"user_id,omitempty"`
+	Scope          string `json:"scope,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
+	Resolved       bool   `json:"resolved,omitempty"`
 	// ResolvedRound is the review round during which Resolved transitioned
 	// false -> true. Cleared to 0 when Resolved transitions back to false.
 	// Legacy comments lacking this field are treated as zero on read; the
@@ -122,6 +152,16 @@ type Comment struct {
 	// Distinct from Comment.Scope ("line" | "file" | "review").
 	DiffScope string `json:"diff_scope,omitempty"`
 
+	// DOMAnchor is non-nil iff this comment is a live-mode pin.
+	// For code-review comments DOMAnchor is always nil.
+	DOMAnchor *DOMAnchor `json:"dom_anchor,omitempty"`
+
+	// PinNumber is a monotonic, review-scoped integer assigned at live-pin
+	// creation, so reviewers can refer to "pin #7" regardless of route. Set
+	// only on comments where DOMAnchor != nil. Zero (omitempty) for code
+	// comments and for any legacy live pin lacking a number.
+	PinNumber int `json:"pin_number,omitempty"`
+
 	// FocusKey identifies the *view* this comment was authored in.
 	// Comments are visible only when the current focus's key matches.
 	//   ""                            — working-tree / pre-feature
@@ -135,6 +175,9 @@ type SSEEvent struct {
 	Type     string `json:"type"`
 	Filename string `json:"filename"`
 	Content  string `json:"content"`
+	// Round is non-zero for live-mode round-start events; carries the
+	// round number that just started.
+	Round int `json:"round,omitempty"`
 }
 
 // FileEntry holds the state for a single file in a review session.
@@ -247,6 +290,18 @@ type Session struct {
 	// render them collapsed by default. Read-only after construction.
 	generatedRules []generatedRule
 
+	// Live-mode runtime fields. Zero values are safe for code reviews.
+	ReviewType string // "", "live", or "preview"
+	Origin     string // upstream URL, e.g. "http://localhost:3000"
+	ProxyPort  int    // proxy server port; 0 for code reviews
+
+	// liveRoundStart, when non-nil and ReviewType is "live" or
+	// "preview", is invoked after ReviewRound is bumped. Production wiring
+	// sets this in runServe before SetSession; tests assign it before
+	// driving the session. Must be installed before the watcher goroutine
+	// starts — read-only after.
+	liveRoundStart func(prevRound, newRound int)
+
 	reviewComments []Comment
 
 	// RoundSnapshots is in-memory state populated from <folder>/snapshots.json
@@ -297,6 +352,9 @@ type Session struct {
 	sharedURL           string
 	deleteToken         string
 	shareScope          string
+	shareOrg            string
+	shareOrgName        string
+	shareVisibility     string
 	status              *Status
 	roundComplete       chan struct{}
 	pendingEdits        int
@@ -344,17 +402,20 @@ func (s *Session) isSessionFile(absPath string) bool {
 
 // CritJSON is the on-disk format for review files.
 type CritJSON struct {
-	Branch         string                  `json:"branch"`
-	BaseRef        string                  `json:"base_ref"`
-	UpdatedAt      string                  `json:"updated_at"`
-	ReviewRound    int                     `json:"review_round"`
-	ShareURL       string                  `json:"share_url,omitempty"`
-	DeleteToken    string                  `json:"delete_token,omitempty"`
-	ShareScope     string                  `json:"share_scope,omitempty"`
-	LastShareHash  string                  `json:"last_share_hash,omitempty"`
-	ReviewComments []Comment               `json:"review_comments,omitempty"`
-	CliArgs        []string                `json:"cli_args,omitempty"`
-	Files          map[string]CritJSONFile `json:"files"`
+	Branch          string                  `json:"branch"`
+	BaseRef         string                  `json:"base_ref"`
+	UpdatedAt       string                  `json:"updated_at"`
+	ReviewRound     int                     `json:"review_round"`
+	ShareURL        string                  `json:"share_url,omitempty"`
+	DeleteToken     string                  `json:"delete_token,omitempty"`
+	ShareScope      string                  `json:"share_scope,omitempty"`
+	ShareOrg        string                  `json:"share_org,omitempty"`
+	ShareOrgName    string                  `json:"share_org_name,omitempty"`
+	ShareVisibility string                  `json:"share_visibility,omitempty"`
+	LastShareHash   string                  `json:"last_share_hash,omitempty"`
+	ReviewComments  []Comment               `json:"review_comments,omitempty"`
+	CliArgs         []string                `json:"cli_args,omitempty"`
+	Files           map[string]CritJSONFile `json:"files"`
 
 	// ActiveDiffScope is the most recent focus diff_scope from this session.
 	// Read by `crit push` to gate full-stack pushes; "" indicates working-tree mode.
@@ -366,6 +427,14 @@ type CritJSON struct {
 	// DELETE succeeds (or returns 404 / 403). Survives intermediate pulls so
 	// the user's intent is not lost.
 	PendingGitHubDeletes []int64 `json:"pending_github_deletes,omitempty"`
+
+	// ReviewType distinguishes review modes. "" (zero value) = code review.
+	// "live" = live mode. Omitted from JSON when empty for back-compat.
+	ReviewType string `json:"review_type,omitempty"`
+
+	// Origin is the upstream URL for live reviews (e.g. "http://localhost:3000").
+	// Empty for code reviews.
+	Origin string `json:"origin,omitempty"`
 }
 
 // CritJSONFile is the per-file section in review files.
@@ -934,6 +1003,62 @@ func (s *Session) AddFileComment(filePath, body, author, userID string) (Comment
 	return c, true
 }
 
+// AddLivePin appends a live-mode pin (zero lines, DOMAnchor set) to a
+// file. If no FileEntry exists for filePath yet, one is auto-created — live
+// sessions start with an empty Files slice and routes register lazily on
+// first pin.
+func (s *Session) AddLivePin(filePath, body, author, userID string, anchor *DOMAnchor) (Comment, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fe := s.fileByPathLocked(filePath)
+	if fe == nil {
+		fe = &FileEntry{
+			Path:     filePath,
+			FileType: "live-route",
+			Status:   "added",
+		}
+		s.Files = append(s.Files, fe)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Compute next PinNumber as max(existing PinNumbers across the session) + 1.
+	// Pin numbers are GLOBAL within a review (REVISION). Gap semantics: deleting
+	// a non-top pin leaves the gap empty — the next add gets max+1, NOT the
+	// gap. Example: pins 1,2,3 → delete 2 → next add is 4. This preserves
+	// stable identifiers for users referring to "pin #N" after a delete.
+	//
+	// Caveat: deleting the top pin and immediately adding another DOES reuse
+	// that number (4 → delete 4 → add gets 4 again). That's acceptable for the
+	// live-mode workflow today; tightening it would require a persisted
+	// session-scoped counter (CritJSON.NextPinNumber).
+	//
+	// O(N×M) scan is fine at this scale: live sessions are bounded to a
+	// handful of routes with <50 pins total. Profile before caching.
+	nextNum := 1
+	for _, file := range s.Files {
+		for _, existing := range file.Comments {
+			if existing.PinNumber >= nextNum {
+				nextNum = existing.PinNumber + 1
+			}
+		}
+	}
+	c := Comment{
+		ID:          randomCommentID(),
+		StartLine:   0,
+		EndLine:     0,
+		Body:        body,
+		Author:      author,
+		UserID:      userID,
+		DOMAnchor:   anchor,
+		PinNumber:   nextNum,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		ReviewRound: s.ReviewRound,
+	}
+	fe.Comments = append(fe.Comments, c)
+	s.scheduleWrite()
+	return c, true
+}
+
 // AddReviewComment adds a review-level comment (not tied to any file).
 func (s *Session) AddReviewComment(body, author, userID string) Comment {
 	s.mu.Lock()
@@ -1091,19 +1216,68 @@ func (s *Session) DeleteReviewCommentReply(commentID, replyID string) bool {
 
 // UpdateComment updates a comment in a specific file.
 func (s *Session) UpdateComment(filePath, id, body string) (Comment, bool) {
+	c, ok, _ := s.UpdateCommentWithAnchor(filePath, id, body, nil)
+	return c, ok
+}
+
+// UpdateCommentWithAnchor updates a comment's body and optionally its DOMAnchor.
+// - body == "" leaves the body unchanged.
+// - newAnchor == nil leaves the existing anchor unchanged.
+// - newAnchor != nil requires the existing comment to be a live pin.
+// Returns (comment, true, "") on success.
+func (s *Session) UpdateCommentWithAnchor(filePath, id, body string, newAnchor *DOMAnchor) (Comment, bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
-	if f == nil {
+	fe := s.fileByPathLocked(filePath)
+	if fe == nil {
+		return Comment{}, false, "not_found"
+	}
+	for i := range fe.Comments {
+		c := &fe.Comments[i]
+		if c.ID != id {
+			continue
+		}
+		if newAnchor != nil && c.DOMAnchor == nil {
+			return Comment{}, false, "anchor_on_code_comment"
+		}
+		if body != "" {
+			c.Body = body
+		}
+		if newAnchor != nil {
+			c.DOMAnchor = newAnchor
+		}
+		c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		s.scheduleWrite()
+		return *c, true, ""
+	}
+	return Comment{}, false, "not_found"
+}
+
+// PatchCommentDrift partially updates the live-pin drift fields on a
+// comment. Pointer arguments distinguish "not set" from "set to zero/false":
+// only non-nil arguments are written. Returns the updated comment and true
+// on success; (zero, false) when the comment is not found.
+func (s *Session) PatchCommentDrift(filePath, id string, drifted *bool, driftedOnRound *int) (Comment, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fe := s.fileByPathLocked(filePath)
+	if fe == nil {
 		return Comment{}, false
 	}
-	for i, c := range f.Comments {
-		if c.ID == id {
-			f.Comments[i].Body = body
-			f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-			s.scheduleWrite()
-			return f.Comments[i], true
+	for i := range fe.Comments {
+		c := &fe.Comments[i]
+		if c.ID != id {
+			continue
 		}
+		if drifted != nil {
+			c.Drifted = *drifted
+		}
+		if driftedOnRound != nil {
+			c.DriftedOnRound = *driftedOnRound
+		}
+		c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		s.scheduleWrite()
+		return *c, true
 	}
 	return Comment{}, false
 }
@@ -1158,6 +1332,46 @@ func (s *Session) SetCommentLive(filePath, id string) bool {
 // issue DELETE upstream — without that, deleting a pushed comment would leave
 // a ghost on the PR. trackDeletedComment guards against a concurrent reload
 // from disk resurrecting the just-removed entry before the next save.
+// deleteResult is the tri-state outcome of an authorized delete. Plain bool
+// can't distinguish "not found" from "forbidden" — handlers need both to
+// return the right HTTP status.
+type deleteResult int
+
+const (
+	deleteResultDeleted deleteResult = iota
+	deleteResultNotFound
+	deleteResultForbidden
+)
+
+// DeleteFileCommentAs is the authorization-aware variant of DeleteComment.
+// When the comment carries a non-empty UserID, requesterID must match;
+// otherwise (legacy / unauthed) anyone may delete. Replies cascade with the
+// parent struct.
+func (s *Session) DeleteFileCommentAs(filePath, id, requesterID string) deleteResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.fileByPathLocked(filePath)
+	if f == nil {
+		return deleteResultNotFound
+	}
+	for i, c := range f.Comments {
+		if c.ID != id {
+			continue
+		}
+		if c.UserID != "" && c.UserID != requesterID {
+			return deleteResultForbidden
+		}
+		if c.GitHubID != 0 {
+			s.appendPendingGHDelete(c.GitHubID)
+		}
+		f.Comments = append(f.Comments[:i], f.Comments[i+1:]...)
+		s.trackDeletedComment(filePath, id)
+		s.scheduleWrite()
+		return deleteResultDeleted
+	}
+	return deleteResultNotFound
+}
+
 func (s *Session) DeleteComment(filePath, id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1506,6 +1720,13 @@ func (s *Session) GetSharedURL() string {
 	return s.sharedURL
 }
 
+// GetToken returns the review token derived from the stored shared URL.
+// Returns empty string if no review is shared. Single source of truth — uses
+// tokenFromHostedURL so callers don't reimplement /r/<token> parsing.
+func (s *Session) GetToken() string {
+	return tokenFromHostedURL(s.GetSharedURL())
+}
+
 // SetSharedURLAndToken atomically updates both the shared URL and delete token.
 func (s *Session) SetSharedURLAndToken(url, token string) {
 	s.mu.Lock()
@@ -1534,6 +1755,21 @@ func (s *Session) GetShareState() (string, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sharedURL, s.deleteToken
+}
+
+func (s *Session) SetShareOrgInfo(org, orgName, visibility string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shareOrg = org
+	s.shareOrgName = orgName
+	s.shareVisibility = visibility
+	s.scheduleWrite()
+}
+
+func (s *Session) GetShareOrgInfo() (string, string, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.shareOrg, s.shareOrgName, s.shareVisibility
 }
 
 // LoadShareFilesFromDisk reads file content from disk for all session files,
@@ -1879,13 +2115,18 @@ func (s *Session) restoreShareStateLocked(cj *CritJSON) {
 			s.sharedURL = cj.ShareURL
 			s.deleteToken = cj.DeleteToken
 			s.shareScope = cj.ShareScope
+			s.shareOrg = cj.ShareOrg
+			s.shareOrgName = cj.ShareOrgName
+			s.shareVisibility = cj.ShareVisibility
 		}
 		return
 	}
 	if cj.ShareURL != "" {
-		// No scope recorded — load unconditionally.
 		s.sharedURL = cj.ShareURL
 		s.deleteToken = cj.DeleteToken
+		s.shareOrg = cj.ShareOrg
+		s.shareOrgName = cj.ShareOrgName
+		s.shareVisibility = cj.ShareVisibility
 	}
 }
 
