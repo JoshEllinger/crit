@@ -16,6 +16,33 @@ import (
 	"time"
 )
 
+type commonDaemonFlags struct {
+	port     int
+	host     string
+	noOpen   bool
+	quiet    bool
+	shareURL string
+}
+
+func appendCommonDaemonFlags(args []string, f commonDaemonFlags) []string {
+	if f.port != 0 {
+		args = append(args, "--port", strconv.Itoa(f.port))
+	}
+	if f.host != "" && f.host != "127.0.0.1" {
+		args = append(args, "--host", f.host)
+	}
+	if f.noOpen {
+		args = append(args, "--no-open")
+	}
+	if f.quiet {
+		args = append(args, "--quiet")
+	}
+	if f.shareURL != "" {
+		args = append(args, "--share-url", f.shareURL)
+	}
+	return args
+}
+
 // aliveClient is used by isDaemonAlive which is called in a loop by
 // listSessionsForCWD — a short timeout keeps listing responsive.
 var aliveClient = &http.Client{Timeout: time.Second}
@@ -28,11 +55,32 @@ var browserClient = &http.Client{Timeout: 2 * time.Second}
 type sessionEntry struct {
 	PID        int      `json:"pid"`
 	Port       int      `json:"port"`
+	Host       string   `json:"host,omitempty"`
 	CWD        string   `json:"cwd"`
 	Args       []string `json:"args,omitempty"`
 	Branch     string   `json:"branch"`
 	ReviewPath string   `json:"review_path"`
 	StartedAt  string   `json:"started_at"`
+}
+
+// displayHost returns the host suitable for user-facing URLs.
+// Falls back to "localhost" for the default 127.0.0.1 binding or
+// when host is empty (older session files).
+func (e sessionEntry) displayHost() string {
+	return hostForDisplay(e.Host)
+}
+
+// baseURL returns the HTTP base URL for connecting to this daemon.
+func (e sessionEntry) baseURL() string {
+	return fmt.Sprintf("http://%s:%d", e.displayHost(), e.Port)
+}
+
+// hostForDisplay maps a listen host to a user-facing hostname.
+func hostForDisplay(host string) string {
+	if host == "" || host == "127.0.0.1" {
+		return "localhost"
+	}
+	return host
 }
 
 // resolvedCWD returns the current working directory with symlinks resolved.
@@ -68,6 +116,18 @@ func sessionKey(cwd string, branch string, args []string) string {
 		h.Write([]byte{0})
 		h.Write([]byte(a))
 	}
+	return fmt.Sprintf("%x", h.Sum(nil))[:12]
+}
+
+// liveSessionKey returns the session/review key for a live-mode session.
+// Formula: sha256(cwd + "\0live\0" + origin)[:12].
+// The "\0live\0" separator ensures live reviews never collide with code
+// reviews in the same cwd (code reviews use "\0" + branch or "\0" + args).
+func liveSessionKey(cwd, origin string) string {
+	h := sha256.New()
+	h.Write([]byte(cwd))
+	h.Write([]byte("\x00live\x00"))
+	h.Write([]byte(origin))
 	return fmt.Sprintf("%x", h.Sum(nil))[:12]
 }
 
@@ -288,7 +348,7 @@ func isDaemonAlive(s sessionEntry) bool {
 	}
 	// HTTP health probe — ensures the port belongs to our daemon, not a reused PID.
 	// We validate the response body to guard against a non-crit process on the same port.
-	resp, err := aliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", s.Port))
+	resp, err := aliveClient.Get(s.baseURL() + "/api/health")
 	if err != nil {
 		return false
 	}
@@ -309,7 +369,7 @@ func isDaemonAlive(s sessionEntry) bool {
 // Uses a pointer to distinguish "field missing" (older daemon) from "false".
 // When the field is missing, assumes a browser is connected (safe default).
 func daemonHasBrowser(s sessionEntry) bool {
-	resp, err := browserClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", s.Port))
+	resp, err := browserClient.Get(s.baseURL() + "/api/health")
 	if err != nil {
 		return true // can't reach daemon, assume browser exists
 	}

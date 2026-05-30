@@ -1,5 +1,9 @@
-#!/bin/sh
+#!/usr/bin/env bash
 set -e
+
+# Prevent Go toolchain from scanning sibling worktrees that share the same
+# module path (wt creates crit-mono/crit.<branch> directories side by side).
+export GOWORK=off
 
 echo "Running pre-commit checks..."
 
@@ -30,7 +34,13 @@ fi
 # golangci-lint is installed via `go install`, not mise — only run if on PATH.
 if command -v golangci-lint >/dev/null 2>&1; then
     echo "  Running golangci-lint..."
-    if ! golangci-lint run ./... 2>&1; then
+    LINT_OUTPUT=$(golangci-lint run ./... 2>/dev/null) || true
+    # Sibling worktrees (crit-mono/crit.<branch>/) share the same module path,
+    # so golangci-lint reports their issues as ../crit.<branch>/file.go paths.
+    # Keep only issue lines for files in the current directory.
+    LINT_LOCAL=$(echo "$LINT_OUTPUT" | grep -E '^[^./][^:]*\.go:[0-9]+:' || true)
+    if [ -n "$LINT_LOCAL" ]; then
+        echo "$LINT_LOCAL"
         echo "  FAIL: Lint issues found"
         exit 1
     fi
@@ -40,7 +50,10 @@ fi
 
 # Run tests
 echo "  Running tests..."
-if ! run_tool go test ./... 2>&1; then
+TEST_OUTPUT=$(run_tool go test ./... 2>&1) || true
+TEST_FILTERED=$(echo "$TEST_OUTPUT" | grep -v '^\.\.\/' || true)
+if echo "$TEST_FILTERED" | grep -q '^FAIL'; then
+    echo "$TEST_FILTERED"
     echo "  FAIL: Tests failed"
     exit 1
 fi
@@ -52,6 +65,15 @@ if [ -f eslint.config.mjs ]; then
         echo "  FAIL: ESLint issues found"
         exit 1
     fi
+fi
+
+# Check for unicode confusables in JS (curly quotes break syntax)
+echo "  Checking for unicode confusables in JS..."
+CURLY=$(grep -rn $’[‘’“”]’ frontend/*.js 2>/dev/null | grep -v ‘\.min\.js:’ || true)
+if [ -n "$CURLY" ]; then
+    echo "  FAIL: Curly quotes found in JS files (use straight quotes):"
+    echo "$CURLY" | sed 's/^/    /'
+    exit 1
 fi
 
 # Check CSS linting

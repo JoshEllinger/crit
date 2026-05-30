@@ -744,6 +744,83 @@ body {
   .share-dialog-qr-col { align-items: center; }
 }
 
+/* ===== Org Share Modal ===== */
+.sd-org-dialog { max-width: 480px; border-radius: 12px; overflow: hidden; }
+.sd-org-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--crit-border); }
+.sd-org-title { font-size: 14px; font-weight: 600; color: var(--crit-fg-primary); line-height: 1.3; margin: 0; }
+.sd-org-close { background: none; border: 0; color: var(--crit-fg-muted); cursor: pointer; padding: 4px; border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: color 120ms, background 120ms; }
+.sd-org-close:hover { color: var(--crit-fg-primary); background: var(--crit-bg-elevated); }
+.sd-org-body { padding: 20px; display: flex; flex-direction: column; gap: 20px; }
+.sd-org-label { display: block; font-size: 12px; font-weight: 600; color: var(--crit-fg-primary); margin-bottom: 8px; letter-spacing: 0.01em; }
+/* Owner radio list */
+.sd-org-owner-list { display: flex; flex-direction: column; border: 1px solid var(--crit-border); border-radius: 8px; overflow: hidden; }
+.sd-org-owner-option { display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; border: 0; background: transparent; transition: background 100ms; text-align: left; font: inherit; color: inherit; width: 100%; }
+.sd-org-owner-option:hover { background: var(--crit-option-hover); }
+.sd-org-owner-option[aria-checked="true"] { background: var(--crit-option-selected-bg); }
+.sd-org-owner-option + .sd-org-owner-option { border-top: 1px solid var(--crit-border); }
+.sd-org-owner-option[aria-checked="true"] + .sd-org-owner-option,
+.sd-org-owner-option + .sd-org-owner-option[aria-checked="true"] { border-top-color: transparent; }
+/* Custom radio dot */
+.sd-org-radio { width: 16px; height: 16px; border-radius: 999px; border: 2px solid var(--crit-border-strong); flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: border-color 120ms, background 120ms; }
+.sd-org-owner-option[aria-checked="true"] .sd-org-radio,
+.sd-org-vis-option[aria-checked="true"] .sd-org-radio { border-color: var(--crit-brand); background: var(--crit-brand); }
+.sd-org-radio-dot { width: 6px; height: 6px; border-radius: 999px; background: var(--crit-fg-on-brand); opacity: 0; transform: scale(0); transition: opacity 120ms, transform 120ms; }
+.sd-org-owner-option[aria-checked="true"] .sd-org-radio-dot,
+.sd-org-vis-option[aria-checked="true"] .sd-org-radio-dot { opacity: 1; transform: scale(1); }
+/* Avatars */
+.sd-org-avatar { width: 20px; height: 20px; border-radius: 999px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 600; flex-shrink: 0; line-height: 1; }
+.sd-org-avatar--personal { background: var(--crit-brand); color: var(--crit-fg-on-brand); }
+.sd-org-avatar--org { background: var(--crit-bg-elevated); border: 1px solid var(--crit-border-strong); color: var(--crit-fg-secondary); border-radius: 5px; }
+.sd-org-owner-info { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.sd-org-owner-name { font-size: 13px; font-weight: 500; color: var(--crit-fg-primary); line-height: 1.3; }
+.sd-org-owner-slug { font-size: 11px; color: var(--crit-fg-muted); line-height: 1.3; }
+/* Visibility options */
+.sd-org-vis-options { display: flex; flex-direction: column; gap: 2px; }
+.sd-org-vis-option { display: flex; align-items: flex-start; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; transition: background 100ms; border: 0; background: transparent; text-align: left; font: inherit; color: inherit; width: 100%; }
+.sd-org-vis-option:hover { background: var(--crit-option-hover); }
+.sd-org-vis-option[aria-checked="true"] { background: var(--crit-option-selected-bg); }
+.sd-org-vis-option .sd-org-radio { margin-top: 1px; }
+.sd-org-vis-icon { flex-shrink: 0; color: var(--crit-fg-muted); margin-top: 1px; transition: color 120ms; }
+.sd-org-vis-option[aria-checked="true"] .sd-org-vis-icon { color: var(--crit-fg-secondary); }
+.sd-org-vis-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.sd-org-vis-label { font-size: 13px; font-weight: 500; color: var(--crit-fg-primary); line-height: 1.3; }
+.sd-org-vis-desc { font-size: 11.5px; color: var(--crit-fg-muted); line-height: 1.4; }
+/* Remember checkbox */
+.sd-org-remember { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.sd-org-remember input[type="checkbox"] { appearance: none; -webkit-appearance: none; width: 16px; height: 16px; border-radius: 4px; border: 1px solid var(--crit-border-strong); background: transparent; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: background 120ms, border-color 120ms; }
+.sd-org-remember input[type="checkbox"]:checked { background: var(--crit-brand); border-color: var(--crit-brand); }
+.sd-org-remember input[type="checkbox"]:checked::after { content: ''; display: block; width: 10px; height: 10px; background: var(--crit-fg-on-brand); mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='currentColor' d='M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z'/%3E%3C/svg%3E") center / contain no-repeat; -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='currentColor' d='M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z'/%3E%3C/svg%3E") center / contain no-repeat; }
+.sd-org-remember input[type="checkbox"]:focus-visible { outline: 2px solid var(--crit-focus-ring); outline-offset: 1px; }
+.sd-org-remember-text { font-size: 12px; color: var(--crit-fg-muted); user-select: none; }
+/* Footer */
+.sd-org-footer { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-top: 1px solid var(--crit-border); gap: 12px; }
+.sd-org-consent { font-size: 11.5px; color: var(--crit-fg-muted); line-height: 1.4; flex: 1; min-width: 0; }
+.sd-org-consent a { color: var(--crit-brand); text-decoration: none; }
+.sd-org-consent a:hover { text-decoration: underline; }
+.sd-org-footer-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.sd-org-btn-cancel { background: var(--crit-bg-elevated); border: 1px solid var(--crit-border-strong); color: var(--crit-fg-primary); font: inherit; font-size: 12px; font-weight: 500; padding: 7px 14px; border-radius: 6px; cursor: pointer; transition: background 100ms; line-height: 1; }
+.sd-org-btn-cancel:hover { background: var(--crit-bg-card); }
+.sd-org-btn-share { background: var(--crit-green); border: 1px solid transparent; color: var(--crit-bg-page); font: inherit; font-size: 12px; font-weight: 600; padding: 7px 16px; border-radius: 6px; cursor: pointer; transition: background 100ms; line-height: 1; white-space: nowrap; }
+.sd-org-btn-share:hover { background: var(--crit-green-hover); }
+.sd-org-btn-share:disabled { opacity: 0.5; cursor: default; }
+/* Focus rings */
+.sd-org-owner-option:focus-visible,
+.sd-org-vis-option:focus-visible,
+.sd-org-close:focus-visible,
+.sd-org-btn-share:focus-visible,
+.sd-org-btn-cancel:focus-visible { outline: 2px solid var(--crit-focus-ring); outline-offset: -2px; }
+/* Post-share org context strip */
+.sd-shared-org-strip { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--crit-option-hover); border: 1px solid var(--crit-border); border-radius: 6px; font-size: 12px; color: var(--crit-fg-secondary); line-height: 1; }
+.sd-shared-org-icon { flex-shrink: 0; width: 14px; height: 14px; color: var(--crit-fg-muted); }
+.sd-shared-org-name { color: var(--crit-fg-primary); font-weight: 500; white-space: nowrap; }
+.sd-shared-org-sep { color: var(--crit-fg-muted); user-select: none; }
+.sd-shared-vis-pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; line-height: 1.4; white-space: nowrap; }
+.sd-shared-vis-pill svg { width: 11px; height: 11px; flex-shrink: 0; }
+.sd-shared-vis-pill--organization { background: var(--crit-vis-org-bg); color: var(--crit-vis-org-fg); }
+.sd-shared-vis-pill--unlisted { background: var(--crit-vis-unlisted-bg); color: var(--crit-vis-unlisted-fg); }
+.sd-shared-vis-pill--public { background: var(--crit-vis-public-bg); color: var(--crit-vis-public-fg); }
+.sd-shared-vis-hint { color: var(--crit-fg-muted); font-size: 11px; margin-left: auto; white-space: nowrap; }
+
 /* ===== Document Container ===== */
 .document-wrapper {
   max-width: var(--content-width);
@@ -875,12 +952,21 @@ body.visual-mode .diff-split-row.focused .diff-split-side {
   cursor: pointer;
 }
 
-.line-comment-gutter:hover .line-add { opacity: 1; pointer-events: auto; }
-
 /* During drag */
 body.dragging { user-select: none; cursor: grabbing; }
-body.dragging .line-comment-gutter.drag-endpoint .line-add { opacity: 1; pointer-events: none; }
-body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { opacity: 0; pointer-events: none; }
+
+/* Desktop only: reveal the blue + button on hover or while dragging.
+   These rules live inside @media (pointer: fine) because the touch
+   affordance is the ::before `+` prefix on .line-num (F3), and the
+   blue button must NOT render at all on touch (see the .line-add base
+   rule below — display:none by default, display:flex only on desktop).
+   Without this guard, touch tap can briefly flash the blue button while
+   .drag-endpoint is set during the pointerdown -> form-render gap. */
+@media (pointer: fine) {
+  .line-comment-gutter:hover .line-add { opacity: 1; pointer-events: auto; }
+  body.dragging .line-comment-gutter.drag-endpoint .line-add { opacity: 1; pointer-events: none; }
+  body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { opacity: 0; pointer-events: none; }
+}
 /* Blue connecting line in document comment gutter */
 .line-comment-gutter.drag-range::after {
   content: '';
@@ -902,20 +988,28 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
   line-height: inherit;
 }
 
+/* Blue + button in the document comment gutter. display:none by default
+   so it never renders on touch (the touch affordance is the F3 ::before
+   `+` prefix). Desktop unhides it via @media (pointer: fine) below. */
 .line-add {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 4px;
-  background: var(--crit-brand);
-  color: var(--crit-fg-on-brand);
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 1;
-  opacity: 0;
-  pointer-events: none;
+  display: none;
+}
+@media (pointer: fine) {
+  .line-add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    background: var(--crit-brand);
+    color: var(--crit-fg-on-brand);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1;
+    opacity: 0;
+    pointer-events: none;
+  }
 }
 
 /* ===== Line Content (rendered markdown) ===== */
@@ -950,6 +1044,38 @@ body.dragging .line-comment-gutter.drag-range:not(.drag-endpoint) .line-add { op
 .line-content h3 { font-size: 1.2rem; }
 .line-content h4 { font-size: 1.05rem; }
 .line-content h5 { font-size: 0.95rem; color: var(--crit-editor-fg-secondary); }
+
+.line-content h1,
+.line-content h2,
+.line-content h3,
+.line-content h4,
+.line-content h5,
+.line-content h6 { position: relative; }
+
+.line-content .heading-anchor {
+  opacity: 0;
+  margin-left: 6px;
+  color: var(--crit-editor-fg-secondary);
+  text-decoration: none;
+  border: none;
+  border-bottom: none;
+  transition: opacity 0.15s;
+}
+.line-content .heading-anchor:hover { color: var(--crit-brand); }
+.line-content .heading-anchor:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--crit-brand);
+  outline-offset: 1px;
+}
+.line-content h1:hover .heading-anchor,
+.line-content h2:hover .heading-anchor,
+.line-content h3:hover .heading-anchor,
+.line-content h4:hover .heading-anchor,
+.line-content h5:hover .heading-anchor,
+.line-content h6:hover .heading-anchor { opacity: 1; }
+
+.heading-anchor-icon { display: inline-block; fill: currentColor; }
+.heading-anchor-copied { opacity: 1; color: var(--crit-green); }
 
 .line-content p {
   margin: 4px 0;
@@ -1982,14 +2108,19 @@ textarea.drag-active {
   background: var(--crit-bg-card);
   border: 1px solid var(--crit-border);
   border-radius: 12px;
-  padding: 32px;
-  max-width: 640px;
+  max-width: 520px;
   width: 90vw;
-  text-align: center;
   box-shadow: var(--crit-shadow);
+  overflow: hidden;
 }
 .waiting-dialog h3 { font-size: 20px; color: var(--crit-green); margin-bottom: 12px; }
-.waiting-dialog p { color: var(--crit-editor-fg-secondary); font-size: 14px; margin-bottom: 8px; }
+.waiting-dialog p { font-size: 14px; color: var(--crit-editor-fg-secondary); margin-bottom: 8px; }
+
+/* -- Header section -- */
+.waiting-header {
+  padding: 24px 24px 0;
+  text-align: center;
+}
 
 .waiting-spinner {
   display: inline-flex;
@@ -2041,8 +2172,10 @@ textarea.drag-active {
   animation: success-check-draw 0.35s cubic-bezier(0.4, 0, 0.2, 1) 0.4s forwards;
 }
 .waiting-dialog.approved .waiting-spinner { display: none; }
-.waiting-dialog.approved #waitingPrompt,
-.waiting-dialog.approved #waitingClipboard { display: none; }
+.waiting-dialog.approved .prompt-copy-row,
+.waiting-dialog.approved .waiting-divider,
+.waiting-dialog.approved .tip-section,
+.waiting-dialog.approved .waiting-footer { display: none; }
 .waiting-dialog.approved .success-mark {
   display: inline-block;
   filter: drop-shadow(0 0 0 transparent);
@@ -2078,35 +2211,153 @@ textarea.drag-active {
   margin-top: 12px;
 }
 
-.waiting-fallback {
-  display: block;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--crit-editor-fg-muted);
+/* -- Prompt copy row -- */
+.prompt-copy-row {
+  margin: 16px 24px 0;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--crit-editor-bg-elevated);
+  border: none;
+  border-radius: var(--crit-r-lg);
+  overflow: hidden;
 }
 
-.waiting-prompt {
-  background: var(--crit-editor-bg-elevated);
-  border: 1px solid var(--crit-border);
-  border-radius: 6px;
+.prompt-preview {
+  flex: 1;
+  min-width: 0;
   padding: 10px 14px;
   font-family: var(--crit-font-mono);
   font-size: 12px;
-  color: var(--crit-editor-fg);
-  margin-top: 12px;
+  line-height: 1.5;
+  color: var(--crit-editor-fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+  user-select: none;
+}
+
+.prompt-copy-btn {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 10px 14px;
+  border: none;
+  background: transparent;
+  color: var(--crit-brand);
+  font-family: var(--crit-font-body);
+  font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
-  user-select: all;
-  word-break: break-word;
-  text-align: left;
+  transition: background var(--crit-dur-fast) var(--crit-ease),
+              color var(--crit-dur-fast) var(--crit-ease);
+  white-space: nowrap;
+}
+.prompt-copy-btn:hover {
+  background: var(--crit-brand-subtle);
+}
+.prompt-copy-btn.copied {
+  color: var(--crit-green);
+}
+.prompt-copy-btn svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
 }
 
-
-.clipboard-confirm {
-  animation: clipboard-fade 2s ease-out forwards;
+.prompt-full-text {
+  display: none;
 }
-@keyframes clipboard-fade {
-  0% { color: var(--crit-green); }
-  100% { color: var(--crit-editor-fg-muted); }
+
+/* -- Divider -- */
+.waiting-divider {
+  height: 1px;
+  background: var(--crit-border);
+  margin: 16px 0 0;
+}
+
+/* -- Tip section -- */
+.tip-section {
+  padding: 14px 24px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 52px;
+}
+
+.tip-icon {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--crit-fg-muted);
+  margin-top: 1px;
+}
+
+.tip-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.tip-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--crit-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+
+.tip-text {
+  font-size: 13px;
+  color: var(--crit-fg-secondary);
+  line-height: 1.45;
+  animation: tipFadeIn var(--crit-dur-slow) var(--crit-ease);
+}
+.tip-text kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  font-family: var(--crit-font-mono);
+  font-size: 11px;
+  background: var(--crit-bg-elevated);
+  border: 1px solid var(--crit-border);
+  border-radius: var(--crit-r-sm);
+  color: var(--crit-fg-primary);
+  line-height: 1.4;
+  vertical-align: baseline;
+}
+
+@keyframes tipFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* -- Footer / actions -- */
+.waiting-footer {
+  padding: 0 24px 20px;
+  display: flex;
+  justify-content: center;
+}
+
+/* -- Edits detected badge -- */
+.waiting-edits-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 14px 0 2px;
+  padding: 6px 12px;
+  background: var(--crit-green-subtle);
+  border: 1px solid var(--crit-green);
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--crit-green);
+}
+.waiting-edits-badge svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
 }
 
 /* ===== No Changes Confirmation Overlay ===== */
@@ -3019,6 +3270,52 @@ body.sidebar-resizing * {
   line-height: 1;
 }
 
+/* Copy path button in file header */
+.file-header-copy-path {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--crit-editor-fg-muted);
+  flex-shrink: 0;
+  line-height: 1;
+  border-radius: 3px;
+  transition: color 0.15s;
+}
+.file-header-copy-path:hover {
+  color: var(--crit-brand);
+}
+.file-header-copy-path:focus-visible {
+  color: var(--crit-brand);
+  outline: 2px solid var(--crit-brand);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+/* Copy button in navbar (branch name / filename chip) */
+.header-copy-path {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 0 0 0 4px;
+  cursor: pointer;
+  color: var(--crit-editor-fg-muted);
+  line-height: 1;
+}
+.header-copy-path:hover {
+  color: var(--crit-brand);
+}
+.header-copy-path:focus-visible {
+  color: var(--crit-brand);
+  outline: 2px solid var(--crit-brand);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
 /* ===== Comments Panel (Right Sidebar) ===== */
 .comments-panel {
   width: 480px;
@@ -3165,6 +3462,7 @@ body.sidebar-resizing * {
   text-align: center;
   color: var(--crit-editor-fg-muted);
   font-size: 13px;
+  line-height: 1.5;
 }
 .comments-panel-empty::before {
   content: '';
@@ -3515,8 +3813,22 @@ body.sidebar-resizing * {
   font-weight: 500;
   color: var(--crit-editor-fg);
   flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
 }
-.file-header-name .dir { color: var(--crit-editor-fg-muted); }
+.file-header-name .dir { color: var(--crit-editor-fg-muted); flex-shrink: 2; }
+.file-header-name .filename { flex-shrink: 1; }
+/* Truncate long paths; copy button (flex-shrink:0 by default) stays full size */
+.file-header-name .dir,
+.file-header-name .filename {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
 .file-header-badge {
   font-size: 10px;
   font-weight: 600;
@@ -3818,31 +4130,43 @@ body.sidebar-resizing * {
   justify-content: center;
   padding-top: 1px;
 }
+/* Blue + button in the diff comment gutter. display:none by default so
+   it never renders on touch (the touch affordance is the F3 ::before
+   `+` prefix on .diff-gutter-num). Desktop unhides it via
+   @media (pointer: fine) below, along with the hover and drag-state
+   reveal rules. Without this guard, touch tap can briefly flash the
+   blue button while .drag-endpoint is set during the pointerdown ->
+   form-render gap. */
 .diff-comment-btn {
-  width: 20px;
-  height: 18px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 3px;
-  border: none;
-  background: var(--crit-brand);
-  color: var(--crit-fg-on-brand);
-  font-size: 14px;
-  font-weight: 700;
-  cursor: pointer;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.1s;
-  padding: 0;
-  line-height: 1;
+  display: none;
 }
-/* Show the + button when hovering the diff line or split side */
-.diff-line:hover .diff-comment-btn,
-.diff-split-side:hover .diff-comment-btn { opacity: 1; pointer-events: auto; }
-/* During drag: show the normal + button at endpoints, hide it on in-between lines */
-.diff-comment-gutter.drag-endpoint .diff-comment-btn { opacity: 1; pointer-events: none; z-index: 2; }
-.diff-comment-gutter.drag-range:not(.drag-endpoint) .diff-comment-btn { opacity: 0; pointer-events: none; }
+@media (pointer: fine) {
+  .diff-comment-btn {
+    display: flex;
+    width: 20px;
+    height: 18px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 3px;
+    border: none;
+    background: var(--crit-brand);
+    color: var(--crit-fg-on-brand);
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.1s;
+    padding: 0;
+    line-height: 1;
+  }
+  /* Show the + button when hovering the diff line or split side */
+  .diff-line:hover .diff-comment-btn,
+  .diff-split-side:hover .diff-comment-btn { opacity: 1; pointer-events: auto; }
+  /* During drag: show the normal + button at endpoints, hide it on in-between lines */
+  .diff-comment-gutter.drag-endpoint .diff-comment-btn { opacity: 1; pointer-events: none; z-index: 2; }
+  .diff-comment-gutter.drag-range:not(.drag-endpoint) .diff-comment-btn { opacity: 0; pointer-events: none; }
+}
 
 /* Blue connecting line between endpoints */
 .diff-comment-gutter.drag-range {
@@ -4043,14 +4367,34 @@ body.sidebar-resizing * {
   padding: 8px 0;
 }
 .outdated-badge {
-  font-size: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
   font-weight: 600;
-  padding: 1px 5px;
-  border-radius: 3px;
-  background: var(--crit-badge-modified-bg);
-  color: var(--crit-yellow);
-  border: 1px solid var(--crit-yellow-border);
+  padding: 1px 7px 1px 4px;
+  border-radius: 10px;
+  background: var(--crit-drift-badge-bg);
+  color: var(--crit-drift-badge-fg);
+  border: 1px solid var(--crit-drift-badge-border);
   white-space: nowrap;
+}
+.outdated-badge::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  background-color: var(--crit-drift-badge-fg);
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='currentColor'%3E%3Cpath d='M5.22 14.78a.75.75 0 001.06-1.06L4.56 12h8.69a.75.75 0 000-1.5H4.56l1.72-1.72a.75.75 0 00-1.06-1.06l-3 3a.75.75 0 000 1.06l3 3zM10.78 1.22a.75.75 0 00-1.06 1.06L11.44 4H2.75a.75.75 0 000 1.5h8.69l-1.72 1.72a.75.75 0 101.06 1.06l3-3a.75.75 0 000-1.06l-3-3z'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='currentColor'%3E%3Cpath d='M5.22 14.78a.75.75 0 001.06-1.06L4.56 12h8.69a.75.75 0 000-1.5H4.56l1.72-1.72a.75.75 0 00-1.06-1.06l-3 3a.75.75 0 000 1.06l3 3zM10.78 1.22a.75.75 0 00-1.06 1.06L11.44 4H2.75a.75.75 0 000 1.5h8.69l-1.72 1.72a.75.75 0 101.06 1.06l3-3a.75.75 0 000-1.06l-3-3z'/%3E%3C/svg%3E");
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+.outdated-comment .comment-card {
+  border-color: var(--crit-drift-card-border);
 }
 /* Drifted anchor context — full-width disclosure bar + line-numbered panel */
 .drifted-context {
@@ -4183,26 +4527,41 @@ body.sidebar-resizing * {
   font-style: italic;
 }
 
-/* ===== Mini Toast ===== */
-.mini-toast {
+/* ===== Mini Toast =====
+   Host is a single fixed container; toasts stack inside. Both code-review
+   (app.js) and live-mode (live-mode.js) feed this via
+   crit.shared.showToast(). Modifier classes (.mini-toast--info / --error /
+   --success) are reserved; default styling is shared. Exit cleanup is
+   transitionend-driven in JS — see frontend-js.md (no .remove() on elements
+   with CSS exit animations). */
+.mini-toast-host {
   position: fixed;
   bottom: 24px;
   left: 50%;
-  transform: translateX(-50%) translateY(20px);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  z-index: 1000;
+  pointer-events: none;
+}
+.mini-toast {
   background: var(--crit-editor-bg-elevated);
   color: var(--crit-editor-fg);
   border: 1px solid var(--crit-border);
   padding: 8px 16px;
   border-radius: 6px;
   font-size: 13px;
+  max-width: 360px;
   opacity: 0;
+  transform: translateY(20px);
   transition: opacity 0.3s, transform 0.3s;
-  z-index: 1000;
-  pointer-events: none;
+  pointer-events: auto;
 }
 .mini-toast-visible {
   opacity: 1;
-  transform: translateX(-50%) translateY(0);
+  transform: translateY(0);
 }
 
 /* ===== Rendered Diff View (file mode) ===== */
@@ -4593,6 +4952,14 @@ body.sidebar-resizing * {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.stack-popover-sha {
+  flex-shrink: 0;
+  margin-left: 8px;
+  font-size: 0.75em;
+  font-family: var(--crit-font-mono);
+  color: var(--crit-editor-fg-muted);
+  opacity: 0.7;
+}
 
 /* Default-branch entry in the stack popover is a non-interactive root
    marker — it indicates "stack starts here" but doesn't trigger any
@@ -4920,3 +5287,245 @@ body.sidebar-resizing * {
   color: var(--crit-brand);
 }
 
+
+/* ===== Mobile / Touch ===== */
+
+/* 768px (tablet portrait) breakpoint — hide sidebars and secondary controls.
+   !important is required because some elements (.header-context,
+   .scope-toggle, .diff-mode-toggle, .base-branch-picker) get inline
+   style.display = '' set by app.js init code that runs unconditionally
+   regardless of viewport, which would otherwise win over the stylesheet. */
+@media (max-width: 768px) {
+  .file-tree-panel { display: none !important; }
+  .sidebar-resize-handle { display: none !important; }
+  .comments-panel { display: none !important; }
+  .scope-toggle { display: none !important; }
+  .diff-mode-toggle { display: none !important; }
+  .header-context { display: none !important; }
+  .base-branch-picker { display: none !important; }
+
+  /* Chrome on mobile computes viewport width from getBoundingClientRect() of
+     all descendants, including those inside overflow:clip containers. A
+     wrapping inline <span> (e.g. hljs-string) has a bounding rect that is
+     the union of all its line boxes — so a span that starts at column 10 and
+     wraps at column 80 reports right:80 even though its container clips at
+     column 40. Converting these spans to inline-block + max-width:100% +
+     overflow:hidden constrains each span's bounding rect to its container,
+     which stops Chrome from expanding the scrollable viewport. */
+  .diff-container,
+  .diff-view,
+  .diff-view-unified { overflow-x: auto; }
+  .diff-content { overflow: clip; }
+  .diff-content span {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  /* File header on mobile: two-row layout.
+     Row 1: [chevron] [icon] [name ………………] [comment-btn]
+     Row 2:           [toggle] ……………… [badge] [+/- stats]
+     Row 2 is indented past the chevron and aligned with the icon. Hide the
+     "Viewed" checkbox whose margin-left:auto would otherwise consume all
+     remaining flex space and crush the filename. Override the base 10px
+     gap on the wrap axis so row 2 sits tight under row 1 (the base gap is
+     fine as column-gap for inline spacing within each row). */
+  .file-header { flex-wrap: wrap; row-gap: 2px; }
+  .file-header-viewed { display: none; }
+
+  /* Row 1: chevron, icon, name, comment-btn (default flex order = source
+     order). Push the comment button to the right edge via margin-left:auto
+     so the name expands to fill the row. */
+  .file-comment-btn { margin-left: auto; }
+
+  /* Force a row break before row 2's items. The pseudo-element on
+     .file-header-name uses the flex-wrap trick: a 100%-basis item triggers
+     wrap before whatever comes after the name in source order.
+     Place it AFTER the name so row 1 ends at the comment button. */
+  .file-header::after {
+    content: '';
+    flex-basis: 100%;
+    width: 0;
+    height: 0;
+    order: 5;
+  }
+
+  /* Row 2 items — assign explicit order so they all land after the break. */
+  .file-header-toggle { order: 10; margin-left: 28px; }
+  .file-header-badge  { order: 20; margin-left: auto; }
+  .file-header-stats  { order: 21; }
+  /* Row 1 items keep default order (0); the comment button stays on row 1
+     because order:0 < 5 < 10. */
+
+  /* Inline comment form + comment-block: desktop indents them past the
+     gutter columns (unified: padding-left:120px; split: 48px + width:50%)
+     so they sit aligned with the code content. On a 375px viewport that
+     consumes most of the row, crushing the textarea. Force full-row width
+     on mobile — the gutter-alignment was a desktop affordance. */
+  .diff-container.unified .comment-block,
+  .diff-container.unified .comment-form-wrapper,
+  .diff-container.split .comment-block,
+  .diff-container.split .comment-form-wrapper {
+    padding-left: 0;
+    width: auto;
+    max-width: none;
+  }
+  .diff-container.split .comment-block.diff-comment-right,
+  .diff-container.split .comment-form-wrapper.diff-comment-right {
+    margin-left: 0;
+  }
+}
+
+/* Mobile file picker — shown instead of the hidden file-tree sidebar. */
+.mobile-file-picker-bar {
+  display: none;
+}
+@media (max-width: 768px) {
+  .mobile-file-picker-bar:not(.mobile-file-picker-hidden) {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: var(--crit-bg-card);
+    border-bottom: 1px solid var(--crit-border);
+    position: sticky;
+    top: var(--header-height, 49px);
+    z-index: 90;
+  }
+  .mobile-file-picker-label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--crit-editor-fg-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .mobile-file-picker-select {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--crit-font-mono);
+    font-size: 13px;
+    color: var(--crit-editor-fg);
+    background: var(--crit-editor-bg-elevated);
+    border: 1px solid var(--crit-border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    cursor: pointer;
+    min-height: 44px;
+  }
+  .mobile-file-picker-select:focus {
+    outline: 2px solid var(--crit-brand);
+    outline-offset: 1px;
+  }
+}
+
+/* Touch-specific affordances and target sizing.
+   Reply actions are hover-revealed on desktop — on touch there's no hover,
+   so always show. All interactive header buttons get ≥44×44 (WCAG 2.5.5).
+   Textareas use 16px font-size to prevent iOS Safari focus-zoom. */
+@media (pointer: coarse) {
+  .reply-actions {
+    opacity: 1;
+  }
+
+  .comment-nav-btn {
+    padding: 12px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .comment-count-btn {
+    padding: 10px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .theme-toggle {
+    padding: 12px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .update-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .file-comment-btn {
+    padding: 12px 10px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .reply-actions button {
+    padding: 10px 8px;
+    min-height: 44px;
+  }
+  .toc-close {
+    min-width: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* iOS Safari zooms any focused input below 16px. */
+  .comment-form textarea,
+  .reply-input {
+    font-size: 16px;
+  }
+
+  /* Tiny header-row affordances: copy-path icon in .file-header-name and
+     the diff hunk-expand button. Both render in the file body on mobile so
+     they need real touch targets. */
+  .file-header-copy-path {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 12px;
+  }
+  .diff-spacer .expand-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+
+/* F3: add-comment affordance for touch.
+   On desktop the affordance is the blue `+` button (.line-add /
+   .diff-comment-btn) revealed on row hover. Touch devices never fire
+   hover, so users need an always-visible cue. We render a `+` prefix as
+   an inline ::before pseudo-element on .line-num / .diff-gutter-num.
+   display:inline-block + width:1.2ch reserves a fixed-width slot at the
+   start of each cell, so the glyph sits flush before the digit inside
+   the cell's right-aligned text. No absolute positioning: the prefix
+   never escapes its own cell, which avoids any phantom-column effect
+   in the two-cell unified diff layout.
+   The desktop blue buttons are NOT hidden on touch: they remain in the
+   DOM as the click target (their mousedown handlers open the form), and
+   are visually invisible because their base opacity:0 has no hover
+   trigger. Making them actually tappable is F4's job (involves
+   pointer-events and touch-action). */
+@media (pointer: coarse) {
+  .line-num::before,
+  .diff-gutter-num::before {
+    content: '+';
+    display: inline-block;
+    width: 1.2ch;
+    color: var(--crit-editor-fg-muted);
+    opacity: 0.6;
+    font-weight: 700;
+    pointer-events: none;
+  }
+  /* Read-only line-number cells must not advertise commentability.
+     - Document view: a .line-block whose .line-comment-gutter has the
+       .diff-no-comment class shows a number but isn't tappable.
+     - Diff view: empty .diff-gutter-num cells (no line number on this
+       side) shouldn't show the cue either. */
+  .line-block:has(.line-comment-gutter.diff-no-comment) .line-num::before,
+  .diff-gutter-num:empty::before {
+    display: none;
+  }
+
+  /* F4 reliability: disable the browser's scroll/zoom gesture recognizer
+     on tap targets so it cannot race the pointerdown handler and fire
+     pointercancel before pointerup. Without this, single taps on phones
+     are sometimes silently dropped. .diff-gutter-num is the touch tap
+     target (an event delegate on .diff-container routes taps to the
+     hidden .diff-comment-btn that owns the form-open logic). */
+  .diff-gutter-num { touch-action: none; }
+  .diff-comment-gutter { touch-action: none; }
+  .line-comment-gutter { touch-action: none; }
+}

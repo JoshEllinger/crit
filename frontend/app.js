@@ -247,6 +247,33 @@
     }
   });
 
+  // Add id attributes and anchor links to headings
+  const HEADING_LINK_SVG = '<svg class="heading-anchor-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a2.002 2.002 0 0 0 0 2.83Z"></path></svg>';
+  // Track seen heading slugs per render pass to dedup duplicates (GitHub-style: examples, examples-1, examples-2)
+  const headingSlugCounter = new Map();
+  documentMd.renderer.rules.heading_open = function(tokens, idx, options, _env, self) {
+    const token = tokens[idx];
+    const inline = tokens[idx + 1];
+    if (inline && inline.type === 'inline') {
+      const baseSlug = window.crit.lineBlocks.slugifyHeading(inline.content);
+      if (baseSlug) {
+        const count = headingSlugCounter.get(baseSlug) || 0;
+        const slug = count === 0 ? baseSlug : baseSlug + '-' + count;
+        headingSlugCounter.set(baseSlug, count + 1);
+        token.attrSet('id', slug);
+      }
+    }
+    return self.renderToken(tokens, idx, options);
+  };
+  documentMd.renderer.rules.heading_close = function(tokens, idx, options, _env, self) {
+    const openIdx = idx - 2;
+    const id = openIdx >= 0 ? tokens[openIdx].attrGet('id') : null;
+    if (id) {
+      return '<a class="heading-anchor" href="#' + id + '" aria-label="Link to this heading">' + HEADING_LINK_SVG + '</a>' + self.renderToken(tokens, idx, options);
+    }
+    return self.renderToken(tokens, idx, options);
+  };
+
   // ===== Cookie helpers (persist across random ports on 127.0.0.1) =====
   function setCookie(name, value) {
     document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=31536000; SameSite=Strict';
@@ -342,7 +369,135 @@
   let deleteToken = '';
   let needsShareConsent = false;
   let authUserName = '';
+  let proxyAuth = false;   // false = direct server-side share; true = browser popup relay
+  let hostedToken = '';    // server-derived (tokenFromHostedURL); never URL-parsed in JS
   let configAuthor = '';
+
+
+  // ===== Share Receiver Popup Relay =====
+  // openShareReceiver(shareURL) opens the crit-web /share-receiver page in a
+  // popup, exchanges a MessagePort handshake, and returns a session handle:
+  //   { ready: Promise, run(op, data, timeoutMs): Promise, close(): void }
+  //
+  // INVARIANTS — do not violate:
+  //   1. MUST be called synchronously inside a user-gesture event handler.
+  //      Any `await` before this call will cause Safari (and often Chrome/
+  //      Firefox) to popup-block the window.open.
+  //   2. The 'ready' postMessage listener is attached BEFORE window.open so
+  //      the receiver's 'ready' message can't arrive before we listen.
+  //   3. After the handshake, all communication is via the MessagePort. The
+  //      port has no origin — it's a private channel. event.origin is only
+  //      validated on the handshake postMessage.
+  //   4. Single persistent port.onmessage with a requestId -> resolver Map.
+  //      No listener-per-op accumulation.
+  //   5. A close-watchdog (setInterval) rejects pending ops if the popup
+  //      closes (user dismisses, navigates away, crashes).
+  function openShareReceiver(baseURL) {
+    if (!baseURL) throw new Error('share_url not configured');
+
+    const nonce = 'n_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const targetOrigin = new URL(baseURL).origin;
+    const popupURL = baseURL.replace(/\/$/, '') + '/share-receiver#nonce=' + encodeURIComponent(nonce);
+
+    let popup = null;
+    let port = null;
+    let readyResolve, readyReject;
+    const readyPromise = new Promise(function(res, rej) { readyResolve = res; readyReject = rej; });
+
+    const pending = new Map(); // requestId -> { resolve, reject, timer }
+    function rejectAllPending(err) {
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        entry.reject(err);
+      }
+      pending.clear();
+    }
+
+    function onPortMessage(event) {
+      const msg = event.data || {};
+      const entry = pending.get(msg.requestId);
+      if (!entry) return;
+      pending.delete(msg.requestId);
+      clearTimeout(entry.timer);
+      if (msg.ok) entry.resolve(msg.data);
+      else entry.reject(new Error(msg.error || 'unknown error'));
+    }
+
+    function onReady(event) {
+      // Validate handshake: source must be our popup, origin must match,
+      // payload must be `{type: 'ready', nonce}`.
+      if (popup && event.source !== popup) return;
+      if (event.origin !== targetOrigin) return;
+      if (!event.data || event.data.type !== 'ready' || event.data.nonce !== nonce) return;
+      window.removeEventListener('message', onReady);
+      const channel = new MessageChannel();
+      port = channel.port1;
+      port.onmessage = onPortMessage;
+      port.start();
+      try {
+        popup.postMessage({ type: 'init', nonce: nonce }, targetOrigin, [channel.port2]);
+      } catch (err) {
+        readyReject(err);
+        return;
+      }
+      readyResolve();
+    }
+
+    // Attach listener BEFORE opening the popup so the receiver's 'ready'
+    // postMessage cannot arrive before we are listening.
+    window.addEventListener('message', onReady);
+
+    popup = window.open(popupURL, 'crit_share_receiver', 'width=520,height=640,resizable=yes,scrollbars=yes');
+    if (!popup) {
+      window.removeEventListener('message', onReady);
+      throw new Error('popup blocked — allow popups for this page');
+    }
+
+    // Watchdog: if the popup closes before init or mid-op, reject everything.
+    const closeWatch = setInterval(function() {
+      if (popup.closed) {
+        clearInterval(closeWatch);
+        window.removeEventListener('message', onReady);
+        readyReject(new Error('popup closed before authenticating'));
+        rejectAllPending(new Error('popup closed'));
+      }
+    }, 500);
+
+    // Init handshake timeout: if the receiver never posts 'ready' (COOP, popup
+    // never navigated, ad blocker, etc.) reject after 60s.
+    const initTimer = setTimeout(function() {
+      window.removeEventListener('message', onReady);
+      readyReject(new Error('share-receiver did not respond — possibly blocked by COOP'));
+    }, 60000);
+    readyPromise.finally(function() { clearTimeout(initTimer); });
+
+    return {
+      ready: readyPromise,
+      async run(op, data, timeoutMs) {
+        await readyPromise;
+        const requestId = nonce + '_' + op + '_' + Math.random().toString(36).slice(2);
+        return new Promise(function(resolve, reject) {
+          const timer = setTimeout(function() {
+            pending.delete(requestId);
+            reject(new Error('share-receiver did not return a result for ' + op));
+          }, timeoutMs || 120000);
+          pending.set(requestId, { resolve: resolve, reject: reject, timer: timer });
+          port.postMessage(Object.assign({}, data, { type: op, requestId: requestId }));
+        });
+      },
+      close() {
+        clearInterval(closeWatch);
+        window.removeEventListener('message', onReady);
+        try { popup.close(); } catch { /* popup may already be closed */ }
+        try { if (port) port.close(); } catch { /* port may already be closed */ }
+        rejectAllPending(new Error('session closed'));
+      },
+    };
+  }
+
+  let cachedOrgs = null;
+  let sharedOrg = null; // {slug, name} if shared under an org, null if personal
+  let sharedVisibility = ''; // 'organization', 'unlisted', or 'public'
   let uiState = 'reviewing';
   let waitingNotApproved = false;
   let hiddenUnresolved = 0;
@@ -362,6 +517,8 @@
         if (brewDismissed !== pendingUpdatesVersion) return true;
       } else if (u.kind === 'integration') {
         if (!u.hash || intDismissed[u.agent] !== u.hash) return true;
+      } else if (u.kind === 'missing-integration') {
+        if (!intDismissed['missing:' + u.agent]) return true;
       } else {
         return true;
       }
@@ -378,6 +535,26 @@
   let cachedConfig = null; // populated on first panel open
 
   let diffMode = getSetting('diffMode', 'split'); // 'split' or 'unified'
+  // Mobile viewports always render unified diffs. Split is unusable in <=768px
+  // because two columns of source code don't fit. The user's saved preference
+  // is preserved so it takes effect again above the breakpoint.
+  const mobileDiffQuery = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+  if (mobileDiffQuery && mobileDiffQuery.matches) {
+    diffMode = 'unified';
+  }
+  if (mobileDiffQuery) {
+    // Re-evaluate on viewport changes (tablet rotation, devtools resize).
+    // When crossing into mobile, force unified; when crossing back out,
+    // restore the user's saved preference. Re-render so the change is visible.
+    mobileDiffQuery.addEventListener('change', function(ev) {
+      if (ev.matches) {
+        diffMode = 'unified';
+      } else {
+        diffMode = getSetting('diffMode', 'split');
+      }
+      renderAllFiles();
+    });
+  }
   let diffScope = getSetting('diffScope', 'all'); // 'all', 'branch', 'staged', or 'unstaged'
 
   // Single source of truth for hide-resolved state. Persisted via the
@@ -413,15 +590,17 @@
   // Track manually toggled collapse state (comment ID → boolean, true = collapsed)
   const commentCollapseOverrides = {};
 
-  // ===== SVG Icon Constants =====
-  const ICON_CHEVRON = '<svg viewBox="0 0 16 16" fill="currentColor" width="16" height="16"><path d="M12.78 5.22a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L3.22 6.28a.75.75 0 0 1 1.06-1.06L8 8.94l3.72-3.72a.75.75 0 0 1 1.06 0Z"/></svg>';
-  const ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>';
-  const ICON_DELETE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>';
-  const ICON_RESOLVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-  const ICON_UNRESOLVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 6.36 2.64M21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.36-2.64"/><polyline points="21 3 21 8 16 8"/><polyline points="3 21 3 16 8 16"/></svg>';
-  const ICON_CLIPBOARD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-  const ICON_CHECK_SMALL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
-  const ICON_COMMENT = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h4.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>';
+  // SVG Icon Constants — extracted to crit-icons.js (window.crit.icons)
+  const ICON_CHEVRON = window.crit.icons.ICON_CHEVRON;
+  const ICON_EDIT = window.crit.icons.ICON_EDIT;
+  const ICON_DELETE = window.crit.icons.ICON_DELETE;
+  const ICON_RESOLVE = window.crit.icons.ICON_RESOLVE;
+  const ICON_UNRESOLVE = window.crit.icons.ICON_UNRESOLVE;
+  const ICON_CLIPBOARD = window.crit.icons.ICON_CLIPBOARD;
+  const ICON_CHECK_SMALL = window.crit.icons.ICON_CHECK_SMALL;
+  const ICON_COMMENT = window.crit.icons.ICON_COMMENT;
+  const ICON_COPY_PATH = window.crit.icons.ICON_COPY_PATH;
+  const ICON_COPY_PATH_CHECK = window.crit.icons.ICON_COPY_PATH_CHECK;
 
   function formKey(form) {
     if (form.scope === 'review') return 'review:' + (form.editingId || 'new');
@@ -429,6 +608,10 @@
     if (form.scope === 'file') return form.filePath + ':file';
     return form.filePath + ':' + form.startLine + ':' + form.endLine + ':' + (form.side || '');
   }
+
+  // Convention-based form-key for edit/reply forms keyed by comment id.
+  // Used by buildCommentCard reply input + live-mode mounts.
+  // Delegates to the shared helper module so both controllers stay aligned.
 
   function addForm(form) {
     form.formKey = formKey(form);
@@ -467,14 +650,11 @@
 
   const enc = encodeURIComponent;
 
-  // Author color-coding for multi-reviewer comments
-  const AUTHOR_COLOR_COUNT = 6;
-
-  function authorColorIndex(name) {
-    let hash = 0;
-    for (const ch of name) hash = ((hash << 5) - hash + ch.charCodeAt(0)) | 0;
-    return Math.abs(hash) % AUTHOR_COLOR_COUNT;
-  }
+  // Author color-coding for multi-reviewer comments — shared helper so
+  // live-mode mounts produce matching swatch indices. The helpers module
+  // is loaded before app.js via index.html script order, so we reference it
+  // directly without a local fallback.
+  const authorColorIndex = window.crit.commentCardHelpers.authorColorIndex;
 
   // Sort comparator: directories before files at each depth, then alphabetical.
   // In files mode the user's CLI argument order is meaningful, so preserve it
@@ -690,50 +870,44 @@
     }
   }
 
+  // Wraps crit.shared.waitForSession with the app.js-specific UI:
+  // an elapsed-seconds "Initializing..." loader in #filesContainer, a
+  // server-disconnected message on network failure, and a body.message
+  // surfacing on HTTP 500. Returns the parsed JSON payload (matches
+  // the previous .then(r => r.json()) call sites at the seam).
   async function fetchWhenReady(url) {
-    const start = Date.now();
-    const maxWait = 5 * 60 * 1000; // 5 minutes
-    while (true) {
-      let r;
-      try {
-        r = await fetch(url);
-      } catch {
-        // Network error — server may have shut down during init
-        const el = document.getElementById('filesContainer');
-        if (el) {
-          el.innerHTML =
-            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
-            'Server disconnected</div>';
-        }
-        throw new Error('Server disconnected');
-      }
-      if (r.status === 503) {
-        if (Date.now() - start > maxWait) {
-          throw new Error('Server did not finish initializing within 5 minutes');
-        }
-        const elapsed = Math.round((Date.now() - start) / 1000);
-        const loadingEl = document.getElementById('filesContainer');
-        if (loadingEl) {
-          loadingEl.innerHTML =
-            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
-            'Initializing\u2026 (' + elapsed + 's)</div>';
-        }
-        await new Promise(function(resolve) { setTimeout(resolve, 500); });
-        continue;
-      }
-      if (r.status === 500) {
-        let body = {};
-        try { body = await r.json(); } catch {}
-        const msg = body.message || 'Server initialization failed';
-        document.getElementById('filesContainer').innerHTML =
+    function renderLoading(text) {
+      const el = document.getElementById('filesContainer');
+      if (el) {
+        el.innerHTML =
           '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
-          msg + '</div>';
+          text + '</div>';
+      }
+    }
+    try {
+      return await window.crit.shared.waitForSession({
+        url: url,
+        intervalMs: 500,
+        maxWaitMs: 5 * 60 * 1000,
+        onProgress: function (elapsedMs) {
+          const elapsed = Math.round(elapsedMs / 1000);
+          renderLoading('Initializing\u2026 (' + elapsed + 's)');
+        },
+      });
+    } catch (err) {
+      if (err && err.status === 500 && err.response) {
+        let body = {};
+        try { body = await err.response.json(); } catch {}
+        const msg = body.message || 'Server initialization failed';
+        renderLoading(msg);
         throw new Error(msg);
       }
-      if (!r.ok) {
-        throw new Error('Unexpected server response: ' + r.status);
+      if (err && err.name === 'TypeError') {
+        // fetch() rejects with TypeError on network failure (server shutdown during init).
+        renderLoading('Server disconnected');
+        throw new Error('Server disconnected');
       }
-      return r;
+      throw err;
     }
   }
 
@@ -755,8 +929,8 @@
       '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
 
     const [sessionRes, configRes] = await Promise.all([
-      fetchWhenReady('/api/session?scope=' + enc(diffScope)).then(r => r.json()),
-      fetchWhenReady('/api/config').then(r => r.json()),
+      fetchWhenReady('/api/session?scope=' + enc(diffScope)),
+      fetchWhenReady('/api/config'),
     ]);
 
     session = sessionRes;
@@ -773,7 +947,16 @@
     deleteToken = configRes.delete_token || '';
     needsShareConsent = configRes.needs_consent || false;
     authUserName = configRes.auth_user_name || '';
+    proxyAuth = !!configRes.proxy_auth;
+    hostedToken = configRes.hosted_token || '';
     configAuthor = configRes.author || '';
+    if (configRes.share_org) {
+      sharedOrg = { slug: configRes.share_org, name: configRes.share_org_name || configRes.share_org };
+      sharedVisibility = configRes.share_visibility || '';
+    } else {
+      sharedOrg = null;
+      sharedVisibility = '';
+    }
     agentEnabled = configRes.agent_cmd_enabled || false;
     agentName = configRes.agent_name || 'agent';
 
@@ -810,6 +993,17 @@
         });
       });
     }
+    if (configRes.missing_integrations) {
+      configRes.missing_integrations.forEach(function(agent) {
+        const name = agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+        pendingUpdates.push({
+          kind: 'missing-integration',
+          agent: agent,
+          label: name + ' detected — install integration',
+          hint: 'crit install ' + agent
+        });
+      });
+    }
 
     pendingUpdatesVersion = configRes.latest_version || configRes.version || '';
     if (hasActivePendingUpdates()) {
@@ -820,6 +1014,20 @@
     if (session.mode === 'git' && session.branch) {
       document.getElementById('branchContext').style.display = '';
       document.getElementById('branchName').textContent = session.branch;
+      const branchCopyBtn = document.createElement('button');
+      branchCopyBtn.className = 'header-copy-path';
+      branchCopyBtn.setAttribute('aria-label', 'Copy branch name');
+      branchCopyBtn.type = 'button';
+      branchCopyBtn.innerHTML = ICON_COPY_PATH;
+      branchCopyBtn.addEventListener('click', function() {
+        const originalLabel = branchCopyBtn.getAttribute('aria-label');
+        navigator.clipboard.writeText(session.branch).then(function() {
+          branchCopyBtn.innerHTML = ICON_COPY_PATH_CHECK;
+          branchCopyBtn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function() { branchCopyBtn.innerHTML = ICON_COPY_PATH; branchCopyBtn.setAttribute('aria-label', originalLabel); }, 1500);
+        }).catch(function() { /* best-effort */ });
+      });
+      document.getElementById('branchContext').appendChild(branchCopyBtn);
       // Base branch picker: show in git mode when on a feature branch
       if (session.base_ref) {
         currentBaseBranch = session.base_branch_name || '';
@@ -831,6 +1039,21 @@
       document.getElementById('branchContext').style.display = '';
       document.querySelector('.branch-icon').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>';
       document.getElementById('branchName').textContent = session.files[0].path.split('/').pop();
+      const headerCopyBtn = document.createElement('button');
+      headerCopyBtn.className = 'header-copy-path';
+      headerCopyBtn.setAttribute('aria-label', 'Copy file path');
+      headerCopyBtn.type = 'button';
+      headerCopyBtn.innerHTML = ICON_COPY_PATH;
+      headerCopyBtn.addEventListener('click', function() {
+        const originalLabel = headerCopyBtn.getAttribute('aria-label');
+        const abs = session.cwd ? session.cwd + '/' + session.files[0].path : session.files[0].path;
+        navigator.clipboard.writeText(abs).then(function() {
+          headerCopyBtn.innerHTML = ICON_COPY_PATH_CHECK;
+          headerCopyBtn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function() { headerCopyBtn.innerHTML = ICON_COPY_PATH; headerCopyBtn.setAttribute('aria-label', originalLabel); }, 1500);
+        }).catch(function() { /* best-effort */ });
+      });
+      document.getElementById('branchContext').appendChild(headerCopyBtn);
     }
 
     // PR overview panel toggle
@@ -869,7 +1092,7 @@
         setSetting('diffScope', 'all');
         // Re-fetch session with corrected scope — the initial fetch used the
         // stale cookie value and may have returned an empty file list.
-        const corrected = await fetchWhenReady('/api/session?scope=all').then(r => r.json());
+        const corrected = await fetchWhenReady('/api/session?scope=all');
         session = corrected;
         reviewComments = corrected.review_comments || [];
       }
@@ -905,6 +1128,7 @@
     updateViewedCount();
     restoreDrafts();
     applyHideResolved();
+    scrollToHashHeading();
   }
 
   // Show/hide the Toggle Diff button and Split/Unified toggle in file mode
@@ -941,6 +1165,8 @@
     sh: 'bash',
     zig: 'zig',        // not a built-in alias in our bundle
     md: 'markdown',    // normalize: callers compare lang against 'markdown'
+    heex: 'heex',
+    leex: 'heex',
   };
   // Files identified by basename rather than extension.
   const BASENAME_LANG = {
@@ -1005,6 +1231,7 @@
 
   // ===== Markdown Parsing =====
   function parseMarkdown(content) {
+    headingSlugCounter.clear();
     const tokens = documentMd.parse(content, {});
     const blocks = buildLineBlocks(tokens, documentMd, content);
     const tocItems = extractTocItems(tokens);
@@ -1025,498 +1252,10 @@
     return items;
   }
 
-  function splitHighlightedCode(html) {
-    const result = [];
-    const openSpans = [];
-    const lines = html.split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      const prefix = openSpans.map(s => s).join('');
-      const line = lines[i];
-      const fullLine = prefix + line;
-
-      // Track open/close spans
-      const opens = line.match(/<span[^>]*>/g) || [];
-      const closes = line.match(/<\/span>/g) || [];
-      for (const o of opens) openSpans.push(o);
-      for (let c = 0; c < closes.length; c++) openSpans.pop();
-
-      // Close any open spans at end of line
-      const suffix = '</span>'.repeat(openSpans.length);
-      result.push(fullLine + suffix);
-    }
-    return result;
-  }
-
-  // Build line blocks for code files in file mode (document view)
-  function buildCodeLineBlocks(file) {
-    const lines = file.content.split('\n');
-    const blocks = [];
-    for (let i = 0; i < lines.length; i++) {
-      const lineNum = i + 1;
-      let html;
-      const cacheEntry = file.highlightCache ? file.highlightCache[lineNum] : null;
-      if (cacheEntry && cacheEntry.raw === (lines[i] || '')) {
-        html = '<code class="hljs">' + cacheEntry.html + '</code>';
-      } else {
-        html = '<code class="hljs">' + escapeHtml(lines[i] || '') + '</code>';
-      }
-      blocks.push({
-        startLine: lineNum,
-        endLine: lineNum,
-        html: html,
-        isEmpty: lines[i].trim() === '',
-        cssClass: 'code-line'
-      });
-    }
-    return blocks;
-  }
-
-  // ===== buildLineBlocks helpers =====
-
-  // Find the matching close token for an open token at openIdx.
-  function findCloseToken(tokens, openIdx) {
-    const openType = tokens[openIdx].type;
-    const closeType = openType.replace('_open', '_close');
-    let depth = 1;
-    for (let j = openIdx + 1; j < tokens.length; j++) {
-      if (tokens[j].type === openType) depth++;
-      if (tokens[j].type === closeType) { depth--; if (depth === 0) return j; }
-    }
-    return openIdx;
-  }
-
-  // Emit gap-line blocks for uncovered source lines up to (but not including) `upTo`.
-  function addGapLineBlocks(blocks, sourceLines, coveredUpTo, upTo) {
-    while (coveredUpTo < upTo) {
-      const lineText = sourceLines[coveredUpTo];
-      blocks.push({
-        startLine: coveredUpTo + 1,
-        endLine: coveredUpTo + 1,
-        html: lineText === '' ? '' : escapeHtml(lineText),
-        isEmpty: lineText.trim() === ''
-      });
-      coveredUpTo++;
-    }
-    return coveredUpTo;
-  }
-
-  // Handle a fence (code block) token — split into per-line blocks.
-  function handleFenceToken(token, blocks, sourceLines, coveredUpTo, blockStart, blockEnd) {
-    const lang = token.info.trim().split(/\s+/)[0] || '';
-
-    // Mermaid diagrams: render as a single block (not split per-line)
-    if (lang === 'mermaid') {
-      blocks.push({
-        startLine: blockStart + 1, endLine: blockEnd,
-        html: '<pre><code class="language-mermaid">' + escapeHtml(token.content) + '</code></pre>',
-        isEmpty: false, cssClass: 'mermaid-block'
-      });
-      return addGapLineBlocks(blocks, sourceLines, blockEnd, blockEnd);
-    }
-
-    let highlighted = '';
-    if (lang && hljs.getLanguage(lang)) {
-      try { highlighted = hljs.highlight(token.content, { language: lang }).value; } catch {}
-    }
-    if (!highlighted) highlighted = escapeHtml(token.content);
-
-    const codeLines = splitHighlightedCode(highlighted);
-    // Remove trailing empty line from fence
-    if (codeLines.length > 0 && codeLines[codeLines.length - 1] === '') codeLines.pop();
-
-    // Opening fence line
-    blocks.push({
-      startLine: blockStart + 1, endLine: blockStart + 1,
-      html: '<span class="fence-marker">' + escapeHtml(sourceLines[blockStart]) + '</span>',
-      isEmpty: false, cssClass: 'code-line code-first'
-    });
-    coveredUpTo = blockStart + 1;
-
-    // Code content lines
-    for (let ci = 0; ci < codeLines.length; ci++) {
-      const ln = blockStart + 2 + ci;
-      if (ln > blockEnd) break;
-      const isLast = (ci === codeLines.length - 1 && blockEnd <= ln);
-      blocks.push({
-        startLine: ln, endLine: ln,
-        html: '<code class="hljs">' + (codeLines[ci] || '&nbsp;') + '</code>',
-        isEmpty: false, cssClass: 'code-line' + (isLast ? ' code-last' : '')
-      });
-      coveredUpTo = ln;
-    }
-
-    // Closing fence line
-    if (blockEnd > coveredUpTo) {
-      blocks.push({
-        startLine: blockEnd, endLine: blockEnd,
-        html: '<span class="fence-marker">' + escapeHtml(sourceLines[blockEnd - 1]) + '</span>',
-        isEmpty: false, cssClass: 'code-line code-last'
-      });
-      coveredUpTo = blockEnd;
-    }
-
-    coveredUpTo = addGapLineBlocks(blocks, sourceLines, coveredUpTo, blockEnd);
-    return coveredUpTo;
-  }
-
-  // Handle a list token (bullet or ordered) — split into per-item blocks.
-  // Recurses into nested lists so each nested item is independently commentable.
-  // Nested-item blocks are rendered with semantic nesting preserved
-  // (e.g. <ul><li><ul><li>content</li></ul></li></ul>) with outer wrappers
-  // marked .crit-list-wrapper so CSS suppresses their bullets.
-  function handleListToken(tokens, i, _token, md, blocks, sourceLines, coveredUpTo, blockEnd) {
-    const listCloseIdx = findCloseToken(tokens, i);
-
-    splitListInto(tokens, i, listCloseIdx, md, blocks, sourceLines, coveredUpTo, function(html) {
-      return html;
-    });
-
-    // After splitListInto, blocks have been pushed and coveredUpTo updated
-    // implicitly via the last block's endLine. Recompute coveredUpTo from blocks.
-    if (blocks.length > 0) {
-      coveredUpTo = Math.max(coveredUpTo, blocks[blocks.length - 1].endLine);
-    }
-
-    coveredUpTo = addGapLineBlocks(blocks, sourceLines, coveredUpTo, blockEnd);
-    return { nextIndex: listCloseIdx + 1, coveredUpTo: coveredUpTo };
-  }
-
-  // Recursively split a list (between listOpenIdx and listCloseIdx) into blocks.
-  // `wrap(innerHtml)` wraps the innermost item HTML with any enclosing list/li
-  // chrome from outer (parent) lists, preserving semantic nesting.
-  // Pushes blocks to `blocks` and emits gap-line blocks between items.
-  // Returns the line number through which content has been emitted (last block's endLine).
-  function splitListInto(tokens, listOpenIdx, listCloseIdx, md, blocks, sourceLines, coveredUpTo, wrap) {
-    const listOpen = tokens[listOpenIdx];
-    const listTag = listOpen.type === 'bullet_list_open' ? 'ul' : 'ol';
-    let j = listOpenIdx + 1;
-
-    while (j < listCloseIdx) {
-      if (tokens[j].type !== 'list_item_open') { j++; continue; }
-      const itemOpenIdx = j;
-      const itemCloseIdx = findCloseToken(tokens, j);
-      const itemMap = tokens[itemOpenIdx].map;
-
-      if (!itemMap) { j = itemCloseIdx + 1; continue; }
-
-      addGapLineBlocks(blocks, sourceLines, coveredUpTo, itemMap[0]);
-      coveredUpTo = itemMap[0];
-
-      // Find nested lists within this item (direct children only).
-      const nestedRanges = findDirectNestedLists(tokens, itemOpenIdx, itemCloseIdx);
-
-      // For ordered lists, preserve numbering across split blocks via start=N.
-      // markdown-it stores the numeric marker on the list_item_open token's info.
-      const itemStartAttr = (listTag === 'ol' && tokens[itemOpenIdx].info)
-        ? ' start="' + tokens[itemOpenIdx].info + '"'
-        : '';
-
-      // The "lead" portion: tokens between item_open and the first nested list (or item_close).
-      const firstNested = nestedRanges.length > 0 ? nestedRanges[0] : null;
-      const leadEndTokenIdx = firstNested ? firstNested.openIdx : itemCloseIdx;
-
-      // Determine source-line range for the lead.
-      const leadStartLine = itemMap[0] + 1;
-      let leadEndLine;
-      if (firstNested) {
-        const nestedFirstMap = tokens[firstNested.openIdx].map;
-        leadEndLine = nestedFirstMap ? nestedFirstMap[0] : itemMap[1];
-      } else {
-        leadEndLine = itemMap[1];
-        // Trim trailing blank lines (markdown-it often claims a trailing blank).
-        while (leadEndLine > leadStartLine && sourceLines[leadEndLine - 1].trim() === '') {
-          leadEndLine--;
-        }
-      }
-
-      // Render lead content: re-use renderer over tokens [item_open .. leadEndTokenIdx-1] + item_close synthetic.
-      // Easiest: render the tokens between item_open+1 and leadEndTokenIdx (exclusive) as inline content,
-      // then wrap in <li>.
-      const leadInnerTokens = tokens.slice(itemOpenIdx + 1, leadEndTokenIdx);
-      const leadInnerHtml = md.renderer.render(leadInnerTokens, md.options, {});
-      const leadLiClass = tokens[itemOpenIdx].attrGet && tokens[itemOpenIdx].attrGet('class');
-      const leadLiAttr = leadLiClass ? ' class="' + escapeAttr(leadLiClass) + '"' : '';
-      const leadInnerWrapped = '<' + listTag + itemStartAttr + '>' +
-        '<li' + leadLiAttr + '>' + leadInnerHtml + '</li>' +
-        '</' + listTag + '>';
-
-      if (leadEndLine > leadStartLine - 1) {
-        blocks.push({
-          startLine: leadStartLine,
-          endLine: leadEndLine,
-          html: wrap(leadInnerWrapped),
-          isEmpty: false
-        });
-        coveredUpTo = leadEndLine;
-      }
-
-      // Recurse into each nested list. Build a wrap-fn that wraps the child HTML
-      // in this item's <listTag><li class="crit-list-wrapper">...</li></listTag>,
-      // then through the parent wrap.
-      for (let n = 0; n < nestedRanges.length; n++) {
-        const nested = nestedRanges[n];
-        const childWrap = function(innerHtml) {
-          // Outer wrappers: marker-suppressed <li> so we don't get phantom bullets.
-          return wrap(
-            '<' + listTag + ' class="crit-list-wrapper">' +
-            '<li class="crit-list-wrapper">' + innerHtml + '</li>' +
-            '</' + listTag + '>'
-          );
-        };
-        coveredUpTo = splitListInto(tokens, nested.openIdx, nested.closeIdx, md, blocks, sourceLines, coveredUpTo, childWrap);
-      }
-
-      // Trailing content after last nested list (rare): handle it as another lead-style block.
-      if (nestedRanges.length > 0) {
-        const lastNested = nestedRanges[nestedRanges.length - 1];
-        const trailStartTokenIdx = lastNested.closeIdx + 1;
-        if (trailStartTokenIdx < itemCloseIdx) {
-          // Find first mapped token for trailing source-line range.
-          const trailStartLine = coveredUpTo;
-          let trailEndLine = itemMap[1];
-          while (trailEndLine > trailStartLine && sourceLines[trailEndLine - 1].trim() === '') {
-            trailEndLine--;
-          }
-          if (trailEndLine > trailStartLine) {
-            const trailInnerTokens = tokens.slice(trailStartTokenIdx, itemCloseIdx);
-            const trailInnerHtml = md.renderer.render(trailInnerTokens, md.options, {});
-            const trailWrapped = '<' + listTag + '>' +
-              '<li>' + trailInnerHtml + '</li>' +
-              '</' + listTag + '>';
-            blocks.push({
-              startLine: trailStartLine + 1,
-              endLine: trailEndLine,
-              html: wrap(trailWrapped),
-              isEmpty: false
-            });
-            coveredUpTo = trailEndLine;
-          }
-        }
-      }
-
-      j = itemCloseIdx + 1;
-    }
-
-    return coveredUpTo;
-  }
-
-  // Find direct-child nested lists within an item (not lists nested inside paragraphs etc.).
-  // Returns array of {openIdx, closeIdx} for each direct nested list_open token.
-  function findDirectNestedLists(tokens, itemOpenIdx, itemCloseIdx) {
-    const result = [];
-    let depth = 0;
-    for (let k = itemOpenIdx + 1; k < itemCloseIdx; k++) {
-      const t = tokens[k];
-      if (t.nesting === 1) {
-        if (depth === 0 && (t.type === 'bullet_list_open' || t.type === 'ordered_list_open')) {
-          const closeIdx = findCloseToken(tokens, k);
-          result.push({ openIdx: k, closeIdx: closeIdx });
-          k = closeIdx; // skip past
-          continue;
-        }
-        depth++;
-      } else if (t.nesting === -1) {
-        if (depth > 0) depth--;
-      }
-    }
-    return result;
-  }
-
-  function escapeAttr(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-  }
-
-  // Handle a table token — split into per-row blocks.
-  function handleTableToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockEnd) {
-    const tableCloseIdx = findCloseToken(tokens, i);
-
-    // Build colgroup from header cell alignments
-    let colgroup = '';
-    const aligns = [];
-    for (let j = i + 1; j < tableCloseIdx; j++) {
-      if (tokens[j].type === 'th_open') {
-        aligns.push(tokens[j].attrGet('style') || '');
-      }
-    }
-    if (aligns.length) {
-      colgroup = '<colgroup>' +
-        aligns.map(s => '<col' + (s ? ' style="' + s + '"' : '') + '>').join('') +
-        '</colgroup>';
-    }
-
-    let j = i + 1;
-    let inThead = false;
-    let rowIndex = 0;
-    let bodyRowIndex = 0;
-
-    while (j < tableCloseIdx) {
-      if (tokens[j].type === 'thead_open') { inThead = true; j++; continue; }
-      if (tokens[j].type === 'thead_close') { inThead = false; j++; continue; }
-      if (tokens[j].type === 'tbody_open' || tokens[j].type === 'tbody_close') { j++; continue; }
-
-      if (tokens[j].type === 'tr_open') {
-        const trCloseIdx = findCloseToken(tokens, j);
-        const trMap = tokens[j].map;
-
-        if (trMap) {
-          // Emit separator / gap lines between rows
-          for (let ln = coveredUpTo; ln < trMap[0]; ln++) {
-            const lineText = sourceLines[ln].trim();
-            if (/^\|[\s\-:|]+\|$/.test(lineText) || /^[-:|][\s\-:|]*$/.test(lineText)) {
-              blocks.push({ startLine: ln + 1, endLine: ln + 1, html: '', isEmpty: false, cssClass: 'table-separator' });
-            } else {
-              blocks.push({ startLine: ln + 1, endLine: ln + 1, html: lineText === '' ? '' : escapeHtml(lineText), isEmpty: lineText === '' });
-            }
-          }
-
-          const trTokens = tokens.slice(j, trCloseIdx + 1);
-          const section = inThead ? 'thead' : 'tbody';
-          const rowHtml = '<table class="split-table">' + colgroup +
-            '<' + section + '>' +
-            md.renderer.render(trTokens, md.options, {}) +
-            '</' + section + '></table>';
-
-          let cls = 'table-row';
-          if (rowIndex === 0) cls += ' table-first';
-          if (!inThead && bodyRowIndex % 2 === 1) cls += ' table-even';
-          blocks.push({
-            startLine: trMap[0] + 1, endLine: trMap[1],
-            html: rowHtml, isEmpty: false, cssClass: cls
-          });
-          coveredUpTo = trMap[1];
-          rowIndex++;
-          if (!inThead) bodyRowIndex++;
-        }
-        j = trCloseIdx + 1;
-      } else {
-        j++;
-      }
-    }
-
-    // Mark the last table row
-    if (blocks.length > 0 && blocks[blocks.length - 1].cssClass &&
-        blocks[blocks.length - 1].cssClass.includes('table-row')) {
-      blocks[blocks.length - 1].cssClass += ' table-last';
-    }
-
-    coveredUpTo = addGapLineBlocks(blocks, sourceLines, coveredUpTo, blockEnd);
-    return { nextIndex: tableCloseIdx + 1, coveredUpTo: coveredUpTo };
-  }
-
-  // Handle a blockquote token — split into child blocks.
-  function handleBlockquoteToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockStart, blockEnd) {
-    const bqCloseIdx = findCloseToken(tokens, i);
-    let j = i + 1;
-    let hasChildren = false;
-
-    while (j < bqCloseIdx) {
-      if (tokens[j].nesting === -1 || !tokens[j].map) { j++; continue; }
-      hasChildren = true;
-      const childMap = tokens[j].map;
-      let childCloseIdx = j;
-      if (tokens[j].nesting === 1) childCloseIdx = findCloseToken(tokens, j);
-      addGapLineBlocks(blocks, sourceLines, coveredUpTo, childMap[0]);
-      const childTokens = tokens.slice(j, childCloseIdx + 1);
-      const childHtml = '<blockquote>' +
-        md.renderer.render(childTokens, md.options, {}) +
-        '</blockquote>';
-      blocks.push({
-        startLine: childMap[0] + 1, endLine: childMap[1],
-        html: childHtml, isEmpty: false
-      });
-      coveredUpTo = childMap[1];
-      j = childCloseIdx + 1;
-    }
-
-    if (!hasChildren) {
-      const bqTokens = tokens.slice(i, bqCloseIdx + 1);
-      blocks.push({
-        startLine: blockStart + 1, endLine: blockEnd,
-        html: md.renderer.render(bqTokens, md.options, {}),
-        isEmpty: false
-      });
-      coveredUpTo = blockEnd;
-    }
-
-    coveredUpTo = addGapLineBlocks(blocks, sourceLines, coveredUpTo, blockEnd);
-    return { nextIndex: bqCloseIdx + 1, coveredUpTo: coveredUpTo };
-  }
-
-  // ===== buildLineBlocks =====
-  // Parses markdown tokens into a flat array of commentable line blocks.
-  // Delegates to per-token-type handlers for fence, list, table, and blockquote tokens.
-
-  function buildLineBlocks(tokens, md, content) {
-    const sourceLines = content.split('\n');
-    const totalLines = sourceLines.length;
-    const blocks = [];
-    let coveredUpTo = 0;
-
-    let i = 0;
-    while (i < tokens.length) {
-      const token = tokens[i];
-      if (token.hidden || !token.map) { i++; continue; }
-
-      const blockStart = token.map[0];
-      const blockEnd = token.map[1];
-
-      coveredUpTo = addGapLineBlocks(blocks, sourceLines, coveredUpTo, blockStart);
-
-      // Code blocks (fence): split into per-line blocks
-      if (token.type === 'fence') {
-        coveredUpTo = handleFenceToken(token, blocks, sourceLines, coveredUpTo, blockStart, blockEnd);
-        i++;
-        continue;
-      }
-
-      // Lists: split into per-item blocks
-      if (token.type === 'bullet_list_open' || token.type === 'ordered_list_open') {
-        const listResult = handleListToken(tokens, i, token, md, blocks, sourceLines, coveredUpTo, blockEnd);
-        i = listResult.nextIndex;
-        coveredUpTo = listResult.coveredUpTo;
-        continue;
-      }
-
-      // Tables: split into per-row blocks
-      if (token.type === 'table_open') {
-        const tableResult = handleTableToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockEnd);
-        i = tableResult.nextIndex;
-        coveredUpTo = tableResult.coveredUpTo;
-        continue;
-      }
-
-      // Blockquotes: split into child blocks
-      if (token.type === 'blockquote_open') {
-        const bqResult = handleBlockquoteToken(tokens, i, md, blocks, sourceLines, coveredUpTo, blockStart, blockEnd);
-        i = bqResult.nextIndex;
-        coveredUpTo = bqResult.coveredUpTo;
-        continue;
-      }
-
-      // Default: render as single block
-      let closeIdx = i;
-      if (token.nesting === 1) closeIdx = findCloseToken(tokens, i);
-
-      const blockTokens = tokens.slice(i, closeIdx + 1);
-      let html;
-      try {
-        html = md.renderer.render(blockTokens, md.options, {});
-      } catch {
-        html = escapeHtml(blockTokens.map(t => t.content || '').join(''));
-      }
-
-      blocks.push({
-        startLine: blockStart + 1, endLine: blockEnd,
-        html: html, isEmpty: false
-      });
-
-      i = closeIdx + 1;
-      coveredUpTo = blockEnd;
-    }
-
-    addGapLineBlocks(blocks, sourceLines, coveredUpTo, totalLines);
-    return blocks;
-  }
+  // Line-block building — extracted to crit-line-blocks.js (window.crit.lineBlocks)
+  const splitHighlightedCode = window.crit.lineBlocks.splitHighlightedCode;
+  const buildCodeLineBlocks = window.crit.lineBlocks.buildCodeLineBlocks;
+  const buildLineBlocks = window.crit.lineBlocks.buildLineBlocks;
 
   // ===== Utility Functions =====
   function processTaskLists(html) {
@@ -1546,26 +1285,13 @@
     });
   }
 
-  function escapeHtml(str) {
-    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  }
-
-  function relativeTime(dateStr) {
-    const now = Date.now();
-    const then = new Date(dateStr).getTime();
-    const diff = Math.floor((now - then) / 1000);
-    if (diff < 60) return 'just now';
-    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
-    if (diff < 604800) return Math.floor(diff / 86400) + 'd ago';
-    return Math.floor(diff / 604800) + 'w ago';
-  }
-
-  function formatTime(isoStr) {
-    if (!isoStr) return '';
-    const d = new Date(isoStr);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
+  // Pure rendering helpers live in crit-comment-card-helpers.js so live-mode
+  // rows render with the same primitives. The helpers module is loaded before
+  // app.js via index.html script order, so we reference it directly.
+  const _ccHelpers = window.crit.commentCardHelpers;
+  const escapeHtml = _ccHelpers.escapeHtml;
+  const relativeTime = _ccHelpers.relativeTime;
+  const formatTime = _ccHelpers.formatTime;
 
   function getFileByPath(path) {
     return files.find(f => f.path === path);
@@ -1622,6 +1348,7 @@
     const panel = document.getElementById('fileTreePanel');
     if (files.length <= 1 && session.mode !== 'git') {
       panel.style.display = 'none';
+      renderMobileFilePicker();
       return;
     }
     panel.style.display = '';
@@ -1675,6 +1402,47 @@
 
     // Set up intersection observer for active file tracking
     setupTreeObserver();
+
+    renderMobileFilePicker();
+  }
+
+  // Mobile (≤768px) replaces the file-tree sidebar with a sticky <select>.
+  // Populates options from the current session files; clicking an option
+  // scrolls that file's section into view. No-op (and hidden) when there's
+  // only one file.
+  function renderMobileFilePicker() {
+    const bar = document.getElementById('mobileFilePickerBar');
+    const select = document.getElementById('mobileFilePicker');
+    if (!bar || !select) return;
+
+    if (files.length <= 1) {
+      bar.classList.add('mobile-file-picker-hidden');
+      return;
+    }
+    bar.classList.remove('mobile-file-picker-hidden');
+
+    const currentValue = select.value;
+    select.innerHTML = '';
+    for (let i = 0; i < files.length; i++) {
+      const opt = document.createElement('option');
+      opt.value = files[i].path;
+      opt.textContent = files[i].path;
+      select.appendChild(opt);
+    }
+
+    if (currentValue && files.some(function(f) { return f.path === currentValue; })) {
+      select.value = currentValue;
+    }
+
+    if (!select._mobilePickerBound) {
+      select._mobilePickerBound = true;
+      select.addEventListener('change', function() {
+        const sectionEl = document.getElementById('file-section-' + select.value);
+        if (sectionEl) {
+          sectionEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        }
+      });
+    }
   }
 
   function buildReviewConversationTreeRow() {
@@ -2196,13 +1964,30 @@
     header.innerHTML =
       '<div class="file-header-chevron"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"/></svg></div>' +
       '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
-      '<span class="file-header-name"><span class="dir">' + escapeHtml(dirPath) + '</span>' + escapeHtml(fileName) + '</span>' +
+      '<span class="file-header-name"><span class="dir">' + escapeHtml(dirPath) + '</span><span class="filename">' + escapeHtml(fileName) + '</span>' +
+        '<button type="button" class="file-header-copy-path" aria-label="Copy file path">' + ICON_COPY_PATH + '</button>' +
+      '</span>' +
       (showBadge ? '<span class="file-header-badge ' + escapeHtml(file.status) + '">' + escapeHtml(badgeLabel) + '</span>' : '') +
       (file.additions || file.deletions ? '<span class="file-header-stats">' +
         (file.additions ? '<span class="add">+' + file.additions + '</span>' : '') +
         (file.deletions ? '<span class="del">-' + file.deletions + '</span>' : '') +
       '</span>' : '') +
       '';
+
+    (function(filePath) {
+      const copyPathBtn = header.querySelector('.file-header-copy-path');
+      copyPathBtn.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const originalLabel = copyPathBtn.getAttribute('aria-label');
+        const abs = session.cwd ? session.cwd + '/' + filePath : filePath;
+        navigator.clipboard.writeText(abs).then(function() {
+          copyPathBtn.innerHTML = ICON_COPY_PATH_CHECK;
+          copyPathBtn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function() { copyPathBtn.innerHTML = ICON_COPY_PATH; copyPathBtn.setAttribute('aria-label', originalLabel); }, 1500);
+        }).catch(function() { /* best-effort */ });
+      });
+    })(file.path);
 
     // Add document/diff toggle for markdown files that have diff hunks
     // Hide when diffActive is on (header-level rendered diff overrides per-file toggle)
@@ -2835,257 +2620,15 @@
     return renderDiffUnified(file);
   }
 
-  // ===== Word-Level Diff =====
 
-  // Compute similarity between two strings using token multiset Dice coefficient.
-  // Returns 0–1 (1 = identical tokens, 0 = nothing in common).
-  // Only counts word tokens (identifiers, numbers) — single punctuation characters
-  // like ", :, {, }, etc. are structural noise that inflates similarity between
-  // unrelated JSON/code lines.
-  function lineSimilarity(a, b) {
-    if (a === b) return 1;
-    if (!a || !b) return 0;
-    // \w+ matches word tokens directly — no need for a separate tokenize pass
-    // followed by a filter (the previous custom LCS path used tokenize for
-    // more, but after the @sanity/diff-match-patch swap this is the only call
-    // site, so it is inlined).
-    const tokA = a.match(/\w+/g) || [];
-    const tokB = b.match(/\w+/g) || [];
-    if (tokA.length === 0 && tokB.length === 0) return 1;
-    if (tokA.length === 0 || tokB.length === 0) return 0;
-    const counts = {};
-    for (let i = 0; i < tokA.length; i++) {
-      counts[tokA[i]] = (counts[tokA[i]] || 0) + 1;
-    }
-    let common = 0;
-    for (let i = 0; i < tokB.length; i++) {
-      if (counts[tokB[i]] > 0) {
-        common++;
-        counts[tokB[i]]--;
-      }
-    }
-    return (2 * common) / (tokA.length + tokB.length);
-  }
+  // Word-level diff — extracted to crit-diff-renderer.js (window.crit.diffRenderer)
+  const bestWordDiffPairing = window.crit.diffRenderer.bestWordDiffPairing;
+  const wordDiff = window.crit.diffRenderer.wordDiff;
+  const applyWordDiffToHtml = window.crit.diffRenderer.applyWordDiffToHtml;
+  const htmlToText = window.crit.diffRenderer.htmlToText;
+  const applyWordDiffPair = window.crit.diffRenderer.applyWordDiffPair;
+  const buildHunkWordDiffs = window.crit.diffRenderer.buildHunkWordDiffs;
 
-  // Find best similarity-based pairing between del and add lines for word diff.
-  // Returns array of [delIdx, addIdx] pairs. Unpaired lines get no word diff.
-  function bestWordDiffPairing(delTexts, addTexts) {
-    const delCount = delTexts.length;
-    const addCount = addTexts.length;
-    const pairCount = Math.min(delCount, addCount);
-    if (pairCount === 0) return [];
-    // Large blocks are code rewrites, not line edits — skip word-diff entirely.
-    // This matches GitHub's behavior of not highlighting large del/add blocks.
-    if (delCount + addCount > 8) return [];
-    // 1:1 — pair directly if similar enough (most common case)
-    if (delCount === 1 && addCount === 1) {
-      return lineSimilarity(delTexts[0], addTexts[0]) >= 0.4 ? [[0, 0]] : [];
-    }
-    // Compute all similarity scores
-    const candidates = [];
-    for (let d = 0; d < delCount; d++) {
-      for (let a = 0; a < addCount; a++) {
-        candidates.push({ d: d, a: a, score: lineSimilarity(delTexts[d], addTexts[a]) });
-      }
-    }
-    candidates.sort(function(x, y) { return y.score - x.score; });
-    // Greedy assignment: pick highest similarity first
-    const usedDels = {};
-    const usedAdds = {};
-    const pairs = [];
-    for (let i = 0; i < candidates.length; i++) {
-      const c = candidates[i];
-      if (usedDels[c.d] || usedAdds[c.a]) continue;
-      if (c.score < 0.4) break;
-      pairs.push([c.d, c.a]);
-      usedDels[c.d] = true;
-      usedAdds[c.a] = true;
-      if (pairs.length === pairCount) break;
-    }
-    return pairs;
-  }
-
-  // Compute word-level diff between two lines using diff-match-patch.
-  // Runs character-level diff with semantic cleanup to produce word-aligned highlights.
-  // Returns { oldRanges, newRanges } where each range is [startCharIdx, endCharIdx] in the raw text.
-  // Returns null if lines are too long, identical, or completely different.
-  function wordDiff(oldLine, newLine) {
-    // Skip for very long lines (perf guard)
-    if (oldLine.length > 500 || newLine.length > 500) return null;
-    // Skip for lines with no spaces and >200 chars (likely minified/binary)
-    if (oldLine.length > 200 && !oldLine.includes(' ')) return null;
-    if (newLine.length > 200 && !newLine.includes(' ')) return null;
-    // Identical lines — no diff needed
-    if (oldLine === newLine) return null;
-
-    const dmp = window.DiffMatchPatch;
-    const diffs = dmp.cleanupSemantic(dmp.makeDiff(oldLine, newLine));
-
-    // Build character ranges from diff tuples.
-    // DIFF_DELETE (-1) tuples advance old position, DIFF_INSERT (1) advance new,
-    // DIFF_EQUAL (0) advances both.
-    const oldRanges = [];
-    const newRanges = [];
-    let oldIdx = 0;
-    let newIdx = 0;
-
-    for (let i = 0; i < diffs.length; i++) {
-      const op = diffs[i][0];
-      const text = diffs[i][1];
-      const len = text.length;
-
-      if (op === dmp.DIFF_EQUAL) {
-        oldIdx += len;
-        newIdx += len;
-      } else if (op === dmp.DIFF_DELETE) {
-        oldRanges.push([oldIdx, oldIdx + len]);
-        oldIdx += len;
-      } else if (op === dmp.DIFF_INSERT) {
-        newRanges.push([newIdx, newIdx + len]);
-        newIdx += len;
-      }
-    }
-
-    if (oldRanges.length === 0 && newRanges.length === 0) return null;
-
-    // If most of the line changed, the lines probably don't correspond —
-    // skip word-diff to avoid noisy highlights on unrelated lines.
-    const oldChanged = oldRanges.reduce(function(s, r) { return s + r[1] - r[0]; }, 0);
-    const newChanged = newRanges.reduce(function(s, r) { return s + r[1] - r[0]; }, 0);
-    if (oldLine.length > 0 && oldChanged / oldLine.length > 0.5) return null;
-    if (newLine.length > 0 && newChanged / newLine.length > 0.5) return null;
-
-    return { oldRanges: oldRanges, newRanges: newRanges };
-  }
-
-  // Overlay word-diff highlight ranges onto syntax-highlighted HTML.
-  // Walks the HTML string, tracking visible character position (skipping HTML tags),
-  // and inserts <span class="cssClass"> wrappers around the character ranges.
-  // ranges: array of [startCharIdx, endCharIdx] in the raw text.
-  function applyWordDiffToHtml(html, ranges, cssClass) {
-    if (!ranges || ranges.length === 0) return html;
-
-    let result = '';
-    let charIdx = 0;       // visible character index
-    let rangeIdx = 0;      // which range we're processing
-    let inRange = false;   // currently inside a word-diff span
-    let i = 0;             // position in html string
-
-    while (i < html.length) {
-      // Skip HTML tags (don't count them as visible characters)
-      if (html[i] === '<') {
-        // If we're in a word-diff range, close it before the tag, reopen after
-        if (inRange) result += '</span>';
-        const tagEnd = html.indexOf('>', i);
-        if (tagEnd === -1) { result += html.slice(i); break; }
-        result += html.slice(i, tagEnd + 1);
-        i = tagEnd + 1;
-        if (inRange) result += '<span class="' + cssClass + '">';
-        continue;
-      }
-
-      // Handle HTML entities (e.g., &amp; &lt; &gt; &quot;) as single visible characters
-      let visibleChar;
-      if (html[i] === '&') {
-        const semiIdx = html.indexOf(';', i);
-        if (semiIdx !== -1 && semiIdx - i < 10) {
-          visibleChar = html.slice(i, semiIdx + 1);
-          i = semiIdx + 1;
-        } else {
-          visibleChar = html[i];
-          i++;
-        }
-      } else {
-        visibleChar = html[i];
-        i++;
-      }
-
-      // Check if we need to open a word-diff span
-      if (!inRange && rangeIdx < ranges.length && charIdx >= ranges[rangeIdx][0]) {
-        result += '<span class="' + cssClass + '">';
-        inRange = true;
-      }
-
-      result += visibleChar;
-      charIdx++;
-
-      // Check if we need to close a word-diff span
-      if (inRange && rangeIdx < ranges.length && charIdx >= ranges[rangeIdx][1]) {
-        result += '</span>';
-        inRange = false;
-        rangeIdx++;
-        // Check if immediately entering next range
-        if (rangeIdx < ranges.length && charIdx >= ranges[rangeIdx][0]) {
-          result += '<span class="' + cssClass + '">';
-          inRange = true;
-        }
-      }
-    }
-
-    if (inRange) result += '</span>';
-    return result;
-  }
-
-  // Strip HTML tags and decode entities to get visible text for word-diff comparison.
-  function htmlToText(html) {
-    return html.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-  }
-
-  // Apply word-level diffs to a pair of old/new blocks if they are sufficiently similar.
-  // Skips pairs where >70% of characters changed (blocks probably don't correspond).
-  function applyWordDiffPair(oldBlock, newBlock) {
-    // Normalize newlines to spaces so paragraph re-wrapping doesn't create false diffs.
-    // In markdown, soft line breaks within a paragraph are just whitespace.
-    // Both \n and ' ' are single chars, so word-diff ranges remain valid for applyWordDiffToHtml.
-    const oldText = htmlToText(oldBlock.html).replace(/\n/g, ' ');
-    const newText = htmlToText(newBlock.html).replace(/\n/g, ' ');
-    const wd = wordDiff(oldText, newText);
-    if (!wd) return;
-    const oldChangedChars = wd.oldRanges.reduce(function(s, r) { return s + r[1] - r[0]; }, 0);
-    const newChangedChars = wd.newRanges.reduce(function(s, r) { return s + r[1] - r[0]; }, 0);
-    if (oldText.length > 0 && oldChangedChars / oldText.length > 0.7) return;
-    if (newText.length > 0 && newChangedChars / newText.length > 0.7) return;
-    oldBlock.wordDiffHtml = applyWordDiffToHtml(oldBlock.html, wd.oldRanges, 'diff-word-del');
-    newBlock.wordDiffHtml = applyWordDiffToHtml(newBlock.html, wd.newRanges, 'diff-word-add');
-  }
-
-  // Pre-compute word diffs for all paired del/add runs in a hunk.
-  // Returns a Map<lineIndex, { ranges, cssClass }> mapping hunk line indices to word-diff info.
-  function buildHunkWordDiffs(hunk) {
-    const wordDiffMap = new Map();
-    const lines = hunk.Lines;
-    let i = 0;
-    while (i < lines.length) {
-      if (lines[i].Type === 'del') {
-        // Collect consecutive dels
-        const delStart = i;
-        while (i < lines.length && lines[i].Type === 'del') i++;
-        // Collect consecutive adds
-        const addStart = i;
-        while (i < lines.length && lines[i].Type === 'add') i++;
-        // Pair by similarity so word diffs highlight the right counterpart
-        const delCount = addStart - delStart;
-        const addCount = i - addStart;
-        const delTexts = [];
-        for (let d = 0; d < delCount; d++) delTexts.push(lines[delStart + d].Content);
-        const addTexts = [];
-        for (let a = 0; a < addCount; a++) addTexts.push(lines[addStart + a].Content);
-        const pairs = bestWordDiffPairing(delTexts, addTexts);
-        for (let p = 0; p < pairs.length; p++) {
-          const dIdx = delStart + pairs[p][0];
-          const aIdx = addStart + pairs[p][1];
-          const wd = wordDiff(lines[dIdx].Content, lines[aIdx].Content);
-          if (wd) {
-            wordDiffMap.set(dIdx, { ranges: wd.oldRanges, cssClass: 'diff-word-del' });
-            wordDiffMap.set(aIdx, { ranges: wd.newRanges, cssClass: 'diff-word-add' });
-          }
-        }
-      } else {
-        i++;
-      }
-    }
-    return wordDiffMap;
-  }
 
   // ===== Diff Gutter Drag (multi-line comment selection) =====
   let diffDragState = null; // { filePath, side, anchorLine, currentLine }
@@ -3158,23 +2701,55 @@
       const ln = parseInt(this.dataset.lineNum);
       const s = this.dataset.side || '';
       const vi = this.dataset.visualIdx !== undefined ? parseInt(this.dataset.visualIdx) : undefined;
-
-      diffDragState = { filePath: fp, side: s, anchorLine: ln, currentLine: ln, anchorVisualIdx: vi, currentVisualIdx: vi };
-      activeFilePath = fp;
-      selectionStart = ln;
-      selectionEnd = ln;
-      if (diffMode !== 'split' && vi !== undefined) {
-        unifiedVisualStart = vi;
-        unifiedVisualEnd = vi;
-      }
-      renderFileByPath(fp);
-
-      document.body.classList.add('dragging');
+      beginDiffCommentDrag(fp, ln, s, vi);
       document.addEventListener('mousemove', handleDiffDragMove);
       document.addEventListener('mouseup', handleDiffDragEnd);
     });
     col.appendChild(btn);
     return col;
+  }
+
+  // Shared drag-init used by both the desktop mousedown handler on
+  // .diff-comment-btn and the touch pointerdown handler on .diff-gutter-num
+  // (added in attachDiffTouchHandler below for F4 mobile reliability).
+  function beginDiffCommentDrag(fp, ln, s, vi) {
+    diffDragState = { filePath: fp, side: s, anchorLine: ln, currentLine: ln, anchorVisualIdx: vi, currentVisualIdx: vi };
+    activeFilePath = fp;
+    selectionStart = ln;
+    selectionEnd = ln;
+    if (diffMode !== 'split' && vi !== undefined) {
+      unifiedVisualStart = vi;
+      unifiedVisualEnd = vi;
+    }
+    renderFileByPath(fp);
+    document.body.classList.add('dragging');
+  }
+
+  // F4: on touch devices, the desktop .diff-comment-btn affordance is
+  // invisible (no hover ever fires) and the user instead sees the `+`
+  // prefix that F3 puts on .diff-gutter-num. Make .diff-gutter-num itself
+  // a touch-tap target by delegating pointerdown on the diff container.
+  // The button's data attrs are co-located on the sibling .diff-comment-btn
+  // inside the same row's .diff-comment-gutter.
+  function attachDiffTouchHandler(container) {
+    container.addEventListener('pointerdown', function(e) {
+      if (e.pointerType !== 'touch') return;
+      const num = e.target.closest('.diff-gutter-num');
+      if (!num) return;
+      const row = num.closest('.diff-line, .diff-split-side');
+      if (!row) return;
+      const btn = row.querySelector('.diff-comment-btn');
+      if (!btn) return; // line not commentable
+      e.preventDefault();
+      e.stopPropagation();
+      const fp = btn.dataset.filePath;
+      const ln = parseInt(btn.dataset.lineNum);
+      const s = btn.dataset.side || '';
+      const vi = btn.dataset.visualIdx !== undefined ? parseInt(btn.dataset.visualIdx) : undefined;
+      beginDiffCommentDrag(fp, ln, s, vi);
+      document.addEventListener('pointermove', handleDiffDragMove);
+      document.addEventListener('pointerup', handleDiffDragEnd);
+    });
   }
 
   function handleDiffDragMove(e) {
@@ -3207,8 +2782,14 @@
   }
 
   function handleDiffDragEnd() {
+    // Remove both mouse and pointer listeners — desktop attaches mouse
+    // listeners via the .diff-comment-btn mousedown handler, touch
+    // attaches pointer listeners via attachDiffTouchHandler. Cleaning
+    // both is safe (removeEventListener is a no-op if not attached).
     document.removeEventListener('mousemove', handleDiffDragMove);
     document.removeEventListener('mouseup', handleDiffDragEnd);
+    document.removeEventListener('pointermove', handleDiffDragMove);
+    document.removeEventListener('pointerup', handleDiffDragEnd);
     document.body.classList.remove('dragging');
 
     if (!diffDragState) return;
@@ -3663,6 +3244,7 @@
   function renderDiffUnified(file) {
     const container = document.createElement('div');
     container.className = 'diff-container unified';
+    attachDiffTouchHandler(container);
 
     expandHunksForComments(file);
 
@@ -3791,6 +3373,7 @@
   function renderDiffSplit(file) {
     const container = document.createElement('div');
     container.className = 'diff-container split';
+    attachDiffTouchHandler(container);
 
     expandHunksForComments(file);
 
@@ -4619,72 +4202,21 @@
   }
 
   // ===== Comment Templates =====
-  function getTemplates() {
-    try {
-      const raw = getCookie('crit-templates');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {}
-    return [];
-  }
-
-  function saveTemplates(templates) {
-    setCookie('crit-templates', JSON.stringify(templates));
-  }
-
-  function populateTemplateBar(bar, textarea) {
-    bar.innerHTML = '';
-    const templates = getTemplates();
-    if (templates.length === 0) {
-      bar.style.display = 'none';
-      return;
-    }
-    bar.style.display = '';
-    templates.forEach(function(tmpl, i) {
-      const chip = document.createElement('button');
-      chip.className = 'template-chip';
-      chip.title = tmpl;
-      const label = document.createElement('span');
-      label.className = 'template-chip-label';
-      label.textContent = tmpl;
-      chip.appendChild(label);
-      const del = document.createElement('span');
-      del.className = 'template-chip-delete';
-      del.textContent = '\u00d7';
-      del.title = 'Remove template';
-      del.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        const t = getTemplates();
-        t.splice(i, 1);
-        saveTemplates(t);
-        populateTemplateBar(bar, textarea);
-      });
-      chip.appendChild(del);
-      chip.addEventListener('click', function(e) {
-        e.preventDefault();
-        const start = textarea.selectionStart;
-        const end = textarea.selectionEnd;
-        textarea.value = textarea.value.substring(0, start) + tmpl + textarea.value.substring(end);
-        textarea.selectionStart = textarea.selectionEnd = start + tmpl.length;
-        textarea.focus();
-        textarea.dispatchEvent(new Event('input'));
-      });
-      bar.appendChild(chip);
-    });
-  }
-
-  function createTemplateBar(textarea) {
-    const bar = document.createElement('div');
-    bar.className = 'comment-template-bar';
-    populateTemplateBar(bar, textarea);
-    return bar;
-  }
+  // Template CRUD and bar DOM delegated to window.crit.commentTemplates (crit-comment-templates.js).
 
   function attachTemplateUI(form, textarea, actions) {
-    const templateBar = createTemplateBar(textarea);
+    const tmplModule = window.crit.commentTemplates;
+
+    const templateBar = tmplModule.buildTemplateBar({
+      onInsert: function(text) {
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        textarea.value = textarea.value.substring(0, start) + text + textarea.value.substring(end);
+        textarea.selectionStart = textarea.selectionEnd = start + text.length;
+        textarea.focus();
+        textarea.dispatchEvent(new Event('input'));
+      }
+    });
 
     const saveTemplateBtn = document.createElement('button');
     saveTemplateBtn.className = 'btn btn-sm';
@@ -4696,7 +4228,7 @@
 
     const suggestBtn = document.createElement('button');
     suggestBtn.className = 'btn btn-sm';
-    suggestBtn.textContent = '\u00B1 Suggest';
+    suggestBtn.textContent = '± Suggest';
     suggestBtn.title = 'Insert the selected lines as a suggestion';
     suggestBtn.addEventListener('click', function() { insertSuggestion(textarea); });
 
@@ -4749,11 +4281,8 @@
     saveBtn.addEventListener('click', function() {
       const val = input.value.trim();
       if (!val) return;
-      const t = getTemplates();
-      t.push(val);
-      saveTemplates(t);
+      templateBar._saveNew(val);
       overlay.remove();
-      populateTemplateBar(templateBar, textarea);
       textarea.focus();
     });
 
@@ -5379,51 +4908,42 @@
     renderFileByPath(formObj.filePath);
   }
 
-  // ===== Draft Autosave =====
-  const draftTimers = {};
-
-  function getDraftKey(formObj) {
-    if (!formObj) return null;
-    return 'crit-draft-' + formObj.formKey;
-  }
+  // ===== Draft Autosave (delegates to window.crit.draft) =====
+  const draftMod = window.crit.draft;
 
   function saveDraft(body, formObj) {
     if (!formObj) return;
-    const key = getDraftKey(formObj);
-    if (!key) return;
-    try {
-      localStorage.setItem(key, JSON.stringify({
-        filePath: formObj.filePath,
-        startLine: formObj.startLine,
-        endLine: formObj.endLine,
-        afterBlockIndex: formObj.afterBlockIndex,
-        editingId: formObj.editingId,
-        side: formObj.side || '',
-        scope: formObj.scope || '',
-        body: body,
-        savedAt: Date.now()
-      }));
-    } catch {}
+    draftMod.saveDraftImmediate(formObj.formKey, {
+      filePath: formObj.filePath,
+      startLine: formObj.startLine,
+      endLine: formObj.endLine,
+      afterBlockIndex: formObj.afterBlockIndex,
+      editingId: formObj.editingId,
+      side: formObj.side || '',
+      scope: formObj.scope || '',
+      body: body,
+      savedAt: Date.now()
+    });
   }
 
   function debouncedSaveDraft(body, formObj) {
     if (!formObj) return;
-    const key = formObj.formKey;
-    clearTimeout(draftTimers[key]);
-    draftTimers[key] = setTimeout(function() { saveDraft(body, formObj); }, 500);
+    draftMod.saveDraft(formObj.formKey, {
+      filePath: formObj.filePath,
+      startLine: formObj.startLine,
+      endLine: formObj.endLine,
+      afterBlockIndex: formObj.afterBlockIndex,
+      editingId: formObj.editingId,
+      side: formObj.side || '',
+      scope: formObj.scope || '',
+      body: body,
+      savedAt: Date.now()
+    });
   }
 
   function clearDraft(formObj) {
     if (!formObj) return;
-    const key = formObj.formKey;
-    if (draftTimers[key]) {
-      clearTimeout(draftTimers[key]);
-      delete draftTimers[key];
-    }
-    const draftKey = getDraftKey(formObj);
-    if (draftKey) {
-      try { localStorage.removeItem(draftKey); } catch {}
-    }
+    draftMod.clearDraft(formObj.formKey);
   }
 
   window.addEventListener('beforeunload', function() {
@@ -5431,6 +4951,7 @@
       const el = document.querySelector('.comment-form[data-form-key="' + formObj.formKey + '"] textarea');
       if (el) saveDraft(el.value, formObj);
     });
+    draftMod.flushAll();
   });
 
   function restoreDrafts() {
@@ -5502,16 +5023,13 @@
     }
   }
 
+  // Thin wrapper kept for existing call sites; delegates to the unified
+  // crit.shared.showToast helper (defined in crit-shared.js, also used by
+  // live-mode.js).
   function showMiniToast(message) {
-    const t = document.createElement('div');
-    t.className = 'mini-toast';
-    t.textContent = message;
-    document.body.appendChild(t);
-    requestAnimationFrame(function() { t.classList.add('mini-toast-visible'); });
-    setTimeout(function() {
-      t.classList.remove('mini-toast-visible');
-      setTimeout(function() { t.remove(); }, 300);
-    }, 3000);
+    if (window.crit && window.crit.shared && window.crit.shared.showToast) {
+      window.crit.shared.showToast(message);
+    }
   }
 
   // ===== Agent Button =====
@@ -5543,200 +5061,39 @@
     return env;
   }
 
-  // Shared helper for building comment card skeleton (header, body, replies)
+  // Shared helper for building comment card skeleton (header, body, replies).
+  // Code-review-internal callers pass a sparse opts object; this wrapper
+  // injects the module-scoped deps and the default override callbacks. The
+  // real implementation lives in frontend/crit-comment-card.js so live-mode
+  // can mount the same renderer with its own deps.
   function buildCommentCard(comment, filePath, opts) {
-    // opts: { wrapperClass, cardClassExtra, collapseDefault, showLineRef, showCarriedForward, repliesExtraClass, showReplyInput }
-    const wrapper = document.createElement('div');
-    wrapper.className = opts.wrapperClass || 'comment-block';
-
-    const card = document.createElement('div');
-    let cardClass = 'comment-card';
-    if (opts.cardClassExtra) cardClass += ' ' + opts.cardClassExtra;
-    card.className = cardClass;
-    card.dataset.commentId = comment.id;
-
-    // Collapse state — live threads stay expanded unless resolved
-    const liveOrPending = !comment.resolved && (isLiveThread(comment) || pendingAgentRequests.has(comment.id));
-    const isCollapsed = liveOrPending ? false
-      : opts.collapseDefault
-        ? (commentCollapseOverrides[comment.id] !== undefined ? commentCollapseOverrides[comment.id] : true)
-        : (commentCollapseOverrides[comment.id] === true);
-    if (isCollapsed) card.classList.add('collapsed');
-
-    const header = document.createElement('div');
-    header.className = 'comment-header';
-
-    const collapseBtn = document.createElement('button');
-    collapseBtn.className = 'comment-collapse-btn';
-    collapseBtn.title = isCollapsed ? 'Expand comment' : 'Collapse comment';
-    collapseBtn.innerHTML = ICON_CHEVRON;
-    collapseBtn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      card.classList.toggle('collapsed');
-      commentCollapseOverrides[comment.id] = card.classList.contains('collapsed');
-      collapseBtn.title = card.classList.contains('collapsed') ? 'Expand comment' : 'Collapse comment';
-    });
-
-    const headerLeft = document.createElement('div');
-    headerLeft.className = 'comment-header-left';
-    headerLeft.prepend(collapseBtn);
-    if (comment.author) {
-      const authorBadge = document.createElement('span');
-      authorBadge.className = 'comment-author-badge author-color-' + authorColorIndex(comment.author);
-      authorBadge.textContent = '@' + comment.author;
-      headerLeft.appendChild(authorBadge);
+    opts = opts || {};
+    const merged = Object.assign({}, opts);
+    if (typeof merged.isPendingAgentRequest !== 'function') {
+      merged.isPendingAgentRequest = function (id) { return pendingAgentRequests.has(id); };
     }
-    if (comment.review_round >= 1) {
-      const roundBadge = document.createElement('span');
-      const rc = comment.review_round === session.review_round ? ' round-current' : comment.review_round === session.review_round - 1 ? ' round-latest' : '';
-      roundBadge.className = 'comment-round-badge' + rc;
-      roundBadge.textContent = 'R' + comment.review_round;
-      headerLeft.appendChild(roundBadge);
+    if (typeof merged.getCollapseOverride !== 'function') {
+      merged.getCollapseOverride = function (id) { return commentCollapseOverrides[id]; };
     }
-    if (opts.showLineRef && comment.scope !== 'file') {
-      const lineRef = document.createElement('span');
-      lineRef.className = 'comment-line-ref';
-      lineRef.textContent = comment.start_line === comment.end_line
-        ? 'Line ' + comment.start_line
-        : 'Lines ' + comment.start_line + '-' + comment.end_line;
-      headerLeft.appendChild(lineRef);
+    if (typeof merged.setCollapseOverride !== 'function') {
+      merged.setCollapseOverride = function (id, val) { commentCollapseOverrides[id] = val; };
     }
-    const time = document.createElement('span');
-    time.className = 'comment-time';
-    time.textContent = formatTime(comment.created_at);
-    headerLeft.appendChild(time);
-
-    if (liveOrPending) {
-      const badge = document.createElement('span');
-      badge.className = 'live-thread-badge' + (pendingAgentRequests.has(comment.id) ? ' pulsing' : '');
-      badge.innerHTML = '<svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor" style="vertical-align: -1px"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg> live';
-      headerLeft.appendChild(badge);
+    if (typeof merged.isLiveThread !== 'function') {
+      merged.isLiveThread = isLiveThread;
     }
-
-    if (comment.drifted) {
-      wrapper.classList.add('outdated-comment');
-      const driftedBadge = document.createElement('span');
-      driftedBadge.className = 'outdated-badge';
-      driftedBadge.textContent = 'Drifted';
-      headerLeft.appendChild(driftedBadge);
-    }
-
-    const actions = document.createElement('div');
-    actions.className = 'comment-actions';
-
-    header.appendChild(headerLeft);
-    header.appendChild(actions);
-
-    const bodyEl = document.createElement('div');
-    bodyEl.className = 'comment-body';
-    bodyEl.innerHTML = commentMd.render(comment.body, filePath ? buildCommentEnv(comment, filePath) : undefined);
-    linkifyCommentRefsInDom(bodyEl);
-
-    card.appendChild(header);
-
-    // Drifted anchor context — show original content that was commented on
-    if (comment.drifted && comment.anchor) {
-      const driftedCtx = document.createElement('div');
-      driftedCtx.className = 'drifted-context';
-
-      const toggle = document.createElement('button');
-      toggle.className = 'drifted-toggle';
-      toggle.type = 'button';
-
-      const chevron = document.createElement('span');
-      chevron.className = 'drifted-chevron';
-      chevron.innerHTML = '<svg viewBox="0 0 10 10" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,1.5 7,5 3.5,8.5"/></svg>';
-
-      const toggleLabel = document.createElement('span');
-      toggleLabel.className = 'drifted-toggle-label';
-      toggleLabel.textContent = 'Referenced content at time of review';
-
-      const anchorLines = comment.anchor.split('\n');
-      const toggleMeta = document.createElement('span');
-      toggleMeta.className = 'drifted-toggle-meta';
-      toggleMeta.textContent = anchorLines.length === 1 ? '1 line' : anchorLines.length + ' lines';
-
-      toggle.appendChild(chevron);
-      toggle.appendChild(toggleLabel);
-      toggle.appendChild(toggleMeta);
-
-      // Panel with CSS grid animation wrapper
-      const panelId = 'drifted-panel-' + comment.id;
-      const wrapper = document.createElement('div');
-      wrapper.className = 'drifted-panel-wrapper';
-      const inner = document.createElement('div');
-      inner.className = 'drifted-panel-inner';
-      const panel = document.createElement('div');
-      panel.className = 'drifted-panel';
-      panel.id = panelId;
-
-      // Render anchor text with line numbers
-      const pre = document.createElement('pre');
-      pre.className = 'drifted-anchor-text';
-      const startLine = comment.start_line || 1;
-      anchorLines.forEach(function(line, i) {
-        const lineEl = document.createElement('span');
-        lineEl.className = 'drifted-line';
-        const numEl = document.createElement('span');
-        numEl.className = 'drifted-line-number';
-        numEl.textContent = String(startLine + i);
-        const contentEl = document.createElement('span');
-        contentEl.className = 'drifted-line-content';
-        contentEl.textContent = line;
-        lineEl.appendChild(numEl);
-        lineEl.appendChild(contentEl);
-        pre.appendChild(lineEl);
-      });
-
-      panel.appendChild(pre);
-      inner.appendChild(panel);
-      wrapper.appendChild(inner);
-
-      toggle.setAttribute('aria-expanded', 'false');
-      toggle.setAttribute('aria-controls', panelId);
-      toggle.addEventListener('click', function() {
-        const isExpanded = driftedCtx.classList.contains('expanded');
-        driftedCtx.classList.toggle('expanded', !isExpanded);
-        toggle.setAttribute('aria-expanded', String(!isExpanded));
-      });
-
-      driftedCtx.appendChild(toggle);
-      driftedCtx.appendChild(wrapper);
-      card.appendChild(driftedCtx);
-    }
-
-    card.appendChild(bodyEl);
-
-    // Render replies
-    if (comment.replies && comment.replies.length > 0) {
-      card.appendChild(renderReplyList(comment, filePath || '', opts.repliesExtraClass));
-    }
-
-    // Pending agent indicator
-    if (pendingAgentRequests.has(comment.id)) {
-      const pending = document.createElement('div');
-      pending.className = 'agent-pending-reply';
-      pending.dataset.commentId = comment.id;
-      pending.innerHTML =
-        '<span class="agent-pending-author">@' + agentName + '</span>' +
-        '<span class="agent-pending-cursor">_</span>';
-      card.appendChild(pending);
-    }
-
-    // Reply input (filePath empty/null → review-level reply)
-    if (opts.showReplyInput) {
-      card.appendChild(createReplyInput(comment.id, filePath || ''));
-    }
-
-    if (pendingAgentRequests.has(comment.id) || isLiveThread(comment)) {
-      wrapper.classList.add('live-thread');
-    }
-    if (pendingAgentRequests.has(comment.id)) {
-      wrapper.classList.add('agent-pending');
-    }
-
-    wrapper.appendChild(card);
-    return { wrapper: wrapper, card: card, actions: actions };
+    merged.deps = Object.assign({
+      commentMd: commentMd,
+      formatTime: formatTime,
+      authorColorIndex: authorColorIndex,
+      getReviewRound: function () { return session && session.review_round; },
+      getAgentName: function () { return agentName; },
+      buildCommentEnv: buildCommentEnv,
+      renderReplyList: renderReplyList,
+      createReplyInput: createReplyInput,
+      iconChevron: ICON_CHEVRON,
+      linkifyDom: linkifyCommentRefsInDom,
+    }, opts.deps || {});
+    return window.crit.commentCard.buildCommentCard(comment, filePath, merged);
   }
 
   function createCommentElement(comment, filePath) {
@@ -5749,7 +5106,6 @@
       cardClassExtra: comment.carried_forward ? 'carried-forward' : '',
       collapseDefault: false,
       showLineRef: true,
-      showCarriedForward: true,
       showReplyInput: true,
     });
 
@@ -5770,7 +5126,10 @@
     resolveBtn.setAttribute('aria-label', 'Resolve thread');
     resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
     resolveBtn.addEventListener('click', function() {
-      toggleResolveStatus(comment.id, 'file', 'resolve', filePath);
+      if (resolveBtn.disabled) return;
+      resolveBtn.disabled = true;
+      toggleResolveStatus(comment.id, 'file', 'resolve', filePath)
+        .finally(function() { resolveBtn.disabled = false; });
     });
 
     parts.actions.appendChild(resolveBtn);
@@ -6085,6 +5444,7 @@
     renderFileByPath(filePath);
     updateCommentCount();
     updateTreeCommentBadges();
+    renderCommentsPanel();
   }
 
   // ===== Review-Level (General) Comments =====
@@ -6259,7 +5619,6 @@
       cardClassExtra: cardClassExtra,
       collapseDefault: isResolved,
       showLineRef: false,
-      showCarriedForward: true,
       showReplyInput: true,
     });
 
@@ -6271,7 +5630,10 @@
       unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
       unresolveBtn.addEventListener('click', function(e) {
         e.stopPropagation();
-        toggleResolveStatus(comment.id, 'review', 'unresolve', null);
+        if (unresolveBtn.disabled) return;
+        unresolveBtn.disabled = true;
+        toggleResolveStatus(comment.id, 'review', 'unresolve', null)
+          .finally(function() { unresolveBtn.disabled = false; });
       });
       parts.actions.appendChild(unresolveBtn);
     } else {
@@ -6282,7 +5644,10 @@
       resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
       resolveBtn.addEventListener('click', function(e) {
         e.stopPropagation();
-        toggleResolveStatus(comment.id, 'review', 'resolve', null);
+        if (resolveBtn.disabled) return;
+        resolveBtn.disabled = true;
+        toggleResolveStatus(comment.id, 'review', 'resolve', null)
+          .finally(function() { resolveBtn.disabled = false; });
       });
       parts.actions.appendChild(resolveBtn);
     }
@@ -6726,7 +6091,6 @@
       cardClassExtra: 'resolved-card',
       collapseDefault: true,
       showLineRef: true,
-      showCarriedForward: false,
       showReplyInput: true,
     });
 
@@ -6736,7 +6100,10 @@
     unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
     unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
     unresolveBtn.addEventListener('click', function() {
-      toggleResolveStatus(comment.id, 'file', 'unresolve', filePath);
+      if (unresolveBtn.disabled) return;
+      unresolveBtn.disabled = true;
+      toggleResolveStatus(comment.id, 'file', 'unresolve', filePath)
+        .finally(function() { unresolveBtn.disabled = false; });
     });
 
     const deleteBtn = document.createElement('button');
@@ -6763,26 +6130,7 @@
       if (c.resolved) resolved++; else unresolved++;
     }
     const total = unresolved + resolved;
-    const navGroup = document.getElementById('commentNavGroup');
-    const el = document.getElementById('commentCount');
-    const numEl = document.getElementById('commentCountNumber');
-    if (total === 0) {
-      if (navGroup) navGroup.style.display = '';
-      if (navGroup) navGroup.classList.remove('has-comments');
-      el.classList.add('comment-count-resolved');
-      el.title = 'Toggle comments panel';
-      numEl.textContent = '';
-    } else if (unresolved > 0) {
-      if (navGroup) { navGroup.style.display = ''; navGroup.classList.add('has-comments'); }
-      el.classList.remove('comment-count-resolved');
-      el.title = unresolved + ' unresolved comment' + (unresolved === 1 ? '' : 's') + ' — toggle panel';
-      numEl.textContent = unresolved;
-    } else {
-      if (navGroup) { navGroup.style.display = ''; navGroup.classList.add('has-comments'); }
-      el.classList.add('comment-count-resolved');
-      el.title = total + ' resolved comment' + (total === 1 ? '' : 's') + ' — toggle panel';
-      numEl.textContent = total;
-    }
+    window.crit.shared.updateCommentCountIndicator({ totalCount: total, openCount: unresolved });
     renderCommentsPanel();
     if (uiState === 'reviewing') {
       document.getElementById('finishBtn').textContent = unresolved === 0 ? 'Approve' : 'Finish Review';
@@ -6830,17 +6178,33 @@
       cardClassExtra: cardClassExtra,
       collapseDefault: isResolved,
       showLineRef: !isGeneral,
-      showCarriedForward: true,
       repliesExtraClass: 'panel-replies',
       showReplyInput: false,
     });
 
+    // Resolve/unresolve button — works for both file and review comments
+    const scope = isGeneral ? 'review' : 'file';
+    const resolveAction = isResolved ? 'unresolve' : 'resolve';
+    const resolveBtn = document.createElement('button');
+    resolveBtn.className = 'resolve-btn' + (isResolved ? ' resolve-btn--active' : '');
+    resolveBtn.title = isResolved ? 'Unresolve' : 'Resolve';
+    resolveBtn.setAttribute('aria-label', isResolved ? 'Unresolve thread' : 'Resolve thread');
+    resolveBtn.innerHTML = (isResolved ? ICON_UNRESOLVE : ICON_RESOLVE) + '<span>' + (isResolved ? 'Unresolve' : 'Resolve') + '</span>';
+    resolveBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (resolveBtn.disabled) return;
+      resolveBtn.disabled = true;
+      toggleResolveStatus(comment.id, scope, resolveAction, filePath || null)
+        .finally(function() { resolveBtn.disabled = false; });
+    });
+    parts.actions.appendChild(resolveBtn);
+
     if (isGeneral) {
-      // General comments are edited/resolved/deleted from the inline
-      // Review Conversation section. Panel cards navigate + flash the inline card,
-      // matching the line-comment behaviour.
       parts.wrapper.style.cursor = 'pointer';
-      parts.wrapper.addEventListener('click', function() { scrollToReviewComment(comment.id); });
+      parts.wrapper.addEventListener('click', function(e) {
+        if (e.target.closest('.comment-actions')) return;
+        scrollToReviewComment(comment.id);
+      });
     } else {
       // File comments are clickable to scroll to inline location
       parts.wrapper.style.cursor = 'pointer';
@@ -7033,6 +6397,7 @@
     updateExpandAllLabel();
   }
 
+
   function scrollToComment(commentId, filePath) {
     // 1. Find the file section and expand if collapsed
     const section = document.getElementById('file-section-' + filePath);
@@ -7053,6 +6418,7 @@
     commentCard.addEventListener('animationend', function() {
       commentCard.classList.remove('comment-card-highlight');
     }, { once: true });
+
   }
 
   // ===== PR Overview Panel =====
@@ -7193,6 +6559,25 @@
     el.classList.toggle('all-viewed', viewed === files.length);
   }
 
+  // ===== Waiting Modal Tips =====
+  function startTipRotation() {
+    const extra = [];
+    if (!agentEnabled) {
+      extra.push('Set <kbd>agent_cmd</kbd> in your config to send comments directly to your AI agent for immediate feedback.');
+    }
+    if (shareURL && !authUserName) {
+      extra.push('Run <kbd>crit auth login</kbd> to link shared reviews with your account.');
+    }
+    if (shareURL) {
+      extra.push('Create a team on <kbd>' + shareURL.replace(/^https?:\/\//, '') + '</kbd> to group and secure your shared reviews.');
+    }
+    window.crit.shared.startTipRotation(extra);
+  }
+
+  function stopTipRotation() {
+    window.crit.shared.stopTipRotation();
+  }
+
   // ===== UI State =====
   function updateHeaderRound() {
     const el = document.getElementById('headerNotify');
@@ -7203,7 +6588,7 @@
 
   function setUIState(state) {
     uiState = state;
-    if (state === 'reviewing') waitingNotApproved = false;
+    if (state === 'reviewing') { waitingNotApproved = false; stopTipRotation(); }
     const finishBtn = document.getElementById('finishBtn');
     const waitingOverlay = document.getElementById('waitingOverlay');
 
@@ -7226,8 +6611,10 @@
         finishBtn.disabled = true;
         finishBtn.classList.remove('btn-primary');
         document.getElementById('waitingEdits').textContent = '';
-        document.getElementById('waitingPrompt').style.display = '';
-        document.getElementById('waitingClipboard').style.display = '';
+        document.getElementById('promptCopyRow').style.display = '';
+        document.getElementById('waitingDivider').style.display = '';
+        document.getElementById('tipSection').style.display = '';
+        startTipRotation();
         waitingOverlay.classList.add('active');
         break;
     }
@@ -7236,47 +6623,18 @@
   // ===== General Comment Button (in panel header) =====
 
   // ===== Finish Review =====
+  // The DOM/clipboard/animation logic lives in crit.shared.runFinishReview;
+  // this thin wrapper preserves the app.js-specific waitingNotApproved flag
+  // and uiState transition (live-mode wires its own state machine).
   async function doFinishReview() {
-    try {
-      const resp = await fetch('/api/finish', { method: 'POST' });
-      if (!resp.ok) {
-        throw new Error('Finish review failed: HTTP ' + resp.status);
-      }
-      const data = await resp.json();
-      const approved = !!data.approved;
-      waitingNotApproved = !approved;
-      const prompt = data.prompt || 'I reviewed the changes, no feedback, good to go!';
-
-      const dialog = document.getElementById('waitingDialog');
-      const headingEl = document.getElementById('waitingHeading');
-      const messageEl = document.getElementById('waitingMessage');
-      const clipEl = document.getElementById('waitingClipboard');
-
-      document.getElementById('waitingPrompt').textContent = prompt;
-      clipEl.textContent = 'Copy prompt';
-      clipEl.classList.remove('clipboard-confirm');
-
-      // Replay the success-mark draw animation each time we enter approved state.
-      dialog.classList.remove('approved');
-      if (approved) {
-        void dialog.offsetWidth; // force reflow — restarts CSS animations on re-added class
-        dialog.classList.add('approved');
-        headingEl.textContent = 'Approved';
-        messageEl.textContent =
-          'Your agent has been notified \u2014 no further action needed. You can close this tab whenever you\u2019re ready.';
-      } else {
-        headingEl.textContent = 'Review Complete';
-        messageEl.innerHTML =
-          'Your agent has been notified. Waiting for updates\u2026' +
-          '<span class="waiting-fallback">If your agent wasn\u2019t listening, paste the prompt below.</span>';
-      }
-
-      try { await navigator.clipboard.writeText(prompt); } catch {}
-      setUIState('waiting');
-    } catch (err) {
-      console.error('Error finishing review:', err);
-      showMiniToast('Failed to finish review');
-    }
+    return await window.crit.shared.runFinishReview({
+      onApproved: function () { waitingNotApproved = false; setUIState('waiting'); },
+      onWaiting: function () { waitingNotApproved = true; setUIState('waiting'); },
+      onError: function (err) {
+        console.error('Error finishing review:', err);
+        showMiniToast('Failed to finish review');
+      },
+    });
   }
 
   async function resolveAllAndFinish() {
@@ -7374,15 +6732,15 @@
     try {
       await navigator.clipboard.writeText(prompt);
       const el = document.getElementById('waitingClipboard');
-      el.textContent = '\u2713 Copied';
+      const label = el.querySelector('.copy-label');
+      label.textContent = 'Copied';
+      el.classList.add('copied');
       el.setAttribute('aria-label', 'Copied');
       announceCopy();
-      el.classList.remove('clipboard-confirm');
-      void el.offsetWidth;
-      el.classList.add('clipboard-confirm');
       setTimeout(function() {
-        el.textContent = 'Copy prompt';
-        el.setAttribute('aria-label', 'Copy prompt');
+        label.textContent = 'Copy';
+        el.classList.remove('copied');
+        el.setAttribute('aria-label', 'Copy prompt to clipboard');
       }, 2000);
     } catch {}
   });
@@ -7390,9 +6748,10 @@
   // ===== SSE Client =====
 
   function connectSSE() {
-    const source = new EventSource('/api/events');
+    let sseErrorCount = 0;
 
-    source.addEventListener('file-changed', async function() {
+    const conn = window.crit.sse.createSSE('/api/events', {
+      'file-changed': async function() {
       try {
         // Reset action tracking for new round
         userActedThisRound = false;
@@ -7465,28 +6824,25 @@
       } catch (err) {
         console.error('Error handling file-changed:', err);
       }
-    });
-
-    source.addEventListener('edit-detected', function(e) {
+      },
+      'edit-detected': function(data) {
       try {
-        const data = JSON.parse(e.data);
         const count = parseInt(data.content, 10);
         const el = document.getElementById('waitingEdits');
         if (el && uiState === 'waiting') {
-          el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-right:4px"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><line x1="12" y1="7" x2="12" y2="11"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>Your agent made ' + count + ' edit' + (count === 1 ? '' : 's');
-          // Hide prompt and clipboard once agent starts making edits
-          const promptEl = document.getElementById('waitingPrompt');
-          const clipEl = document.getElementById('waitingClipboard');
-          if (promptEl) promptEl.style.display = 'none';
-          if (clipEl) clipEl.style.display = 'none';
+          el.innerHTML = '<span class="waiting-edits-badge"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><line x1="12" y1="7" x2="12" y2="11"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>' + count + ' edit' + (count === 1 ? '' : 's') + '</span>';
+          // Hide prompt copy row and divider once agent starts making edits
+          const copyRow = document.getElementById('promptCopyRow');
+          const divider = document.getElementById('waitingDivider');
+          if (copyRow) copyRow.style.display = 'none';
+          if (divider) divider.style.display = 'none';
           if (waitingNotApproved) {
             document.getElementById('waitingMessage').textContent = 'Waiting for your agent to finish...';
           }
         }
       } catch {}
-    });
-
-    source.addEventListener('comments-changed', async function() {
+      },
+      'comments-changed': async function() {
       try {
         // Only re-fetch comments data, not file content or diffs (those only
         // change on file-changed events). This reduces O(3N) to O(N) requests.
@@ -7533,19 +6889,17 @@
       } catch (err) {
         console.error('Error handling comments-changed:', err);
       }
-    });
-
-    source.addEventListener('base-changed', function() {
+      },
+      'base-changed': function() {
       reloadForScope();
       fetchCommits();
-    });
-
-    source.addEventListener('focus-changed', function(e) {
+      },
+      'focus-changed': function(data) {
       try {
         // Server SSE wraps every event in {type, filename, content} where
         // `content` is a JSON string carrying the actual payload. Parse the
         // SSE envelope first, then the inner content for the focus object.
-        const envelope = JSON.parse(e.data || '{}');
+        const envelope = data || {};
         const inner = envelope.content ? JSON.parse(envelope.content) : envelope;
         const focus = inner && inner.focus;
         if (focus) {
@@ -7571,61 +6925,29 @@
       // Reuse the same refresh path as base-changed.
       reloadForScope();
       fetchCommits();
-    });
-
-    source.addEventListener('server-shutdown', function() {
-      source.close();
+      },
+      'server-shutdown': function() {
+      conn.close();
       showDisconnected();
+      },
+    }, {
+      onError: function() {
+        sseErrorCount++;
+        if (sseErrorCount >= 3) {
+          showMiniToast('Connection lost \u2014 retrying\u2026');
+        }
+      },
     });
 
-    let sseErrorCount = 0;
-    source.addEventListener('message', function() { sseErrorCount = 0; });
-    source.addEventListener('file-changed', function() { sseErrorCount = 0; });
-    source.addEventListener('comments-changed', function() { sseErrorCount = 0; });
-    source.addEventListener('base-changed', function() { sseErrorCount = 0; });
-
-    source.onerror = function() {
-      sseErrorCount++;
-      if (sseErrorCount >= 3) {
-        showMiniToast('Connection lost \u2014 retrying\u2026');
-      }
-    };
+    // Reset error count on successful events by wrapping source listeners
+    conn.source.addEventListener('message', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('file-changed', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('comments-changed', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('base-changed', function() { sseErrorCount = 0; });
   }
 
   function showDisconnected() {
-    // Idempotent: bail if a banner is already present.
-    if (document.querySelector('.disconnected-banner')) return;
-
-    const header = document.querySelector('.header');
-    const banner = document.createElement('div');
-    banner.className = 'disconnected-banner';
-    banner.setAttribute('role', 'status');
-    banner.setAttribute('aria-live', 'polite');
-
-    const pill = document.createElement('div');
-    pill.className = 'disconnected-pill';
-    pill.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="6" fill="currentColor" opacity="0.18"/><circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.25"/><path d="M4.5 7.1 L6.3 8.9 L9.5 5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Session complete';
-
-    const text = document.createElement('span');
-    text.className = 'disconnected-text';
-    text.textContent = 'Server stopped \u2014 your review is now read only. Safe to close this tab.';
-
-    banner.appendChild(pill);
-    banner.appendChild(text);
-    header.insertAdjacentElement('afterend', banner);
-
-    // Sticky offset is driven by the --crit-header-height CSS variable, kept
-    // in sync by ResizeObserver below — no inline style, so resize is handled.
-    const setHeaderVar = function() {
-      document.documentElement.style.setProperty('--crit-header-height', header.offsetHeight + 'px');
-    };
-    setHeaderVar();
-    if (typeof ResizeObserver !== 'undefined') {
-      const ro = new ResizeObserver(setHeaderVar);
-      ro.observe(header);
-    } else {
-      window.addEventListener('resize', setHeaderVar);
-    }
+    window.crit.shared.showDisconnected();
   }
 
   // ===== Share =====
@@ -7654,6 +6976,336 @@
       const trigger = document.getElementById('shareBtn');
       if (trigger) trigger.focus();
     }
+  }
+
+  let fetchOrgsPromise = null;
+  async function fetchOrgs() {
+    if (cachedOrgs !== null) return cachedOrgs;
+    if (fetchOrgsPromise) return fetchOrgsPromise;
+    fetchOrgsPromise = (async function() {
+      try {
+        const resp = await fetch('/api/auth/orgs');
+        if (!resp.ok) { cachedOrgs = []; return cachedOrgs; }
+        cachedOrgs = await resp.json();
+      } catch {
+        cachedOrgs = [];
+      }
+      fetchOrgsPromise = null;
+      return cachedOrgs;
+    })();
+    return fetchOrgsPromise;
+  }
+
+  async function performShare(org, visibility, orgMeta, popupSession) {
+    if (shareInFlight) return;
+    shareInFlight = true;
+
+    setShareButtonState('sharing');
+    dismissToast('share');
+    try {
+      let result;
+      if (popupSession) {
+        const payloadResp = await fetch('/api/share/payload');
+        if (!payloadResp.ok) {
+          const errBody = await payloadResp.json().catch(function() { return {}; });
+          throw new Error(errBody.error || 'failed to build share payload');
+        }
+        const payload = await payloadResp.json();
+        if (org) payload.org = org;
+        if (visibility) payload.visibility = visibility;
+        if (orgMeta && orgMeta.name) payload.org_name = orgMeta.name;
+        result = await popupSession.run('share', { payload: payload });
+
+        const persistResp = await fetch('/api/share-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: result.url,
+            delete_token: result.delete_token || '',
+            org: org || '',
+            org_name: (orgMeta && orgMeta.name) || '',
+            visibility: visibility || '',
+          }),
+        });
+        if (!persistResp.ok) throw new Error('Server error persisting share state ' + persistResp.status);
+        const persisted = await persistResp.json().catch(function() { return {}; });
+        if (!persisted.hosted_token) {
+          console.warn('share: /api/share-url did not return hosted_token');
+        }
+        hostedToken = persisted.hosted_token || '';
+      } else {
+        const opts = { method: 'POST' };
+        if (org || visibility) {
+          opts.headers = { 'Content-Type': 'application/json' };
+          const shareBody = {};
+          if (org) shareBody.org = org;
+          if (visibility) shareBody.visibility = visibility;
+          if (orgMeta && orgMeta.name) shareBody.org_name = orgMeta.name;
+          opts.body = JSON.stringify(shareBody);
+        }
+        const resp = await fetch('/api/share', opts);
+        if (!resp.ok) {
+          const errBody = await resp.json().catch(function() { return {}; });
+          throw new Error(errBody.error || 'Server error ' + resp.status);
+        }
+        result = await resp.json();
+        try {
+          const cfgResp = await fetch('/api/config');
+          if (cfgResp.ok) {
+            const cfg = await cfgResp.json();
+            hostedToken = cfg.hosted_token || '';
+          }
+        } catch { /* non-fatal; hostedToken will be empty */ }
+      }
+      hostedURL = result.url;
+      deleteToken = result.delete_token || '';
+      sharedOrg = orgMeta || null;
+      sharedVisibility = visibility || 'unlisted';
+      setShareButtonState('shared');
+      showShareModal();
+    } catch (err) {
+      setShareButtonState('default');
+      showShareError(err);
+    } finally {
+      if (popupSession) popupSession.close();
+      shareInFlight = false;
+    }
+  }
+
+  function showOrgShareModal(orgs) {
+    closeShareModal();
+    const overlay = document.createElement('div');
+    overlay.className = 'share-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'orgShareTitle');
+
+    const savedOrg = getSetting('shareOrg', '');
+    const savedVis = getSetting('shareVisibility', '');
+    const initials = authUserName
+      ? authUserName.split(/\s+/).filter(Boolean).map(function(w) { return w[0]; }).join('').slice(0, 2).toUpperCase()
+      : '';
+
+    const ICON_ORG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 16A1.75 1.75 0 0 1 0 14.25V1.75C0 .784.784 0 1.75 0h8.5C11.216 0 12 .784 12 1.75v12.5c0 .085-.006.168-.018.25h2.268a.25.25 0 0 0 .25-.25V8.285a.25.25 0 0 0-.111-.208l-1.055-.703a.749.749 0 1 1 .832-1.248l1.055.703c.487.325.777.871.777 1.456v5.965A1.75 1.75 0 0 1 14.25 16h-3.5a.766.766 0 0 1-.197-.026c-.099.017-.2.026-.303.026h-3a.75.75 0 0 1-.75-.75V14h-1v1.25a.75.75 0 0 1-.75.75h-3Zm-.25-1.75c0 .138.112.25.25.25H4v-1.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 .75.75v1.25h2.25a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25ZM3.75 6h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5ZM3 3.75A.75.75 0 0 1 3.75 3h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 3.75Zm4 3A.75.75 0 0 1 7.75 6h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 7 6.75ZM7.75 3h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5ZM3 9.75A.75.75 0 0 1 3.75 9h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 9.75ZM7.75 9h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5Z"/></svg>';
+    const ICON_VIS_ORG = '<svg class="sd-org-vis-icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 16A1.75 1.75 0 0 1 0 14.25V1.75C0 .784.784 0 1.75 0h8.5C11.216 0 12 .784 12 1.75v12.5c0 .085-.006.168-.018.25h2.268a.25.25 0 0 0 .25-.25V8.285a.25.25 0 0 0-.111-.208l-1.055-.703a.749.749 0 1 1 .832-1.248l1.055.703c.487.325.777.871.777 1.456v5.965A1.75 1.75 0 0 1 14.25 16h-3.5a.766.766 0 0 1-.197-.026c-.099.017-.2.026-.303.026h-3a.75.75 0 0 1-.75-.75V14h-1v1.25a.75.75 0 0 1-.75.75h-3Zm-.25-1.75c0 .138.112.25.25.25H4v-1.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 .75.75v1.25h2.25a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25ZM3.75 6h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5ZM3 3.75A.75.75 0 0 1 3.75 3h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 3.75Zm4 3A.75.75 0 0 1 7.75 6h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 7 6.75ZM7.75 3h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5ZM3 9.75A.75.75 0 0 1 3.75 9h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 9.75ZM7.75 9h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5Z"/></svg>';
+    const ICON_VIS_UNLISTED = '<svg class="sd-org-vis-icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 2c1.981 0 3.671.992 4.933 2.078 1.27 1.091 2.187 2.345 2.637 3.023a1.62 1.62 0 0 1 0 1.798c-.45.678-1.367 1.932-2.637 3.023C11.67 13.008 9.981 14 8 14s-3.671-.992-4.933-2.078C1.797 10.831.88 9.577.43 8.9a1.619 1.619 0 0 1 0-1.798c.45-.678 1.367-1.932 2.637-3.023C4.33 2.992 6.019 2 8 2ZM1.679 7.932a.12.12 0 0 0 0 .136c.411.622 1.241 1.75 2.366 2.717C5.176 11.758 6.527 12.5 8 12.5s2.825-.742 3.955-1.715c1.124-.967 1.954-2.096 2.366-2.717a.12.12 0 0 0 0-.136c-.412-.621-1.242-1.75-2.366-2.717C10.824 4.242 9.473 3.5 8 3.5S5.176 4.242 4.045 5.215C2.92 6.182 2.09 7.311 1.679 7.932ZM8 10a2 2 0 1 1-.001-3.999A2 2 0 0 1 8 10Z"/></svg>';
+    const ICON_VIS_PUBLIC = '<svg class="sd-org-vis-icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z"/></svg>';
+
+    const isPersonalSelected = !savedOrg || !orgs.some(function(o) { return o.slug === savedOrg; });
+
+    // Build owner rows using sd-org-owner-option (custom radio, no native input)
+    let ownerRows = '';
+    ownerRows +=
+      '<div class="sd-org-owner-option" role="radio" aria-checked="' + isPersonalSelected + '" tabindex="' + (isPersonalSelected ? '0' : '-1') + '" data-owner="" data-default-vis="unlisted">' +
+        '<span class="sd-org-radio"><span class="sd-org-radio-dot"></span></span>' +
+        '<span class="sd-org-avatar sd-org-avatar--personal">' + escapeHtml(initials || '?') + '</span>' +
+        '<span class="sd-org-owner-info"><span class="sd-org-owner-name">' + escapeHtml(authUserName || 'Personal') + '</span><span class="sd-org-owner-slug">Personal</span></span>' +
+      '</div>';
+    for (let oi = 0; oi < orgs.length; oi++) {
+      const org = orgs[oi];
+      const isSelected = savedOrg === org.slug;
+      ownerRows +=
+        '<div class="sd-org-owner-option" role="radio" aria-checked="' + isSelected + '" tabindex="' + (isSelected ? '0' : '-1') + '" data-owner="' + escapeHtml(org.slug) + '" data-default-vis="organization">' +
+          '<span class="sd-org-radio"><span class="sd-org-radio-dot"></span></span>' +
+          '<span class="sd-org-avatar sd-org-avatar--org">' + ICON_ORG + '</span>' +
+          '<span class="sd-org-owner-info"><span class="sd-org-owner-name">' + escapeHtml(org.name) + '</span><span class="sd-org-owner-slug">' + escapeHtml(org.slug) + '</span></span>' +
+        '</div>';
+    }
+
+    overlay.innerHTML =
+      '<div class="share-dialog sd-org-dialog">' +
+        '<div class="sd-org-header">' +
+          '<h3 id="orgShareTitle" class="sd-org-title">Share review</h3>' +
+          '<button class="sd-org-close" aria-label="Close"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/></svg></button>' +
+        '</div>' +
+        '<div class="sd-org-body">' +
+          '<div>' +
+            '<label class="sd-org-label" id="orgOwnerLabel">Owner</label>' +
+            '<div class="sd-org-owner-list" role="radiogroup" aria-labelledby="orgOwnerLabel">' + ownerRows + '</div>' +
+          '</div>' +
+          '<div>' +
+            '<label class="sd-org-label" id="orgVisLabel">Visibility</label>' +
+            '<div class="sd-org-vis-options" role="radiogroup" aria-labelledby="orgVisLabel" id="orgVisOptions">' +
+              '<div class="sd-org-vis-option" role="radio" aria-checked="false" tabindex="-1" data-vis="organization" style="display:none">' +
+                '<span class="sd-org-radio"><span class="sd-org-radio-dot"></span></span>' +
+                ICON_VIS_ORG +
+                '<span class="sd-org-vis-text"><span class="sd-org-vis-label">Organization</span><span class="sd-org-vis-desc" id="orgVisOrgDesc">Only members can view</span></span>' +
+              '</div>' +
+              '<div class="sd-org-vis-option" role="radio" aria-checked="false" tabindex="-1" data-vis="unlisted">' +
+                '<span class="sd-org-radio"><span class="sd-org-radio-dot"></span></span>' +
+                ICON_VIS_UNLISTED +
+                '<span class="sd-org-vis-text"><span class="sd-org-vis-label">Unlisted</span><span class="sd-org-vis-desc" id="orgVisUnlistedDesc">Anyone with the link can view</span></span>' +
+              '</div>' +
+              '<div class="sd-org-vis-option" role="radio" aria-checked="false" tabindex="-1" data-vis="public">' +
+                '<span class="sd-org-radio"><span class="sd-org-radio-dot"></span></span>' +
+                ICON_VIS_PUBLIC +
+                '<span class="sd-org-vis-text"><span class="sd-org-vis-label">Public</span><span class="sd-org-vis-desc">Discoverable by anyone on the web</span></span>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          '<label class="sd-org-remember"><input type="checkbox" id="orgRememberCheck" /><span class="sd-org-remember-text">Remember my choice</span></label>' +
+        '</div>' +
+        '<div class="sd-org-footer">' +
+          '<span class="sd-org-consent">Uploads to <a href="' + escapeHtml(shareURL) + '" target="_blank" rel="noopener">' + escapeHtml(shareURL.replace(/^https?:\/\//, '')) + '</a></span>' +
+          '<div class="sd-org-footer-actions">' +
+            '<button class="sd-org-btn-cancel" id="orgCancelBtn">Cancel</button>' +
+            '<button class="sd-org-btn-share" id="orgShareBtn">Share</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    document.body.appendChild(overlay);
+    shareModalEl = overlay;
+
+    const ownerList = overlay.querySelector('.sd-org-owner-list');
+    const visOptions = overlay.querySelector('#orgVisOptions');
+    const orgVisOption = visOptions.querySelector('[data-vis="organization"]');
+    const orgVisDesc = overlay.querySelector('#orgVisOrgDesc');
+    const unlistedVisDesc = overlay.querySelector('#orgVisUnlistedDesc');
+
+    function selectOwner(el) {
+      ownerList.querySelectorAll('.sd-org-owner-option').forEach(function(o) {
+        o.setAttribute('aria-checked', 'false');
+        o.setAttribute('tabindex', '-1');
+      });
+      el.setAttribute('aria-checked', 'true');
+      el.setAttribute('tabindex', '0');
+      el.focus();
+      const owner = el.getAttribute('data-owner');
+      const orgName = el.querySelector('.sd-org-owner-name').textContent;
+      if (owner) {
+        orgVisOption.style.display = '';
+        orgVisDesc.textContent = 'Only members of ' + orgName + ' can view';
+        unlistedVisDesc.textContent = 'Anyone with the link at ' + orgName + ' can view';
+      } else {
+        orgVisOption.style.display = 'none';
+        unlistedVisDesc.textContent = 'Anyone with the link can view';
+        if (orgVisOption.getAttribute('aria-checked') === 'true') {
+          selectVis(visOptions.querySelector('[data-vis="unlisted"]'));
+        }
+      }
+      selectVis(visOptions.querySelector('[data-vis="' + el.getAttribute('data-default-vis') + '"]'));
+    }
+
+    function selectVis(el) {
+      if (!el || el.style.display === 'none') return;
+      visOptions.querySelectorAll('.sd-org-vis-option').forEach(function(o) {
+        o.setAttribute('aria-checked', 'false');
+        o.setAttribute('tabindex', '-1');
+      });
+      el.setAttribute('aria-checked', 'true');
+      el.setAttribute('tabindex', '0');
+    }
+
+    function radioKeyNav(container, selector, selectFn) {
+      container.addEventListener('keydown', function(e) {
+        const items = Array.from(container.querySelectorAll(selector)).filter(function(o) { return o.style.display !== 'none'; });
+        const current = e.target.closest(selector);
+        if (!current) return;
+        const idx = items.indexOf(current);
+        if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+          e.preventDefault();
+          selectFn(items[(idx + 1) % items.length]);
+        } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+          e.preventDefault();
+          selectFn(items[(idx - 1 + items.length) % items.length]);
+        }
+      });
+    }
+
+    ownerList.addEventListener('click', function(e) {
+      const opt = e.target.closest('.sd-org-owner-option');
+      if (opt) selectOwner(opt);
+    });
+    radioKeyNav(ownerList, '.sd-org-owner-option', selectOwner);
+
+    visOptions.addEventListener('click', function(e) {
+      const opt = e.target.closest('.sd-org-vis-option');
+      if (opt && opt.style.display !== 'none') { selectVis(opt); opt.focus(); }
+    });
+    radioKeyNav(visOptions, '.sd-org-vis-option', function(el) { selectVis(el); el.focus(); });
+
+    // Apply initial selection
+    const initialOwner = ownerList.querySelector('[aria-checked="true"]');
+    if (initialOwner) {
+      const owner = initialOwner.getAttribute('data-owner');
+      if (owner) {
+        const initialOrgName = initialOwner.querySelector('.sd-org-owner-name').textContent;
+        orgVisOption.style.display = '';
+        orgVisDesc.textContent = 'Only members of ' + initialOrgName + ' can view';
+        unlistedVisDesc.textContent = 'Anyone with the link at ' + initialOrgName + ' can view';
+      }
+      const defVis = savedVis || initialOwner.getAttribute('data-default-vis');
+      const visEl = visOptions.querySelector('[data-vis="' + defVis + '"]');
+      if (visEl && visEl.style.display !== 'none') {
+        selectVis(visEl);
+      } else {
+        selectVis(visOptions.querySelector('[data-vis="' + initialOwner.getAttribute('data-default-vis') + '"]'));
+      }
+    }
+
+    // Close handlers
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) closeShareModal(); });
+    overlay.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeShareModal(); });
+    overlay.querySelector('.sd-org-close').addEventListener('click', closeShareModal);
+    overlay.querySelector('#orgCancelBtn').addEventListener('click', closeShareModal);
+
+    // Share handler
+    overlay.querySelector('#orgShareBtn').addEventListener('click', async function() {
+      const btn = this;
+      btn.disabled = true;
+
+      const selectedOwnerEl = ownerList.querySelector('[aria-checked="true"]');
+      const selectedVisEl = visOptions.querySelector('[aria-checked="true"]');
+      const orgSlug = selectedOwnerEl ? selectedOwnerEl.getAttribute('data-owner') : '';
+      const visibility = selectedVisEl ? selectedVisEl.getAttribute('data-vis') : 'unlisted';
+      const remember = overlay.querySelector('#orgRememberCheck').checked;
+
+      if (remember) {
+        setSetting('shareOrg', orgSlug);
+        setSetting('shareVisibility', visibility);
+      }
+
+      const orgMeta = orgSlug && selectedOwnerEl
+        ? { slug: orgSlug, name: selectedOwnerEl.querySelector('.sd-org-owner-name').textContent }
+        : null;
+
+      closeShareModal();
+
+      // Open popup synchronously BEFORE any await — Safari blocks popups
+      // after async gaps.
+      let popupSession = null;
+      if (proxyAuth) {
+        try { popupSession = openShareReceiver(shareURL); }
+        catch (err) { btn.disabled = false; showShareError(err); return; }
+      }
+
+      if (needsShareConsent) {
+        try {
+          const cr = await fetch('/api/share-consent', { method: 'POST' });
+          if (cr.ok) {
+            needsShareConsent = false;
+          } else {
+            btn.disabled = false;
+            if (popupSession) popupSession.close();
+            showToast('share', 'error', '<span>Failed to record consent. Please try again.</span>');
+            return;
+          }
+        } catch {
+          btn.disabled = false;
+          if (popupSession) popupSession.close();
+          showToast('share', 'error', '<span>Network error. Please try again.</span>');
+          return;
+        }
+      }
+
+      performShare(orgSlug, visibility, orgMeta, popupSession);
+    });
+
+    requestAnimationFrame(function() {
+      const btn = overlay.querySelector('#orgShareBtn');
+      if (btn) btn.focus();
+    });
   }
 
   function showConsentModal() {
@@ -7738,6 +7390,41 @@
           '</div>' +
         '</div>';
 
+    let subtitleText = 'Anyone with the link can read it. The page works without an account.';
+    let orgStripHtml = '';
+    if (sharedOrg) {
+      const orgName = escapeHtml(sharedOrg.name);
+      const vis = sharedVisibility || 'unlisted';
+      const ICON_BUILDING_SM = '<svg class="sd-shared-org-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h4.5a.75.75 0 00.75-.75v-3.5a.25.25 0 01.25-.25h1.5a.25.25 0 01.25.25v3.5c0 .414.336.75.75.75h4.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm.25 1.75a.25.25 0 01.25-.25h11.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H10v-2.75A1.75 1.75 0 008.25 9h-1.5A1.75 1.75 0 005 10.75V14H2.25a.25.25 0 01-.25-.25V2.75zM4 4a1 1 0 011-1h1a1 1 0 010 2H5a1 1 0 01-1-1zm6-1a1 1 0 100 2h1a1 1 0 100-2h-1zM4 7a1 1 0 011-1h1a1 1 0 110 2H5a1 1 0 01-1-1zm6-1a1 1 0 100 2h1a1 1 0 100-2h-1z"/></svg>';
+      let pillIcon = '';
+      const pillClass = 'sd-shared-vis-pill--' + vis;
+      let pillLabel = '';
+      let hintText = '';
+      if (vis === 'organization') {
+        subtitleText = 'Only ' + orgName + ' members can view this review.';
+        pillIcon = '<svg viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M7.467.133a1.75 1.75 0 011.066 0l5.25 1.68A1.75 1.75 0 0115 3.48V7c0 1.566-.32 3.182-1.303 4.682-.983 1.498-2.585 2.813-5.032 3.855a1.7 1.7 0 01-1.33 0c-2.447-1.042-4.049-2.357-5.032-3.855C1.32 10.182 1 8.566 1 7V3.48a1.75 1.75 0 011.217-1.667l5.25-1.68zm.61 1.429a.25.25 0 00-.153 0l-5.25 1.68a.25.25 0 00-.174.238V7c0 1.358.275 2.666 1.057 3.86.784 1.194 2.121 2.34 4.366 3.297a.2.2 0 00.154 0c2.245-.956 3.582-2.103 4.366-3.298C13.225 9.666 13.5 8.358 13.5 7V3.48a.25.25 0 00-.174-.238l-5.25-1.68z"/></svg>';
+        pillLabel = 'Members only';
+      } else if (vis === 'unlisted') {
+        subtitleText = 'Anyone at ' + orgName + ' with the link can view this review.';
+        pillIcon = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"/></svg>';
+        pillLabel = 'Unlisted';
+        hintText = 'Anyone at org with link';
+      } else if (vis === 'public') {
+        subtitleText = 'This review is discoverable by anyone on the web.';
+        pillIcon = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z"/></svg>';
+        pillLabel = 'Public';
+        hintText = 'Discoverable by anyone';
+      }
+      orgStripHtml =
+        '<div class="sd-shared-org-strip">' +
+          ICON_BUILDING_SM +
+          '<span class="sd-shared-org-name">' + orgName + '</span>' +
+          '<span class="sd-shared-org-sep">&middot;</span>' +
+          '<span class="sd-shared-vis-pill ' + pillClass + '">' + pillIcon + pillLabel + '</span>' +
+          (hintText ? '<span class="sd-shared-vis-hint">' + hintText + '</span>' : '') +
+        '</div>';
+    }
+
     overlay.innerHTML =
       '<div class="share-dialog">' +
         '<div class="share-dialog-body">' +
@@ -7747,7 +7434,7 @@
           '</div>' +
           '<div class="share-dialog-narrative">' +
             '<h3 id="shareDialogTitle" class="share-dialog-headline">Your review is live.</h3>' +
-            '<p class="share-dialog-sub">Anyone with the link can read it. The page works without an account.</p>' +
+            '<p class="share-dialog-sub">' + subtitleText + '</p>' +
             '<div class="share-dialog-url">' +
               '<span>' + escapeHtml(hostedURL) + '</span>' +
               '<button class="copy-icon-btn" id="modalCopyBtn" aria-label="Copy link">' +
@@ -7755,11 +7442,14 @@
               '</button>' +
             '</div>' +
             nextShareBlock +
+            orgStripHtml +
           '</div>' +
         '</div>' +
         '<div class="sd-actions">' +
           (deleteToken ? '<button class="sd-link-btn sd-link-btn--danger" id="modalUnpublishBtn">Unpublish</button>' : '<span></span>') +
           '<div class="sd-actions-right">' +
+            '<button class="sd-link-btn" id="modalPullBtn">Pull comments</button>' +
+            '<button class="sd-link-btn" id="modalReshareBtn">Re-share</button>' +
             '<button class="sd-primary" id="modalCloseBtn">Done</button>' +
           '</div>' +
         '</div>' +
@@ -7820,6 +7510,178 @@
     if (deleteToken) {
       overlay.querySelector('#modalUnpublishBtn').addEventListener('click', showUnpublishConfirm);
     }
+
+    overlay.querySelector('#modalPullBtn').addEventListener('click', handlePullComments);
+    overlay.querySelector('#modalReshareBtn').addEventListener('click', handleReshare);
+  }
+
+  // After /api/comments/merge updates the local review file, re-fetch each
+  // file's comments and re-render in place. Uses the existing per-file
+  // refresh + render-panel path — preserves scroll position, expanded
+  // threads, and unsubmitted drafts (no location.reload).
+  async function refreshAllComments() {
+    await Promise.all(files.map(async function(f) {
+      try {
+        const r = await fetch('/api/file/comments?path=' + enc(f.path));
+        if (r.ok) {
+          f.comments = await r.json();
+        }
+      } catch { /* per-file refresh is best-effort */ }
+    }));
+    renderCommentsPanel();
+    updateCommentCount();
+    updateTreeCommentBadges();
+  }
+
+  // Pull remote comments through the popup relay (or directly when
+  // proxy_auth is unset), then merge into the local review file via
+  // /api/comments/merge, then refresh the UI in place.
+  async function handlePullComments() {
+    const btn = document.getElementById('modalPullBtn');
+    if (!btn) return;
+    btn.disabled = true;
+    const origLabel = btn.textContent;
+    btn.textContent = 'Pulling…';
+
+    // Open popup synchronously inside the click handler.
+    let popupSession = null;
+    if (proxyAuth) {
+      try {
+        popupSession = openShareReceiver(shareURL);
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = origLabel;
+        showToast('share', 'error', '<span>Pull failed: ' + escapeHtml(err.message) + '</span>');
+        return;
+      }
+    }
+
+    try {
+      if (!hostedToken) throw new Error('no shared review token (try re-sharing)');
+
+      let comments;
+      if (popupSession) {
+        comments = await popupSession.run('fetch', { token: hostedToken });
+      } else {
+        const r = await fetch(shareURL.replace(/\/$/, '') + '/api/reviews/' + encodeURIComponent(hostedToken) + '/comments');
+        if (!r.ok) throw new Error('Server error ' + r.status);
+        comments = await r.json();
+      }
+
+      const mergeResp = await fetch('/api/comments/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comments: comments }),
+      });
+      if (!mergeResp.ok) {
+        const errBody = await mergeResp.json().catch(function() { return {}; });
+        throw new Error(errBody.error || 'merge failed: ' + mergeResp.status);
+      }
+
+      await refreshAllComments();
+      showToast('share', 'success', '<span>Comments pulled</span>', { autoDismiss: true });
+    } catch (err) {
+      showToast('share', 'error', '<span>Pull failed: ' + escapeHtml(err.message) + '</span>');
+    } finally {
+      if (popupSession) popupSession.close();
+      const liveBtn = document.getElementById('modalPullBtn');
+      if (liveBtn) {
+        liveBtn.disabled = false;
+        liveBtn.textContent = origLabel;
+      }
+    }
+  }
+
+  // Re-share chains pull -> merge -> upsert in a single popup session.
+  // If the upsert fails after the merge succeeds, the local review file is
+  // already updated with remote comments; the user must re-click Re-share
+  // (and possibly re-authenticate) to push the merged state back up.
+  async function handleReshare() {
+    const btn = document.getElementById('modalReshareBtn');
+    if (!btn) return;
+    btn.disabled = true;
+    const origLabel = btn.textContent;
+    btn.textContent = 'Re-sharing…';
+
+    // Open popup synchronously inside the click handler.
+    let popupSession = null;
+    if (proxyAuth) {
+      try {
+        popupSession = openShareReceiver(shareURL);
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = origLabel;
+        showToast('share', 'error', '<span>Re-share failed: ' + escapeHtml(err.message) + '</span>');
+        return;
+      }
+    }
+
+    try {
+      if (!hostedToken) throw new Error('no shared review token (try re-sharing)');
+
+      // 1. Pull remote comments through the (still authenticated) popup.
+      let remoteComments;
+      if (popupSession) {
+        remoteComments = await popupSession.run('fetch', { token: hostedToken });
+      } else {
+        const r = await fetch(shareURL.replace(/\/$/, '') + '/api/reviews/' + encodeURIComponent(hostedToken) + '/comments');
+        if (!r.ok) throw new Error('Server error ' + r.status);
+        remoteComments = await r.json();
+      }
+
+      // 2. Merge locally. NOTE: this mutates the local review file even if
+      // the upsert in step 4 fails — the toast in the catch block documents
+      // the partial-failure recovery path.
+      const mergeResp = await fetch('/api/comments/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comments: remoteComments }),
+      });
+      if (!mergeResp.ok) {
+        const errBody = await mergeResp.json().catch(function() { return {}; });
+        throw new Error(errBody.error || 'merge failed: ' + mergeResp.status);
+      }
+
+      // 3. Build upsert payload from the merged local state.
+      const payloadResp = await fetch('/api/share/upsert-payload');
+      if (!payloadResp.ok) {
+        const errBody = await payloadResp.json().catch(function() { return {}; });
+        throw new Error(errBody.error || 'failed to build upsert payload');
+      }
+      const payload = await payloadResp.json();
+
+      // 4. PUT through the same popup session (still authenticated).
+      if (popupSession) {
+        await popupSession.run('upsert', { token: hostedToken, payload: payload });
+      } else {
+        const r = await fetch(shareURL.replace(/\/$/, '') + '/api/reviews/' + encodeURIComponent(hostedToken), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error('Server error ' + r.status);
+      }
+
+      await refreshAllComments();
+      showToast('share', 'success', '<span>Re-shared</span>', { autoDismiss: true });
+    } catch (err) {
+      // Document partial-failure state explicitly. If the merge succeeded
+      // but the upsert failed, the user's local review file already contains
+      // the remote comments — clicking Re-share again will retry the upsert
+      // (idempotent on the server) but may require re-authentication if the
+      // popup was closed.
+      showToast('share', 'error',
+        '<span>Re-share failed: ' + escapeHtml(err.message) +
+        '. Local comments may have been updated; click Re-share again to retry ' +
+        '(you may need to re-authenticate in the popup).</span>');
+    } finally {
+      if (popupSession) popupSession.close();
+      const liveBtn = document.getElementById('modalReshareBtn');
+      if (liveBtn) {
+        liveBtn.disabled = false;
+        liveBtn.textContent = origLabel;
+      }
+    }
   }
 
   function showUnpublishConfirm() {
@@ -7842,32 +7704,79 @@
   async function handleUnpublish() {
     const btn = document.getElementById('confirmUnpublishBtn');
     if (btn) { btn.textContent = 'Unpublishing\u2026'; btn.disabled = true; }
+
+    // Popup-relay path: open the popup synchronously inside the click chain.
+    // handleUnpublish is wired via addEventListener in showUnpublishConfirm,
+    // so this function is still inside the user-gesture tick when the user
+    // clicks "Unpublish" in the confirm dialog.
+    let popupSession = null;
+    if (proxyAuth) {
+      try {
+        popupSession = openShareReceiver(shareURL);
+      } catch (err) {
+        closeShareModal();
+        showUnpublishError(err);
+        return;
+      }
+    }
+
     try {
-      const resp = await fetch(shareURL + '/api/reviews', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ delete_token: deleteToken }),
-      });
-      const alreadyDeleted = resp.status === 404;
-      if (!alreadyDeleted && !resp.ok) throw new Error('Server error ' + resp.status);
+      if (popupSession) {
+        // Receiver normalises 404 (already deleted) to {already_deleted: true}.
+        await popupSession.run('unpublish', { delete_token: deleteToken });
+      } else {
+        const resp = await fetch(shareURL + '/api/reviews', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ delete_token: deleteToken }),
+        });
+        const alreadyDeleted = resp.status === 404;
+        if (!alreadyDeleted && !resp.ok) throw new Error('Server error ' + resp.status);
+      }
       hostedURL = '';
       deleteToken = '';
+      hostedToken = '';
+      sharedOrg = null;
+      sharedVisibility = '';
       fetch('/api/share-url', { method: 'DELETE' }).catch(function() { /* fire-and-forget */ });
       closeShareModal();
       setShareButtonState('default');
     } catch (err) {
       closeShareModal();
-      const el = showToast('share', 'error',
-        '<span>Unpublish failed: ' + escapeHtml(err.message) + '</span>' +
-        '<div class="toast-actions">' +
-          '<button class="toast-btn toast-btn-filled" id="shareUnpublishRetryBtn">Retry</button>' +
-          '<button class="toast-btn toast-btn-ghost" data-dismiss-toast="share">Dismiss</button>' +
-        '</div>');
-      el.querySelector('#shareUnpublishRetryBtn').addEventListener('click', function() {
-        dismissToast('share');
-        handleUnpublish();
-      });
+      showUnpublishError(err);
+    } finally {
+      if (popupSession) popupSession.close();
     }
+  }
+
+  function showUnpublishError(err) {
+    const el = showToast('share', 'error',
+      '<span>Unpublish failed: ' + escapeHtml(err.message) + '</span>' +
+      '<div class="toast-actions">' +
+        '<button class="toast-btn toast-btn-filled" id="shareUnpublishRetryBtn">Retry</button>' +
+        '<button class="toast-btn toast-btn-ghost" data-dismiss-toast="share">Dismiss</button>' +
+      '</div>');
+    el.querySelector('#shareUnpublishRetryBtn').addEventListener('click', function() {
+      dismissToast('share');
+      handleUnpublish();
+    });
+  }
+
+  // Dedup guard: prevents a double-click from opening two popups racing for
+  // the same crit-web review.
+  let shareInFlight = false;
+
+  function showShareError(err) {
+    const el = showToast('share', 'error',
+      '<span>Share failed: ' + escapeHtml(err.message) + '</span>' +
+      '<div class="toast-actions">' +
+        '<button class="toast-btn toast-btn-filled" id="shareRetryBtn">Retry</button>' +
+        '<button class="toast-btn toast-btn-ghost" data-dismiss-toast="share">Dismiss</button>' +
+      '</div>');
+    el.querySelector('#shareRetryBtn').addEventListener('click', function() {
+      dismissToast('share');
+      document.getElementById('shareBtn').click();
+    });
   }
 
   document.getElementById('shareBtn').addEventListener('click', async function() {
@@ -7881,39 +7790,34 @@
       return;
     }
 
-    // First-time consent gate
+    // Open popup synchronously BEFORE any await — Safari blocks popups
+    // after async gaps. If we end up showing the org modal instead, close it.
+    let popupSession = null;
+    if (proxyAuth) {
+      try { popupSession = openShareReceiver(shareURL); }
+      catch (err) { showShareError(err); return; }
+    }
+
+    // If user has orgs, show org share modal (handles consent inline)
+    if (authUserName) {
+      this.disabled = true;
+      const orgs = await fetchOrgs();
+      this.disabled = false;
+      if (orgs.length > 0) {
+        if (popupSession) popupSession.close();
+        showOrgShareModal(orgs);
+        return;
+      }
+    }
+
+    // No orgs — existing consent gate
     if (needsShareConsent) {
+      if (popupSession) popupSession.close();
       showConsentModal();
       return;
     }
 
-    setShareButtonState('sharing');
-    dismissToast('share');
-
-    try {
-      const resp = await fetch('/api/share', { method: 'POST' });
-      if (!resp.ok) {
-        const errBody = await resp.json().catch(function() { return {}; });
-        throw new Error(errBody.error || 'Server error ' + resp.status);
-      }
-      const result = await resp.json();
-      hostedURL = result.url;
-      deleteToken = result.delete_token || '';
-      setShareButtonState('shared');
-      showShareModal();
-    } catch (err) {
-      setShareButtonState('default');
-      const el = showToast('share', 'error',
-        '<span>Share failed: ' + escapeHtml(err.message) + '</span>' +
-        '<div class="toast-actions">' +
-          '<button class="toast-btn toast-btn-filled" id="shareRetryBtn">Retry</button>' +
-          '<button class="toast-btn toast-btn-ghost" data-dismiss-toast="share">Dismiss</button>' +
-        '</div>');
-      el.querySelector('#shareRetryBtn').addEventListener('click', function() {
-        dismissToast('share');
-        document.getElementById('shareBtn').click();
-      });
-    }
+    performShare('', '', null, popupSession);
   });
 
   // Announce copy action to screen readers via live region
@@ -8062,6 +7966,32 @@
     tocScrollHandler();
   }
 
+  // ===== Hash Navigation (heading anchors) =====
+  function scrollToHashHeading() {
+    const hash = window.location.hash;
+    if (!hash || hash === '#') return;
+    const target = document.getElementById(decodeURIComponent(hash.slice(1)));
+    if (!target) return;
+    const headerHeight = (document.querySelector('.header')?.offsetHeight || 49) + 8;
+    const y = target.getBoundingClientRect().top + window.scrollY - headerHeight;
+    window.scrollTo({ top: y, behavior: 'instant' });
+  }
+  window.addEventListener('hashchange', scrollToHashHeading);
+
+  document.addEventListener('click', function(e) {
+    const anchor = e.target.closest('.heading-anchor');
+    if (!anchor) return;
+    e.preventDefault();
+    const hash = anchor.getAttribute('href');
+    const url = anchor.href;
+    history.replaceState(null, '', hash);
+    scrollToHashHeading();
+    navigator.clipboard.writeText(url).then(function() {
+      anchor.classList.add('heading-anchor-copied');
+      setTimeout(function() { anchor.classList.remove('heading-anchor-copied'); }, 1500);
+    }).catch(function() {});
+  });
+
   // ===== Mermaid =====
   function getMermaidTheme() {
     const dataTheme = document.documentElement.getAttribute('data-theme');
@@ -8134,64 +8064,18 @@
     SIDEBAR_RESIZE.forEach(function(cfg) {
       const target = document.getElementById(cfg.targetId);
       if (!target) return;
-      const saved = getSetting(cfg.settingKey, null);
-      if (typeof saved === 'number' && saved >= cfg.min) {
-        target.style.width = saved + 'px';
-      }
       const handle = document.getElementById(cfg.handleId);
-      if (handle) attachSidebarResizeHandle(handle, target, cfg);
-    });
-  }
-
-  function attachSidebarResizeHandle(handle, target, cfg) {
-    // Pointer events + setPointerCapture: the handle keeps receiving move/up
-    // events even if the pointer leaves the window, devtools opens, or the
-    // user alt-tabs. Avoids the "stuck dragging" leak that document-level
-    // mousemove listeners suffer from.
-    handle.addEventListener('pointerdown', function(e) {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      handle.setPointerCapture(e.pointerId);
-      const startX = e.clientX;
-      const startWidth = target.getBoundingClientRect().width;
-      // For a left-edge handle (comments panel), dragging right shrinks the panel.
-      const dir = cfg.edge === 'left' ? -1 : 1;
-      handle.classList.add('dragging');
-      document.body.classList.add('sidebar-resizing');
-      let lastWidth = startWidth;
-
-      function onMove(ev) {
-        const delta = (ev.clientX - startX) * dir;
-        const w = Math.max(cfg.min, startWidth + delta);
-        target.style.width = w + 'px';
-        lastWidth = w;
-      }
-      function onEnd() {
-        handle.removeEventListener('pointermove', onMove);
-        handle.removeEventListener('pointerup', onEnd);
-        handle.removeEventListener('pointercancel', onEnd);
-        handle.classList.remove('dragging');
-        document.body.classList.remove('sidebar-resizing');
-        setSetting(cfg.settingKey, Math.round(lastWidth));
-      }
-      handle.addEventListener('pointermove', onMove);
-      handle.addEventListener('pointerup', onEnd);
-      handle.addEventListener('pointercancel', onEnd);
-    });
-
-    // Keyboard resize for a11y: ArrowLeft / ArrowRight nudges by 16px.
-    // For left-edge handles (comments panel) the direction flips so
-    // ArrowRight always shrinks the controlled panel — matching pointer
-    // drag semantics.
-    handle.addEventListener('keydown', function(e) {
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-      e.preventDefault();
-      const dir = cfg.edge === 'left' ? -1 : 1;
-      const sign = e.key === 'ArrowRight' ? 1 : -1;
-      const current = target.getBoundingClientRect().width;
-      const w = Math.max(cfg.min, current + sign * dir * 16);
-      target.style.width = w + 'px';
-      setSetting(cfg.settingKey, Math.round(w));
+      if (!handle) return;
+      // Pointer capture, body.sidebar-resizing class, persistence, min clamp,
+      // and keyboard a11y all live in the shared helper. Both code-review
+      // handles (file-tree, comments-panel) and live-mode's comments-panel
+      // share the implementation so cursor-locking and keyboard nudge stay
+      // in lockstep across modes.
+      window.crit.shared.installSidebarResize(handle, target, {
+        settingKey: cfg.settingKey,
+        min: cfg.min,
+        edge: cfg.edge,
+      });
     });
   }
 
@@ -8699,84 +8583,44 @@
   });
 
   // ===== Settings Panel =====
+  // Open/close, focus trap, sliding underline, Esc/?, tab keyboard nav and
+  // click delegation are all owned by the shared settings-overlay shell
+  // (crit-settings-overlay.js). This file only supplies pane-render hooks
+  // (cfg fetch + renderSettingsPane/AboutPane/ShortcutsPane).
+  let settingsCtl = null;
+  function getSettingsCtl() {
+    if (settingsCtl) return settingsCtl;
+    const overlay = document.getElementById('settingsOverlay');
+    const toggle = document.getElementById('settingsToggle');
+    const closeBtn = document.getElementById('settingsClose');
+    if (!overlay || !window.crit || !window.crit.settingsOverlay) return null;
+    settingsCtl = window.crit.settingsOverlay.install({
+      overlay: overlay,
+      toggle: toggle,
+      closeBtn: closeBtn,
+      initialTab: 'settings',
+      onOpen: function (tab) {
+        settingsPanelOpen = true;
+        settingsPanelTab = tab || 'settings';
+        if (!cachedConfig) {
+          fetch('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
+            cachedConfig = cfg;
+            renderSettingsPane(cfg);
+            renderAboutPane(cfg);
+          });
+        }
+        renderShortcutsPane();
+      },
+      onTabSwitch: function (tab) { settingsPanelTab = tab; },
+      onClose: function () { settingsPanelOpen = false; },
+    });
+    return settingsCtl;
+  }
   function openSettingsPanel(tab) {
     settingsPanelTab = tab || 'settings';
     settingsPanelOpen = true;
-    const overlay = document.getElementById('settingsOverlay');
-    overlay.classList.add('active');
-    // Ensure the sliding underline element exists
-    if (!overlay.querySelector('.settings-tab-underline')) {
-      const underline = document.createElement('div');
-      underline.className = 'settings-tab-underline';
-      overlay.querySelector('.settings-tabs').appendChild(underline);
-    }
-    switchSettingsTab(settingsPanelTab);
-    // Fetch config if not cached
-    if (!cachedConfig) {
-      fetch('/api/config').then(function(r) { return r.json(); }).then(function(cfg) {
-        cachedConfig = cfg;
-        renderSettingsPane(cfg);
-        renderAboutPane(cfg);
-      });
-    }
-    renderShortcutsPane();
-    // Trap focus inside the settings dialog
-    trapFocusIn(overlay);
-  }
-
-  let focusTrapCleanup = null;
-
-  function trapFocusIn(container) {
-    releaseFocusTrap();
-    function handler(e) {
-      if (e.key !== 'Tab') return;
-      const focusable = container.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey) {
-        if (document.activeElement === first) { e.preventDefault(); last.focus(); }
-      } else {
-        if (document.activeElement === last) { e.preventDefault(); first.focus(); }
-      }
-    }
-    container.addEventListener('keydown', handler);
-    focusTrapCleanup = function() { container.removeEventListener('keydown', handler); };
-    // Focus the first focusable element
-    const firstFocusable = container.querySelector('button:not([disabled]), [href], input:not([disabled])');
-    if (firstFocusable) requestAnimationFrame(function() { firstFocusable.focus(); });
-  }
-
-  function releaseFocusTrap() {
-    if (focusTrapCleanup) { focusTrapCleanup(); focusTrapCleanup = null; }
-  }
-
-  function closeSettingsPanel() {
-    settingsPanelOpen = false;
-    releaseFocusTrap();
-    document.getElementById('settingsOverlay').classList.remove('active');
-  }
-
-  function switchSettingsTab(tab) {
-    settingsPanelTab = tab;
-    let activeBtn = null;
-    document.querySelectorAll('.settings-tab[role="tab"]').forEach(function(t) {
-      const isActive = t.dataset.tab === tab;
-      t.classList.toggle('active', isActive);
-      t.setAttribute('aria-selected', String(isActive));
-      if (isActive) activeBtn = t;
-    });
-    document.querySelectorAll('.settings-pane').forEach(function(p) {
-      p.classList.toggle('active', p.dataset.pane === tab);
-    });
-    // Position the sliding underline
-    const underline = document.querySelector('.settings-tab-underline');
-    if (underline && activeBtn) {
-      const tabsRect = activeBtn.parentElement.getBoundingClientRect();
-      const btnRect = activeBtn.getBoundingClientRect();
-      underline.style.left = (btnRect.left - tabsRect.left) + 'px';
-      underline.style.width = btnRect.width + 'px';
-    }
+    const ctl = getSettingsCtl();
+    if (ctl) ctl.open(settingsPanelTab);
   }
 
   function applyHideResolved() {
@@ -8797,12 +8641,29 @@
 
   function renderSettingsPane(cfg) {
     const pane = document.getElementById('settingsPane');
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderSettingsTab) {
+      shared.renderSettingsTab(pane, {
+        mode: 'code-review',
+        cfg: cfg,
+        hooks: {
+          applyTheme: window.applyTheme,
+          applyWidth: applyWidth,
+          getHideResolved: isHideResolved,
+          setHideResolved: setHideResolved,
+          onHideResolvedChange: function () { renderAllFiles(); },
+          hasActivePendingUpdates: hasActivePendingUpdates,
+          announceCopy: announceCopy,
+          escape: escapeHtml,
+        },
+      });
+      return;
+    }
+    // Fallback (shared module not loaded — should never happen since
+    // crit-settings-panes.js is loaded before app.js).
     const currentTheme = getSetting('theme', 'system');
     const currentWidth = getSetting('width', 'default');
-
     let html = '';
-
-    // Display section
     html += '<div class="settings-section-label">Display</div>';
     html += '<div class="settings-display-group">';
 
@@ -8866,7 +8727,7 @@
       if (alreadyDismissed) {
         html += '<span class="config-card-dismissed" id="updateDismissedNote">Dismissed — will remind you on next version</span>';
       } else {
-        html += '<button type="button" class="config-card-dismiss" id="updateDismissBtn" data-dismiss-version="' + escapeHtml(cfg.latest_version) + '">Don’t remind me until next version</button>';
+        html += '<button type="button" class="config-card-dismiss" id="updateDismissBtn" data-dismiss-version="' + escapeHtml(cfg.latest_version) + '">Don\'t remind me until next version</button>';
       }
       html += '</div>';
       html += '</div>';
@@ -8947,7 +8808,7 @@
             if (intAlreadyDismissed) {
               html += '<span class="config-card-dismissed" id="integrationDismissedNote">Dismissed — will remind you when this integration changes</span>';
             } else {
-              html += '<button type="button" class="config-card-dismiss" id="integrationDismissBtn" data-agent="' + escapeHtml(si.agent) + '" data-hash="' + escapeHtml(si.hash) + '">Don’t remind me until next version</button>';
+              html += '<button type="button" class="config-card-dismiss" id="integrationDismissBtn" data-agent="' + escapeHtml(si.agent) + '" data-hash="' + escapeHtml(si.hash) + '">Don\'t remind me until next version</button>';
             }
             html += '</div>';
             html += '</div>';
@@ -9077,130 +8938,22 @@
   }
 
   function renderShortcutsPane() {
-    const pane = document.getElementById('shortcutsPane');
-    let html = '';
-
-    const groups = [
-      { label: 'Navigation', shortcuts: [
-        { key: '<kbd>j</kbd>', action: 'Next block' },
-        { key: '<kbd>k</kbd>', action: 'Previous block' },
-        { key: '<kbd>Shift</kbd>+<kbd>V</kbd>', action: 'Visual line mode (extend with j/k, then c to comment)' },
-        { key: '<kbd>]</kbd>', action: 'Next comment' },
-        { key: '<kbd>[</kbd>', action: 'Previous comment' },
-        { key: '<kbd>n</kbd>', action: 'Next change', mode: 'file mode' },
-        { key: '<kbd>N</kbd>', action: 'Previous change', mode: 'file mode' },
-      ]},
-      { label: 'Comments', shortcuts: [
-        { key: '<kbd>c</kbd>', action: 'Comment on focused block (or text selection, with quote)' },
-        { key: '<kbd>e</kbd>', action: 'Edit comment on focused block' },
-        { key: '<kbd>d</kbd>', action: 'Delete comment on focused block' },
-        { key: '<kbd>G</kbd>', action: 'General comment' },
-        { key: '<kbd>Ctrl</kbd>+<kbd>Enter</kbd>', action: 'Comment' },
-      ]},
-      { label: 'Review', shortcuts: [
-        { key: '<kbd>Shift</kbd>+<kbd>F</kbd>', action: 'Finish review' },
-        { key: '<kbd>Shift</kbd>+<kbd>C</kbd>', action: 'Toggle comments panel' },
-        { key: '<kbd>Shift</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>/<kbd>4</kbd>', action: 'Switch scope', mode: 'vcs mode' },
-      ]},
-      { label: 'View', shortcuts: [
-        { key: '<kbd>t</kbd>', action: 'Toggle table of contents', mode: 'file mode' },
-        { key: '<kbd>h</kbd>', action: 'Toggle hide resolved' },
-        { key: '<kbd>Esc</kbd>', action: 'Cancel / clear focus' },
-        { key: '<kbd>?</kbd>', action: 'Toggle this panel' },
-      ]},
-    ];
-
-    groups.forEach(function(group) {
-      html += '<div class="shortcuts-group-label">' + group.label + '</div>';
-      html += '<table class="shortcuts-table">';
-      group.shortcuts.forEach(function(s) {
-        const modeTag = s.mode ? '<span class="shortcut-mode-badge">' + s.mode + '</span>' : '';
-        html += '<tr><td>' + s.key + '</td><td>' + s.action + modeTag + '</td></tr>';
-      });
-      html += '</table>';
-    });
-
-    pane.innerHTML = html;
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderShortcutsPane) {
+      shared.renderShortcutsPane(document.getElementById('shortcutsPane'), { mode: 'code-review' });
+    }
   }
 
   function renderAboutPane(cfg) {
-    const pane = document.getElementById('aboutPane');
-    let html = '';
-
-    // Version header
-    html += '<div class="about-header">';
-    html += '<h2>Crit</h2>';
-    const ver = cfg.version || 'dev';
-    html += '<div class="about-version">' + escapeHtml(ver) + '</div>';
-    if (!cfg.no_update_check) {
-      if (cfg.latest_version && cfg.version && cfg.latest_version !== cfg.version) {
-        html += '<div class="about-badge about-badge--update">Update available: ' + escapeHtml(cfg.latest_version) + '</div>';
-      } else if (cfg.version && cfg.version !== 'dev') {
-        html += '<div class="about-badge about-badge--current">Up to date</div>';
-      }
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderAboutPane) {
+      shared.renderAboutPane(document.getElementById('aboutPane'), cfg, session);
     }
-    html += '</div>';
-
-    // Session info
-    html += '<div class="settings-section-label">Current Session</div>';
-    html += '<div class="about-session"><div class="about-session-grid">';
-    html += '<span class="about-session-label">Mode</span><span class="about-session-value">' + (session.vcs_name || session.mode || 'unknown') + '</span>';
-    if (session.mode === 'git' && session.branch) {
-      html += '<span class="about-session-label">Branch</span><span class="about-session-value">' + escapeHtml(session.branch) + '</span>';
-    }
-    if (session.base_ref) {
-      html += '<span class="about-session-label">Base</span><span class="about-session-value">' + escapeHtml(session.base_branch_name || session.base_ref) + '</span>';
-    }
-    html += '<span class="about-session-label">Round</span><span class="about-session-value">' + (session.review_round || 1) + '</span>';
-    html += '<span class="about-session-label">Files</span><span class="about-session-value">' + (session.files ? session.files.length : 0) + ' changed</span>';
-    if (cfg.review_path) {
-      html += '<span class="about-session-label">Review file</span><span class="about-session-value"><code>' + escapeHtml(cfg.review_path) + '</code></span>';
-    }
-    html += '</div></div>';
-
-    // Links
-    html += '<div class="settings-section-label">Links</div>';
-    html += '<div class="about-links">';
-    html += '<a class="about-link" href="https://crit.md" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1v4M5.5 3h5M3 7h10v6.5a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5V7Z"/></svg>Homepage</a>';
-    html += '<a class="about-link" href="https://github.com/tomasz-tomczyk/crit" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>GitHub</a>';
-    html += '<a class="about-link" href="https://github.com/tomasz-tomczyk/crit/releases" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l6.25 6.25a1.75 1.75 0 0 1 0 2.474l-5.026 5.026a1.75 1.75 0 0 1-2.474 0l-6.25-6.25A1.752 1.752 0 0 1 1 7.775Zm1.5 0c0 .066.026.13.073.177l6.25 6.25a.25.25 0 0 0 .354 0l5.025-5.025a.25.25 0 0 0 0-.354l-6.25-6.25a.25.25 0 0 0-.177-.073H2.75a.25.25 0 0 0-.25.25ZM6 5a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>Changelog</a>';
-    html += '</div>';
-
-    pane.innerHTML = html;
   }
 
-  // Gear icon opens Settings tab
-  document.getElementById('settingsToggle').addEventListener('click', function() {
-    if (settingsPanelOpen) closeSettingsPanel();
-    else openSettingsPanel('settings');
-  });
-
-  // Close button
-  document.getElementById('settingsClose').addEventListener('click', closeSettingsPanel);
-
-  // Click outside to close
-  document.getElementById('settingsOverlay').addEventListener('click', function(e) {
-    if (e.target === this) closeSettingsPanel();
-  });
-
-  // Tab switching
-  document.querySelectorAll('.settings-tab[data-tab]').forEach(function(tab) {
-    tab.addEventListener('click', function() { switchSettingsTab(tab.dataset.tab); });
-  });
-
-  // Arrow key navigation for ARIA tabs pattern
-  document.querySelector('.settings-tabs[role="tablist"]').addEventListener('keydown', function(e) {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    const tabs = Array.from(this.querySelectorAll('.settings-tab[data-tab]'));
-    const current = tabs.findIndex(function(t) { return t.getAttribute('aria-selected') === 'true'; });
-    if (current === -1) return;
-    let next = e.key === 'ArrowRight' ? current + 1 : current - 1;
-    if (next < 0) next = tabs.length - 1;
-    if (next >= tabs.length) next = 0;
-    e.preventDefault();
-    switchSettingsTab(tabs[next].dataset.tab);
-    tabs[next].focus();
-  });
+  // Settings overlay shell (open/close/Esc/?/focus-trap/sliding-underline/
+  // tab click + arrow nav) is owned by crit-settings-overlay.js.
+  getSettingsCtl();
 
   document.getElementById('noChangesOverlay').addEventListener('click', function(e) {
     if (e.target === this) hideNoChangesConfirm();
@@ -9228,17 +8981,9 @@
       return;
     }
 
-    if (settingsPanelOpen) {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        closeSettingsPanel();
-      } else if (e.key === '?') {
-        e.preventDefault();
-        if (settingsPanelTab === 'shortcuts') closeSettingsPanel();
-        else switchSettingsTab('shortcuts');
-      }
-      return;
-    }
+    // Esc/? while settings overlay is open are owned by crit-settings-overlay.js;
+    // short-circuit the rest of the keymap so we don't double-handle.
+    if (settingsPanelOpen) return;
 
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
@@ -9430,6 +9175,7 @@
         break;
       }
       case '?': {
+        if (settingsPanelOpen) break;
         e.preventDefault();
         openSettingsPanel('shortcuts');
         break;
@@ -9726,44 +9472,25 @@
       return;
     }
 
-    // Filter out the default-branch entry from the linear stack — it's
-    // surfaced separately as the root marker above the tree. Use the focus's
-    // default_sha when available; fall back to per-entry default_sha (stamped
-    // by assignStackBases) so range-mode focuses without a resolved
-    // default_sha still drop the redundant ghost row.
-    // Picker already excludes the literal default branch from `stack`
-    // (see stackTipLabels in picker.go), so no need to filter — just
-    // reverse so the topmost (deepest) entry renders first.
-    const ordered = stack.slice().reverse();
-    // Prefer the repo's actual default branch name (e.g. "master") over
-    // guessing from the topmost stack entry's base_ref_name (often empty
-    // for branch-tier entries) or hardcoding 'main'.
-    // defaultBranchNameCache is populated by /api/picker.
+    const ordered = stack.slice();
     const defaultBranchName = defaultBranchNameCache || (ordered[0] && ordered[0].base_ref_name) || 'main';
 
     const parts = [];
     parts.push('<div class="stack-popover-title">Stack</div>');
 
-    // Default-branch entry — non-interactive root marker. The
-    // layer/full-stack toggle inside this popover is the canonical
-    // way to switch scopes; clicking here used to flip diff_scope but
-    // that overlapped confusingly with the toggle.
-    parts.push('<span class="stack-popover-item stack-popover-root stack-popover-default" role="presentation">' +
-      '<span class="stack-popover-tree" aria-hidden="true">\u2502 </span>' +
-      '<span class="stack-popover-label">' + escapeHtml(defaultBranchName) + '</span>' +
-      '</span>');
-
-    // Stack entries — base→head, with ├─ / └─ prefixes.
+    // Stack entries — head→base (newest at top), with ├─ / └─ prefixes.
     ordered.forEach(function(entry, i) {
       const isLast = i === ordered.length - 1;
       const tree = isLast ? '\u2514\u2500 ' : '\u251C\u2500 ';
       const isCurrent = entry.head_sha === focus.head_sha;
-      const label = entryLabel(entry, 40);
+      const label = entryLabel(entry, 34);
+      const shortSha = entry.head_sha ? entry.head_sha.slice(0, 7) : '';
       if (isCurrent) {
         parts.push('<span class="stack-popover-item stack-popover-current" aria-current="page" role="menuitem"' +
           ' data-head-sha="' + escapeHtml(entry.head_sha || '') + '">' +
           '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
           '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
+          (shortSha ? '<span class="stack-popover-sha">' + escapeHtml(shortSha) + '</span>' : '') +
           '</span>');
       } else {
         const payload = focusPayloadFromStackEntry(entry, focus);
@@ -9775,21 +9502,27 @@
           ' aria-label="' + escapeHtml(aria) + '">' +
           '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
           '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
+          (shortSha ? '<span class="stack-popover-sha">' + escapeHtml(shortSha) + '</span>' : '') +
           '</button>');
       }
     });
 
+    // Base marker — non-interactive root at the bottom of the tree.
+    parts.push('<span class="stack-popover-item stack-popover-root stack-popover-default" role="presentation">' +
+      '<span class="stack-popover-tree" aria-hidden="true">  </span>' +
+      '<span class="stack-popover-label">base: ' + escapeHtml(defaultBranchName) + '</span>' +
+      '</span>');
+
     // "Compare against" radio section. Lives inside the popover so the
     // page header doesn't need a second toolbar row for what is a
     // relatively rare action. One-line subcopy explains what each scope
-    // means — first-time users always ask "wait, what does Layer mean?"
-    // Scope rows are always rendered in range mode — Layer is the
+    // means — first-time users always ask "wait, what does This commit mean?"
+    // Scope rows are always rendered in range mode — "This commit" is the
     // canonical default. Full stack is disabled (with explanation) when
     // default_sha is missing, which keeps the option discoverable so the
     // user understands why they can't reach it rather than wondering
     // where the option went.
-    const showScope = true;
-    if (showScope) {
+    {
       const activeScope = focus.diff_scope || 'layer';
       const fullStackEnabled = !!focus.default_sha;
       // Subcopy mirrors what full-stack diffs against: the literal
@@ -9803,8 +9536,8 @@
         ' data-action="scope" data-diff-scope="layer">' +
           '<span class="stack-popover-scope-radio" aria-hidden="true"></span>' +
           '<span class="stack-popover-scope-text">' +
-            '<span class="stack-popover-scope-name">Layer</span>' +
-            '<span class="stack-popover-scope-sub">Only changes in this layer</span>' +
+            '<span class="stack-popover-scope-name">This commit</span>' +
+            '<span class="stack-popover-scope-sub">Only changes in this commit</span>' +
           '</span>' +
         '</button>'
       );
@@ -10078,6 +9811,64 @@
       }
     })
     .then(connectSSE)
+    .then(function() {
+      // Register as InlineContentRenderer
+      if (window.crit && window.crit.renderer) {
+        // eslint-disable-next-line no-unused-vars
+        let annotationIntentCb = null;
+
+        window.crit.renderer.register({
+          scrollToAnchor: function (anchor) {
+            if (anchor.type !== 'line') return Promise.resolve();
+            const section = document.getElementById('file-section-' + anchor.filePath);
+            if (!section) return Promise.resolve();
+            if (!section.open) section.open = true;
+            const el = section.querySelector('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"][data-end-line="' + anchor.endLine + '"]');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return Promise.resolve();
+          },
+
+          highlightAnchor: function (anchor) {
+            if (anchor.type !== 'line') return Promise.resolve();
+            const section = document.getElementById('file-section-' + anchor.filePath);
+            if (!section) return Promise.resolve();
+            const blocks = section.querySelectorAll('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"]');
+            blocks.forEach(function (el) {
+              const start = parseInt(el.dataset.startLine);
+              const end = parseInt(el.dataset.endLine);
+              if (start >= anchor.startLine && end <= anchor.endLine) {
+                el.classList.remove('comment-card-highlight');
+                void el.offsetWidth;
+                el.classList.add('comment-card-highlight');
+                el.addEventListener('animationend', function () {
+                  el.classList.remove('comment-card-highlight');
+                }, { once: true });
+              }
+            });
+            return Promise.resolve();
+          },
+
+          clearHighlight: function () {
+            document.querySelectorAll('.line-block.comment-card-highlight').forEach(function (el) {
+              el.classList.remove('comment-card-highlight');
+            });
+          },
+
+          onAnnotationIntent: function (callback) {
+            annotationIntentCb = callback;
+            return function () { annotationIntentCb = null; };
+          },
+
+          getMode: function () {
+            return (session && session.mode) || 'files';
+          },
+
+          getAnchorType: function () {
+            return 'line';
+          },
+        });
+      }
+    })
     .catch(function(err) {
       console.error('Init failed:', err.message);
     });

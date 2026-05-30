@@ -130,6 +130,16 @@
   --crit-yellow-bg:     rgba(224, 175, 104, 0.14);
   --crit-yellow-border: rgba(224, 175, 104, 0.2);
 
+  /* ---- Drifted comment ---- */
+  --crit-drift-badge-fg:     #f0a030;
+  --crit-drift-badge-bg:     rgba(240, 160, 48, 0.14);
+  --crit-drift-badge-border: rgba(240, 160, 48, 0.30);
+
+  --crit-drift-card-border:  rgba(240, 160, 48, 0.25);
+
+  /* ---- Green subtle ---- */
+  --crit-green-subtle: rgba(86, 211, 100, 0.10);
+
   /* ---- Finish/disconnected state ---- */
   --crit-finish-pill-bg:     rgba(86, 211, 100, 0.10);
   --crit-finish-pill-border: rgba(86, 211, 100, 0.20);
@@ -176,6 +186,51 @@
   --author-5-bg: rgba(85,200,200,0.15);
   --author-5-border: rgba(85,200,200,0.35);
   --author-5-fg: #60d0d0;
+
+  /* ---- Live-mode chrome (R2: only iframe pane tokens; markers in Phase D) ---- */
+  --crit-live-iframe-frame: #2f3342;
+  --crit-live-iframe-bg:    #0e0f13;
+
+  /* ---- Phase C: composer, ancestor menu, mode toggle, toast ---- */
+  --crit-live-composer-bg:           #1a1c23;
+  --crit-live-composer-border:       #2f3342;
+  --crit-live-composer-input-bg:     #0e0f13;
+  --crit-live-composer-error-fg:     #f85149;
+  --crit-live-ancestor-menu-bg:      #1a1c23;
+  --crit-live-ancestor-menu-fg:      #e6e8ed;
+  --crit-live-ancestor-menu-hover-bg:#2f3342;
+  --crit-live-toast-bg:              #1a1c23;
+  --crit-live-toast-fg:              #e6e8ed;
+  --crit-live-toast-border:          #2f3342;
+
+  /* ---- Phase D: markers + drifted tray + re-anchor ---- */
+  --crit-live-marker-bg:             #3b82f6;
+  --crit-live-marker-fg:             #ffffff;
+  --crit-live-marker-border:         rgba(255,255,255,0.18);
+  --crit-live-marker-shadow:         0 1px 3px rgba(0,0,0,0.5);
+  --crit-live-marker-focus-ring:     #fbbf24;
+  --crit-live-reanchor-active-outline: #f59e0b;
+
+  /* ---- Phase E: drift-this-round, focus, tooltip, marker flash, menu hl ---- */
+  --crit-live-focus-ring:             #fbbf24;
+  --crit-live-tooltip-bg:             #1c1f29;
+  --crit-live-tooltip-fg:             #e6e8ef;
+  --crit-live-tooltip-border:         #2f3342;
+  --crit-live-marker-flash-bg:        rgba(245, 158, 11, 0.7);
+  --crit-live-menu-highlight-bg:      rgba(59, 130, 246, 0.18);
+  --crit-live-menu-highlight-fg:      #e6e8ef;
+
+  /* ---- Org share modal ---- */
+  --crit-option-hover:       rgba(133, 170, 248, 0.06);
+  --crit-option-selected-bg: rgba(133, 170, 248, 0.08);
+  --crit-focus-ring:         rgba(133, 170, 248, 0.5);
+  --crit-green-hover:        #6ade7a;
+  --crit-vis-org-bg:         rgba(133, 170, 248, 0.10);
+  --crit-vis-org-fg:         #85aaf8;
+  --crit-vis-unlisted-bg:    rgba(255, 158, 100, 0.10);
+  --crit-vis-unlisted-fg:    #ff9e64;
+  --crit-vis-public-bg:      rgba(86, 211, 100, 0.10);
+  --crit-vis-public-fg:      #56d364;
 }
 
 /* ===== System preference: light ===== */
@@ -272,6 +327,16 @@
     --crit-yellow-bg:     rgba(122, 88, 0, 0.1);
     --crit-yellow-border: rgba(122, 88, 0, 0.16);
 
+    /* ---- Drifted comment ---- */
+    --crit-drift-badge-fg:     #8a5200;
+    --crit-drift-badge-bg:     rgba(138, 82, 0, 0.09);
+    --crit-drift-badge-border: rgba(138, 82, 0, 0.22);
+
+    --crit-drift-card-border:  rgba(138, 82, 0, 0.20);
+
+    /* ---- Green subtle ---- */
+    --crit-green-subtle: rgba(22, 111, 48, 0.08);
+
     /* ---- Finish/disconnected state ---- */
     --crit-finish-pill-bg:     rgba(22, 127, 48, 0.08);
     --crit-finish-pill-border: rgba(22, 127, 48, 0.18);
@@ -317,6 +382,51 @@
     --author-5-bg: rgba(14,110,110,0.10);
     --author-5-border: rgba(14,110,110,0.25);
     --author-5-fg: #0e6e6e;
+
+    /* ---- Live-mode chrome (R2: only iframe pane tokens; markers in Phase D) ---- */
+    --crit-live-iframe-frame: #d0d7de;
+    --crit-live-iframe-bg:    #f6f8fa;
+
+    /* ---- Phase C: composer, ancestor menu, mode toggle, toast ---- */
+    --crit-live-composer-bg:           #ffffff;
+    --crit-live-composer-border:       #d0d7de;
+    --crit-live-composer-input-bg:     #f6f8fa;
+    --crit-live-composer-error-fg:     #cf222e;
+    --crit-live-ancestor-menu-bg:      #ffffff;
+    --crit-live-ancestor-menu-fg:      #1f2328;
+    --crit-live-ancestor-menu-hover-bg:#eef2f7;
+    --crit-live-toast-bg:              #ffffff;
+    --crit-live-toast-fg:              #1f2328;
+    --crit-live-toast-border:          #d0d7de;
+
+    /* ---- Phase D: markers + drifted tray + re-anchor ---- */
+    --crit-live-marker-bg:             #2563eb;
+    --crit-live-marker-fg:             #ffffff;
+    --crit-live-marker-border:         rgba(0,0,0,0.15);
+    --crit-live-marker-shadow:         0 1px 2px rgba(0,0,0,0.25);
+    --crit-live-marker-focus-ring:     #b45309;
+    --crit-live-reanchor-active-outline: #d97706;
+
+    /* ---- Phase E ---- */
+    --crit-live-focus-ring:             #b45309;
+    --crit-live-tooltip-bg:             #1a1d23;
+    --crit-live-tooltip-fg:             #ffffff;
+    --crit-live-tooltip-border:         rgba(0,0,0,0.15);
+    --crit-live-marker-flash-bg:        rgba(217, 119, 6, 0.6);
+    --crit-live-menu-highlight-bg:      #e0e7ff;
+    --crit-live-menu-highlight-fg:      #1a1d23;
+
+    /* ---- Org share modal ---- */
+    --crit-option-hover:       rgba(61, 106, 224, 0.04);
+    --crit-option-selected-bg: rgba(61, 106, 224, 0.06);
+    --crit-focus-ring:         rgba(61, 106, 224, 0.4);
+    --crit-green-hover:        #178a33;
+    --crit-vis-org-bg:         rgba(61, 106, 224, 0.08);
+    --crit-vis-org-fg:         #3d6ae0;
+    --crit-vis-unlisted-bg:    rgba(214, 122, 44, 0.08);
+    --crit-vis-unlisted-fg:    #d67a2c;
+    --crit-vis-public-bg:      rgba(26, 157, 59, 0.08);
+    --crit-vis-public-fg:      #1a9d3b;
   }
 }
 
@@ -413,6 +523,16 @@
   --crit-yellow-bg:     rgba(224, 175, 104, 0.14);
   --crit-yellow-border: rgba(224, 175, 104, 0.2);
 
+  /* ---- Drifted comment ---- */
+  --crit-drift-badge-fg:     #f0a030;
+  --crit-drift-badge-bg:     rgba(240, 160, 48, 0.14);
+  --crit-drift-badge-border: rgba(240, 160, 48, 0.30);
+
+  --crit-drift-card-border:  rgba(240, 160, 48, 0.25);
+
+  /* ---- Green subtle ---- */
+  --crit-green-subtle: rgba(86, 211, 100, 0.10);
+
   /* ---- Finish/disconnected state ---- */
   --crit-finish-pill-bg:     rgba(86, 211, 100, 0.10);
   --crit-finish-pill-border: rgba(86, 211, 100, 0.20);
@@ -458,6 +578,51 @@
   --author-5-bg: rgba(85,200,200,0.15);
   --author-5-border: rgba(85,200,200,0.35);
   --author-5-fg: #60d0d0;
+
+  /* ---- Live-mode chrome (R2: only iframe pane tokens; markers in Phase D) ---- */
+  --crit-live-iframe-frame: #2f3342;
+  --crit-live-iframe-bg:    #0e0f13;
+
+  /* ---- Phase C: composer, ancestor menu, mode toggle, toast ---- */
+  --crit-live-composer-bg:           #1a1c23;
+  --crit-live-composer-border:       #2f3342;
+  --crit-live-composer-input-bg:     #0e0f13;
+  --crit-live-composer-error-fg:     #f85149;
+  --crit-live-ancestor-menu-bg:      #1a1c23;
+  --crit-live-ancestor-menu-fg:      #e6e8ed;
+  --crit-live-ancestor-menu-hover-bg:#2f3342;
+  --crit-live-toast-bg:              #1a1c23;
+  --crit-live-toast-fg:              #e6e8ed;
+  --crit-live-toast-border:          #2f3342;
+
+  /* ---- Phase D: markers + drifted tray + re-anchor ---- */
+  --crit-live-marker-bg:             #3b82f6;
+  --crit-live-marker-fg:             #ffffff;
+  --crit-live-marker-border:         rgba(255,255,255,0.18);
+  --crit-live-marker-shadow:         0 1px 3px rgba(0,0,0,0.5);
+  --crit-live-marker-focus-ring:     #fbbf24;
+  --crit-live-reanchor-active-outline: #f59e0b;
+
+  /* ---- Phase E ---- */
+  --crit-live-focus-ring:             #fbbf24;
+  --crit-live-tooltip-bg:             #1c1f29;
+  --crit-live-tooltip-fg:             #e6e8ef;
+  --crit-live-tooltip-border:         #2f3342;
+  --crit-live-marker-flash-bg:        rgba(245, 158, 11, 0.7);
+  --crit-live-menu-highlight-bg:      rgba(59, 130, 246, 0.18);
+  --crit-live-menu-highlight-fg:      #e6e8ef;
+
+  /* ---- Org share modal ---- */
+  --crit-option-hover:       rgba(133, 170, 248, 0.06);
+  --crit-option-selected-bg: rgba(133, 170, 248, 0.08);
+  --crit-focus-ring:         rgba(133, 170, 248, 0.5);
+  --crit-green-hover:        #6ade7a;
+  --crit-vis-org-bg:         rgba(133, 170, 248, 0.10);
+  --crit-vis-org-fg:         #85aaf8;
+  --crit-vis-unlisted-bg:    rgba(255, 158, 100, 0.10);
+  --crit-vis-unlisted-fg:    #ff9e64;
+  --crit-vis-public-bg:      rgba(86, 211, 100, 0.10);
+  --crit-vis-public-fg:      #56d364;
 }
 
 /* ===== Light (explicit) ===== */
@@ -553,6 +718,15 @@
   --crit-yellow-bg:     rgba(122, 88, 0, 0.1);
   --crit-yellow-border: rgba(122, 88, 0, 0.16);
 
+  /* ---- Drifted comment ---- */
+  --crit-drift-badge-fg:     #8a5200;
+  --crit-drift-badge-bg:     rgba(138, 82, 0, 0.09);
+  --crit-drift-badge-border: rgba(138, 82, 0, 0.22);
+  --crit-drift-card-border:  rgba(138, 82, 0, 0.20);
+
+  /* ---- Green subtle ---- */
+  --crit-green-subtle: rgba(22, 111, 48, 0.08);
+
   /* ---- Finish/disconnected state ---- */
   --crit-finish-pill-bg:     rgba(22, 127, 48, 0.08);
   --crit-finish-pill-border: rgba(22, 127, 48, 0.18);
@@ -598,6 +772,51 @@
   --author-5-bg: rgba(14,110,110,0.10);
   --author-5-border: rgba(14,110,110,0.25);
   --author-5-fg: #0e6e6e;
+
+  /* ---- Live-mode chrome (R2: only iframe pane tokens; markers in Phase D) ---- */
+  --crit-live-iframe-frame: #d0d7de;
+  --crit-live-iframe-bg:    #f6f8fa;
+
+  /* ---- Phase C: composer, ancestor menu, mode toggle, toast ---- */
+  --crit-live-composer-bg:           #ffffff;
+  --crit-live-composer-border:       #d0d7de;
+  --crit-live-composer-input-bg:     #f6f8fa;
+  --crit-live-composer-error-fg:     #cf222e;
+  --crit-live-ancestor-menu-bg:      #ffffff;
+  --crit-live-ancestor-menu-fg:      #1f2328;
+  --crit-live-ancestor-menu-hover-bg:#eef2f7;
+  --crit-live-toast-bg:              #ffffff;
+  --crit-live-toast-fg:              #1f2328;
+  --crit-live-toast-border:          #d0d7de;
+
+  /* ---- Phase D: markers + drifted tray + re-anchor ---- */
+  --crit-live-marker-bg:             #2563eb;
+  --crit-live-marker-fg:             #ffffff;
+  --crit-live-marker-border:         rgba(0,0,0,0.15);
+  --crit-live-marker-shadow:         0 1px 2px rgba(0,0,0,0.25);
+  --crit-live-marker-focus-ring:     #b45309;
+  --crit-live-reanchor-active-outline: #d97706;
+
+  /* ---- Phase E ---- */
+  --crit-live-focus-ring:             #b45309;
+  --crit-live-tooltip-bg:             #1a1d23;
+  --crit-live-tooltip-fg:             #ffffff;
+  --crit-live-tooltip-border:         rgba(0,0,0,0.15);
+  --crit-live-marker-flash-bg:        rgba(217, 119, 6, 0.6);
+  --crit-live-menu-highlight-bg:      #e0e7ff;
+  --crit-live-menu-highlight-fg:      #1a1d23;
+
+  /* ---- Org share modal ---- */
+  --crit-option-hover:       rgba(61, 106, 224, 0.04);
+  --crit-option-selected-bg: rgba(61, 106, 224, 0.06);
+  --crit-focus-ring:         rgba(61, 106, 224, 0.4);
+  --crit-green-hover:        #178a33;
+  --crit-vis-org-bg:         rgba(61, 106, 224, 0.08);
+  --crit-vis-org-fg:         #3d6ae0;
+  --crit-vis-unlisted-bg:    rgba(214, 122, 44, 0.08);
+  --crit-vis-unlisted-fg:    #d67a2c;
+  --crit-vis-public-bg:      rgba(26, 157, 59, 0.08);
+  --crit-vis-public-fg:      #1a9d3b;
 }
 
 /* ===== highlight.js Dark Theme (Tokyo Night Dark) =====

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -73,6 +74,44 @@ func TestSessionKey_Length(t *testing.T) {
 	k := sessionKey("/tmp/repo", "main", nil)
 	if len(k) != 12 {
 		t.Errorf("expected key length 12, got %d: %s", len(k), k)
+	}
+}
+
+func TestSessionEntry_DisplayHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want string
+	}{
+		{"", "localhost"},
+		{"127.0.0.1", "localhost"},
+		{"0.0.0.0", "0.0.0.0"},
+		{"::", "::"},
+		{"192.168.1.10", "192.168.1.10"},
+	}
+	for _, tt := range tests {
+		e := sessionEntry{Host: tt.host, Port: 3000}
+		if got := e.displayHost(); got != tt.want {
+			t.Errorf("displayHost(%q) = %q, want %q", tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestSessionEntry_BaseURL(t *testing.T) {
+	tests := []struct {
+		host string
+		port int
+		want string
+	}{
+		{"", 3000, "http://localhost:3000"},
+		{"127.0.0.1", 4567, "http://localhost:4567"},
+		{"0.0.0.0", 8080, "http://0.0.0.0:8080"},
+		{"192.168.1.10", 3000, "http://192.168.1.10:3000"},
+	}
+	for _, tt := range tests {
+		e := sessionEntry{Host: tt.host, Port: tt.port}
+		if got := e.baseURL(); got != tt.want {
+			t.Errorf("baseURL(host=%q, port=%d) = %q, want %q", tt.host, tt.port, got, tt.want)
+		}
 	}
 }
 
@@ -815,23 +854,23 @@ func TestReadDaemonLog(t *testing.T) {
 }
 
 func TestOpenReadyPipe_NoEnvVar(t *testing.T) {
-	t.Setenv("_CRIT_READY_FD", "")
-	os.Unsetenv("_CRIT_READY_FD")
+	t.Setenv("_CRIT_READY_STDOUT", "")
+	os.Unsetenv("_CRIT_READY_STDOUT")
 
 	pipe := openReadyPipe()
 	if pipe != nil {
 		pipe.Close()
-		t.Error("expected nil when _CRIT_READY_FD is not set")
+		t.Error("expected nil when _CRIT_READY_STDOUT is not set")
 	}
 }
 
 func TestOpenReadyPipe_WrongValue(t *testing.T) {
-	t.Setenv("_CRIT_READY_FD", "99")
+	t.Setenv("_CRIT_READY_STDOUT", "99")
 
 	pipe := openReadyPipe()
 	if pipe != nil {
 		pipe.Close()
-		t.Error("expected nil when _CRIT_READY_FD is not 3")
+		t.Error("expected nil when _CRIT_READY_STDOUT is not 3")
 	}
 }
 
@@ -934,5 +973,102 @@ func TestCleanOrphanedSessions(t *testing.T) {
 	// Live PID session should still exist.
 	if _, err := os.Stat(filepath.Join(sessDir, "livepid12345.json")); err != nil {
 		t.Error("expected live PID session file to still exist")
+	}
+}
+
+func TestLiveSessionKey_MatchesSpec(t *testing.T) {
+	cwd := "/Users/alice/myapp"
+	origin := "http://localhost:3000"
+	got := liveSessionKey(cwd, origin)
+	if len(got) != 12 {
+		t.Errorf("key length = %d, want 12", len(got))
+	}
+	h := sha256.New()
+	h.Write([]byte(cwd))
+	h.Write([]byte("\x00live\x00"))
+	h.Write([]byte(origin))
+	want := fmt.Sprintf("%x", h.Sum(nil))[:12]
+	if got != want {
+		t.Errorf("key = %q, want %q", got, want)
+	}
+}
+
+func TestLiveSessionKey_NoCollisionWithCodeKey(t *testing.T) {
+	cwd := "/Users/alice/myapp"
+	dk := liveSessionKey(cwd, "http://localhost:3000")
+	ck := sessionKey(cwd, "main", nil)
+	if dk == ck {
+		t.Errorf("live key collides with code key: %s", dk)
+	}
+}
+
+func TestLiveSessionKey_DifferentOriginsProduceDifferentKeys(t *testing.T) {
+	cwd := "/Users/alice/myapp"
+	k1 := liveSessionKey(cwd, "http://localhost:3000")
+	k2 := liveSessionKey(cwd, "http://localhost:4000")
+	if k1 == k2 {
+		t.Errorf("different origins produced same key: %s", k1)
+	}
+}
+
+func TestLiveSessionKey_Deterministic(t *testing.T) {
+	k1 := liveSessionKey("/app", "http://localhost:3000")
+	k2 := liveSessionKey("/app", "http://localhost:3000")
+	if k1 != k2 {
+		t.Errorf("non-deterministic: %s vs %s", k1, k2)
+	}
+}
+
+func TestAppendCommonDaemonFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		f    commonDaemonFlags
+		want []string
+	}{
+		{
+			name: "empty flags produce no args",
+			f:    commonDaemonFlags{},
+			want: []string{"--preview-file", "/tmp/x.html"},
+		},
+		{
+			name: "all flags set",
+			f: commonDaemonFlags{
+				port:     3456,
+				host:     "0.0.0.0",
+				noOpen:   true,
+				quiet:    true,
+				shareURL: "https://crit.md",
+			},
+			want: []string{"--preview-file", "/tmp/x.html",
+				"--port", "3456",
+				"--host", "0.0.0.0",
+				"--no-open",
+				"--quiet",
+				"--share-url", "https://crit.md"},
+		},
+		{
+			name: "default host 127.0.0.1 is not forwarded",
+			f:    commonDaemonFlags{host: "127.0.0.1"},
+			want: []string{"--preview-file", "/tmp/x.html"},
+		},
+		{
+			name: "port only",
+			f:    commonDaemonFlags{port: 8080},
+			want: []string{"--preview-file", "/tmp/x.html", "--port", "8080"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := []string{"--preview-file", "/tmp/x.html"}
+			got := appendCommonDaemonFlags(base, tt.f)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("arg[%d]: got %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

@@ -118,6 +118,11 @@
 <div id="copyStatus" role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap"></div>
 <div class="bottom-toast-container" id="bottomToastContainer"></div>
 
+<div class="mobile-file-picker-bar mobile-file-picker-hidden" id="mobileFilePickerBar" aria-label="File navigation">
+  <label class="mobile-file-picker-label" for="mobileFilePicker">File:</label>
+  <select class="mobile-file-picker-select" id="mobileFilePicker" aria-label="Select file to review"></select>
+</div>
+
 <div class="main-layout">
   <div class="file-tree-panel" id="fileTreePanel">
     <div class="tree-section--conversation" id="treeConversationSection"></div>
@@ -175,17 +180,44 @@
 
 <div class="waiting-overlay" id="waitingOverlay" role="dialog" aria-modal="true" aria-labelledby="waitingHeading">
   <div class="waiting-dialog" id="waitingDialog">
-    <div class="waiting-spinner" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-    <svg class="success-mark" viewBox="0 0 64 64" aria-hidden="true">
-      <circle class="success-mark-ring" cx="32" cy="32" r="28"/>
-      <path class="success-mark-check" d="M19 33 L28 42 L45 23"/>
-    </svg>
-    <h3 id="waitingHeading">Review Complete</h3>
-    <p id="waitingMessage"></p>
-    <p class="waiting-edits" id="waitingEdits"></p>
-    <div class="waiting-prompt" id="waitingPrompt"></div>
-    <button class="btn btn-sm" style="margin-top: 8px;" id="waitingClipboard" aria-label="Copy prompt to clipboard"></button>
-    <button class="btn btn-sm" id="backToEditing" style="margin-top: 16px;">Back to editing</button>
+    <!-- Header -->
+    <div class="waiting-header">
+      <div class="waiting-spinner" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+      <svg class="success-mark" viewBox="0 0 64 64" aria-hidden="true">
+        <circle class="success-mark-ring" cx="32" cy="32" r="28"/>
+        <path class="success-mark-check" d="M19 33 L28 42 L45 23"/>
+      </svg>
+      <h3 id="waitingHeading">Review Complete</h3>
+      <p id="waitingMessage"></p>
+      <p class="waiting-edits" id="waitingEdits"></p>
+    </div>
+
+    <!-- Prompt copy row -->
+    <div class="prompt-copy-row" id="promptCopyRow">
+      <span class="prompt-preview" id="promptPreview"></span>
+      <button class="prompt-copy-btn" id="waitingClipboard" aria-label="Copy prompt to clipboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        <span class="copy-label">Copy</span>
+      </button>
+    </div>
+    <div class="prompt-full-text" id="waitingPrompt"></div>
+
+    <!-- Divider -->
+    <div class="waiting-divider" id="waitingDivider"></div>
+
+    <!-- Tip -->
+    <div class="tip-section" id="tipSection">
+      <svg class="tip-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+      <div class="tip-content">
+        <div class="tip-label">Tip</div>
+        <div class="tip-text" id="tipText"></div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="waiting-footer">
+      <button class="btn btn-sm" id="backToEditing">Back to editing</button>
+    </div>
   </div>
 </div>
 
@@ -219,10 +251,173 @@
   </div>
 </div>
 
-<script src="markdown-it.min.js"></script>
-<script src="highlight.min.js"></script>
-<script src="mermaid.min.js"></script>
-<script src="diff-match-patch.min.js"></script>
-<script src="app.js"></script>
+<script>
+  (function () {
+    // Path-based fork. The server serves this same index.html raw at /live,
+    // so pathname is the most reliable trigger — survives reload, doesn't
+    // depend on a query string being present.
+    var isLive = window.location.pathname === '/live';
+    var isPreview = window.location.pathname === '/preview';
+
+    if (isLive || isPreview) {
+      // Keep <body> intact and just mark <html> with a mode class. style-live.css
+      // hides code-review-only chrome (file tree, main-content, comments-panel,
+      // pr-panel, etc.) while keeping the header + settings overlay alive, so the
+      // shared bootstrap (theme pill, settings dialog, shared helpers) keeps working.
+      document.documentElement.classList.add('crit-mode-live');
+
+      // Pull in shared helpers + live-mode CSS, then the controller.
+      var sh = document.createElement('script'); sh.src = 'crit-shared.js';
+      document.head.appendChild(sh);
+
+      var cr = document.createElement('script'); cr.src = 'crit-renderer.js';
+      document.head.appendChild(cr);
+
+      var dr = document.createElement('script'); dr.src = 'crit-draft.js';
+      document.head.appendChild(dr);
+
+      var ctpl = document.createElement('script'); ctpl.src = 'crit-comment-templates.js';
+      document.head.appendChild(ctpl);
+
+      var sse = document.createElement('script'); sse.src = 'crit-sse.js';
+      document.head.appendChild(sse);
+
+      var cf = document.createElement('script'); cf.src = 'crit-comment-form.js';
+      document.head.appendChild(cf);
+
+      var ru = document.createElement('script'); ru.src = 'live-route-utils.js';
+      document.head.appendChild(ru);
+
+      // markdown-it powers comment-body rendering inside the shared
+      // buildCommentCard. Loaded for /live too so live rows reach parity
+      // with code-review's renderer.
+      var mi = document.createElement('script'); mi.src = 'markdown-it.min.js';
+      document.head.appendChild(mi);
+
+      var l = document.createElement('link');
+      l.rel = 'stylesheet';
+      l.href = 'style-live.css';
+      document.head.appendChild(l);
+
+      // Sub-modules loaded in parallel; live-mode.js (loaded last) requires
+      // their window.crit.* / window.crit.live.* namespaces to be present.
+      var liveDeps = [
+        'crit-comment-card-helpers.js',
+        'crit-comment-card.js',
+        'crit-settings-panes.js',
+        'crit-settings-overlay.js',
+        'agent-protocol.js',
+        'live-mode.dispatch.js',
+        'live-mode.inflight.js',
+        'live-mode.toggle.js',
+        'live-mode.composer.js',
+        'live-mode.menu.js',
+        'live-mode.shortcut.js',
+        'live-mode.queue.js',
+        'live-mode.origin.js',
+        'live-mode.size.js',
+        'live-mode.row.js',
+        'live-mode.panel.js',
+        'live-mode.panel-render.js',
+        'live-mode.sse.js',
+        'live-mode.comments-loader.js',
+        'live-mode.redirect-notice.js',
+        'live-mode-pin-filter.js',
+        'live-mode-resolution-gate.js',
+        'live-mode-pin-state.js',
+        'live-mode-thread-scroll.js',
+        'live-mode-reanchor-click.js',
+        'live-mode-reanchor-put.js',
+        'live-mode-deeplink.js',
+        'live-mode-round-resolve.js',
+        'live-mode-round-tooltip.js',
+        'live-mode.menu-controller.js',
+      ];
+      // async=false on dynamically-inserted scripts preserves DOM order for
+      // execution while still loading in parallel. Without this, a module
+      // like live-mode.dispatch.js may execute before agent-protocol.js
+      // has parsed, leaving window.crit.agentProtocol undefined and crashing
+      // boot with "Cannot read properties of undefined (reading 'A2C')".
+      var depTags = liveDeps.map(function (p) {
+        var t = document.createElement('script');
+        t.src = p;
+        t.async = false;
+        document.head.appendChild(t);
+        return t;
+      });
+
+      // Defer live-mode.js until all deps have parsed. Promise.all over a
+      // settled-on-either-load-or-error promise per tag means adding a new
+      // module to liveDeps automatically participates in the gate — no
+      // hand-counted totalNeeded to keep in sync. Errors don't hang boot;
+      // they surface a banner and log a console error with the failed src
+      // so the user can see which module failed.
+      function trackTag(tag, optional) {
+        return new Promise(function (resolve) {
+          tag.addEventListener('load', function () { resolve({ ok: true, src: tag.src }); });
+          tag.addEventListener('error', function () {
+            // markdown-it is optional — booting without it degrades comment
+            // rendering but doesn't crash the app. Treat as resolved for the
+            // boot gate; render path falls back to plain text.
+            if (!optional) {
+              try { console.error('[crit] live-mode dep failed to load:', tag.src); } catch (_) {}
+            }
+            resolve({ ok: false, src: tag.src, optional: !!optional });
+          });
+        });
+      }
+      var bootGate = [trackTag(sh), trackTag(cr), trackTag(dr), trackTag(ctpl), trackTag(sse), trackTag(cf), trackTag(ru), trackTag(mi, true)]
+        .concat(depTags.map(function (t) { return trackTag(t); }));
+      Promise.all(bootGate).then(function (results) {
+        var failed = results.filter(function (r) { return !r.ok && !r.optional; });
+        if (failed.length) {
+          var box = document.createElement('div');
+          box.style.cssText = 'position:fixed;inset:24px;background:var(--crit-bg-card,#1a1d24);color:var(--crit-red,#f7768e);border:1px dashed var(--crit-red,#f7768e);border-radius:6px;padding:16px;font-family:var(--crit-font-mono,monospace);font-size:13px;z-index:2147483647;white-space:pre-wrap';
+          box.textContent = 'Live mode failed to load:\n' + failed.map(function (r) { return '  • ' + r.src; }).join('\n');
+          document.body.appendChild(box);
+          return;
+        }
+        if (window.crit && window.crit.shared) window.crit.shared.applyThemeFromCookie();
+        var s = document.createElement('script');
+        s.src = 'live-mode.js';
+        document.body.appendChild(s);
+      });
+    } else {
+      // Code-review chrome — load existing vendor + app.js.
+      // async=false on dynamically-inserted scripts preserves DOM order for
+      // execution while still loading in parallel. Without this, app.js may
+      // execute before crit-shared.js parses, producing
+      // "Cannot read properties of undefined (reading 'installSidebarResize')"
+      // (and similar for other window.crit.shared.* helpers).
+      var v1 = document.createElement('script'); v1.src = 'markdown-it.min.js'; v1.async = false; document.body.appendChild(v1);
+      var v2 = document.createElement('script'); v2.src = 'highlight.min.js'; v2.async = false; document.body.appendChild(v2);
+      var v3 = document.createElement('script'); v3.src = 'mermaid.min.js'; v3.async = false; document.body.appendChild(v3);
+      var v4 = document.createElement('script'); v4.src = 'diff-match-patch.min.js'; v4.async = false; document.body.appendChild(v4);
+      // Shared helpers (escapeHTML, fetchJSON, installSidebarResize, theme cookie, etc.)
+      // used by app.js. Must load before app.js.
+      var sh = document.createElement('script'); sh.src = 'crit-shared.js'; sh.async = false; document.body.appendChild(sh);
+      var cr = document.createElement('script'); cr.src = 'crit-renderer.js'; cr.async = false; document.body.appendChild(cr);
+      var dr = document.createElement('script'); dr.src = 'crit-draft.js'; dr.async = false; document.body.appendChild(dr);
+      var ctpl = document.createElement('script'); ctpl.src = 'crit-comment-templates.js'; ctpl.async = false; document.body.appendChild(ctpl);
+      var sse = document.createElement('script'); sse.src = 'crit-sse.js'; sse.async = false; document.body.appendChild(sse);
+      var cf = document.createElement('script'); cf.src = 'crit-comment-form.js'; cf.async = false; document.body.appendChild(cf);
+      // Pure rendering helpers shared with live-mode rows. Must load before app.js.
+      var ch = document.createElement('script'); ch.src = 'crit-comment-card-helpers.js'; ch.async = false; document.body.appendChild(ch);
+      // Shared comment-card renderer (used by app.js and live-mode). Must load before app.js.
+      var cc = document.createElement('script'); cc.src = 'crit-comment-card.js'; cc.async = false; document.body.appendChild(cc);
+      // Shared settings-overlay panes (Shortcuts + About). Must load before app.js.
+      var sp = document.createElement('script'); sp.src = 'crit-settings-panes.js'; sp.async = false; document.body.appendChild(sp);
+      // Shared settings-overlay shell (open/close/Esc/focus-trap/tab nav). Must load before app.js.
+      var so = document.createElement('script'); so.src = 'crit-settings-overlay.js'; so.async = false; document.body.appendChild(so);
+      // Line-block building (buildLineBlocks, splitHighlightedCode). Must load before app.js.
+      var lb = document.createElement('script'); lb.src = 'crit-line-blocks.js'; lb.async = false; document.body.appendChild(lb);
+      // Word-level diff computation (pure functions). Must load before app.js.
+      var df = document.createElement('script'); df.src = 'crit-diff-renderer.js'; df.async = false; document.body.appendChild(df);
+      // SVG icon constants used by app.js. Must load before app.js.
+      var ic = document.createElement('script'); ic.src = 'crit-icons.js'; ic.async = false; document.body.appendChild(ic);
+      var a = document.createElement('script'); a.src = 'app.js'; a.async = false; document.body.appendChild(a);
+    }
+  })();
+</script>
 </body>
 </html>

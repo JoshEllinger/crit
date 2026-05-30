@@ -1,25 +1,28 @@
 ---
 name: crit
-description: "Review code changes or a plan with crit inline comments"
-argument-hint: "[file]"
+description: "Review code changes, a plan, a live page (running dev server), or a local HTML file with crit inline comments. Use when asked to review code, a plan, a diff, a running web app, or when you want structured human feedback on your work."
+argument-hint: "[file|url]"
 agent: all
 ---
 
 # Review with Crit
 
-Review and revise code changes or a plan using `crit` for inline comment review.
+Review and revise code changes, plans, live pages (running dev servers, staging URLs), or local HTML files using `crit` for inline comment review.
 
-## Step 1: Determine review mode
+## Step 1: Pass arguments to `crit`
 
-Pick whichever applies — don't ask for confirmation:
+The CLI auto-detects the review mode from its arguments. **Do not ask the user which mode to use.** Pass arguments through:
 
-1. **User argument** — `$ARGUMENTS` provided (e.g., `/crit my-plan.md`) → review that file
-2. **Recent plan** — no argument, but a plan was written earlier in this conversation → `crit <plan-file>`
-3. **Branch review** — otherwise → bare `crit`. Auto-detects uncommitted changes or branch-vs-default-branch diff. Works on clean branches.
+```
+crit <arguments>               # file, dir, URL, .html — CLI auto-detects mode
+crit --pr <num|url>            # GitHub PR (range mode)
+crit --range <base>..<head>    # commit range (range mode)
+crit                           # no args → branch diff
+```
+If no arguments, check conversation context:
 
-<important if="the user asked to review a specific GitHub PR or a commit range">
-Use `crit --pr <num|url>` or `crit --range <baseSHA>..<headSHA>`. This boots crit in *range mode*, scoping the review to a fixed range of commits rather than the working tree.
-</important>
+1. A plan file was written earlier in this conversation → `crit <plan-file>`
+2. Otherwise → bare `crit` (branch diff)
 
 ## Step 2: Launch crit and block until review completes
 
@@ -47,7 +50,7 @@ The file contains structured JSON. Three comment types:
 - File comments (per-file `comments` array, no `start_line`/`end_line`) — about the file as a whole
 - Line comments (per-file `comments` array, with `start_line`/`end_line`) — about specific lines
 
-Identify all comments where `resolved` is `false` or missing.
+Identify all comments where `resolved` is `false` or missing. Unresolved comments may have `replies` — read them before acting.
 
 <important if="a comment has a quote, anchor, or drifted field">
 - `quote`: the specific text the reviewer selected — focus your changes on the quoted text rather than the entire line range
@@ -103,7 +106,7 @@ crit share <file>
 To remove a shared review:
 
 ```bash
-crit unpublish
+crit unpublish [file...]
 ```
 </important>
 

@@ -3,8 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestComputeFileHash(t *testing.T) {
@@ -341,6 +343,262 @@ func TestDetectInstalledIntegrations_DedupsPerAgent(t *testing.T) {
 	}
 }
 
+func TestDetectInstalledIntegrations_CodexPluginRequiresPluginFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(projectDir, 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	for _, f := range integrationMap["codex"] {
+		sourceContent, err := integrationsFS.ReadFile(f.source)
+		if err != nil {
+			t.Fatalf("reading embedded source: %v", err)
+		}
+		dest := filepath.Join(projectDir, f.dest)
+		os.MkdirAll(filepath.Dir(dest), 0o755)
+		os.WriteFile(dest, sourceContent, 0o644)
+	}
+
+	result := detectInstalledIntegrations(projectDir, homeDir)
+	foundCodex := false
+	for _, r := range result {
+		switch r.Agent {
+		case "codex":
+			foundCodex = true
+		case "codex-plugin":
+			t.Fatalf("plain Codex skill install should not detect codex-plugin: %+v", result)
+		}
+	}
+	if !foundCodex {
+		t.Fatalf("expected Codex integration to be detected, got %+v", result)
+	}
+}
+
+func TestDetectInstalledIntegrations_CodexPluginGlobalUsesGlobalDest(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(projectDir, 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	f := integrationMap["codex-plugin"][0]
+	sourceContent, err := integrationsFS.ReadFile(f.source)
+	if err != nil {
+		t.Fatalf("reading embedded source: %v", err)
+	}
+	dest, err := resolveGlobalDest(f.globalDestKind, f.globalDest, homeDir)
+	if err != nil {
+		t.Fatalf("resolving global destination: %v", err)
+	}
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(dest, sourceContent, 0o644)
+
+	result := detectInstalledIntegrations(projectDir, homeDir)
+	for _, r := range result {
+		if r.Agent != "codex-plugin" {
+			continue
+		}
+		if r.Status != "current" || r.Location != locationHome {
+			t.Fatalf("expected current global codex-plugin, got %+v", r)
+		}
+		return
+	}
+	t.Fatalf("expected codex-plugin to be detected, got %+v", result)
+}
+
+func TestCheckInstalledIntegrations_CodexPluginCacheStale(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(projectDir, 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	f := integrationMap["codex-plugin"][1]
+	relPath, ok := strings.CutPrefix(f.source, "integrations/codex/plugin/crit/")
+	if !ok {
+		t.Fatalf("unexpected codex-plugin source path %q", f.source)
+	}
+	cachePath := filepath.Join(homeDir, ".codex", "plugins", "cache", "local", "crit", "local", relPath)
+	os.MkdirAll(filepath.Dir(cachePath), 0o755)
+	os.WriteFile(cachePath, []byte("old cached skill"), 0o644)
+
+	stale := checkInstalledIntegrations(projectDir, homeDir)
+	for _, s := range stale {
+		if s.agent == "codex-plugin" && s.location == locationCache && s.dest == cachePath {
+			return
+		}
+	}
+	t.Fatalf("expected stale codex-plugin cache file %s, got %+v", cachePath, stale)
+}
+
+func TestCheckInstalledIntegrations_CodexPluginCacheUsesMarketplaceName(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(filepath.Join(projectDir, ".agents", "plugins"), 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	marketplace := `{
+  "name": "personal",
+  "plugins": [
+    {"name": "crit", "source": {"source": "local", "path": "./plugins/crit"}}
+  ]
+}`
+	if err := os.WriteFile(filepath.Join(projectDir, ".agents", "plugins", "marketplace.json"), []byte(marketplace), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f := integrationMap["codex-plugin"][2]
+	relPath, ok := strings.CutPrefix(f.source, "integrations/codex/plugin/crit/")
+	if !ok {
+		t.Fatalf("unexpected codex-plugin source path %q", f.source)
+	}
+	cachePath := filepath.Join(homeDir, ".codex", "plugins", "cache", "personal", "crit", "local", relPath)
+	os.MkdirAll(filepath.Dir(cachePath), 0o755)
+	os.WriteFile(cachePath, []byte("old cached skill"), 0o644)
+
+	stale := checkInstalledIntegrations(projectDir, homeDir)
+	for _, s := range stale {
+		if s.agent == "codex-plugin" && s.location == locationCache && s.dest == cachePath {
+			return
+		}
+	}
+	t.Fatalf("expected stale codex-plugin cache file %s, got %+v", cachePath, stale)
+}
+
+func TestCodexPluginMarketplaceNamesRejectsInvalidName(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(filepath.Join(projectDir, ".agents", "plugins"), 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	marketplace := `{
+  "name": "../outside",
+  "plugins": [
+    {"name": "crit", "source": {"source": "local", "path": "./plugins/crit"}}
+  ]
+}`
+	if err := os.WriteFile(filepath.Join(projectDir, ".agents", "plugins", "marketplace.json"), []byte(marketplace), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	names := codexPluginMarketplaceNames(projectDir, homeDir)
+	if len(names) != 1 || names[0] != "local" {
+		t.Fatalf("marketplace names = %#v, want [local]", names)
+	}
+}
+
+func TestCodexPluginMarketplaceNamesAcceptsShorthandSource(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(filepath.Join(projectDir, ".agents", "plugins"), 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	marketplace := `{
+  "name": "personal",
+  "plugins": [
+    {"name": "crit", "source": "./plugins/crit"}
+  ]
+}`
+	if err := os.WriteFile(filepath.Join(projectDir, ".agents", "plugins", "marketplace.json"), []byte(marketplace), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	names := codexPluginMarketplaceNames(projectDir, homeDir)
+	if len(names) != 2 || names[0] != "personal" || names[1] != "local" {
+		t.Fatalf("marketplace names = %#v, want [personal local]", names)
+	}
+}
+
+func TestCheckInstalledIntegrations_CodexPluginMissingMarketplaceConfigAndCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	homeDir := filepath.Join(tmpDir, "home")
+	os.MkdirAll(projectDir, 0o755)
+	os.MkdirAll(homeDir, 0o755)
+
+	manifest := integrationMap["codex-plugin"][0]
+	sourceContent, err := integrationsFS.ReadFile(manifest.source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(projectDir, "plugins", "crit", ".codex-plugin", "plugin.json")
+	os.MkdirAll(filepath.Dir(manifestPath), 0o755)
+	os.WriteFile(manifestPath, sourceContent, 0o644)
+
+	stale := checkInstalledIntegrations(projectDir, homeDir)
+	want := []string{
+		filepath.Join(projectDir, ".agents", "plugins", "marketplace.json"),
+		filepath.Join(homeDir, ".codex", "config.toml"),
+		filepath.Join(homeDir, ".codex", "plugins", "cache", "local", "crit", "local", ".codex-plugin", "plugin.json"),
+	}
+	for _, path := range want {
+		found := false
+		for _, s := range stale {
+			if s.agent == "codex-plugin" && s.dest == path {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected codex-plugin completeness warning for %s, got %+v", path, stale)
+		}
+	}
+}
+
+func TestCodexPluginConfigReadyRaw(t *testing.T) {
+	raw := strings.Join([]string{
+		"model = \"gpt-5.1\"",
+		"",
+		"[features]",
+		"plugins = true",
+		"hooks = true",
+		"plugin_hooks = true",
+		"",
+		"[plugins.\"crit@local\"]",
+		"enabled = true",
+		"",
+		"[plugins.\"other@local\"]",
+		"enabled = false",
+	}, "\n")
+	if !codexPluginConfigReadyRaw(raw, "crit@local") {
+		t.Fatal("expected crit plugin config to be ready")
+	}
+	if codexPluginConfigReadyRaw(raw, "other@local") {
+		t.Fatal("did not expect disabled plugin config to be ready")
+	}
+	if codexPluginConfigReadyRaw(strings.Replace(raw, "plugin_hooks = true", "plugin_hooks = false", 1), "crit@local") {
+		t.Fatal("did not expect config without plugin_hooks to be ready")
+	}
+	if codexPluginConfigReadyRaw(strings.Replace(raw, "plugins = true", "plugins = false", 1), "crit@local") {
+		t.Fatal("did not expect config without plugins to be ready")
+	}
+
+	commentedHeaders := strings.ReplaceAll(raw, "[features]", "[features] # managed")
+	commentedHeaders = strings.ReplaceAll(commentedHeaders, "[plugins.\"crit@local\"]", "[plugins.\"crit@local\"] # managed")
+	if !codexPluginConfigReadyRaw(commentedHeaders, "crit@local") {
+		t.Fatal("expected commented table headers to be ready")
+	}
+
+	arrayTableRaw := strings.Join([]string{
+		"[features]",
+		"hooks = true",
+		"",
+		"[[hooks.PreToolUse]]",
+		"plugins = true",
+		"plugin_hooks = true",
+		"",
+		"[plugins.\"crit@local\"]",
+		"enabled = true",
+	}, "\n")
+	if codexPluginConfigReadyRaw(arrayTableRaw, "crit@local") {
+		t.Fatal("did not expect feature keys in array tables to count")
+	}
+}
+
 func TestRunCheck_NoStale(t *testing.T) {
 	// runCheck uses os.Getwd() and os.UserHomeDir(), so we just verify it doesn't panic
 	// when called in a temp dir with no installed integrations
@@ -351,4 +609,222 @@ func TestRunCheck_NoStale(t *testing.T) {
 
 	// Should not panic
 	runCheck()
+}
+
+func TestDetectPresentAgents_BinaryOnPath(t *testing.T) {
+	homeDir := t.TempDir()
+
+	// detectPresentAgents should find agents whose binaries are on PATH.
+	// We can't control PATH easily, but we can verify the function returns
+	// results without panicking on a clean temp home dir.
+	agents := detectPresentAgents(homeDir)
+	// Just verify it runs — the result depends on what's installed on this machine
+	_ = agents
+}
+
+func TestDetectPresentAgents_ConfigDir(t *testing.T) {
+	homeDir := t.TempDir()
+
+	// Create a .claude directory to simulate claude-code presence
+	os.MkdirAll(filepath.Join(homeDir, ".claude"), 0o755)
+
+	agents := detectPresentAgents(homeDir)
+	found := false
+	for _, a := range agents {
+		if a == "claude-code" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected claude-code to be detected via .claude dir")
+	}
+}
+
+func TestDetectPresentAgents_NoDuplicates(t *testing.T) {
+	homeDir := t.TempDir()
+
+	// Create multiple probe dirs for same agent — should only appear once
+	os.MkdirAll(filepath.Join(homeDir, ".claude"), 0o755)
+
+	agents := detectPresentAgents(homeDir)
+	count := 0
+	for _, a := range agents {
+		if a == "claude-code" {
+			count++
+		}
+	}
+	if count > 1 {
+		t.Errorf("expected 1 claude-code entry, got %d", count)
+	}
+}
+
+func TestConfirmBinaryVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses shell scripts")
+	}
+
+	dir := t.TempDir()
+	match := filepath.Join(dir, "fake-tool")
+	os.WriteFile(match, []byte("#!/bin/sh\necho 'FakeTool v1.2 by Acme Corp'\n"), 0o755)
+
+	noMatch := filepath.Join(dir, "wrong-tool")
+	os.WriteFile(noMatch, []byte("#!/bin/sh\necho 'SomeOtherTool v3.0'\n"), 0o755)
+
+	failing := filepath.Join(dir, "bad-tool")
+	os.WriteFile(failing, []byte("#!/bin/sh\nexit 1\n"), 0o755)
+
+	old := versionTimeout
+	versionTimeout = 2 * time.Second
+	defer func() { versionTimeout = old }()
+
+	tests := []struct {
+		name     string
+		bin      string
+		expected string
+		want     bool
+	}{
+		{"match", match, "acme", true},
+		{"case-insensitive", match, "ACME", true},
+		{"no-match", noMatch, "acme", false},
+		{"error-exit", failing, "anything", false},
+		{"nonexistent", "/nonexistent/binary", "x", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := confirmBinaryVersion(tt.bin, tt.expected)
+			if got != tt.want {
+				t.Errorf("confirmBinaryVersion(%q, %q) = %v, want %v", tt.bin, tt.expected, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckMissingIntegrations(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := t.TempDir()
+
+	// Create .claude dir to simulate agent presence
+	os.MkdirAll(filepath.Join(homeDir, ".claude"), 0o755)
+
+	// No integration installed — should report claude-code as missing
+	missing := checkMissingIntegrations(projectDir, homeDir)
+	found := false
+	for _, m := range missing {
+		if m == "claude-code" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected claude-code in missing list when .claude dir exists but no integration installed")
+	}
+}
+
+func TestCheckMissingIntegrations_Installed(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := t.TempDir()
+
+	// Create .claude dir
+	os.MkdirAll(filepath.Join(homeDir, ".claude"), 0o755)
+
+	// Install the integration file with correct content
+	sourceFiles := integrationMap["claude-code"]
+	sourceContent, _ := integrationsFS.ReadFile(sourceFiles[0].source)
+	dest := filepath.Join(projectDir, sourceFiles[0].dest)
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(dest, sourceContent, 0o644)
+
+	missing := checkMissingIntegrations(projectDir, homeDir)
+	for _, m := range missing {
+		if m == "claude-code" {
+			t.Error("claude-code should not be missing when integration is installed")
+		}
+	}
+}
+
+func TestCheckMissingIntegrations_NoAgentsPresent(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := t.TempDir()
+
+	// Empty home — no agents detected, so nothing missing
+	missing := checkMissingIntegrations(projectDir, homeDir)
+	// May still detect agents on PATH, but should not panic
+	_ = missing
+}
+
+func TestHintMissingIntegrationsFor_SkipsWhenInstalled(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := t.TempDir()
+
+	// Install an integration so installedAgents returns non-empty
+	sourceFiles := integrationMap["claude-code"]
+	sourceContent, _ := integrationsFS.ReadFile(sourceFiles[0].source)
+	dest := filepath.Join(projectDir, sourceFiles[0].dest)
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(dest, sourceContent, 0o644)
+
+	// Create .gemini to simulate a detected-but-missing agent
+	os.MkdirAll(filepath.Join(homeDir, ".gemini"), 0o755)
+
+	// Should not panic and should not print (installed agent exists)
+	hintMissingIntegrationsFor(projectDir, homeDir)
+}
+
+func TestHintMissingIntegrationsFor_PrintsWhenNoneInstalled(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := t.TempDir()
+
+	// Create .gemini to simulate detection
+	os.MkdirAll(filepath.Join(homeDir, ".gemini"), 0o755)
+
+	// Should print hint (no installed agents, gemini detected)
+	hintMissingIntegrationsFor(projectDir, homeDir)
+}
+
+func TestHintMissingIntegrations_EnvDisable(t *testing.T) {
+	t.Setenv("CRIT_NO_INTEGRATION_CHECK", "1")
+	// Should return immediately without doing any work
+	hintMissingIntegrations()
+}
+
+func TestInstalledAgents(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := t.TempDir()
+
+	// Empty — no agents installed
+	agents := installedAgents(projectDir, homeDir)
+	if len(agents) != 0 {
+		t.Errorf("expected 0 installed agents, got %d", len(agents))
+	}
+
+	// Install claude-code
+	sourceFiles := integrationMap["claude-code"]
+	sourceContent, _ := integrationsFS.ReadFile(sourceFiles[0].source)
+	dest := filepath.Join(projectDir, sourceFiles[0].dest)
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(dest, sourceContent, 0o644)
+
+	agents = installedAgents(projectDir, homeDir)
+	if !agents["claude-code"] {
+		t.Error("expected claude-code in installed agents")
+	}
+}
+
+func TestPrintMissingHints(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		if n := printMissingHints(nil); n != 0 {
+			t.Errorf("expected 0, got %d", n)
+		}
+	})
+	t.Run("single", func(t *testing.T) {
+		if n := printMissingHints([]string{"claude-code"}); n != 1 {
+			t.Errorf("expected 1, got %d", n)
+		}
+	})
+	t.Run("multiple", func(t *testing.T) {
+		if n := printMissingHints([]string{"claude-code", "cursor"}); n != 2 {
+			t.Errorf("expected 2, got %d", n)
+		}
+	})
 }

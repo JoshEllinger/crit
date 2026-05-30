@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4537,6 +4538,25 @@ func TestHandleCritJSONDeleted(t *testing.T) {
 	}
 }
 
+// TestHandleCritJSONDeleted_ResetsReviewRound: when the review file is wiped
+// out from under a long-lived daemon (`crit cleanup`, manual `rm`, hosted-side
+// unpublish), the next pin authored against a fresh review must land on round
+// 1 — not on whatever round the daemon's in-memory state still remembered.
+func TestHandleCritJSONDeleted_ResetsReviewRound(t *testing.T) {
+	s := &Session{
+		Files:         []*FileEntry{{Path: "/", Comments: []Comment{{ID: "c1"}}}},
+		ReviewRound:   3,
+		subscribers:   make(map[chan SSEEvent]struct{}),
+		roundComplete: make(chan struct{}, 1),
+	}
+	if !s.handleCritJSONDeleted() {
+		t.Fatal("handleCritJSONDeleted should return true")
+	}
+	if s.ReviewRound != 1 {
+		t.Errorf("ReviewRound = %d after disk wipe, want 1", s.ReviewRound)
+	}
+}
+
 // --- GetShareScope / SetShareScope tests ---
 
 func TestGetShareScope(t *testing.T) {
@@ -5238,4 +5258,168 @@ func mapKeys[V any](m map[string]V) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestDOMAnchor_JSONRoundTrip(t *testing.T) {
+	anchor := &DOMAnchor{
+		Pathname:       "/dashboard",
+		CSSSelector:    "#main > :nth-of-type(2) > h2",
+		TagChain:       []string{"MAIN", "SECTION", "H2"},
+		AccessibleName: "Overview",
+		Role:           "heading",
+		Landmark:       "main",
+		OuterHTML:      "<h2>Overview</h2>",
+		ViewportWidth:  1280,
+		ViewportHeight: 800,
+	}
+	c := Comment{
+		ID:        "c_test01",
+		StartLine: 0,
+		EndLine:   0,
+		Body:      "pin body",
+		DOMAnchor: anchor,
+		CreatedAt: "2026-05-06T00:00:00Z",
+		UpdatedAt: "2026-05-06T00:00:00Z",
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"dom_anchor"`) {
+		t.Fatalf("missing dom_anchor key in JSON: %s", data)
+	}
+	var got Comment
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.DOMAnchor == nil {
+		t.Fatal("DOMAnchor is nil after unmarshal")
+	}
+	if got.DOMAnchor.Pathname != "/dashboard" {
+		t.Errorf("Pathname = %q, want /dashboard", got.DOMAnchor.Pathname)
+	}
+	if got.DOMAnchor.CSSSelector != "#main > :nth-of-type(2) > h2" {
+		t.Errorf("CSSSelector = %q", got.DOMAnchor.CSSSelector)
+	}
+	if len(got.DOMAnchor.TagChain) != 3 || got.DOMAnchor.TagChain[0] != "MAIN" {
+		t.Errorf("TagChain = %v", got.DOMAnchor.TagChain)
+	}
+	if got.DOMAnchor.ViewportWidth != 1280 {
+		t.Errorf("ViewportWidth = %d, want 1280", got.DOMAnchor.ViewportWidth)
+	}
+}
+
+func TestDOMAnchor_NilOmitted(t *testing.T) {
+	c := Comment{
+		ID:        "c_code01",
+		StartLine: 10,
+		EndLine:   10,
+		Body:      "code comment",
+		CreatedAt: "2026-05-06T00:00:00Z",
+		UpdatedAt: "2026-05-06T00:00:00Z",
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "dom_anchor") {
+		t.Fatalf("dom_anchor key must be absent when nil, got: %s", data)
+	}
+}
+
+func TestComment_LegacyFileNoLiveFields(t *testing.T) {
+	raw := `{"id":"c_old","start_line":5,"end_line":5,"body":"old","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z"}`
+	var c Comment
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if c.DOMAnchor != nil {
+		t.Errorf("DOMAnchor should be nil for legacy comment, got %+v", c.DOMAnchor)
+	}
+}
+
+func TestCritJSON_LiveFields_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	critPath := filepath.Join(dir, "test-review")
+	cj := CritJSON{
+		ReviewType:  "live",
+		Origin:      "http://localhost:3000",
+		ReviewRound: 1,
+		Files:       map[string]CritJSONFile{},
+	}
+	if err := saveCritJSON(critPath, cj); err != nil {
+		t.Fatalf("saveCritJSON: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(critPath, "review.json"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), `"review_type"`) {
+		t.Errorf("review_type missing in persisted file: %s", data)
+	}
+	if !strings.Contains(string(data), `"origin"`) {
+		t.Errorf("origin missing in persisted file: %s", data)
+	}
+	var loaded CritJSON
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if loaded.ReviewType != "live" {
+		t.Errorf("ReviewType = %q, want live", loaded.ReviewType)
+	}
+	if loaded.Origin != "http://localhost:3000" {
+		t.Errorf("Origin = %q, want http://localhost:3000", loaded.Origin)
+	}
+}
+
+func TestCritJSON_LegacyNoReviewType(t *testing.T) {
+	raw := `{"branch":"main","review_round":1,"files":{}}`
+	var cj CritJSON
+	if err := json.Unmarshal([]byte(raw), &cj); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if cj.ReviewType != "" {
+		t.Errorf("ReviewType = %q, want empty for legacy file", cj.ReviewType)
+	}
+	if cj.Origin != "" {
+		t.Errorf("Origin = %q, want empty for legacy file", cj.Origin)
+	}
+}
+
+func TestComment_DriftedOnRound_RoundTrip(t *testing.T) {
+	in := Comment{
+		ID:             "p1",
+		Body:           "hi",
+		DOMAnchor:      &DOMAnchor{Pathname: "/", CSSSelector: "h2"},
+		Drifted:        true,
+		DriftedOnRound: 3,
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(b, []byte(`"drifted_on_round":3`)) {
+		t.Fatalf("DriftedOnRound not in JSON: %s", b)
+	}
+	if !bytes.Contains(b, []byte(`"drifted":true`)) {
+		t.Fatalf("Drifted dropped when DriftedOnRound set: %s", b)
+	}
+	var out Comment
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.DriftedOnRound != 3 {
+		t.Fatalf("got %d want 3", out.DriftedOnRound)
+	}
+}
+
+func TestComment_DriftedOnRound_OmitWhenZero(t *testing.T) {
+	in := Comment{ID: "p1", Body: "hi"}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(b, []byte("drifted_on_round")) {
+		t.Fatalf("zero value should be omitted: %s", b)
+	}
 }

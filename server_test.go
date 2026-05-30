@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -42,7 +43,7 @@ func newTestServer(t *testing.T) (*Server, *Session) {
 		},
 	}
 
-	s, err := NewServer(session, frontendFS, "", "", "", "test", 0, "")
+	s, err := NewServer(session, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,6 +638,8 @@ func TestReviewCycle_NextCommand(t *testing.T) {
 		{"unknown leading-dash arg formats verbatim", []string{"--pr", "42"}, "crit --pr 42"},
 		{"non-ASCII arg passes through", []string{"résumé.md"}, "crit résumé.md"},
 		{"single quote in arg is escaped", []string{"it's.md"}, `crit 'it'\''s.md'`},
+		{"live mode", []string{"live", "http://localhost:4000"}, "crit live http://localhost:4000"},
+		{"preview mode", []string{"preview", "/tmp/mock.html"}, "crit preview /tmp/mock.html"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -778,6 +781,188 @@ func TestHandleFiles_MethodNotAllowed(t *testing.T) {
 	s.ServeHTTP(w, req)
 	if w.Code != 405 {
 		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestApiSharePayload_ReturnsBuildableJSON(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/api/share/payload", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status %d body %s", w.Code, w.Body)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := body["files"]; !ok {
+		t.Errorf("missing files key: %v", body)
+	}
+	if _, ok := body["review_round"]; !ok {
+		t.Errorf("missing review_round key: %v", body)
+	}
+	if _, ok := body["comments"]; !ok {
+		t.Errorf("missing comments key: %v", body)
+	}
+}
+
+func TestApiSharePayload_MethodNotAllowed(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("POST", "/api/share/payload", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestApiUpsertPayload_ReturnsExpectedShape(t *testing.T) {
+	s, session := newTestServer(t)
+	session.SetSharedURLAndToken("https://crit.example/r/abc", "delete-token-xyz")
+	req := httptest.NewRequest("GET", "/api/share/upsert-payload", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status %d body %s", w.Code, w.Body)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body["delete_token"] != "delete-token-xyz" {
+		t.Errorf("delete_token = %v, want delete-token-xyz", body["delete_token"])
+	}
+	if _, ok := body["files"]; !ok {
+		t.Errorf("missing files key")
+	}
+}
+
+func TestApiCommentsMerge_RejectsMissingSharedURL(t *testing.T) {
+	s, _ := newTestServer(t)
+	body := bytes.NewReader([]byte(`{"comments":[]}`))
+	req := httptest.NewRequest("POST", "/api/comments/merge", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Errorf("got %d, want 400, body=%s", w.Code, w.Body)
+	}
+}
+
+func TestApiCommentsMerge_DerivesTokenFromSession(t *testing.T) {
+	s, session := newTestServer(t)
+	session.SetSharedURLAndToken("https://crit.example/r/abc123", "delete")
+	// Seed an empty review file so mergeWebComments has something to read.
+	if err := saveCritJSON(session.critJSONPath(), CritJSON{Files: map[string]CritJSONFile{}}); err != nil {
+		t.Fatalf("seed review file: %v", err)
+	}
+	body := bytes.NewReader([]byte(`{"comments":[{"body":"hi","file_path":"test.md","start_line":1,"end_line":1}]}`))
+	req := httptest.NewRequest("POST", "/api/comments/merge", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("got %d, want 200, body=%s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["merged"].(float64) != 1 {
+		t.Errorf("merged = %v, want 1", resp["merged"])
+	}
+}
+
+func TestApiCommentsMerge_BodyTooLarge(t *testing.T) {
+	s, session := newTestServer(t)
+	session.SetSharedURLAndToken("https://crit.example/r/abc", "delete")
+	// Build an 11MB valid-prefix JSON payload so the decoder reads through the
+	// MaxBytesReader limit (zeros would fail JSON parsing before hitting it).
+	big := make([]byte, 0, 11*1024*1024+128)
+	big = append(big, []byte(`{"comments":[{"body":"`)...)
+	pad := make([]byte, 11*1024*1024)
+	for i := range pad {
+		pad[i] = 'a'
+	}
+	big = append(big, pad...)
+	big = append(big, []byte(`"}]}`)...)
+	req := httptest.NewRequest("POST", "/api/comments/merge", bytes.NewReader(big))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 413 {
+		t.Errorf("got %d, want 413, body=%s", w.Code, w.Body)
+	}
+}
+
+func TestApiCommentsMerge_MethodNotAllowed(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/api/comments/merge", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestApiConfig_IncludesProxyAuth(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.proxyAuth = true
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body["proxy_auth"] != true {
+		t.Errorf("got proxy_auth=%v, want true", body["proxy_auth"])
+	}
+}
+
+func TestApiConfig_IncludesHostedToken(t *testing.T) {
+	s, session := newTestServer(t)
+	session.SetSharedURLAndToken("https://crit.example/r/tok42", "delete")
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	var body map[string]any
+	json.Unmarshal(w.Body.Bytes(), &body)
+	if body["hosted_token"] != "tok42" {
+		t.Errorf("hosted_token = %v, want tok42", body["hosted_token"])
+	}
+}
+
+func TestPostShareURL_ReturnsHostedToken(t *testing.T) {
+	s, _ := newTestServer(t)
+	body := `{"url":"https://crit.example/r/zzz","delete_token":"d"}`
+	req := httptest.NewRequest("POST", "/api/share-url", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["hosted_token"] != "zzz" {
+		t.Errorf("hosted_token = %q, want zzz", resp["hosted_token"])
+	}
+}
+
+func TestApiConfig_ProxyAuthFalseByDefault(t *testing.T) {
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	var body map[string]any
+	json.Unmarshal(w.Body.Bytes(), &body)
+	if body["proxy_auth"] != false {
+		t.Errorf("got proxy_auth=%v, want false", body["proxy_auth"])
 	}
 }
 
@@ -1498,7 +1683,7 @@ func TestGetFilesList(t *testing.T) {
 		Files:         []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1562,7 +1747,7 @@ func TestGetFilesList_RespectsIgnorePatterns(t *testing.T) {
 		Files:          []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1596,7 +1781,7 @@ func TestGetFilesList_FilesMode(t *testing.T) {
 		Files:         []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1637,6 +1822,22 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+// Regression: /api/review-cycle is POST-only. The frontend used to GET it
+// for round-counter init, which 405'd; live-mode.js now reads
+// review_round from /api/session instead. Lock the contract so future
+// frontend pulls on the wrong verb fail loudly.
+func TestReviewCycle_GETMethodNotAllowed(t *testing.T) {
+	srv, _ := newTestServer(t)
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		req := httptest.NewRequest(method, "/api/review-cycle", nil)
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /api/review-cycle: got %d, want %d", method, w.Code, http.StatusMethodNotAllowed)
+		}
+	}
+}
+
 func TestReviewCycleFirstRound(t *testing.T) {
 	srv, session := newTestServer(t)
 
@@ -1667,7 +1868,7 @@ func TestGetFilesList_MethodNotAllowed(t *testing.T) {
 		subscribers:   make(map[chan SSEEvent]struct{}),
 		roundComplete: make(chan struct{}, 1),
 	}
-	srv, _ := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, _ := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	req := httptest.NewRequest("POST", "/api/files/list", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
@@ -2175,7 +2376,7 @@ func TestHandleSession_PlanMode(t *testing.T) {
 		},
 		subscribers: make(map[chan SSEEvent]struct{}),
 	}
-	srv, _ := NewServer(session, frontendFS, "", "", "", "dev", 0, "")
+	srv, _ := NewServer(session, frontendFS, "", false, "", "", "dev", 0, "")
 
 	req := httptest.NewRequest("GET", "/api/session", nil)
 	w := httptest.NewRecorder()
@@ -2190,7 +2391,7 @@ func TestHandleSession_PlanMode(t *testing.T) {
 }
 
 func TestReadinessGate_Returns503WhenNotReady(t *testing.T) {
-	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2216,7 +2417,7 @@ func TestReadinessGate_Returns503WhenNotReady(t *testing.T) {
 }
 
 func TestReadinessGate_HealthAlwaysOK(t *testing.T) {
-	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2229,7 +2430,7 @@ func TestReadinessGate_HealthAlwaysOK(t *testing.T) {
 }
 
 func TestReadinessGate_Returns200AfterSetSession(t *testing.T) {
-	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2295,7 +2496,7 @@ func TestRouteCommentByID(t *testing.T) {
 }
 
 func TestReadinessGate_Returns500OnInitError(t *testing.T) {
-	s, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2584,7 +2785,7 @@ func TestHandleCommits_GitMode(t *testing.T) {
 		Files:       []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2652,7 +2853,7 @@ func TestHandleBranches_WithGitVCS(t *testing.T) {
 		Files:       []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2710,7 +2911,7 @@ func TestHandleBaseBranch_InvalidJSON(t *testing.T) {
 func TestHandleQR_Success(t *testing.T) {
 	srv, _ := newTestServer(t)
 	// Note: /api/qr is NOT guarded by withReady, so it works even without a session.
-	noSessionSrv, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	noSessionSrv, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2737,7 +2938,7 @@ func TestHandleQR_Success(t *testing.T) {
 }
 
 func TestHandleQR_MissingURL(t *testing.T) {
-	srv, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	srv, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2750,7 +2951,7 @@ func TestHandleQR_MissingURL(t *testing.T) {
 }
 
 func TestHandleQR_MethodNotAllowed(t *testing.T) {
-	srv, err := NewServer(nil, frontendFS, "", "", "", "test", 0, "")
+	srv, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2823,7 +3024,7 @@ func TestBuildPlanFeedback(t *testing.T) {
 		PlanDir:     "/tmp/plans/my-feature",
 		subscribers: make(map[chan SSEEvent]struct{}),
 	}
-	srv, err := NewServer(session, frontendFS, "", "", "", "test", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3339,7 +3540,7 @@ func TestHandleFinish_PlanMode(t *testing.T) {
 			},
 		},
 	}
-	srv, err := NewServer(session, frontendFS, "", "", "", "test", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3377,7 +3578,7 @@ func TestHandleFinish_WithStatus(t *testing.T) {
 			},
 		},
 	}
-	srv, err := NewServer(session, frontendFS, "", "", "", "test", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3499,7 +3700,7 @@ func TestHandleConfig_WithAuthToken(t *testing.T) {
 		subscribers: make(map[chan SSEEvent]struct{}),
 		Files:       []*FileEntry{},
 	}
-	srv, err := NewServer(session, frontendFS, "https://crit.md", "test-token", "tester", "v2.0.0", 3000, "claude -p")
+	srv, err := NewServer(session, frontendFS, "https://crit.md", false, "test-token", "tester", "v2.0.0", 3000, "claude -p")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3541,7 +3742,7 @@ func TestHandleSession_WithScope(t *testing.T) {
 		Files:       []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3662,7 +3863,7 @@ func TestHandleSession_WithCommit(t *testing.T) {
 		Files:       []*FileEntry{},
 	}
 
-	srv, err := NewServer(session, frontendFS, "", "", "", "", 0, "")
+	srv, err := NewServer(session, frontendFS, "", false, "", "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3769,6 +3970,591 @@ func TestEvents_SafariCompat(t *testing.T) {
 	}
 }
 
+func TestLiveRoutes_NotGatedByWithReady(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"/live", "/crit-agent.js",
+		"/agent-protocol.js", "/agent-anchor-utils.js",
+		"/agent-marker-overlay.js", "/agent-mutation-batcher.js",
+		"/agent-resolution.js", "/agent-reanchor-state.js",
+		"/agent-marker.css",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest("GET", path, nil)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, req)
+			if w.Code == http.StatusServiceUnavailable {
+				t.Errorf("GET %s returned 503 before SetSession — must not be withReady gated", path)
+			}
+		})
+	}
+}
+
+func TestLive_ProtocolAndUtilsServedUnguarded(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/agent-protocol.js", "/agent-anchor-utils.js"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("%s: want 200, got %d", path, w.Code)
+			}
+			if !strings.Contains(w.Header().Get("Content-Type"), "javascript") {
+				t.Fatalf("%s: want JS content-type, got %q", path, w.Header().Get("Content-Type"))
+			}
+			if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+				t.Errorf("%s: missing CORS header, got %q", path, got)
+			}
+		})
+	}
+}
+
+func TestAgentMarkerCSS_ServedUnguarded(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/agent-marker.css", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/css") {
+		t.Fatalf("content-type %q, want text/css*", ct)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, ".crit-live-marker") {
+		end := 200
+		if len(body) < end {
+			end = len(body)
+		}
+		t.Fatalf("missing marker class in body: %s", body[:end])
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("missing CORS header, got %q", got)
+	}
+}
+
+func TestLiveAssets_CORSHeader(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/crit-agent.js"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest("GET", path, nil)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("GET %s status = %d", path, w.Code)
+			}
+			if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+				t.Errorf("GET %s Access-Control-Allow-Origin = %q, want %q", path, got, "*")
+			}
+		})
+	}
+}
+
+func TestHandleSession_LiveFields(t *testing.T) {
+	s, session := newTestServer(t)
+	session.ReviewType = "live"
+	session.Origin = "http://localhost:3000"
+	session.ProxyPort = 54322
+
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["review_type"] != "live" {
+		t.Errorf("review_type = %v, want live", resp["review_type"])
+	}
+	if resp["origin"] != "http://localhost:3000" {
+		t.Errorf("origin = %v", resp["origin"])
+	}
+	if v, _ := resp["proxy_port"].(float64); int(v) != 54322 {
+		t.Errorf("proxy_port = %v, want 54322", resp["proxy_port"])
+	}
+}
+
+func TestHandleFileComments_AcceptsDOMAnchor_AutoRegistersRoute(t *testing.T) {
+	s, session := newTestServer(t)
+	session.ReviewType = "live"
+	session.Origin = "http://localhost:3000"
+	session.Files = []*FileEntry{}
+
+	body := `{"start_line":0,"end_line":0,"body":"pin","dom_anchor":{"pathname":"/dashboard","css_selector":"#main > h2","tag_chain":["MAIN","H2"],"outer_html":"<h2>x</h2>","viewport_width":1280,"viewport_height":800}}`
+	req := httptest.NewRequest("POST", "/api/file/comments?path=/dashboard", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var c Comment
+	json.NewDecoder(w.Body).Decode(&c)
+	if c.DOMAnchor == nil {
+		t.Fatal("DOMAnchor nil in response")
+	}
+	if c.DOMAnchor.Pathname != "/dashboard" {
+		t.Errorf("Pathname = %q", c.DOMAnchor.Pathname)
+	}
+
+	found := false
+	for _, fe := range session.Files {
+		if fe.Path == "/dashboard" {
+			found = true
+			if len(fe.Comments) != 1 {
+				t.Errorf("auto-registered route has %d comments, want 1", len(fe.Comments))
+			}
+		}
+	}
+	if !found {
+		t.Errorf("FileEntry for /dashboard was not auto-created on first pin")
+	}
+}
+
+func TestLive_PostFileCommentsWithDOMAnchor(t *testing.T) {
+	s, session := newTestServer(t)
+	session.ReviewType = "live"
+	session.Origin = "http://localhost:3000"
+	body := strings.NewReader(`{
+		"start_line": 0, "end_line": 0, "body": "looks off",
+		"dom_anchor": {
+			"pathname": "/dashboard",
+			"css_selector": "#main > h1:nth-of-type(1)",
+			"tag_chain": ["MAIN", "H1"],
+			"accessible_name": "Welcome",
+			"role": "heading",
+			"landmark": "main",
+			"outer_html": "<h1>Welcome</h1>",
+			"screenshot": "data:image/jpeg;base64,abc",
+			"viewport_width": 1280,
+			"viewport_height": 800
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/file/comments?path=/dashboard", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK && w.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var got Comment
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.DOMAnchor == nil {
+		t.Fatal("DOMAnchor not persisted")
+	}
+	if got.DOMAnchor.CSSSelector != "#main > h1:nth-of-type(1)" {
+		t.Fatalf("wrong selector: %q", got.DOMAnchor.CSSSelector)
+	}
+	if got.DOMAnchor.AccessibleName != "Welcome" {
+		t.Errorf("accessible_name lost: %q", got.DOMAnchor.AccessibleName)
+	}
+	if got.DOMAnchor.Role != "heading" {
+		t.Errorf("role lost: %q", got.DOMAnchor.Role)
+	}
+}
+
+func TestHandleFileComments_CodeComment_LineValidationUnchanged(t *testing.T) {
+	s, _ := newTestServer(t)
+	body := `{"start_line":0,"end_line":0,"body":"code comment"}`
+	req := httptest.NewRequest("POST", "/api/file/comments?path=test.md", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for zero-line code comment", w.Code)
+	}
+}
+
+func TestHandleFileCommentUpdate_AcceptsDOMAnchor(t *testing.T) {
+	type tc struct {
+		name       string
+		seedAnchor *DOMAnchor
+		body       string
+		wantStatus int
+		wantAnchor func(*DOMAnchor) bool
+	}
+	cases := []tc{
+		{
+			name:       "PUT dom_anchor on existing live pin replaces anchor",
+			seedAnchor: &DOMAnchor{Pathname: "/dashboard", CSSSelector: "#old"},
+			body:       `{"body":"pin","dom_anchor":{"pathname":"/dashboard","css_selector":"#new","tag_chain":["MAIN","H2"],"outer_html":"<h2>x</h2>","viewport_width":1280,"viewport_height":800}}`,
+			wantStatus: http.StatusOK,
+			wantAnchor: func(a *DOMAnchor) bool { return a != nil && a.CSSSelector == "#new" },
+		},
+		{
+			name:       "PUT without dom_anchor preserves existing anchor (does not drop it)",
+			seedAnchor: &DOMAnchor{Pathname: "/dashboard", CSSSelector: "#keep"},
+			body:       `{"body":"pin updated"}`,
+			wantStatus: http.StatusOK,
+			wantAnchor: func(a *DOMAnchor) bool { return a != nil && a.CSSSelector == "#keep" },
+		},
+		{
+			name:       "PUT dom_anchor on code comment is rejected (only live pins re-anchor)",
+			seedAnchor: nil,
+			body:       `{"body":"x","dom_anchor":{"pathname":"/x","css_selector":"#y","tag_chain":["H1"],"outer_html":"<h1/>","viewport_width":1,"viewport_height":1}}`,
+			wantStatus: http.StatusBadRequest,
+			wantAnchor: func(a *DOMAnchor) bool { return a == nil },
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, session := newTestServer(t)
+			session.ReviewType = "live"
+			session.Origin = "http://localhost:3000"
+			session.Files = []*FileEntry{{
+				Path: "/dashboard", FileType: "live-route", Status: "added",
+				Comments: []Comment{{ID: "c1", Body: "seed", DOMAnchor: c.seedAnchor}},
+			}}
+			req := httptest.NewRequest("PUT", "/api/comment/c1?path=/dashboard", strings.NewReader(c.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, req)
+			if w.Code != c.wantStatus {
+				t.Fatalf("status = %d, want %d, body = %s", w.Code, c.wantStatus, w.Body.String())
+			}
+			var stored *DOMAnchor
+			for _, fe := range session.Files {
+				for _, cm := range fe.Comments {
+					if cm.ID == "c1" {
+						stored = cm.DOMAnchor
+					}
+				}
+			}
+			if !c.wantAnchor(stored) {
+				t.Errorf("post-state DOMAnchor mismatch: %+v", stored)
+			}
+		})
+	}
+}
+
+func TestSSE_LiveRoundStart_Broadcasts(t *testing.T) {
+	prev := sseHeartbeatInterval
+	sseHeartbeatInterval = 50 * time.Millisecond
+	t.Cleanup(func() { sseHeartbeatInterval = prev })
+
+	srv, session := newTestServer(t)
+	session.ReviewType = "live"
+	session.liveRoundStart = func(_, next int) {
+		session.notify(SSEEvent{Type: "live-round-start", Round: next})
+	}
+
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/api/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	// Drain initial Safari frame.
+	tmp := make([]byte, 3)
+	if _, err := io.ReadFull(resp.Body, tmp); err != nil {
+		t.Fatalf("initial frame: %v", err)
+	}
+
+	// Wait briefly for the server to register the subscriber, then fire.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		// subscribers is guarded by subMu (not the session-state mu) — see
+		// Subscribe/Unsubscribe/notify in session.go. Reading it under the
+		// wrong mutex would race with Subscribe; the race detector would
+		// flag it even though both are sync.Mutex.
+		session.subMu.Lock()
+		n := len(session.subscribers)
+		session.subMu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fireOnLiveRoundStart(session, 1, 2)
+
+	// Read until we see the live-round-start event.
+	scanCtx, scanCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer scanCancel()
+	got := readSSEUntil(t, scanCtx, resp.Body, "live-round-start")
+	if !strings.Contains(got, `"round":2`) {
+		t.Fatalf("missing round field: %q", got)
+	}
+}
+
+// readSSEUntil reads SSE frames until one with the given event name is seen
+// or the context expires. Returns the matching frame's full text.
+func readSSEUntil(t *testing.T, ctx context.Context, r io.Reader, eventName string) string {
+	t.Helper()
+	type res struct {
+		s   string
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		buf := make([]byte, 0, 4096)
+		tmp := make([]byte, 256)
+		for {
+			n, err := r.Read(tmp)
+			if n > 0 {
+				buf = append(buf, tmp[:n]...)
+				// Split on blank line (\n\n).
+				for {
+					idx := bytes.Index(buf, []byte("\n\n"))
+					if idx < 0 {
+						break
+					}
+					frame := string(buf[:idx])
+					buf = buf[idx+2:]
+					if strings.Contains(frame, "event: "+eventName) {
+						ch <- res{s: frame}
+						return
+					}
+				}
+			}
+			if err != nil {
+				ch <- res{err: err}
+				return
+			}
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for SSE event %q", eventName)
+		return ""
+	case r := <-ch:
+		if r.err != nil {
+			t.Fatalf("SSE read error: %v", r.err)
+		}
+		return r.s
+	}
+}
+
+func TestPUTComment_AcceptsDriftedOnRound(t *testing.T) {
+	srv, session := newTestServer(t)
+	session.ReviewType = "live"
+	c, _ := session.AddComment("test.md", 1, 1, "", "live pin", "", "", "")
+	// Tag as a live pin so the patch path is meaningful.
+	session.mu.Lock()
+	for i := range session.Files[0].Comments {
+		if session.Files[0].Comments[i].ID == c.ID {
+			session.Files[0].Comments[i].DOMAnchor = &DOMAnchor{Pathname: "/", CSSSelector: "h1"}
+		}
+	}
+	session.mu.Unlock()
+
+	body := []byte(`{"drifted": true, "drifted_on_round": 4}`)
+	req := httptest.NewRequest("PUT", "/api/comment/"+c.ID+"?path=test.md", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	var got *Comment
+	for i := range session.Files[0].Comments {
+		if session.Files[0].Comments[i].ID == c.ID {
+			got = &session.Files[0].Comments[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("comment not found after PUT")
+	}
+	if got.DriftedOnRound != 4 || !got.Drifted {
+		t.Fatalf("got %+v; want DriftedOnRound=4 Drifted=true", got)
+	}
+}
+
+// TestAPIDeleteComment_FansOutSSE pins down that DELETE /api/comment/{id}
+// emits a comments-changed SSE event. Without this fanout, the
+// frontend-agent's delete-affordance can't update other tabs (or even the
+// current tab's comment panel) until the watcher's mtime tick. Insert and
+// reply paths already broadcast (db0a12f, ea5297e); delete must too.
+func TestAPIDeleteComment_FansOutSSE(t *testing.T) {
+	s, session := newTestServer(t)
+	c, _ := session.AddComment("test.md", 1, 1, "", "to delete", "", "", "")
+
+	sub := session.Subscribe()
+	defer session.Unsubscribe(sub)
+
+	req := httptest.NewRequest("DELETE", "/api/comment/"+c.ID+"?path=test.md", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	select {
+	case ev := <-sub:
+		if ev.Type != "comments-changed" {
+			t.Errorf("event type = %q, want comments-changed", ev.Type)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("no SSE event after DELETE — frontend tabs would stall on stale state")
+	}
+}
+
+// TestAPIResolveComment_FansOutSSE pins down that PUT
+// /api/comment/{id}/resolve emits a comments-changed SSE event for both
+// resolve and unresolve transitions, on both the file-scoped and
+// review-scoped routes. Insert/reply/delete already broadcast (db0a12f,
+// 2c8b87d); resolve must too — without it, the resolve-affordance can't
+// update other tabs (or the originating tab's review panel) until the
+// watcher's 1s mtime tick.
+func TestAPIResolveComment_FansOutSSE(t *testing.T) {
+	cases := []struct {
+		name     string
+		resolved bool
+	}{
+		{"resolve", true},
+		{"unresolve", false},
+	}
+	for _, tc := range cases {
+		t.Run("file-scoped/"+tc.name, func(t *testing.T) {
+			s, session := newTestServer(t)
+			c, _ := session.AddComment("test.md", 1, 1, "", "to resolve", "", "", "")
+			// For unresolve, flip it to resolved first (no SSE drained — we
+			// subscribe after).
+			if !tc.resolved {
+				session.SetCommentResolved("test.md", c.ID, true)
+			}
+
+			sub := session.Subscribe()
+			defer session.Unsubscribe(sub)
+
+			body := strings.NewReader(fmt.Sprintf(`{"resolved":%t}`, tc.resolved))
+			req := httptest.NewRequest("PUT", "/api/comment/"+c.ID+"/resolve?path=test.md", body)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+			}
+
+			select {
+			case ev := <-sub:
+				if ev.Type != "comments-changed" {
+					t.Errorf("event type = %q, want comments-changed", ev.Type)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("no SSE event after PUT resolve — frontend tabs would stall on stale state")
+			}
+		})
+
+		t.Run("review-scoped/"+tc.name, func(t *testing.T) {
+			s, session := newTestServer(t)
+			c := session.AddReviewComment("review-level", "alice", "")
+			if !tc.resolved {
+				session.ResolveReviewComment(c.ID, true)
+			}
+
+			sub := session.Subscribe()
+			defer session.Unsubscribe(sub)
+
+			body := strings.NewReader(fmt.Sprintf(`{"resolved":%t}`, tc.resolved))
+			req := httptest.NewRequest("PUT", "/api/review-comment/"+c.ID+"/resolve", body)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+			}
+
+			select {
+			case ev := <-sub:
+				if ev.Type != "comments-changed" {
+					t.Errorf("event type = %q, want comments-changed", ev.Type)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("no SSE event after PUT review-comment resolve")
+			}
+		})
+	}
+}
+
+// TestAPIDeleteComment_AuthorizationMatrix is the auth pin-down for the
+// live-mode delete affordance. When a comment carries a non-empty UserID,
+// only that user (matched against the daemon's configured AuthUserID) may
+// delete it. Comments with empty UserID (legacy / unauthed sessions) remain
+// deletable by anyone — preserving compatibility with existing tests.
+func TestAPIDeleteComment_AuthorizationMatrix(t *testing.T) {
+	cases := []struct {
+		name       string
+		commentUID string
+		serverUID  string
+		wantStatus int
+		wantGone   bool
+	}{
+		{"author matches", "u1", "u1", http.StatusOK, true},
+		{"author mismatch (anon requester)", "u1", "", http.StatusForbidden, false},
+		{"author mismatch (other user)", "u1", "u2", http.StatusForbidden, false},
+		{"legacy empty author allows anon", "", "", http.StatusOK, true},
+		{"legacy empty author allows any", "", "u1", http.StatusOK, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, sess := newTestServer(t)
+			srv.cfg.AuthUserID = tc.serverUID
+			c, _ := sess.AddComment("test.md", 1, 1, "", "owned", "", "alice", tc.commentUID)
+
+			req := httptest.NewRequest("DELETE", "/api/comment/"+c.ID+"?path=test.md", nil)
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, req)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%s)", w.Code, tc.wantStatus, w.Body.String())
+			}
+			gone := len(sess.GetComments("test.md")) == 0
+			if gone != tc.wantGone {
+				t.Errorf("comment gone = %v, want %v", gone, tc.wantGone)
+			}
+		})
+	}
+}
+
+// TestAPIDeleteComment_CascadesReplies pins down that deleting a parent
+// comment removes its nested replies. Replies live inside Comment.Replies, so
+// removing the parent struct cascades naturally — this test guards against a
+// future refactor that splits replies into a separate top-level slice without
+// updating delete to walk it.
+func TestAPIDeleteComment_CascadesReplies(t *testing.T) {
+	srv, sess := newTestServer(t)
+	c, _ := sess.AddComment("test.md", 1, 1, "", "parent", "", "alice", "")
+	if _, ok := sess.AddReply("test.md", c.ID, "reply 1", "bob", ""); !ok {
+		t.Fatal("AddReply 1 returned ok=false")
+	}
+	if _, ok := sess.AddReply("test.md", c.ID, "reply 2", "carol", ""); !ok {
+		t.Fatal("AddReply 2 returned ok=false")
+	}
+
+	req := httptest.NewRequest("DELETE", "/api/comment/"+c.ID+"?path=test.md", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := sess.GetComments("test.md"); len(got) != 0 {
+		t.Errorf("comments remain after parent delete = %d (replies should cascade with the parent struct)", len(got))
+	}
+}
+
 func TestHandleShareConsent_OK(t *testing.T) {
 	setHome(t, t.TempDir())
 	s, _ := newTestServer(t)
@@ -3815,6 +4601,24 @@ func TestHandleShare_ConsentRequired(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d, body = %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+}
+
+func TestHandleShare_MalformedBody(t *testing.T) {
+	setHome(t, t.TempDir())
+	s, _ := newTestServer(t)
+	s.shareURL = defaultShareURL
+	s.authMu.Lock()
+	s.cfg.ShareConsented = true
+	s.authMu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/share", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body = %s", w.Code, http.StatusBadRequest, w.Body.String())
 	}
 }
 
@@ -3887,5 +4691,361 @@ func TestHandleShareConsent_SaveFails(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d, body = %s", w.Code, http.StatusInternalServerError, w.Body.String())
+	}
+}
+
+// --- handleSharePayload tests ---
+
+func TestHandleSharePayload_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "plan.md")
+	os.WriteFile(filePath, []byte("# Plan"), 0o644)
+
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files: []*FileEntry{
+			{Path: "plan.md", AbsPath: filePath, Status: "added"},
+		},
+	}
+
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/share/payload", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	files, ok := payload["files"].([]any)
+	if !ok || len(files) == 0 {
+		t.Fatal("expected non-empty files array in payload")
+	}
+}
+
+func TestHandleSharePayload_NoFiles(t *testing.T) {
+	dir := t.TempDir()
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files:       []*FileEntry{},
+	}
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/share/payload", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleSharePayload_MethodNotAllowed(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/payload", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+// --- handleUpsertPayload tests ---
+
+func TestHandleUpsertPayload_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "plan.md")
+	os.WriteFile(filePath, []byte("# Plan"), 0o644)
+
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files: []*FileEntry{
+			{Path: "plan.md", AbsPath: filePath, Status: "added"},
+		},
+	}
+	sess.SetSharedURLAndToken("https://crit.md/r/tok123", "del-tok")
+
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/share/upsert-payload", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if payload["delete_token"] != "del-tok" {
+		t.Errorf("delete_token = %v, want del-tok", payload["delete_token"])
+	}
+}
+
+func TestHandleUpsertPayload_NoFiles(t *testing.T) {
+	dir := t.TempDir()
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files:       []*FileEntry{},
+	}
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/share/upsert-payload", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleUpsertPayload_MethodNotAllowed(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/upsert-payload", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+// --- handleMergeComments tests ---
+
+func TestHandleMergeComments_MethodNotAllowed(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/comments/merge", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 405 {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestHandleMergeComments_InvalidJSON(t *testing.T) {
+	srv, sess := newTestServer(t)
+	sess.SetSharedURLAndToken("https://crit.md/r/tok123", "del-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/comments/merge", strings.NewReader("not json"))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleMergeComments_NoSharedReview(t *testing.T) {
+	srv, _ := newTestServer(t)
+	// Session has no shared URL set.
+
+	body := `{"comments": []}`
+	req := httptest.NewRequest(http.MethodPost, "/api/comments/merge", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if !strings.Contains(resp["error"], "no shared review") {
+		t.Errorf("error = %q, want 'no shared review'", resp["error"])
+	}
+}
+
+func TestHandleMergeComments_EmptyComments(t *testing.T) {
+	dir := t.TempDir()
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files:       []*FileEntry{{Path: "test.md", AbsPath: filepath.Join(dir, "test.md")}},
+	}
+	sess.SetSharedURLAndToken("https://crit.md/r/tok123", "del-tok")
+
+	// Write a minimal review file so readFileShared succeeds.
+	writeCritJSONForTest(t, dir, CritJSON{
+		Files: map[string]CritJSONFile{
+			"test.md": {Comments: []Comment{}},
+		},
+	})
+
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"comments": []}`
+	req := httptest.NewRequest(http.MethodPost, "/api/comments/merge", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["merged"].(float64) != 0 {
+		t.Errorf("merged = %v, want 0", resp["merged"])
+	}
+	if resp["replies_updated"].(float64) != 0 {
+		t.Errorf("replies_updated = %v, want 0", resp["replies_updated"])
+	}
+}
+
+func TestHandleMergeComments_NewComment(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "plan.md")
+	os.WriteFile(filePath, []byte("# Plan\nline2\n"), 0o644)
+
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files:       []*FileEntry{{Path: "plan.md", AbsPath: filePath}},
+	}
+	sess.SetSharedURLAndToken("https://crit.md/r/tok123", "del-tok")
+
+	writeCritJSONForTest(t, dir, CritJSON{
+		Files: map[string]CritJSONFile{
+			"plan.md": {Comments: []Comment{}},
+		},
+	})
+
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := `{"comments": [{"body": "new web comment", "file_path": "plan.md", "start_line": 1, "end_line": 1, "external_id": "ext-1", "author_display_name": "Web User"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/comments/merge", strings.NewReader(payload))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["merged"].(float64) != 1 {
+		t.Errorf("merged = %v, want 1", resp["merged"])
+	}
+}
+
+func TestHandleMergeComments_DuplicateFiltered(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "plan.md")
+	os.WriteFile(filePath, []byte("# Plan\n"), 0o644)
+
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files:       []*FileEntry{{Path: "plan.md", AbsPath: filePath}},
+	}
+	sess.SetSharedURLAndToken("https://crit.md/r/tok123", "del-tok")
+
+	// Pre-populate the review file with an existing comment.
+	writeCritJSONForTest(t, dir, CritJSON{
+		Files: map[string]CritJSONFile{
+			"plan.md": {Comments: []Comment{
+				{ID: "c1", Body: "existing", StartLine: 1, EndLine: 1, Author: "Web User"},
+			}},
+		},
+	})
+
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Send a web comment that matches the existing one by fingerprint.
+	payload := `{"comments": [{"body": "existing", "file_path": "plan.md", "start_line": 1, "end_line": 1, "author_display_name": "Web User"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/comments/merge", strings.NewReader(payload))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["merged"].(float64) != 0 {
+		t.Errorf("merged = %v, want 0 (duplicate should be filtered)", resp["merged"])
+	}
+}
+
+func TestHandleMergeComments_NoReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files:       []*FileEntry{{Path: "test.md"}},
+	}
+	sess.SetSharedURLAndToken("https://crit.md/r/tok123", "del-tok")
+	// Intentionally don't write a review file.
+
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"comments": [{"body": "x", "file_path": "test.md", "start_line": 1, "end_line": 1}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/comments/merge", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 500 {
+		t.Errorf("status = %d, want 500 (no review file)", w.Code)
 	}
 }
