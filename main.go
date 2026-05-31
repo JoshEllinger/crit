@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	qrterminal "github.com/mdp/qrterminal/v3"
+	"golang.org/x/term"
 )
 
 //go:embed frontend/*.html frontend/*.css frontend/*.js frontend/*.png frontend/*.svg frontend/*.ico frontend/*.webmanifest
@@ -59,6 +61,7 @@ type shareFlags struct {
 	showQR     bool
 	org        string
 	visibility string
+	preview    string
 	files      []string
 }
 
@@ -81,6 +84,13 @@ func parseShareFlags(args []string) shareFlags {
 			}
 			i++
 			sf.svcURL = args[i]
+		case arg == "--preview":
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: --preview requires an HTML file path\n")
+				os.Exit(1)
+			}
+			i++
+			sf.preview = args[i]
 		case arg == "--qr":
 			sf.showQR = true
 		case arg == "--org":
@@ -102,6 +112,70 @@ func parseShareFlags(args []string) shareFlags {
 		}
 	}
 	return sf
+}
+
+// runSharePreview crawls the local HTML file referenced by sf.preview and its
+// assets, then uploads the snapshot to crit-web as a preview review. It is the
+// --preview branch of the share command (the direct transport; the in-UI Share
+// button and proxy-auth relay are handled in server.go / frontend/app.js).
+func runSharePreview(sf shareFlags) {
+	if len(sf.files) > 0 {
+		fmt.Fprintln(os.Stderr, "Error: --preview cannot be combined with file arguments")
+		os.Exit(1)
+	}
+	cfg := loadShareConfig()
+	svcURL := resolveShareURL(sf.svcURL, cfg, defaultShareURL)
+	url, err := postPreviewShare(sf.preview, svcURL, resolveAuthToken(cfg))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(url)
+}
+
+// postPreviewShare crawls preview files and POSTs them to crit-web with
+// review_type=preview, returning the resulting share URL.
+func postPreviewShare(htmlPath, svcURL, authToken string) (string, error) {
+	files, err := crawlPreview(htmlPath)
+	if err != nil {
+		return "", fmt.Errorf("crawling preview assets: %w", err)
+	}
+
+	payload := buildSharePayload(files, nil, 1, nil, "", "", "preview")
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshaling preview payload: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, svcURL+"/api/reviews", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBearer(req, authToken)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("posting preview to share service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", errShareUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("preview share failed with status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		URL         string `json:"url"`
+		DeleteToken string `json:"delete_token"`
+	}
+	if err := decodeJSONOrHTMLHint(resp, &result); err != nil {
+		return "", err
+	}
+	return result.URL, nil
 }
 
 func printShareUsage() {
@@ -196,7 +270,7 @@ func runShareExisting(existingCfg CritJSON, critPath string, files []shareFile, 
 }
 
 func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL, authToken, fallbackAuthor, org, visibility string, showQR bool) {
-	res, err := shareReviewFiles(critPath, files, filePaths, svcURL, authToken, fallbackAuthor, org, visibility)
+	res, err := shareReviewFiles(critPath, files, filePaths, svcURL, authToken, fallbackAuthor, org, visibility, "")
 	if err != nil {
 		if errors.Is(err, errShareUnauthorized) {
 			handleShareAuthError()
@@ -240,6 +314,11 @@ func promptShareURLConfirm(out io.Writer, in io.Reader, shareURL string) bool {
 
 func runShare(args []string) {
 	sf := parseShareFlags(args)
+
+	if sf.preview != "" {
+		runSharePreview(sf)
+		return
+	}
 
 	if len(sf.files) == 0 {
 		printShareUsage()
@@ -291,7 +370,12 @@ func runShare(args []string) {
 		}
 		cfg.ShareConsented = true
 	}
-	if flagURL {
+	// Confirm sharing to a custom URL — but only in genuine interactive
+	// sessions. In non-interactive contexts (CI, the integration suite,
+	// scripted/agent usage) there is no TTY, so the prompt would read EOF,
+	// abort, and the share would never persist its result to the review file.
+	// Auto-proceed there; keep the confirm for real terminals.
+	if flagURL && term.IsTerminal(int(os.Stdin.Fd())) {
 		if !promptShareURLConfirm(os.Stderr, os.Stdin, sf.svcURL) {
 			return
 		}
@@ -2406,6 +2490,11 @@ func runReviewClient(entry sessionEntry, sessionKey string) (approved bool) {
 	var result struct {
 		Approved    bool   `json:"approved"`
 		NextCommand string `json:"next_command"`
+		Stats       *struct {
+			Duration int `json:"duration_seconds"`
+			Files    int `json:"files_reviewed"`
+			Comments int `json:"comments_submitted"`
+		} `json:"stats"`
 	}
 	if json.Unmarshal(body, &result) == nil {
 		// Print the exact command for the next round so the agent can
@@ -2415,9 +2504,31 @@ func runReviewClient(entry sessionEntry, sessionKey string) (approved bool) {
 		if !result.Approved && result.NextCommand != "" {
 			fmt.Fprintf(os.Stdout, "\nNext round: %s\n", result.NextCommand)
 		}
+		if result.Approved && result.Stats != nil {
+			printSessionSummary(result.Stats)
+		}
 		return result.Approved
 	}
 	return false
+}
+
+func printSessionSummary(s *struct {
+	Duration int `json:"duration_seconds"`
+	Files    int `json:"files_reviewed"`
+	Comments int `json:"comments_submitted"`
+}) {
+	if s.Files == 0 && s.Comments == 0 {
+		return
+	}
+	var parts []string
+	if s.Files > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", s.Files, pluralize(s.Files, "file", "files")))
+	}
+	if s.Comments > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", s.Comments, pluralize(s.Comments, "comment", "comments")))
+	}
+	parts = append(parts, formatDuration(s.Duration))
+	fmt.Fprintf(os.Stderr, "\nDone reviewing — %s\n", strings.Join(parts, " · "))
 }
 
 // dirArgs returns the subset of paths that are directories.

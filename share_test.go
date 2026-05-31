@@ -265,7 +265,7 @@ func TestBuildSharePayload(t *testing.T) {
 		files := []shareFile{
 			{Path: "plan.md", Content: "# My Plan\n\nStep 1: do the thing"},
 		}
-		payload := buildSharePayload(files, nil, 1, nil, "", "")
+		payload := buildSharePayload(files, nil, 1, nil, "", "", "")
 
 		pFiles, ok := payload["files"].([]map[string]any)
 		if !ok {
@@ -297,7 +297,7 @@ func TestBuildSharePayload(t *testing.T) {
 			{Path: "plan.md", Content: "# Plan"},
 			{Path: "src/main.go", Content: "package main"},
 		}
-		payload := buildSharePayload(files, nil, 2, nil, "", "")
+		payload := buildSharePayload(files, nil, 2, nil, "", "", "")
 
 		pFiles := payload["files"].([]map[string]any)
 		if len(pFiles) != 2 {
@@ -315,7 +315,7 @@ func TestBuildSharePayload(t *testing.T) {
 		comments := []shareComment{
 			{File: "plan.md", StartLine: 1, EndLine: 3, Body: "Needs more detail", Author: "Claude"},
 		}
-		payload := buildSharePayload(files, comments, 1, nil, "", "")
+		payload := buildSharePayload(files, comments, 1, nil, "", "", "")
 
 		pComments := payload["comments"].([]shareComment)
 		if len(pComments) != 1 {
@@ -357,7 +357,7 @@ func TestShareFilesToWeb(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		url, token, err := shareFilesToWeb(files, nil, srv.URL, 1, "", nil, "", "")
+		url, token, err := shareFilesToWeb(files, nil, srv.URL, 1, "", nil, "", "", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -376,13 +376,13 @@ func TestShareFilesToWeb(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		if _, _, err := shareFilesToWeb(files, nil, srv.URL, 1, "", nil, "", ""); err == nil {
+		if _, _, err := shareFilesToWeb(files, nil, srv.URL, 1, "", nil, "", "", ""); err == nil {
 			t.Fatal("expected error for server error response")
 		}
 	})
 
 	t.Run("network error", func(t *testing.T) {
-		if _, _, err := shareFilesToWeb(files, nil, "http://localhost:1", 1, "", nil, "", ""); err == nil {
+		if _, _, err := shareFilesToWeb(files, nil, "http://localhost:1", 1, "", nil, "", "", ""); err == nil {
 			t.Fatal("expected error for unreachable server")
 		}
 	})
@@ -1097,7 +1097,7 @@ func TestBuildSharePayload_WithStatusAndOrphaned(t *testing.T) {
 		{Path: "removed.go", Content: "", Status: "removed"},
 		{Path: "nostat.md", Content: "# Hello"},
 	}
-	payload := buildSharePayload(files, nil, 1, nil, "", "")
+	payload := buildSharePayload(files, nil, 1, nil, "", "", "")
 
 	pFiles, ok := payload["files"].([]map[string]any)
 	if !ok {
@@ -1191,7 +1191,7 @@ func TestBuildSharePayload_WithReplies(t *testing.T) {
 			{Body: "verified", Author: "Alice"},
 		},
 	}}
-	payload := buildSharePayload(files, comments, 1, nil, "", "")
+	payload := buildSharePayload(files, comments, 1, nil, "", "", "")
 	cs := payload["comments"].([]shareComment)
 	if len(cs) != 1 {
 		t.Fatalf("expected 1 comment, got %d", len(cs))
@@ -1212,7 +1212,7 @@ func TestBuildSharePayload_WithCliArgs(t *testing.T) {
 
 	t.Run("included when provided", func(t *testing.T) {
 		args := []string{"plan.md", "notes.md"}
-		payload := buildSharePayload(files, nil, 1, args, "", "")
+		payload := buildSharePayload(files, nil, 1, args, "", "", "")
 		got, ok := payload["cli_args"].([]string)
 		if !ok {
 			t.Fatal("expected cli_args in payload")
@@ -1223,14 +1223,14 @@ func TestBuildSharePayload_WithCliArgs(t *testing.T) {
 	})
 
 	t.Run("omitted when nil", func(t *testing.T) {
-		payload := buildSharePayload(files, nil, 1, nil, "", "")
+		payload := buildSharePayload(files, nil, 1, nil, "", "", "")
 		if _, ok := payload["cli_args"]; ok {
 			t.Error("cli_args should be absent when nil")
 		}
 	})
 
 	t.Run("omitted when empty", func(t *testing.T) {
-		payload := buildSharePayload(files, nil, 1, []string{}, "", "")
+		payload := buildSharePayload(files, nil, 1, []string{}, "", "", "")
 		if _, ok := payload["cli_args"]; ok {
 			t.Error("cli_args should be absent when empty")
 		}
@@ -1241,7 +1241,7 @@ func TestBuildSharePayload_OrgVisibility(t *testing.T) {
 	files := []shareFile{{Path: "test.md", Content: "hello"}}
 
 	t.Run("without org", func(t *testing.T) {
-		p := buildSharePayload(files, nil, 1, nil, "", "")
+		p := buildSharePayload(files, nil, 1, nil, "", "", "")
 		if _, ok := p["org"]; ok {
 			t.Fatal("org should not be in payload when empty")
 		}
@@ -1251,7 +1251,7 @@ func TestBuildSharePayload_OrgVisibility(t *testing.T) {
 	})
 
 	t.Run("with org and visibility", func(t *testing.T) {
-		p := buildSharePayload(files, nil, 1, nil, "acme", "organization")
+		p := buildSharePayload(files, nil, 1, nil, "acme", "organization", "")
 		if p["org"] != "acme" {
 			t.Fatalf("expected org=acme, got %v", p["org"])
 		}
@@ -1261,7 +1261,7 @@ func TestBuildSharePayload_OrgVisibility(t *testing.T) {
 	})
 
 	t.Run("with org only", func(t *testing.T) {
-		p := buildSharePayload(files, nil, 1, nil, "acme", "")
+		p := buildSharePayload(files, nil, 1, nil, "acme", "", "")
 		if p["org"] != "acme" {
 			t.Fatal("org should be in payload")
 		}
@@ -1323,7 +1323,7 @@ func TestShareFilesToWeb_SendsBearerToken(t *testing.T) {
 	defer server.Close()
 
 	files := []shareFile{{Path: "plan.md", Content: "# Plan"}}
-	shareFilesToWeb(files, nil, server.URL, 1, "crit_testtoken", nil, "", "")
+	shareFilesToWeb(files, nil, server.URL, 1, "crit_testtoken", nil, "", "", "")
 	if gotAuth != "Bearer crit_testtoken" {
 		t.Errorf("expected Authorization: Bearer crit_testtoken, got %q", gotAuth)
 	}
@@ -2041,7 +2041,7 @@ func TestShareReviewFiles_InlinesAttachmentsEndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	files := []shareFile{{Path: "README.md", Content: "stub content\n"}}
-	if _, err := shareReviewFiles(review, files, []string{"README.md"}, srv.URL, "", "Alice", "", ""); err != nil {
+	if _, err := shareReviewFiles(review, files, []string{"README.md"}, srv.URL, "", "Alice", "", "", ""); err != nil {
 		t.Fatalf("shareReviewFiles: %v", err)
 	}
 
@@ -2155,7 +2155,7 @@ func TestShareReviewFiles_PlanMode_InlinesAttachments(t *testing.T) {
 	defer srv.Close()
 
 	files := []shareFile{{Path: planFile, Content: "stub plan content\n"}}
-	if _, err := shareReviewFiles(critPath, files, []string{planFile}, srv.URL, "", "Samuel Tissot", "", ""); err != nil {
+	if _, err := shareReviewFiles(critPath, files, []string{planFile}, srv.URL, "", "Samuel Tissot", "", "", ""); err != nil {
 		t.Fatalf("shareReviewFiles: %v", err)
 	}
 
@@ -2302,5 +2302,107 @@ func TestDedupWebComments(t *testing.T) {
 				t.Errorf("got %d reply updates, want %d", len(replyUpdates), tt.wantReplies)
 			}
 		})
+	}
+}
+
+// TestBuildSharePayload_GitHubSynced verifies that comments and replies
+// synced from GitHub carry their GitHubID into the wire payload as
+// "github_id". crit-web reads this signal to badge re-shared reviews
+// (issue #370).
+func TestBuildSharePayload_GitHubSynced(t *testing.T) {
+	c := Comment{
+		ID:        "c1",
+		StartLine: 5,
+		EndLine:   5,
+		Body:      "from GitHub",
+		Author:    "Alice",
+		GitHubID:  12345,
+		Replies: []Reply{
+			{ID: "r1", Body: "reply too", Author: "Bob", GitHubID: 67890},
+		},
+	}
+	sc := commentToShareComment(c, "main.go", "line", "", "", false, true)
+	if sc.GitHubID != 12345 {
+		t.Errorf("shareComment.GitHubID = %d, want 12345", sc.GitHubID)
+	}
+	if len(sc.Replies) != 1 || sc.Replies[0].GitHubID != 67890 {
+		t.Errorf("shareReply.GitHubID = %d, want 67890", sc.Replies[0].GitHubID)
+	}
+
+	payload := buildSharePayload(nil, []shareComment{sc}, 1, nil, "", "", "")
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	js := string(body)
+	if !strings.Contains(js, `"github_id":12345`) {
+		t.Errorf("comment github_id missing from payload JSON: %s", js)
+	}
+	if !strings.Contains(js, `"github_id":67890`) {
+		t.Errorf("reply github_id missing from payload JSON: %s", js)
+	}
+}
+
+// TestBuildSharePayload_NotGitHubSynced verifies that the github_id field is
+// elided entirely when the local comment has no GitHub ID, so locally-authored
+// comments stay byte-equivalent to the pre-#370 wire format.
+func TestBuildSharePayload_NotGitHubSynced(t *testing.T) {
+	c := Comment{
+		ID:        "c1",
+		StartLine: 5,
+		EndLine:   5,
+		Body:      "local only",
+		Author:    "Alice",
+		Replies: []Reply{
+			{ID: "r1", Body: "local reply", Author: "Bob"},
+		},
+	}
+	sc := commentToShareComment(c, "main.go", "line", "", "", false, true)
+	if sc.GitHubID != 0 {
+		t.Errorf("shareComment.GitHubID = %d, want 0", sc.GitHubID)
+	}
+	if len(sc.Replies) != 1 || sc.Replies[0].GitHubID != 0 {
+		t.Errorf("shareReply.GitHubID = %d, want 0", sc.Replies[0].GitHubID)
+	}
+
+	payload := buildSharePayload(nil, []shareComment{sc}, 1, nil, "", "", "")
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if strings.Contains(string(body), "github_id") {
+		t.Errorf("github_id should be omitted when zero, got: %s", body)
+	}
+}
+
+func TestShareFileEntriesEncoding(t *testing.T) {
+	files := []shareFile{
+		{Path: "index.html", Content: "<html></html>"},
+		{Path: "logo.png", Content: "AAAA", Encoding: "base64"},
+	}
+
+	entries := shareFileEntries(files)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if _, ok := entries[0]["encoding"]; ok {
+		t.Errorf("text file should omit encoding, got %v", entries[0]["encoding"])
+	}
+	if got := entries[1]["encoding"]; got != "base64" {
+		t.Errorf("binary file should have encoding=base64, got %v", got)
+	}
+}
+
+func TestBuildSharePayloadReviewType(t *testing.T) {
+	files := []shareFile{{Path: "index.html", Content: "<html></html>"}}
+
+	withType := buildSharePayload(files, nil, 1, nil, "", "", "preview")
+	if got := withType["review_type"]; got != "preview" {
+		t.Errorf("expected review_type=preview, got %v", got)
+	}
+
+	withoutType := buildSharePayload(files, nil, 1, nil, "", "", "")
+	if _, ok := withoutType["review_type"]; ok {
+		t.Errorf("empty review_type should be omitted, got %v", withoutType["review_type"])
 	}
 }
