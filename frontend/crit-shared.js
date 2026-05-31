@@ -211,6 +211,62 @@
     return dismiss;
   }
 
+  // ===== formatStatsDuration =====
+  // Human-readable duration: "42s", "3m", "1h", "1h 15m".
+  function formatStatsDuration(seconds) {
+    if (seconds < 60) return seconds + 's';
+    var hours = Math.floor(seconds / 3600);
+    var minutes = Math.floor((seconds % 3600) / 60);
+    if (hours === 0) return minutes + 'm';
+    if (minutes === 0) return hours + 'h';
+    return hours + 'h ' + minutes + 'm';
+  }
+
+  // Wire up the summary receipt copy button (once).
+  var _summaryBtnWired = false;
+  function wireSummaryCopyBtn() {
+    if (_summaryBtnWired) return;
+    var btn = document.getElementById('summaryCopyBtn');
+    if (!btn) return;
+    _summaryBtnWired = true;
+    btn.addEventListener('click', function () {
+      var receipt = btn.closest('.summary-receipt');
+      var text = receipt ? receipt.getAttribute('data-copy-text') : '';
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(function () {
+        btn.classList.add('copied');
+        var iconCopy = btn.querySelector('.icon-copy');
+        var iconCheck = btn.querySelector('.icon-check');
+        if (iconCopy) iconCopy.style.display = 'none';
+        if (iconCheck) iconCheck.style.display = '';
+        setTimeout(function () {
+          btn.classList.remove('copied');
+          if (iconCopy) iconCopy.style.display = '';
+          if (iconCheck) iconCheck.style.display = 'none';
+        }, 1800);
+      });
+    });
+  }
+
+  var CONFETTI_COLORS = ['#56d364', '#85aaf8', '#ff8c6b', '#e8c555', '#d285f8'];
+  function spawnConfetti(container) {
+    if (!container) return;
+    container.style.position = 'relative';
+    container.style.overflow = 'hidden';
+    for (var i = 0; i < 14; i++) {
+      var dot = document.createElement('span');
+      dot.className = 'confetti-dot';
+      var size = 4 + Math.random() * 5;
+      dot.style.width = size + 'px';
+      dot.style.height = size + 'px';
+      dot.style.left = (8 + Math.random() * 84) + '%';
+      dot.style.top = (10 + Math.random() * 30) + '%';
+      dot.style.background = CONFETTI_COLORS[i % CONFETTI_COLORS.length];
+      dot.style.animationDelay = (Math.random() * 0.5) + 's';
+      container.appendChild(dot);
+    }
+  }
+
   // ===== runFinishReview =====
   // Shared finish-review flow used by both code-review (app.js) and
   // live-mode (live-mode.js). POSTs /api/finish, parses
@@ -264,21 +320,47 @@
 
       if (dialog) {
         dialog.classList.remove('approved');
+        dialog.querySelectorAll('.confetti-dot').forEach(function (d) { d.remove(); });
         if (approved) {
           // Force reflow so the CSS animation restarts when the class is re-added.
           void dialog.offsetWidth;
           dialog.classList.add('approved');
+          spawnConfetti(dialog.querySelector('.waiting-header'));
         }
       }
       if (headingEl) headingEl.textContent = approved ? 'Approved' : 'Review Complete';
       if (messageEl) {
         if (approved) {
-          messageEl.textContent =
-            'Your agent has been notified — no further action needed. ' +
-            'You can close this tab whenever you\'re ready.';
+          messageEl.style.display = 'none';
         } else {
+          messageEl.style.display = '';
           messageEl.textContent =
             "Agent notified. Copy the prompt below if it wasn't listening.";
+        }
+      }
+
+      var receiptEl = document.getElementById('summaryReceipt');
+      var lineEl = document.getElementById('summaryLine');
+      if (receiptEl && lineEl) {
+        if (approved && data.stats) {
+          var statParts = [];
+          if (data.stats.files_reviewed) statParts.push(data.stats.files_reviewed + (data.stats.files_reviewed === 1 ? ' file' : ' files'));
+          if (data.stats.comments_submitted) statParts.push(data.stats.comments_submitted + (data.stats.comments_submitted === 1 ? ' comment' : ' comments'));
+          var dur = data.stats.duration_seconds;
+          if (dur != null) statParts.push(formatStatsDuration(dur));
+          if (statParts.length) {
+            var plainText = 'Done reviewing — ' + statParts.join(' · ');
+            receiptEl.setAttribute('data-copy-text', plainText);
+            var html = 'Done reviewing <span class="sep">—</span> ';
+            html += statParts.join(' <span class="sep">·</span> ');
+            lineEl.innerHTML = html;
+            receiptEl.style.display = '';
+            wireSummaryCopyBtn();
+          } else {
+            receiptEl.style.display = 'none';
+          }
+        } else {
+          receiptEl.style.display = 'none';
         }
       }
 

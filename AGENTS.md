@@ -133,13 +133,14 @@ Two-level JSON config files, merged (project overrides global):
 - **Global**: `~/.crit.config.json` — user-wide defaults
 - **Project**: `.crit.config.json` in repo root — per-project overrides
 
-Config keys: `port`, `host`, `no_open`, `share_url`, `quiet`, `output`, `author`, `base_branch`, `ignore_patterns`, `agent_cmd`, `auth_token`, `auth_user_name`, `auth_user_email`, `auth_user_id`, `cleanup_on_approve`, `no_update_check`, `no_integration_check`, `vcs`, `proxy_auth`.
+Config keys: `port`, `host`, `no_open`, `share_url`, `quiet`, `output`, `author`, `base_branch`, `ignore_patterns`, `agent_cmd`, `auth_token`, `auth_user_name`, `auth_user_email`, `auth_user_id`, `cleanup_on_approve`, `disable_stats`, `no_update_check`, `no_integration_check`, `vcs`, `proxy_auth`.
 
 - `base_branch` overrides auto-detected default branch (used as diff base in git mode, and by `crit pull`/`crit push`/`crit comment`)
 - `author` falls back to the configured VCS user name if not set
 - `agent_cmd`, `auth_token`, `share_url`, and `proxy_auth` are **global config only**; project-level config cannot override (security — prevents malicious repos from hijacking the agent command or redirecting share requests to an attacker-controlled host)
 - `proxy_auth` (default: `false`) — when `true`, share/pull/unpublish use browser popup relay instead of direct CLI HTTP. Global-only for security.
 - `cleanup_on_approve` (default: `true`) — auto-delete review file when reviewer approves with no unresolved comments
+- `disable_stats` (default: `false`) — disable session stats recording to `~/.crit/stats.json`
 - `ignore_patterns` are unioned (global + project both apply); types: `*.ext`, `dir/`, `exact.file`, `path/*.ext`
 - `vcs` selects backend: `"git"` (default), `"sl"` (sapling), or `"jj"` (Jujutsu)
 - `auth_*` keys hold cached hosted-crit-web credentials (set by `crit auth`); treat as secrets
@@ -302,6 +303,18 @@ Hunk headers (`@@ -27,6 +31,23 @@`), dual gutters, colored backgrounds for addit
 - Table separators (`|---|---|`): not in tokens, appear as gap lines. Detected via regex and hidden with CSS.
 - Per-row tables: each row in its own `<table>` with `table-layout: fixed` + `<colgroup>` for column alignment.
 - `splitHighlightedCode()` tracks open `<span>` tags across lines to properly close/reopen them.
+</important>
+
+<important if="you are changing any agent-*.js, crit-agent.js, or agent-marker.css in frontend/">
+
+These files are the scripts crit injects into live/preview iframes — the canonical set + order is `agentScriptFiles` in `server.go`, plus `agent-marker.css` (served at `/agent-marker.css`). **crit-web vendors them verbatim** into `crit-web/priv/static/preview-agent/` so DOM anchoring stays byte-identical across both renderers.
+
+When you change any of these files here:
+
+1. Re-sync into crit-web: run `crit-web/scripts/sync-preview-agent.sh` (copies the 8 files from `../crit/frontend/`).
+2. Commit the change in **both** repos.
+
+crit-web's drift-guard test `test/crit_web/preview_agent_sync_test.exs` fails loudly if the vendored copies diverge (and skips when the sibling `crit/` checkout is absent, e.g. CI). Don't hand-edit `crit-web/priv/static/preview-agent/*` — always re-sync from here.
 </important>
 
 <important if="you are adding CSS variables or modifying theme.css">

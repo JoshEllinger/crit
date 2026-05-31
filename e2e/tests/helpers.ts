@@ -6,7 +6,25 @@ export async function clearAllComments(request: APIRequestContext) {
 }
 
 // Navigate to the root page and wait for loading to complete.
+// Ensures diffScope=all is set in the crit-settings cookie so tests see
+// all files (branch+untracked), matching the pre-smart-default behavior.
+// Merges with any existing cookie values to avoid clobbering other settings.
 export async function loadPage(page: Page) {
+  const cookies = await page.context().cookies();
+  const existing = cookies.find(c => c.name === 'crit-settings');
+  let settings: Record<string, unknown> = {};
+  if (existing) {
+    try { settings = JSON.parse(decodeURIComponent(existing.value)); } catch {}
+  }
+  if (!settings.diffScope) {
+    settings.diffScope = 'all';
+    await page.context().addCookies([{
+      name: 'crit-settings',
+      value: encodeURIComponent(JSON.stringify(settings)),
+      domain: 'localhost',
+      path: '/',
+    }]);
+  }
   await page.goto('/');
   await expect(page.locator('.loading')).toBeHidden({ timeout: 10_000 });
 }

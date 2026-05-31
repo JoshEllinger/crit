@@ -114,7 +114,8 @@
       "Bash(echo \"# Test plan\\\\n\\\\nThis is a smoke test.\")",
       "Bash(~/.local/bin/crit --no-open smoke-test.md)",
       "Bash(echo \"PID: $!\")",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(python3 -c \"import json,sys; [print\\(a['name'], a['size']\\) for a in json.load\\(sys.stdin\\)['assets']]\")"
     ]
   }
 }

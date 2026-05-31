@@ -77,9 +77,9 @@ body {
   gap: 6px;
   font-family: var(--crit-font-mono);
   font-size: 12px;
-  color: var(--crit-pill-fg);
-  background: var(--crit-pill-bg);
-  border: 1px solid var(--crit-pill-border);
+  color: var(--crit-brand);
+  background: var(--crit-brand-subtle);
+  border: 1px solid var(--crit-brand-bg);
   padding: 3px 10px;
   border-radius: 6px;
   height: 24px;
@@ -2108,7 +2108,7 @@ textarea.drag-active {
   background: var(--crit-bg-card);
   border: 1px solid var(--crit-border);
   border-radius: 12px;
-  max-width: 520px;
+  max-width: 480px;
   width: 90vw;
   box-shadow: var(--crit-shadow);
   overflow: hidden;
@@ -2202,6 +2202,64 @@ textarea.drag-active {
     animation: none;
   }
   .waiting-spinner .dot { animation: none; opacity: 0.6; }
+  .confetti-dot { animation: none !important; display: none; }
+}
+
+.confetti-dot {
+  position: absolute;
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  animation: confetti-fall 1.6s var(--crit-ease) forwards;
+}
+@keyframes confetti-fall {
+  0%   { opacity: 0; transform: translateY(-16px) scale(0.5); }
+  15%  { opacity: 0.8; }
+  100% { opacity: 0; transform: translateY(50px) scale(0.3); }
+}
+
+.waiting-dialog .summary-receipt {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 12px 0 0;
+  cursor: text;
+}
+.waiting-dialog .summary-line {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--crit-editor-fg-secondary);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.waiting-dialog .summary-copy-btn {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--crit-fg-muted);
+  cursor: pointer;
+  transition: background var(--crit-dur-fast) ease, color var(--crit-dur-fast) ease;
+}
+.waiting-dialog .summary-copy-btn:hover {
+  background: var(--crit-brand-subtle);
+  color: var(--crit-brand);
+}
+.waiting-dialog .summary-copy-btn:active {
+  transform: scale(0.92);
+}
+.waiting-dialog .summary-copy-btn.copied {
+  color: var(--crit-green);
+}
+.waiting-dialog .summary-copy-btn svg {
+  width: 16px;
+  height: 16px;
 }
 
 .waiting-dialog .waiting-edits {
@@ -4395,6 +4453,36 @@ body.sidebar-resizing * {
 }
 .outdated-comment .comment-card {
   border-color: var(--crit-drift-card-border);
+}
+/* GitHub-synced comment badge -- small pill with the GitHub mark, same
+   sizing as .outdated-badge. Uses neutral pill tokens so it reads as
+   informational ("synced from GitHub") rather than warning (#370). */
+.github-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px 1px 4px;
+  border-radius: 10px;
+  background: var(--crit-pill-bg);
+  color: var(--crit-pill-fg);
+  border: 1px solid var(--crit-pill-border);
+  white-space: nowrap;
+}
+.github-badge::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  background-color: var(--crit-pill-fg);
+  -webkit-mask-image: var(--crit-icon-github);
+  mask-image: var(--crit-icon-github);
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
 }
 /* Drifted anchor context — full-width disclosure bar + line-numbered panel */
 .drifted-context {
