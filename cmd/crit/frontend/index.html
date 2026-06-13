@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crit</title>
+<link rel="icon" type="image/png" sizes="96x96" href="favicon-96x96.png">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+<link rel="manifest" href="site.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="header-title"><svg class="header-logo" viewBox="50 -1600 3430 1650" aria-label="crit"><g transform="scale(1,-1)"><path d="M628 -22Q459 -22 336.5 50.5Q214 123 147.5 252.5Q81 382 81 554Q81 727 147.5 857.0Q214 987 336.5 1059.5Q459 1132 628 1132Q827 1132 960.0 1032.5Q1093 933 1125 760L846 708Q827 795 772.5 845.5Q718 896 631 896Q511 896 449.0 801.5Q387 707 387 555Q387 405 449.0 309.5Q511 214 631 214Q718 214 774.0 266.5Q830 319 848 409L1127 358Q1095 181 962.0 79.5Q829 -22 628 -22Z" fill="currentColor"/><path d="M128 0V1118H418V923H430Q461 1026 533.5 1079.5Q606 1133 700 1133Q751 1133 797 1123V855Q777 861 738.5 865.5Q700 870 667 870Q563 870 495.5 805.0Q428 740 428 636V0Z" fill="currentColor" transform="translate(1103,0)"/><path d="M128 0V1118H428V0ZM278 1264Q210 1264 162.0 1309.0Q114 1354 114 1418Q114 1482 162.0 1527.0Q210 1572 278 1572Q346 1572 394.5 1527.0Q443 1482 443 1418Q443 1354 394.5 1309.0Q346 1264 278 1264Z" fill="currentColor" transform="translate(1835,0)"/><path d="M683 1118V889H474V327Q474 223 576 223Q593 223 623.5 227.5Q654 232 671 236L714 11Q664 -4 614.5 -10.0Q565 -16 520 -16Q352 -16 263.0 65.5Q174 147 174 301V889H20V1118H174V1384H474V1118Z" fill="currentColor" transform="translate(2288,0)"/><path d="M342 -19Q269 -19 219.0 30.5Q169 80 169 153Q169 226 219.0 275.5Q269 325 342 325Q415 325 465.0 275.5Q515 226 515 153Q515 80 465.0 30.5Q415 -19 342 -19Z" fill="#7aa2f7" transform="translate(2936,0)"/></g></svg></span>
+    <button class="update-btn" id="updateBtn" style="display:none" title="Updates available" aria-label="Updates available">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v8m0 0l-3-3m3 3l3-3"/><path d="M2.5 11v1.75c0 .69.56 1.25 1.25 1.25h8.5c.69 0 1.25-.56 1.25-1.25V11"/></svg>
+      <span class="update-btn-label">Update</span>
+    </button>
+    <div class="compare-rail" id="compareRail" role="group" aria-label="Diff target">
+      <span class="base-branch-picker" id="baseBranchPicker" style="display:none">
+        <button class="header-chip base-branch-btn" id="baseBranchBtn" title="Change base branch" aria-haspopup="listbox" aria-expanded="false">
+          <span class="base-branch-label" id="baseBranchLabel"></span>
+          <svg class="base-branch-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.75 5 6.25 7.5 3.75"/></svg>
+        </button>
+        <div class="base-branch-menu" id="baseBranchMenu">
+          <input class="base-branch-search" id="baseBranchSearch" type="text" placeholder="Filter branches…" autocomplete="off" aria-label="Filter branches" />
+          <div class="base-branch-list" id="baseBranchList"></div>
+        </div>
+      </span>
+      <svg class="compare-rail-arrow" id="baseBranchArrow" width="14" height="14" viewBox="0 0 16 16" fill="none" style="display:none" aria-hidden="true"><path d="M10 4L6 8l4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span class="header-chip header-context" id="branchContext" style="display:none">
+        <span class="branch-icon">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M11.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm-2.25.75a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.492 2.492 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25zM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zM3.5 3.25a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0z"/></svg>
+        </span>
+        <span id="branchName"></span>
+      </span>
+      <div class="stack-chip" id="stackChip" style="display:none">
+        <button class="stack-chip-btn" id="stackChipBtn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="stackPopover">
+          <svg class="stack-chip-icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 4h12v1.5H2zM2 7.25h12v1.5H2zM2 10.5h12V12H2z"/></svg>
+          <span class="stack-chip-label" id="stackChipLabel">Stack</span>
+          <span class="stack-chip-chevron" aria-hidden="true">&#x25BE;</span>
+        </button>
+        <button class="stack-chip-exit" id="stackChipExit" type="button" title="Exit to working tree" aria-label="Exit to working tree">&#x2715;</button>
+        <div class="stack-popover" id="stackPopover" role="menu" aria-label="Stack navigation"></div>
+      </div>
+      <button class="resume-pr-pill" id="resumePrPill" type="button" style="display:none" aria-label="Resume previous range view"></button>
+    </div>
+    <span class="header-notify" id="headerNotify"></span>
+    <span class="header-update" id="headerUpdate" style="display:none">
+      <a id="updateLink" href="https://github.com/JoshEllinger/crit/releases/latest" target="_blank" rel="noopener noreferrer"></a>
+      <button class="header-update-dismiss" onclick="dismissUpdate()" title="Dismiss">&#x2715;</button>
+    </span>
+  </div>
+  <div class="header-right">
+    <span class="viewed-count" id="viewedCount"></span>
+    <button class="pr-toggle-btn" id="prToggle" style="display:none" title="Pull request overview" aria-label="Pull request overview">
+      <svg class="pr-toggle-icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+        <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z"/>
+      </svg>
+      <span class="pr-toggle-number" id="prToggleNumber"></span>
+    </button>
+    <div class="comment-nav-group" id="commentNavGroup" style="display:none">
+      <button class="comment-nav-btn" id="commentNavPrev" title="Previous comment ([)" aria-label="Previous comment">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+          <path d="M4 10l4-4 4 4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+      <button class="comment-count-btn" id="commentCount" title="Toggle comments panel" aria-label="Toggle comments panel">
+        <svg class="comment-count-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+          <path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Z" stroke-linejoin="round"/>
+        </svg>
+        <span class="comment-count-number" id="commentCountNumber"></span>
+      </button>
+      <button class="comment-nav-btn" id="commentNavNext" title="Next comment (])" aria-label="Next comment">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+          <path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+    <div class="scope-toggle" id="scopeToggle" style="display:none">
+      <button class="toggle-btn active" data-scope="all" title="All changes">All</button>
+      <button class="toggle-btn" data-scope="branch" title="Committed changes">Branch</button>
+      <button class="toggle-btn" data-scope="staged" title="Staged changes">Staged</button>
+      <button class="toggle-btn" data-scope="unstaged" title="Unstaged changes">Unstaged</button>
+    </div>
+    <button class="btn btn-sm" id="diffToggle" style="display:none">Toggle Diff</button>
+    <div class="diff-mode-toggle" id="diffModeToggle" style="display:none">
+      <button class="toggle-btn active" data-mode="split" title="Split diff">Split</button>
+      <button class="toggle-btn" data-mode="unified" title="Unified diff">Unified</button>
+    </div>
+    <button class="theme-toggle" id="settingsToggle" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M7.429 1.525a3.5 3.5 0 0 1 1.142 0c.036.003.108.036.137.146l.289 1.105c.147.56.55.967.997 1.189.174.086.341.183.501.29.417.278.97.423 1.53.27l1.102-.303c.11-.03.175.016.195.046.219.31.41.641.573.989.014.031.022.11-.059.19l-.815.806c-.411.406-.562.957-.53 1.456a4.6 4.6 0 0 1 0 .582c-.032.499.119 1.05.53 1.456l.815.806c.08.08.073.159.059.19a6 6 0 0 1-.573.99c-.02.029-.086.074-.195.045l-1.103-.303c-.559-.153-1.112-.008-1.529.27-.16.107-.327.204-.5.29-.449.222-.851.628-.998 1.189l-.289 1.105c-.029.11-.101.143-.137.146a3.5 3.5 0 0 1-1.142 0c-.036-.003-.108-.037-.137-.146l-.289-1.105c-.147-.56-.55-.967-.997-1.189a4 4 0 0 1-.501-.29c-.417-.278-.97-.423-1.53-.27l-1.102.303c-.11.03-.175-.016-.195-.046a6 6 0 0 1-.573-.989c-.014-.031-.022-.11.059-.19l.815-.806c.411-.406.562-.957.53-1.456a4.6 4.6 0 0 1 0-.582c.032-.499-.119-1.05-.53-1.456l-.815-.806c-.08-.08-.073-.159-.059-.19a6 6 0 0 1 .573-.99c.02-.029.086-.074.195-.045l1.103.303c.559.153 1.112.008 1.529-.27.16-.107.327-.204.5-.29.449-.222.851-.628.998-1.189l.289-1.105c.029-.11.101-.143.137-.146M8 0a4.5 4.5 0 0 0-1.46.243 1.5 1.5 0 0 0-1.088 1.158l-.289 1.105a1 1 0 0 1-.249.432 3 3 0 0 0-.37.215 1 1 0 0 1-.473.083l-1.103-.303a1.5 1.5 0 0 0-1.53.463 7 7 0 0 0-.688 1.186 1.5 1.5 0 0 0 .442 1.621l.815.806a1 1 0 0 1 .168.474 3.6 3.6 0 0 0 0 .428 1 1 0 0 1-.168.474l-.815.806a1.5 1.5 0 0 0-.442 1.621c.17.434.378.846.618 1.236a1.5 1.5 0 0 0 1.6.413l1.103-.303a1 1 0 0 1 .473.083c.121.065.24.137.37.215a1 1 0 0 1 .249.432l.289 1.105a1.5 1.5 0 0 0 1.088 1.158A4.5 4.5 0 0 0 8 16a4.5 4.5 0 0 0 1.46-.243 1.5 1.5 0 0 0 1.088-1.158l.289-1.105a1 1 0 0 1 .249-.432 3 3 0 0 0 .37-.215 1 1 0 0 1 .473-.083l1.103.303a1.5 1.5 0 0 0 1.53-.463c.24-.39.447-.802.617-1.236a1.5 1.5 0 0 0-.442-1.621l-.815-.806a1 1 0 0 1-.168-.474 3.6 3.6 0 0 0 0-.428 1 1 0 0 1 .168-.474l.815-.806a1.5 1.5 0 0 0 .442-1.621 7 7 0 0 0-.688-1.186 1.5 1.5 0 0 0-1.53-.463l-1.103.303a1 1 0 0 1-.473-.083 3 3 0 0 0-.37-.215 1 1 0 0 1-.249-.432l-.289-1.105A1.5 1.5 0 0 0 9.46.243 4.5 4.5 0 0 0 8 0M5.5 8a2.5 2.5 0 1 1 5 0 2.5 2.5 0 0 1-5 0M8 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3" clip-rule="evenodd"/></svg>
+    </button>
+    <button class="theme-toggle" id="tocToggle" title="Table of contents" aria-label="Table of contents">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" stroke-linecap="round"/></svg>
+    </button>
+    <button class="btn" id="shareBtn" style="display:none">Share</button>
+    <button class="btn btn-primary" id="finishBtn">Approve</button>
+  </div>
+</div>
+
+<div id="toc" class="toc toc-hidden">
+  <div class="toc-header">
+    <span>Contents</span>
+    <button class="toc-close" title="Close table of contents" aria-label="Close table of contents">&#x2715;</button>
+  </div>
+  <ul class="toc-list"></ul>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+<div id="copyStatus" role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap"></div>
+<div class="bottom-toast-container" id="bottomToastContainer"></div>
+
+<div class="mobile-file-picker-bar mobile-file-picker-hidden" id="mobileFilePickerBar" aria-label="File navigation">
+  <label class="mobile-file-picker-label" for="mobileFilePicker">File:</label>
+  <select class="mobile-file-picker-select" id="mobileFilePicker" aria-label="Select file to review"></select>
+</div>
+
+<div class="main-layout">
+  <div class="file-tree-panel" id="fileTreePanel">
+    <div class="tree-section--conversation" id="treeConversationSection"></div>
+    <div class="file-tree-header">
+      <span class="file-tree-title">Files</span>
+      <span class="file-tree-stats" id="fileTreeStats"></span>
+    </div>
+    <div class="commit-picker" id="commitDropdown" style="display:none">
+      <button class="commit-picker-btn" id="commitDropdownBtn">
+        <span class="commit-picker-label" id="commitDropdownLabel">All commits</span>
+        <svg class="commit-picker-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.75 5 6.25 7.5 3.75"/></svg>
+      </button>
+      <div class="commit-picker-menu" id="commitDropdownMenu">
+        <div class="commit-picker-item active" data-commit="" role="button" tabindex="0"><span class="commit-picker-item-check-spacer" aria-hidden="true"></span>All commits</div>
+        <div class="commit-picker-separator"></div>
+        <div class="commit-picker-list" id="commitDropdownList"></div>
+      </div>
+    </div>
+    <div class="file-tree-body" id="fileTreeBody"></div>
+  </div>
+  <div class="sidebar-resize-handle" id="fileTreeResizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize file tree" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div>
+  <div class="main-content">
+    <div id="reviewConversation" class="review-conversation" hidden></div>
+    <div id="filesContainer">
+      <div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>
+    </div>
+  </div>
+  <div class="sidebar-resize-handle" id="commentsPanelResizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize comments panel" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div>
+  <div class="comments-panel comments-panel-hidden" id="commentsPanel">
+    <div class="comments-panel-header">
+      <div class="comments-panel-header-row1">
+        <div class="comments-panel-header-left">
+          <span class="comments-panel-title">Comments</span>
+          <span class="comments-panel-count-badge" id="commentsPanelCountBadge">0</span>
+        </div>
+        <div class="comments-panel-header-actions">
+          <button class="comments-panel-close" title="Close comments panel" aria-label="Close comments panel">&#x2715;</button>
+        </div>
+      </div>
+      <div class="comments-panel-header-row2">
+        <div class="comments-filter-toggle" id="commentsFilterPill" role="radiogroup" aria-label="Filter comments">
+          <button type="button" class="toggle-btn active" data-filter="all" role="radio" aria-checked="true" tabindex="0">All <span class="filter-count">0</span></button>
+          <button type="button" class="toggle-btn" data-filter="open" role="radio" aria-checked="false" tabindex="-1">Open <span class="filter-count">0</span></button>
+          <button type="button" class="toggle-btn" data-filter="resolved" role="radio" aria-checked="false" tabindex="-1">Resolved <span class="filter-count">0</span></button>
+        </div>
+        <button type="button" class="comments-panel-expand-all" id="commentsPanelExpandAll" aria-pressed="false">Expand all</button>
+      </div>
+    </div>
+    <div class="comments-panel-body" id="commentsPanelBody" aria-live="polite" aria-label="Comments list"></div>
+  </div>
+  <div class="pr-panel pr-panel-hidden" id="prPanel" aria-label="Pull request overview">
+    <div class="pr-panel-body" id="prPanelBody"></div>
+  </div>
+</div>
+
+<div class="waiting-overlay" id="waitingOverlay" role="dialog" aria-modal="true" aria-labelledby="waitingHeading">
+  <div class="waiting-dialog" id="waitingDialog">
+    <!-- Header -->
+    <div class="waiting-header">
+      <div class="waiting-spinner" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+      <svg class="success-mark" viewBox="0 0 64 64" aria-hidden="true">
+        <circle class="success-mark-ring" cx="32" cy="32" r="28"/>
+        <path class="success-mark-check" d="M19 33 L28 42 L45 23"/>
+      </svg>
+      <h3 id="waitingHeading">Review Complete</h3>
+      <p id="waitingMessage"></p>
+      <div class="summary-receipt" id="summaryReceipt" style="display:none">
+        <span class="summary-line" id="summaryLine"></span>
+        <button class="summary-copy-btn" id="summaryCopyBtn" aria-label="Copy summary to clipboard">
+          <svg class="icon-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="8" height="8" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <svg class="icon-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M3 8.5L6.5 12L13 4"/></svg>
+        </button>
+      </div>
+      <p class="waiting-edits" id="waitingEdits"></p>
+    </div>
+
+    <!-- Prompt copy row -->
+    <div class="prompt-copy-row" id="promptCopyRow">
+      <span class="prompt-preview" id="promptPreview"></span>
+      <button class="prompt-copy-btn" id="waitingClipboard" aria-label="Copy prompt to clipboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        <span class="copy-label">Copy</span>
+      </button>
+    </div>
+    <div class="prompt-full-text" id="waitingPrompt"></div>
+
+    <!-- Divider -->
+    <div class="waiting-divider" id="waitingDivider"></div>
+
+    <!-- Tip -->
+    <div class="tip-section" id="tipSection">
+      <svg class="tip-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+      <div class="tip-content">
+        <div class="tip-label">Tip</div>
+        <div class="tip-text" id="tipText"></div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="waiting-footer">
+      <button class="btn btn-sm" id="backToEditing">Back to editing</button>
+    </div>
+  </div>
+</div>
+
+<div class="confirm-overlay" id="noChangesOverlay" role="dialog" aria-modal="true" aria-labelledby="noChangesHeading">
+  <div class="confirm-dialog">
+    <h3 id="noChangesHeading">No changes this round</h3>
+    <p>You haven't added any new comments or replies. The remaining unresolved threads are from a previous round — the agent has no new feedback to act on.</p>
+    <div class="confirm-actions">
+      <div class="confirm-actions-row">
+        <button class="btn btn-primary" id="noChangesResolveAll">Resolve all &amp; approve</button>
+        <button class="btn" id="noChangesGoBack">Go back</button>
+      </div>
+      <button class="confirm-send-anyway" id="noChangesSendAnyway">Send anyway</button>
+    </div>
+  </div>
+</div>
+
+<div class="settings-overlay" id="settingsOverlay" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="settings-dialog">
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button class="settings-tab active" data-tab="settings" role="tab" aria-selected="true" aria-controls="settingsPane" id="tab-settings">Settings</button>
+      <button class="settings-tab" data-tab="shortcuts" role="tab" aria-selected="false" aria-controls="shortcutsPane" id="tab-shortcuts">Shortcuts</button>
+      <button class="settings-tab" data-tab="about" role="tab" aria-selected="false" aria-controls="aboutPane" id="tab-about">About</button>
+      <button class="settings-tab-close" id="settingsClose" aria-label="Close">&times;</button>
+    </div>
+    <div class="settings-content">
+      <div class="settings-pane active" data-pane="settings" id="settingsPane" role="tabpanel" aria-labelledby="tab-settings"></div>
+      <div class="settings-pane" data-pane="shortcuts" id="shortcutsPane" role="tabpanel" aria-labelledby="tab-shortcuts"></div>
+      <div class="settings-pane" data-pane="about" id="aboutPane" role="tabpanel" aria-labelledby="tab-about"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function () {
+    // Path-based fork. The server serves this same index.html raw at /live,
+    // so pathname is the most reliable trigger — survives reload, doesn't
+    // depend on a query string being present.
+    var isLive = window.location.pathname === '/live';
+    var isPreview = window.location.pathname === '/preview';
+
+    if (isLive || isPreview) {
+      // Keep <body> intact and just mark <html> with a mode class. style-live.css
+      // hides code-review-only chrome (file tree, main-content, comments-panel,
+      // pr-panel, etc.) while keeping the header + settings overlay alive, so the
+      // shared bootstrap (theme pill, settings dialog, shared helpers) keeps working.
+      document.documentElement.classList.add('crit-mode-live');
+      // Preview is a self-contained, shareable snapshot, so mark it distinctly:
+      // style-live.css un-hides the Share button for preview (design/live keeps
+      // it hidden — there's a running app behind it, nothing to publish).
+      if (isPreview) document.documentElement.classList.add('crit-mode-preview');
+
+      // Pull in shared helpers + live-mode CSS, then the controller.
+      var sh = document.createElement('script'); sh.src = 'crit-shared.js';
+      document.head.appendChild(sh);
+
+      var cr = document.createElement('script'); cr.src = 'crit-renderer.js';
+      document.head.appendChild(cr);
+
+      var dr = document.createElement('script'); dr.src = 'crit-draft.js';
+      document.head.appendChild(dr);
+
+      var ctpl = document.createElement('script'); ctpl.src = 'crit-comment-templates.js';
+      document.head.appendChild(ctpl);
+
+      var sse = document.createElement('script'); sse.src = 'crit-sse.js';
+      document.head.appendChild(sse);
+
+      var cf = document.createElement('script'); cf.src = 'crit-comment-form.js';
+      document.head.appendChild(cf);
+
+      var ru = document.createElement('script'); ru.src = 'live-route-utils.js';
+      document.head.appendChild(ru);
+
+      // markdown-it powers comment-body rendering inside the shared
+      // buildCommentCard. Loaded for /live too so live rows reach parity
+      // with code-review's renderer.
+      var mi = document.createElement('script'); mi.src = 'markdown-it.min.js';
+      document.head.appendChild(mi);
+
+      var l = document.createElement('link');
+      l.rel = 'stylesheet';
+      l.href = 'style-live.css';
+      document.head.appendChild(l);
+
+      // Sub-modules loaded in parallel; live-mode.js (loaded last) requires
+      // their window.crit.* / window.crit.live.* namespaces to be present.
+      var liveDeps = [
+        'crit-icons.js',
+        'crit-comment-card-helpers.js',
+        'crit-comment-card.js',
+        'crit-settings-panes.js',
+        'crit-settings-overlay.js',
+        'crit-share.js',
+        'agent-protocol.js',
+        'live-mode.dispatch.js',
+        'live-mode.inflight.js',
+        'live-mode.toggle.js',
+        'live-mode.composer.js',
+        'live-mode.menu.js',
+        'live-mode.shortcut.js',
+        'live-mode.queue.js',
+        'live-mode.origin.js',
+        'live-mode.size.js',
+        'live-mode.row.js',
+        'live-mode.panel.js',
+        'live-mode.panel-render.js',
+        'live-mode.sse.js',
+        'live-mode.comments-loader.js',
+        'live-mode.redirect-notice.js',
+        'live-mode-pin-filter.js',
+        'live-mode-resolution-gate.js',
+        'live-mode-pin-state.js',
+        'live-mode-thread-scroll.js',
+        'live-mode-reanchor-click.js',
+        'live-mode-reanchor-put.js',
+        'live-mode-deeplink.js',
+        'live-mode-round-resolve.js',
+        'live-mode-round-tooltip.js',
+        'live-mode.menu-controller.js',
+      ];
+      // async=false on dynamically-inserted scripts preserves DOM order for
+      // execution while still loading in parallel. Without this, a module
+      // like live-mode.dispatch.js may execute before agent-protocol.js
+      // has parsed, leaving window.crit.agentProtocol undefined and crashing
+      // boot with "Cannot read properties of undefined (reading 'A2C')".
+      var depTags = liveDeps.map(function (p) {
+        var t = document.createElement('script');
+        t.src = p;
+        t.async = false;
+        document.head.appendChild(t);
+        return t;
+      });
+
+      // Defer live-mode.js until all deps have parsed. Promise.all over a
+      // settled-on-either-load-or-error promise per tag means adding a new
+      // module to liveDeps automatically participates in the gate — no
+      // hand-counted totalNeeded to keep in sync. Errors don't hang boot;
+      // they surface a banner and log a console error with the failed src
+      // so the user can see which module failed.
+      function trackTag(tag, optional) {
+        return new Promise(function (resolve) {
+          tag.addEventListener('load', function () { resolve({ ok: true, src: tag.src }); });
+          tag.addEventListener('error', function () {
+            // markdown-it is optional — booting without it degrades comment
+            // rendering but doesn't crash the app. Treat as resolved for the
+            // boot gate; render path falls back to plain text.
+            if (!optional) {
+              try { console.error('[crit] live-mode dep failed to load:', tag.src); } catch (_) {}
+            }
+            resolve({ ok: false, src: tag.src, optional: !!optional });
+          });
+        });
+      }
+      var bootGate = [trackTag(sh), trackTag(cr), trackTag(dr), trackTag(ctpl), trackTag(sse), trackTag(cf), trackTag(ru), trackTag(mi, true)]
+        .concat(depTags.map(function (t) { return trackTag(t); }));
+      Promise.all(bootGate).then(function (results) {
+        var failed = results.filter(function (r) { return !r.ok && !r.optional; });
+        if (failed.length) {
+          var box = document.createElement('div');
+          box.style.cssText = 'position:fixed;inset:24px;background:var(--crit-bg-card,#1a1d24);color:var(--crit-red,#f7768e);border:1px dashed var(--crit-red,#f7768e);border-radius:6px;padding:16px;font-family:var(--crit-font-mono,monospace);font-size:13px;z-index:2147483647;white-space:pre-wrap';
+          box.textContent = 'Live mode failed to load:\n' + failed.map(function (r) { return '  • ' + r.src; }).join('\n');
+          document.body.appendChild(box);
+          return;
+        }
+        if (window.crit && window.crit.shared) window.crit.shared.applyThemeFromCookie();
+        var s = document.createElement('script');
+        s.src = 'live-mode.js';
+        document.body.appendChild(s);
+      });
+    } else {
+      // Code-review chrome — load existing vendor + app.js.
+      // async=false on dynamically-inserted scripts preserves DOM order for
+      // execution while still loading in parallel. Without this, app.js may
+      // execute before crit-shared.js parses, producing
+      // "Cannot read properties of undefined (reading 'installSidebarResize')"
+      // (and similar for other window.crit.shared.* helpers).
+      var v1 = document.createElement('script'); v1.src = 'markdown-it.min.js'; v1.async = false; document.body.appendChild(v1);
+      var v2 = document.createElement('script'); v2.src = 'highlight.min.js'; v2.async = false; document.body.appendChild(v2);
+      var v3 = document.createElement('script'); v3.src = 'mermaid.min.js'; v3.async = false; document.body.appendChild(v3);
+      var v4 = document.createElement('script'); v4.src = 'diff-match-patch.min.js'; v4.async = false; document.body.appendChild(v4);
+      // Shared helpers (escapeHTML, fetchJSON, installSidebarResize, theme cookie, etc.)
+      // used by app.js. Must load before app.js.
+      var sh = document.createElement('script'); sh.src = 'crit-shared.js'; sh.async = false; document.body.appendChild(sh);
+      var cr = document.createElement('script'); cr.src = 'crit-renderer.js'; cr.async = false; document.body.appendChild(cr);
+      var dr = document.createElement('script'); dr.src = 'crit-draft.js'; dr.async = false; document.body.appendChild(dr);
+      var ctpl = document.createElement('script'); ctpl.src = 'crit-comment-templates.js'; ctpl.async = false; document.body.appendChild(ctpl);
+      var sse = document.createElement('script'); sse.src = 'crit-sse.js'; sse.async = false; document.body.appendChild(sse);
+      var cf = document.createElement('script'); cf.src = 'crit-comment-form.js'; cf.async = false; document.body.appendChild(cf);
+      // Pure rendering helpers shared with live-mode rows. Must load before app.js.
+      var ch = document.createElement('script'); ch.src = 'crit-comment-card-helpers.js'; ch.async = false; document.body.appendChild(ch);
+      // Shared comment-card renderer (used by app.js and live-mode). Must load before app.js.
+      var cc = document.createElement('script'); cc.src = 'crit-comment-card.js'; cc.async = false; document.body.appendChild(cc);
+      // Shared settings-overlay panes (Shortcuts + About). Must load before app.js.
+      var sp = document.createElement('script'); sp.src = 'crit-settings-panes.js'; sp.async = false; document.body.appendChild(sp);
+      // Shared settings-overlay shell (open/close/Esc/focus-trap/tab nav). Must load before app.js.
+      var so = document.createElement('script'); so.src = 'crit-settings-overlay.js'; so.async = false; document.body.appendChild(so);
+      // Line-block building (buildLineBlocks, splitHighlightedCode). Must load before app.js.
+      var lb = document.createElement('script'); lb.src = 'crit-line-blocks.js'; lb.async = false; document.body.appendChild(lb);
+      // Word-level diff computation (pure functions). Must load before app.js.
+      var df = document.createElement('script'); df.src = 'crit-diff-renderer.js'; df.async = false; document.body.appendChild(df);
+      // SVG icon constants used by app.js. Must load before app.js.
+      var ic = document.createElement('script'); ic.src = 'crit-icons.js'; ic.async = false; document.body.appendChild(ic);
+      // Shared Share flow (window.crit.share). Must load before app.js.
+      var shr = document.createElement('script'); shr.src = 'crit-share.js'; shr.async = false; document.body.appendChild(shr);
+      var a = document.createElement('script'); a.src = 'app.js'; a.async = false; document.body.appendChild(a);
+    }
+  })();
+</script>
+</body>
+</html>
