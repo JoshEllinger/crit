@@ -12,7 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
@@ -23,7 +23,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
@@ -34,11 +34,11 @@ jobs:
           node-version: 22
 
       - name: Install Playwright
-        working-directory: e2e
+        working-directory: test/e2e
         run: npm ci && npx playwright install chromium --with-deps
 
       - name: Run E2E tests
-        working-directory: e2e
+        working-directory: test/e2e
         run: bash run.sh
 
       - name: Upload test results
@@ -46,13 +46,13 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: e2e-test-results
-          path: e2e/test-results/
+          path: test/e2e/test-results/
           retention-days: 7
 
   nix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: DeterminateSystems/nix-installer-action@main
 
@@ -63,7 +63,7 @@ jobs:
     needs: [test, e2e, nix]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:

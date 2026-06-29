@@ -2,11 +2,21 @@
 
 ## Context
 
-We maintain a fork of `tomasz-tomczyk/crit` with three custom changes that need to survive each upstream merge:
+We maintain a fork of `tomasz-tomczyk/crit` with two custom changes that need to survive each upstream merge:
 
-1. **Files outside repo root fix** — When crit is given a file outside the repo root (e.g. `~/.claude/plans/foo.md`), `filepath.Rel` produces a `../..` path that the `/files/` endpoint rejects. Our fix: use absolute paths and validate against known session files via `isSessionFile()`. Upstream does NOT have this fix.
+1. **Files outside repo root fix** — When crit is given a file outside the repo root (e.g. `~/.claude/plans/foo.md`), `filepath.Rel` produces a `../..` path that the `/files/` endpoint rejects. Our fix: use absolute paths and validate against known session files via `IsSessionFile()`. Upstream does NOT have this fix.
+   - Method lives in `internal/session/session.go` as `IsSessionFile` (exported, uppercase — required for cross-package access from `internal/server/`)
+   - Validation block lives in `internal/server/server.go` `handleFiles` function
 2. **No Homebrew tap push** — upstream's release.yml pushes to `tomasz-tomczyk/homebrew-tap` using a `HOMEBREW_TAP_TOKEN` secret we don't have. Strip this step after merge if present.
-3. **`--global` flag for `crit install`** — `crit install --global claude-code` writes to `~/.claude/commands/crit.md` for user-wide availability. Upstream does not have this.
+
+### Removed custom changes (no longer needed)
+- **`--global` flag for `crit install`** — This flag was removed upstream. Global install is now determined automatically: if `cwd == $HOME`, the install is global. Do NOT re-add `--global`.
+
+### Upstream structural notes (as of v0.16.3+)
+- **`integrations/` moved to repo root** — was `cmd/crit/integrations/`, now `integrations/` at the repo root, with `integrations/embed.go` providing the Go embed.
+- **claude-code integration is now SKILLS** — `integrations/claude-code/skills/crit/SKILL.md` and `integrations/claude-code/skills/crit-cli/SKILL.md`, not a single `.claude/commands/crit.md` file.
+- **`integrations.go` renamed to `cli_install.go`** — the install CLI subcommand.
+- **Package layout refactored** — code moved from flat `cmd/crit/` into `internal/` packages (server, session, vcs, github, share, etc.) and `web/` for frontend assets. `cmd/crit/` is now a thin CLI wiring layer.
 
 Items that are NOT concerns:
 - The Nix flake and marketplace JSON files reference `tomasz-tomczyk/crit` but are inert in our fork.
@@ -18,22 +28,8 @@ Items that are NOT concerns:
 |---------|------|-----------|-------|
 | v0.8.3 | 2026-04-10 | main.go, session.go, server.go | Initial merge from v0.7.0 |
 | v0.9.2 | 2026-04-17 | main.go (help text), session.go (isSessionFile) | Clean merge, 20 upstream commits |
-
-## What's new in v0.9.2 (upstream additions)
-
-- Content-based comment anchoring for carry-forward positioning
-- Tab-ready title indicator for background review rounds
-- Opportunistic background cleanup of stale reviews and sessions
-- Orphaned comments surfaced on removed files
-- `crit auth` subcommands (login/logout/whoami)
-- `crit status` and `crit cleanup` subcommands
-- Only poll git status while waiting for agent edits
-- Hide share button in git mode
-- Various fixes: comment index perf, CSS, test isolation, session key dedup, debounced writes, unified-diff selection, hljs markdown fences, git --no-optional-locks, crit comment --reply-to subdirectory fix
-- Quality guardrails (linting, accessibility, rules)
-- Favicons and web app manifest
-- "review file" terminology replaces ".crit.json" references
-- Prevent agents from proactively resolving review comments
+| v0.16.2 | 2026-05-xx | Various (large refactor range) | Merged through v0.16.2 |
+| v0.16.5 | 2026-06-29 | internal/config/config.go (OpenCmd added; kept ShareURL=""), test/e2e/tests/settings-panel.spec.ts (config card assertions) | Massive repo layout refactor (v0.16.3): internal/ packages, web/, integrations/ moved to root; 127 Go files needed module path updated from tomasz-tomczyk to JoshEllinger; isSessionFile exported as IsSessionFile for cross-package use. The "configuration cards" test was re-resolved to match fork rendering (Account/Share cards absent with empty share_url). |
 
 ## Steps for future merges
 
@@ -48,33 +44,53 @@ git merge v0.X.Y
 
 Expected conflict areas (our custom code vs upstream changes):
 
-- **main.go** — `printHelp()` has our `--global` flag text. Take upstream additions, keep `[--global]` on the install line.
-- **session.go** — Our `isSessionFile()` method. Keep it; upstream doesn't have it.
-- **server.go** — Our `filepath.IsAbs` block in `handleFiles`. Keep it; upstream doesn't have it.
+- **internal/config/config.go** — `defaultConfig()` has `ShareURL: ""` (fork intentionally suppresses the crit.md default). Upstream may add new fields (e.g. `OpenCmd`). Take new upstream fields, keep `ShareURL: ""`.
+- **internal/session/session.go** — Our `IsSessionFile()` method. Keep it; upstream doesn't have it.
+- **internal/server/server.go** — Our `filepath.IsAbs` block in `handleFiles`. Keep it; upstream doesn't have it.
+- **test/e2e/tests/settings-panel.spec.ts** — The "settings pane shows configuration cards" test WILL conflict on every merge. Upstream asserts that "Account" and "Sharing enabled" cards are visible because upstream defaults `share_url` to `"https://crit.md"`. Our fork defaults `share_url` to `""`, so those cards do NOT render in git-mode. After merging, resolve this test toward the fork's actual rendering: keep "Agent Command" and the `AI Integration|Integration Available` assertions; assert "Account" has count 0 (not visible); assert "Share" (not "Sharing enabled") is visible. Do NOT blindly take upstream's Account/Share assertions.
 
 ### 3. Verify custom changes survived
 
 ```bash
 # Files-outside-root fix
-grep -n 'isSessionFile' session.go server.go
-grep -n 'filepath.IsAbs(reqPath)' server.go
+grep -rn 'IsSessionFile' internal/session/ internal/server/
+grep -rn 'filepath.IsAbs(reqPath)' internal/server/
 
-# --global flag
-grep -n '\-\-global' main.go
+# No homebrew tap push
+grep -n 'homebrew\|HOMEBREW_TAP' .github/workflows/release.yml  # expect NO output
 ```
 
-### 4. Sync local skill
+### 4. Module import path fix (if new files were added by upstream)
 
-Compare `.claude/commands/crit.md` with upstream's `integrations/claude-code/skills/crit/SKILL.md` and sync content changes while keeping local frontmatter format.
-
-### 5. Build, test, install
+Upstream uses `github.com/tomasz-tomczyk/crit/...`; our fork uses `github.com/JoshEllinger/crit/...`. After any merge that brings in new Go files:
 
 ```bash
-go test ./...
-go build -o ~/.local/bin/crit .
+# Check for stale upstream import paths
+grep -r 'github.com/tomasz-tomczyk/crit' . --include='*.go' -l
+
+# Fix them all at once if any are found
+find . -name '*.go' -exec grep -l 'github.com/tomasz-tomczyk/crit' {} \; | \
+  xargs sed -i '' 's|github.com/tomasz-tomczyk/crit|github.com/JoshEllinger/crit|g'
 ```
 
-### 6. Commit
+### 5. Build, test, format
+
+```bash
+go build -o /tmp/crit-build ./cmd/crit; echo "build $?"
+go test ./... 2>&1 | tail -30; echo "test $?"
+gofmt -l .         # should be empty
+gofmt -w $(gofmt -l .)  # fix any formatting issues
+```
+
+### 6. Bump flake.nix version
+
+```nix
+version = "0.X.Y";
+```
+
+Note: if `go.mod`/`go.sum` changed, the Nix `vendorHash` in `flake.nix` will be stale. Set it to `pkgs.lib.fakeHash`, run `nix build .`, and copy the correct hash from the error.
+
+### 7. Commit
 
 ```bash
 git add -A && git commit -m "merge: upstream tomasz-tomczyk/crit vX.Y.Z"
