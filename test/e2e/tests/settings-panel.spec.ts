@@ -77,16 +77,26 @@ test.describe('Settings Panel', () => {
   test('settings pane shows configuration cards', async ({ page }) => {
     await page.click('#settingsToggle');
     const pane = page.locator('.settings-pane[data-pane="settings"]');
-    // Core cards — always rendered (in various states). Integration title varies
-    // (AI Integration vs Integration Available); share title varies (Share vs Sharing enabled).
-    await expect(pane.locator('.config-card-title', { hasText: 'Account' })).toBeVisible();
+    // Fork divergence: this fork defaults share_url to "" (config.go), unlike upstream which
+    // defaults to "https://crit.md". Account and "Sharing enabled" cards are gated on
+    // cfg.share_url in app.js renderSettingsPane(), so they do NOT render in git-mode for
+    // this fork. On each upstream merge, do NOT blindly adopt upstream's Account/Share
+    // assertions — resolve this test toward the fork's actual rendering (empty share_url).
+    //
+    // Cards rendered in git-mode with empty share_url:
+    //   - "Agent Command"   — unconditional
+    //   - "AI Integration"  — unconditional unless no_integration_check
+    //   - "Share"           — always rendered (the else-branch when share_url is empty)
+    //   - "Account"         — NOT rendered (gated on share_url)
+    //   - "Sharing enabled" — NOT rendered (gated on share_url)
     await expect(pane.locator('.config-card-title', { hasText: 'Agent Command' })).toBeVisible();
     await expect(
       pane.locator('.config-card-title', { hasText: /AI Integration|Integration Available/ }).first(),
     ).toBeVisible();
-    await expect(
-      pane.locator('.config-card-title', { hasText: /Share|Sharing enabled/ }).first(),
-    ).toBeVisible();
+    // "Share" title renders when share_url is empty (the disabled/unconfigured state).
+    await expect(pane.locator('.config-card-title', { hasText: 'Share' })).toBeVisible();
+    // Account card must NOT appear when share_url is empty (fork's privacy default).
+    await expect(pane.locator('.config-card-title', { hasText: 'Account' })).toHaveCount(0);
   });
 
   test('about pane shows version and session info', async ({ page }) => {

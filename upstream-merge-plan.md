@@ -29,7 +29,7 @@ Items that are NOT concerns:
 | v0.8.3 | 2026-04-10 | main.go, session.go, server.go | Initial merge from v0.7.0 |
 | v0.9.2 | 2026-04-17 | main.go (help text), session.go (isSessionFile) | Clean merge, 20 upstream commits |
 | v0.16.2 | 2026-05-xx | Various (large refactor range) | Merged through v0.16.2 |
-| v0.16.5 | 2026-06-29 | internal/config/config.go (OpenCmd added; kept ShareURL=""), test/e2e/tests/settings-panel.spec.ts (config card assertions) | Massive repo layout refactor (v0.16.3): internal/ packages, web/, integrations/ moved to root; 127 Go files needed module path updated from tomasz-tomczyk to JoshEllinger; isSessionFile exported as IsSessionFile for cross-package use |
+| v0.16.5 | 2026-06-29 | internal/config/config.go (OpenCmd added; kept ShareURL=""), test/e2e/tests/settings-panel.spec.ts (config card assertions) | Massive repo layout refactor (v0.16.3): internal/ packages, web/, integrations/ moved to root; 127 Go files needed module path updated from tomasz-tomczyk to JoshEllinger; isSessionFile exported as IsSessionFile for cross-package use. The "configuration cards" test was re-resolved to match fork rendering (Account/Share cards absent with empty share_url). |
 
 ## Steps for future merges
 
@@ -47,6 +47,7 @@ Expected conflict areas (our custom code vs upstream changes):
 - **internal/config/config.go** — `defaultConfig()` has `ShareURL: ""` (fork intentionally suppresses the crit.md default). Upstream may add new fields (e.g. `OpenCmd`). Take new upstream fields, keep `ShareURL: ""`.
 - **internal/session/session.go** — Our `IsSessionFile()` method. Keep it; upstream doesn't have it.
 - **internal/server/server.go** — Our `filepath.IsAbs` block in `handleFiles`. Keep it; upstream doesn't have it.
+- **test/e2e/tests/settings-panel.spec.ts** — The "settings pane shows configuration cards" test WILL conflict on every merge. Upstream asserts that "Account" and "Sharing enabled" cards are visible because upstream defaults `share_url` to `"https://crit.md"`. Our fork defaults `share_url` to `""`, so those cards do NOT render in git-mode. After merging, resolve this test toward the fork's actual rendering: keep "Agent Command" and the `AI Integration|Integration Available` assertions; assert "Account" has count 0 (not visible); assert "Share" (not "Sharing enabled") is visible. Do NOT blindly take upstream's Account/Share assertions.
 
 ### 3. Verify custom changes survived
 
