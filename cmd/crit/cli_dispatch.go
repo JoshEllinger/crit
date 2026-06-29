@@ -23,6 +23,7 @@ var commandDispatch = map[string]func([]string){
 	"pull":      runPull,
 	"push":      runPush,
 	"comment":   runComment,
+	"comments":  runComments,
 	"review":    runReview,
 	"live":      runLive,
 	"preview":   runPreview,
@@ -57,6 +58,7 @@ Comments:
   crit comment --reply-to <id> <body>        Reply to a comment
   crit comment --json                        Bulk add comments from JSON on stdin
   crit comment --clear                       Remove all comments
+  crit comments [--json] [--all] [review]    List unresolved comments (review-level first)
 
 Sharing:
   crit share <file> [file...]                Share files to crit-web, print URL
@@ -172,14 +174,16 @@ Available keys:
   base_branch       string    Base branch to diff against (overrides auto-detection)
   vcs                    string    Preferred VCS backend: git, sl, or jj (default: auto-detect)
   ignore_patterns        []string  Gitignore-style patterns to exclude files from review
+  auto_viewed_patterns   []string  Patterns whose files are auto-marked viewed once per launch
   no_integration_check   bool      Skip integration staleness check (default: false)
   no_update_check        bool      Disable update check on startup (default: false)
   cleanup_on_approve     bool      Auto-delete review file when approved (default: true)
   disable_stats          bool      Disable session stats recording (default: false)
+  open_cmd               string    Custom browser/open command
   agent_cmd              string    Shell command to send comments to an AI agent (e.g. "claude -p")
   auth_token             string    Authentication token for crit-web share service
 
-Note: agent_cmd, auth_token, host, and share_url are global-only (~/.crit.config.json).
+Note: agent_cmd, auth_token, host, open_cmd, and share_url are global-only (~/.crit.config.json).
 Project-level .crit.config.json cannot override them for security reasons.
 
 Ignore pattern syntax:

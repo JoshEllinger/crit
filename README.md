@@ -6,25 +6,27 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/tomasz-tomczyk/crit)](https://goreportcard.com/report/github.com/tomasz-tomczyk/crit)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A browser-based review UI for AI agent output. Point at the line. Tell the agent.
+Review and comment on plans, code diffs, frontend elements and send feedback directly to your agent.
 
-Your agent just touched 14 files. In the terminal you're scrolling through diffs hoping nothing broke. Crit opens those changes in a browser — click line 47, type "this drops the refresh token", and the agent fixes it. You see exactly what changed, round by round.
+![Crit UI for "notification-plan.md" showing comment left on "Queue - Redis Streams, SQS, RabbitMQ" line saying "Just use SQS - we're in AWS"](docs/images/demo-overview.png)
 
-![Crit review UI](images/demo-overview.png)
+## Adaptive UI for each type of output
 
-## Four review modes
+For agents, plans and code are all the same - it's just text, but for us, humans, reviewing generated plans and reviewing web application are two very different activities.
 
-Agents don't just write code. They write plans, generate HTML pages, modify running apps. Each output needs a different review surface — terminal diffs work for none of them.
+Crit adds a proper interface for each type of output and lets you point at the exact thing that is wrong and leave a comment for the agent to fix:
 
-- **Plans & docs** — `crit plan.md` renders markdown in the browser. Comment on the section that's wrong, not the whole document.
-- **Code** — `crit` auto-detects branch changes and shows syntax-highlighted diffs. Like a PR review, but instant and local.
-- **Live** — `crit http://localhost:3000` proxies your running app into a review surface. Click the misaligned button, pin a comment to it.
-- **Preview** — `crit landing.html` renders a static HTML artifact in an iframe. Pin comments to elements, no dev server needed.
+- `crit plan.md` renders a markdown file with proper formatting and review UI
+- `crit` auto-detects git changes and shows syntax-highlighted diffs for local review.
+- `crit http://localhost:3000` proxies your running app and adds a review interface to it
+- `crit landing.html` renders a static HTML artifact to review
 
-Single binary. Local by default. No account, no config, no dependencies.
+Everything runs locally via one single binary.
 
-## Install
+## Quickstart
 
+### 1. Install Crit binary
+Brew:
 ```bash
 curl -fsSL https://github.com/JoshEllinger/crit/releases/latest/download/install.sh | sh
 ```
@@ -34,31 +36,46 @@ To install to a custom location:
 ```bash
 INSTALL_DIR=~/.local/bin curl -fsSL https://github.com/JoshEllinger/crit/releases/latest/download/install.sh | sh
 ```
+<details>
+<summary>Also available via Go, Nix, Windows</summary>
 
-Also available via [Go, Nix, or binary download](#other-install-methods).
+Go:
+```bash
+go install github.com/tomasz-tomczyk/crit@latest
+```
 
-## Agent Integrations
+Nix:
+```bash
+nix profile install github:tomasz-tomczyk/crit
+```
 
-Works with Claude Code, Cursor, GitHub Copilot, OpenCode, Codex, Gemini, Qwen, Hermes, Windsurf, Cline, Grok, Aider, and Pi — any agent that can read a file and run a command. See [`cmd/crit/integrations/`](cmd/crit/integrations/) for all install methods and details.
+Windows:
+```bash
+iwr https://github.com/tomasz-tomczyk/crit/releases/latest/download/crit-windows-amd64.exe -OutFile crit.exe
+```
+> Note: Then move crit.exe somewhere on your PATH. ARM64 users: swap amd64 for arm64. WSL users: use the Linux binary instead.
 
-### Plugin install (Claude Code)
+</details>
 
-For the full experience - installs globally with a `/crit` command plus a `crit` skill that auto-activates when your agent works with review files, `crit comment`, `crit pull/push`, etc:
+Or download the latest release from [GitHub](https://github.com/tomasz-tomczyk/crit/releases/latest).
 
+## 2. Integrate with your agent
+Claude Code:
 ```
 claude plugin marketplace add tomasz-tomczyk/crit
 claude plugin install crit@crit
 ```
 
-### `/crit` command
+Crit also works with Cursor, GitHub Copilot, OpenCode, Codex, Gemini, Qwen, Hermes, Windsurf, Cline, Grok, Aider, and Pi — any agent that can read a file and run a command. See [`integrations/`](integrations/) for all install methods and details.
 
-Most integrations include a `/crit` slash command that automates the full review loop. It launches Crit, waits for your review; your agent acts on the feedback and you go back and forth until the work is approved.
+### 3. Tell your agent to use `crit`
 
-## Demo
+Most integrations include a `/crit` slash command that automates the full review loop. 
+Agent launches Crit, waits for your review and acts on the feedback.
+Repeat the process until you approve the changes.
 
-A 2-minute walkthrough of plan review and branch review.
-
-[![Crit demo](images/video-thumbnail.png)](https://www.youtube.com/watch?v=LHwfdvePf5A)
+Here's a 2-minute demo walkthrough of plan review and branch review:
+[![Crit demo](docs/images/video-thumbnail.png)](https://www.youtube.com/watch?v=LHwfdvePf5A)
 
 ## Usage
 
@@ -110,17 +127,17 @@ After your agent edits the file, Crit shows a split or unified diff of what chan
 
 #### Split view
 
-![Round-to-round diff - split view](images/diff-split.png)
+![Round-to-round diff - split view](docs/images/diff-split.png)
 
 #### Unified view
 
-![Round-to-round diff - unified view](images/diff-unified.png)
+![Round-to-round diff - unified view](docs/images/diff-unified.png)
 
 ### Inline comments: single lines and ranges
 
 Click a line number to comment. Drag to select a range. Comments are rendered inline after their referenced lines, just like a GitHub PR review.
 
-![Simple comments](images/simple-comments.gif)
+![Simple comments](docs/images/simple-comments.gif)
 
 ### Programmatic comments
 
@@ -193,7 +210,7 @@ Click "Send now" on any comment during a review to get an AI agent response in r
 The agent reads the comment context, addresses it (editing code if needed), and replies
 inline - all while you continue reviewing.
 
-![Send to agent](images/live-mode.png)
+![Send to agent](docs/images/live-mode.png)
 
 Configure in `~/.crit.config.json` (global config only):
 
@@ -287,6 +304,7 @@ All keys are optional — omit any you don't need.
 | `author`               | string   | VCS user name              | Author name shown on comments. Falls back to your configured VCS user name.                                                                                                            |
 | `base_branch`          | string   | auto-detected              | Base branch to diff against (e.g. `"main"`, `"develop"`). Overrides auto-detection.                                                                                                     |
 | `ignore_patterns`      | string[] | `[".crit/"]` | File patterns to exclude from git-mode file lists. Global and project patterns are merged.                                                                                              |
+| `auto_viewed_patterns` | string[] | `[]`                       | File patterns auto-marked as viewed (collapsed) once when a review opens — e.g. `["*.lock", "generated/", "PLAN.md"]`. Manually un-marking a file keeps it open. Global and project patterns are merged. |
 | `cleanup_on_approve`   | bool     | `true`                     | Automatically delete the review file when you approve with no unresolved comments. Set to `false` to preserve review history.                                                           |
 | `no_update_check`      | bool     | `false`                    | Don't check for new versions on startup.                                                                                                                                                |
 | `no_integration_check` | bool     | `false`                    | Skip the integration config freshness check on startup.                                                                                                                                 |
@@ -296,11 +314,12 @@ All keys are optional — omit any you don't need.
 
 ### Global-only config keys
 
-These keys can only be set in `~/.crit.config.json` (global). Project-level `.crit.config.json` cannot override them — this prevents a malicious repository from hijacking the agent command or redirecting share requests.
+These keys can only be set in `~/.crit.config.json` (global). Project-level `.crit.config.json` cannot override them — this prevents a malicious repository from hijacking local commands or redirecting share requests.
 
 | Key                    | Type     | Default                    | Description                                                                                                                                                                             |
 | ---------------------- | -------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `agent_cmd`            | string   | `""`                       | Shell command for "Send to agent" (e.g. `"claude -p"`). See [Send to agent](#send-to-agent-experimental). |
+| `open_cmd`             | string   | `""`                       | Custom command to open review URLs — receives the URL as its only argument (must be a single executable, no flags). Use when the browser isn't on the machine running crit, e.g. crit runs on a remote host over SSH and a small wrapper script opens the URL on your local machine. When unset, crit uses the platform default opener. |
 | `auth_token`           | string   | `""`                       | Authentication token for crit.md. Set automatically by `crit auth login`. |
 | `share_url`            | string   | `"https://crit.md"`        | Base URL of the share service. Set to `""` to disable sharing entirely. Self-host with [`crit-web`](https://github.com/tomasz-tomczyk/crit-web). |
 | `share_consented`      | bool     | `false`                    | Written automatically to `true` after you confirm the first-time share prompt. Reset to `false` to see the prompt again. Not used when `share_url` is a custom (self-hosted) URL. |
@@ -399,7 +418,7 @@ WSL: install the Linux binary as you would on Linux (`go install`, `nix run`, or
 
 ### Docker (sandboxed agents)
 
-For running crit alongside an AI agent inside a container, with the review UI reachable from your host browser, see [`cmd/crit/integrations/docker/`](cmd/crit/integrations/docker/). Includes a working `Dockerfile` + `entrypoint.sh` that bridges crit's loopback-bound server via `socat` so `docker -p` forwarding works without changing crit's threat model.
+For running crit alongside an AI agent inside a container, with the review UI reachable from your host browser, see [`integrations/docker/`](integrations/docker/). Includes a working `Dockerfile` + `entrypoint.sh` that bridges crit's loopback-bound server via `socat` so `docker -p` forwarding works without changing crit's threat model.
 
 ## Acknowledgements
 

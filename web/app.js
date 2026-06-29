@@ -1,0 +1,9252 @@
+(function() {
+  'use strict';
+
+  // ===== Comment Markdown Renderer =====
+  const commentMd = window.markdownit({
+    html: false,
+    linkify: true,
+    typographer: true,
+    highlight: function(str, lang) {
+      if (lang && hljs.getLanguage(lang)) {
+        try { return hljs.highlight(str, { language: lang }).value; } catch {}
+      }
+      return '';
+    }
+  });
+
+  // ===== File Reference Inline Rule =====
+  commentMd.inline.ruler.push('file_ref', function(state, silent) {
+    const start = state.pos;
+    const max = state.posMax;
+    if (state.src.charCodeAt(start) !== 0x40 /* @ */) return false;
+    if (start > 0 && !/\s/.test(state.src[start - 1])) return false;
+    let end = start + 1;
+    while (end < max && /[a-zA-Z0-9._\-\/]/.test(state.src[end])) end++;
+    const path = state.src.substring(start + 1, end);
+    if (path.length === 0 || (path.indexOf('.') === -1 && path.indexOf('/') === -1)) return false;
+    if (!silent) {
+      const token = state.push('file_ref', '', 0);
+      token.content = path;
+    }
+    state.pos = end;
+    return true;
+  });
+  commentMd.renderer.rules.file_ref = function(tokens, idx) {
+    const path = tokens[idx].content;
+    return '<span class="file-ref">' + escapeHtml(path) + '</span>';
+  };
+
+  // Override code_inline so backtick-wrapped comment IDs render as the same chip.
+  const defaultCodeInline = commentMd.renderer.rules.code_inline || function(tokens, idx, options, _env, self) {
+    return self.renderToken(tokens, idx, options);
+  };
+  commentMd.renderer.rules.code_inline = function(tokens, idx, options, env, self) {
+    const content = tokens[idx].content;
+    if (/^(c|r|rp)_[a-f0-9]{6,}$/.test(content)) {
+      return '<span class="comment-ref comment-ref-code" data-ref-id="' + escapeHtml(content) + '" tabindex="0" role="link">' + escapeHtml(content) + '</span>';
+    }
+    return defaultCodeInline(tokens, idx, options, env, self);
+  };
+
+  function linkifyCommentRefsInDom(el) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      // skip text inside code/pre elements and already-linked chips
+      if (node.parentNode.closest('code, pre, .comment-ref')) continue;
+      textNodes.push(node);
+    }
+    const re = /((?:c|r|rp)_[a-f0-9]{6,})/g;
+    textNodes.forEach(function(tn) {
+      if (!re.test(tn.nodeValue)) { re.lastIndex = 0; return; }
+      re.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let last = 0, m;
+      while ((m = re.exec(tn.nodeValue)) !== null) {
+        if (m.index > last) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last, m.index)));
+        const span = document.createElement('span');
+        span.className = 'comment-ref';
+        span.dataset.refId = m[1];
+        span.textContent = m[1];
+        span.tabIndex = 0;
+        span.setAttribute('role', 'link');
+        frag.appendChild(span);
+        last = m.index + m[0].length;
+      }
+      if (last < tn.nodeValue.length) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last)));
+      tn.parentNode.replaceChild(frag, tn);
+    });
+  }
+
+  // Scroll/expand/flash a comment card located anywhere in the document, given just its id.
+  // Distinct from scrollToComment(commentId, filePath) below — that one needs filePath context.
+  function scrollToCommentRef(id) {
+    const card = document.querySelector('.comment-card[data-comment-id="' + CSS.escape(id) + '"]');
+    if (!card) return;
+    // Make sure any containing <details> file section is open
+    const section = card.closest('details');
+    if (section && !section.open) section.open = true;
+    if (card.classList.contains('collapsed')) {
+      card.classList.remove('collapsed');
+      if (typeof commentCollapseOverrides !== 'undefined') commentCollapseOverrides[id] = false;
+    }
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.remove('comment-ref-flash');
+    void card.offsetWidth;
+    card.classList.add('comment-ref-flash');
+    card.addEventListener('animationend', function() {
+      card.classList.remove('comment-ref-flash');
+    }, { once: true });
+  }
+
+  document.addEventListener('click', function(e) {
+    const ref = e.target.closest && e.target.closest('.comment-ref');
+    if (!ref) return;
+    e.preventDefault();
+    scrollToCommentRef(ref.dataset.refId);
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const ref = e.target.closest && e.target.closest('.comment-ref');
+    if (!ref) return;
+    e.preventDefault();
+    scrollToCommentRef(ref.dataset.refId);
+  });
+
+  // ===== Attachment Image Src Rewrite =====
+  // Markdown stored in review.json uses canonical relative paths
+  // (`attachments/<uuid>.<ext>`) — never absolute URLs. Each render target
+  // rewrites at its own publish boundary; in the local UI that means
+  // pointing the browser at /api/attachments/<uuid>.<ext>. External URLs
+  // (https/http/data/absolute paths) pass through untouched so historical
+  // GitHub raw URLs or external image hosts still render after `crit pull`.
+  commentMd.renderer.rules.image = function(tokens, idx, options, _env, self) {
+    const token = tokens[idx];
+    const srcIdx = token.attrIndex('src');
+    if (srcIdx >= 0) {
+      const src = token.attrs[srcIdx][1];
+      if (!/^https?:\/\/|^data:|^\//.test(src) && /^attachments\//.test(src)) {
+        token.attrs[srcIdx][1] = '/api/' + src;
+      }
+    }
+    return self.renderToken(tokens, idx, options);
+  };
+
+  // ===== Suggestion Diff Renderer =====
+  function renderSuggestionDiff(suggestionContent, originalLines) {
+    const sugLines = suggestionContent.replace(/\n$/, '').split('\n');
+    let html = '<div class="suggestion-diff">';
+    html += '<div class="suggestion-header">Suggested change</div>';
+
+    const origLen = (originalLines && originalLines.length > 0) ? originalLines.length : 0;
+    const isEmptySuggestion = sugLines.length === 1 && sugLines[0] === '' && origLen > 0;
+    const sugLen = isEmptySuggestion ? 0 : sugLines.length;
+    const pairedLen = Math.min(origLen, sugLen);
+
+    // Compute word-level diffs for paired lines
+    const delContents = [];
+    const addContents = [];
+    for (let i = 0; i < pairedLen; i++) {
+      const wd = wordDiff(originalLines[i], sugLines[i]);
+      if (wd) {
+        delContents.push(applyWordDiffToHtml(escapeHtml(originalLines[i]), wd.oldRanges, 'diff-word-del'));
+        addContents.push(applyWordDiffToHtml(escapeHtml(sugLines[i]), wd.newRanges, 'diff-word-add'));
+      } else {
+        delContents.push(escapeHtml(originalLines[i]));
+        addContents.push(escapeHtml(sugLines[i]));
+      }
+    }
+
+    // All deletion lines first (paired + unpaired)
+    for (let j = 0; j < origLen; j++) {
+      const dc = j < pairedLen ? delContents[j] : escapeHtml(originalLines[j]);
+      html += '<div class="suggestion-line suggestion-line-del">'
+        + '<span class="suggestion-line-sign">\u2212</span>'
+        + '<span class="suggestion-line-content">' + dc + '</span></div>';
+    }
+
+    // All addition lines (paired + unpaired)
+    for (let k = 0; k < sugLen; k++) {
+      const ac = k < pairedLen ? addContents[k] : escapeHtml(sugLines[k]);
+      html += '<div class="suggestion-line suggestion-line-add">'
+        + '<span class="suggestion-line-sign">+</span>'
+        + '<span class="suggestion-line-content">' + ac + '</span></div>';
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  // ===== Tab-Ready Indicator =====
+  // Prepends a bullet to document.title when a review round completes while
+  // the tab is hidden. Clears on visibilitychange → visible.
+  const BADGE_PREFIX = '\u25CF ';
+  let baseTitle = document.title;
+  let badgeActive = false;
+
+  // Set the page title, preserving the badge prefix if currently active.
+  function setDocumentTitle(nextBase) {
+    baseTitle = nextBase;
+    document.title = badgeActive ? BADGE_PREFIX + baseTitle : baseTitle;
+  }
+
+  function setTabBadge() {
+    if (badgeActive) return;
+    badgeActive = true;
+    if (!document.title.startsWith(BADGE_PREFIX)) {
+      document.title = BADGE_PREFIX + baseTitle;
+    }
+  }
+
+  function clearTabBadge() {
+    if (!badgeActive) return;
+    badgeActive = false;
+    document.title = baseTitle;
+  }
+
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') clearTabBadge();
+  });
+
+  // Expose for tests — only when ?test query param is present.
+  if (location.search.includes('test')) {
+    window.__critTabBadge = {
+      set: setTabBadge,
+      clear: clearTabBadge,
+      isActive: function() { return badgeActive; },
+    };
+  }
+
+  (function() {
+    const defaultFence = commentMd.renderer.rules.fence;
+    commentMd.renderer.rules.fence = function(tokens, idx, options, env, self) {
+      const token = tokens[idx];
+      const info = token.info ? token.info.trim() : '';
+      if (info === 'suggestion') {
+        return renderSuggestionDiff(token.content, env && env.originalLines);
+      }
+      if (defaultFence) {
+        return defaultFence(tokens, idx, options, env, self);
+      }
+      return self.renderToken(tokens, idx, options);
+    };
+  })();
+
+  // ===== Document Markdown Renderer =====
+  const documentMd = window.markdownit({
+    html: true,
+    typographer: true,
+    linkify: true,
+    highlight: function(str, lang) {
+      if (lang && hljs.getLanguage(lang)) {
+        try { return hljs.highlight(str, { language: lang }).value; } catch {}
+      }
+      return '';
+    }
+  });
+
+  // Add id attributes and anchor links to headings
+  const HEADING_LINK_SVG = '<svg class="heading-anchor-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a2.002 2.002 0 0 0 0 2.83Z"></path></svg>';
+  // Track seen heading slugs per render pass to dedup duplicates (GitHub-style: examples, examples-1, examples-2)
+  const headingSlugCounter = new Map();
+  documentMd.renderer.rules.heading_open = function(tokens, idx, options, _env, self) {
+    const token = tokens[idx];
+    const inline = tokens[idx + 1];
+    if (inline && inline.type === 'inline') {
+      const baseSlug = window.crit.lineBlocks.slugifyHeading(inline.content);
+      if (baseSlug) {
+        const count = headingSlugCounter.get(baseSlug) || 0;
+        const slug = count === 0 ? baseSlug : baseSlug + '-' + count;
+        headingSlugCounter.set(baseSlug, count + 1);
+        token.attrSet('id', slug);
+      }
+    }
+    return self.renderToken(tokens, idx, options);
+  };
+  documentMd.renderer.rules.heading_close = function(tokens, idx, options, _env, self) {
+    const openIdx = idx - 2;
+    const id = openIdx >= 0 ? tokens[openIdx].attrGet('id') : null;
+    if (id) {
+      return '<a class="heading-anchor" href="#' + id + '" aria-label="Link to this heading">' + HEADING_LINK_SVG + '</a>' + self.renderToken(tokens, idx, options);
+    }
+    return self.renderToken(tokens, idx, options);
+  };
+
+  // ===== Cookie helpers (persist across random ports on 127.0.0.1) =====
+  function setCookie(name, value) {
+    document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=31536000; SameSite=Strict';
+  }
+  function getCookie(name) {
+    const match = document.cookie.match('(?:^|; )' + name + '=([^;]*)');
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  // ===== Settings (consolidated cookie) =====
+  // All persisted view preferences live in a single `crit-settings` JSON cookie.
+  // Exception: `crit-templates` stays in its own cookie because it's user-defined
+  // and can be longer than the rest combined.
+  const SETTINGS_COOKIE = 'crit-settings';
+  let settingsCache = null;
+
+  function loadSettings() {
+    if (settingsCache) return settingsCache;
+    const raw = getCookie(SETTINGS_COOKIE);
+    try { settingsCache = raw ? JSON.parse(raw) : {}; }
+    catch { settingsCache = {}; }
+    return settingsCache;
+  }
+
+  function getSetting(key, fallback) {
+    const v = loadSettings()[key];
+    return v === undefined ? fallback : v;
+  }
+
+  function setSetting(key, value) {
+    const s = loadSettings();
+    s[key] = value;
+    setCookie(SETTINGS_COOKIE, JSON.stringify(s));
+  }
+
+  // Bind Ctrl/Cmd+Enter (submit) and Escape (cancel) to a text input/textarea.
+  // opts.stopPropagation defaults to true (matches comment-form keydown behavior).
+  function bindSubmitCancelKeys(el, onSubmit, onCancel, opts) {
+    const stop = !opts || opts.stopPropagation !== false;
+    el.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        if (stop) e.stopPropagation();
+        onSubmit(e);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        if (stop) e.stopPropagation();
+        onCancel(e);
+      }
+    });
+  }
+
+  // ===== State =====
+  let session = {};       // { mode, branch, base_ref, review_round, files: [...] }
+  let files = [];         // [{ path, status, fileType, content, diffHunks, comments, lineBlocks, tocItems, collapsed, viewMode }]
+  let shareURL = '';       // read by the tip-rotation block; share flow gets its own copy
+  let authUserName = '';   // read by the tip-rotation block; share flow gets its own copy
+  let configAuthor = '';
+  let autoViewedPatterns = [];  // config auto_viewed_patterns; applied once per launch (issue #658)
+
+  // Share flow (button + modals + popup relay) lives in crit-share.js
+  // (window.crit.share). The controller is created in init() once /api/config
+  // resolves, and stored here so other code can call reveal()/closeModal().
+  let shareCtl = null;
+
+  let uiState = 'reviewing';
+  let waitingNotApproved = false;
+  let hiddenUnresolved = 0;
+  let pendingUpdates = [];
+  let pendingUpdatesVersion = '';
+
+  // Returns true if at least one pending update entry has not been dismissed.
+  // Brew dismiss is keyed by version; integration dismiss is keyed per-agent
+  // by content hash (so re-prompts when we ship a new template).
+  function hasActivePendingUpdates() {
+    if (!pendingUpdates.length) return false;
+    const brewDismissed = getSetting('updatesDismissed', '');
+    const intDismissed = getSetting('dismissedIntegrations', {}) || {};
+    for (let i = 0; i < pendingUpdates.length; i++) {
+      const u = pendingUpdates[i];
+      if (u.kind === 'brew') {
+        if (brewDismissed !== pendingUpdatesVersion) return true;
+      } else if (u.kind === 'integration') {
+        if (!u.hash || intDismissed[u.agent] !== u.hash) return true;
+      } else if (u.kind === 'missing-integration') {
+        if (!intDismissed['missing:' + u.agent]) return true;
+      } else {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  let reviewComments = []; // review-level (general) comments
+  let reviewCommentFormActive = false; // is the review comment form open?
+  let reviewCommentEditingId = null; // id of review comment being edited, or null
+
+  let settingsPanelOpen = false;
+  let settingsPanelTab = 'settings';
+  let cachedConfig = null; // populated on first panel open
+
+  let diffMode = getSetting('diffMode', 'split'); // 'split' or 'unified'
+  // Mobile viewports always render unified diffs. Split is unusable in <=768px
+  // because two columns of source code don't fit. The user's saved preference
+  // is preserved so it takes effect again above the breakpoint.
+  const mobileDiffQuery = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+  if (mobileDiffQuery && mobileDiffQuery.matches) {
+    diffMode = 'unified';
+  }
+  if (mobileDiffQuery) {
+    // Re-evaluate on viewport changes (tablet rotation, devtools resize).
+    // When crossing into mobile, force unified; when crossing back out,
+    // restore the user's saved preference. Re-render so the change is visible.
+    mobileDiffQuery.addEventListener('change', function(ev) {
+      if (ev.matches) {
+        diffMode = 'unified';
+      } else {
+        diffMode = getSetting('diffMode', 'split');
+      }
+      renderAllFiles();
+    });
+  }
+  let diffScope = getSetting('diffScope', null); // null = no preference saved yet
+
+  // Whether code diffs are fetched with whitespace ignored (appends `&w=1` to
+  // /api/file/diff). Persisted via the consolidated `crit-settings` cookie (not
+  // localStorage) so it survives random-port restarts. Only meaningful in git
+  // mode — the settings toggle is gated to git mode in renderSettingsPane().
+  let ignoreWhitespace = !!getSetting('ignoreWhitespace', false);
+
+  // Single source of truth for hide-resolved state. Persisted via the
+  // consolidated `crit-settings` cookie (not localStorage) so the setting
+  // survives random-port server restarts — localStorage is scoped per origin
+  // (incl. port), cookies are host-scoped.
+  let hideResolvedState = getSetting('hideResolved', false);
+  function isHideResolved() { return hideResolvedState; }
+  function setHideResolved(v) {
+    hideResolvedState = !!v;
+    setSetting('hideResolved', hideResolvedState);
+    document.body.classList.toggle('hide-resolved', hideResolvedState);
+  }
+
+  // diffCommit is the DERIVED backend param string (kept so the existing
+  // &commit= append sites and the reloadForScope key work unchanged):
+  //   0 selected      -> ''                  (all commits)
+  //   exactly 1       -> '<full sha>'         (single-commit path)
+  //   2+ selected     -> '<baseSHA>..<headSHA>' (git range)
+  // selectedCommits holds the user-checked full SHAs; diffCommit is recomputed
+  // from it via recomputeDiffCommit() whenever the selection changes.
+  let diffCommit = '';
+  const selectedCommits = new Set();
+  let commitList = [];
+  let diffActive = false; // rendered diff view toggle for file mode
+
+  let filePickerReady = false;  // set true once /api/files/list is confirmed working
+  let userActedThisRound = false; // tracks if user made any comment/resolve/edit action this round
+
+  // Per-file active form state
+  let activeFilePath = null;
+  let activeForms = [];  // Array of { formKey, filePath, afterBlockIndex, startLine, endLine, editingId, side }
+  let prData = null;     // PR metadata from /api/config (set once on load)
+  let agentEnabled = false;
+  let agentName = 'agent';
+  const pendingAgentRequests = new Set();
+
+  // Track active reply form state so it survives DOM re-renders (commentId → { text })
+  const activeReplyForms = new Map();
+
+  // Track manually toggled collapse state (comment ID → boolean, true = collapsed)
+  const commentCollapseOverrides = {};
+
+  // SVG Icon Constants — extracted to crit-icons.js (window.crit.icons)
+  const ICON_CHEVRON = window.crit.icons.ICON_CHEVRON;
+  const ICON_EDIT = window.crit.icons.ICON_EDIT;
+  const ICON_DELETE = window.crit.icons.ICON_DELETE;
+  const ICON_RESOLVE = window.crit.icons.ICON_RESOLVE;
+  const ICON_UNRESOLVE = window.crit.icons.ICON_UNRESOLVE;
+  const ICON_CLIPBOARD = window.crit.icons.ICON_CLIPBOARD;
+  const ICON_CHECK_SMALL = window.crit.icons.ICON_CHECK_SMALL;
+  const ICON_COMMENT = window.crit.icons.ICON_COMMENT;
+  const ICON_COPY_PATH = window.crit.icons.ICON_COPY_PATH;
+  const ICON_COPY_PATH_CHECK = window.crit.icons.ICON_COPY_PATH_CHECK;
+
+  function formKey(form) {
+    if (form.scope === 'review') return 'review:' + (form.editingId || 'new');
+    if (form.editingId) return form.filePath + ':edit:' + form.editingId;
+    if (form.scope === 'file') return form.filePath + ':file';
+    return form.filePath + ':' + form.startLine + ':' + form.endLine + ':' + (form.side || '');
+  }
+
+  // Convention-based form-key for edit/reply forms keyed by comment id.
+  // Used by buildCommentCard reply input + live-mode mounts.
+  // Delegates to the shared helper module so both controllers stay aligned.
+
+  function addForm(form) {
+    form.formKey = formKey(form);
+    const idx = activeForms.findIndex(function(f) { return f.formKey === form.formKey; });
+    if (idx >= 0) {
+      activeForms[idx] = form;
+    } else {
+      activeForms.push(form);
+    }
+  }
+
+  function removeForm(key) {
+    activeForms = activeForms.filter(function(f) { return f.formKey !== key; });
+  }
+
+  function getFormsForFile(filePath) {
+    return activeForms.filter(function(f) { return f.filePath === filePath; });
+  }
+
+  function findFormForEdit(commentId) {
+    return activeForms.find(function(f) { return f.editingId === commentId; });
+  }
+  let selectionStart = null;
+  let selectionEnd = null;
+  let unifiedVisualStart = null; // visual index range for unified drag (cross-number-space)
+  let unifiedVisualEnd = null;
+  let focusedBlockIndex = null;
+  let focusedFilePath = null;
+  let focusedElement = null; // currently focused navigable element
+  let navElements = []; // cached .kb-nav list, rebuilt on render
+  // Stable j/k position across re-renders (DOM refs and block indices alone are not enough).
+  let keyboardFocusTarget = null; // { filePath, blockIndex?, diffLineNum?, diffSide?, startLine?, endLine? }
+  // Vim-style visual line mode (entered with V).
+  // { kind: 'markdown'|'diff', filePath, anchorStartLine, anchorEndLine, anchorSide }
+  let visualMode = null;
+  let changeGroups = [];      // [{elements: [DOM], filePath: string}]
+  let currentChangeIdx = -1;
+
+  const enc = encodeURIComponent;
+
+  // Author color-coding for multi-reviewer comments — shared helper so
+  // live-mode mounts produce matching swatch indices. The helpers module
+  // is loaded before app.js via index.html script order, so we reference it
+  // directly without a local fallback.
+  const authorColorIndex = window.crit.commentCardHelpers.authorColorIndex;
+  const pathCompare = window.crit.shared.pathCompare;
+
+  // Sort comparator: directories before files at each depth, then path order
+  // matching GitHub PR diffs (ASCII byte compare, not localeCompare).
+  // In files mode the user's CLI argument order is meaningful, so preserve it
+  // (Array.prototype.sort is stable, so returning 0 keeps original order).
+  function fileSortComparator(a, b) {
+    if (session && session.mode === 'files') return 0;
+    const pa = a.path.split('/'), pb = b.path.split('/');
+    const min = Math.min(pa.length, pb.length);
+    for (let i = 0; i < min - 1; i++) {
+      if (pa[i] !== pb[i]) return pathCompare(pa[i], pb[i]);
+    }
+    if (pa.length !== pb.length) return pb.length - pa.length;
+    return pathCompare(pa[pa.length - 1], pb[pa.length - 1]);
+  }
+
+  // Fetch and build file objects from the API for a list of file infos.
+  // Files marked as lazy by the backend are returned with metadata only;
+  // their content/diff/comments are fetched on demand when expanded.
+  async function loadAllFileData(fileInfos, scope) {
+    const hasLazy = fileInfos.some(function(fi) { return fi.lazy; });
+
+    // If no lazy files, load everything eagerly (identical to previous behavior)
+    if (!hasLazy) {
+      return Promise.all(fileInfos.map(function(fi) { return loadSingleFile(fi, scope); }));
+    }
+
+    // Split into eager and lazy batches
+    const eager = [];
+    const lazy = [];
+    for (let i = 0; i < fileInfos.length; i++) {
+      if (fileInfos[i].lazy) {
+        lazy.push(fileInfos[i]);
+      } else {
+        eager.push(fileInfos[i]);
+      }
+    }
+
+    // Load eager files fully
+    const eagerFiles = await Promise.all(eager.map(function(fi) { return loadSingleFile(fi, scope); }));
+
+    // Create lightweight placeholders for lazy files
+    const lazyFiles = lazy.map(function(fi) {
+      return {
+        path: fi.path,
+        oldPath: fi.old_path || '',
+        status: fi.status,
+        fileType: fi.file_type,
+        content: '',
+        previousContent: '',
+        comments: [],
+        diffHunks: [],
+        lineBlocks: null,
+        previousLineBlocks: null,
+        tocItems: [],
+        collapsed: true,
+        viewMode: (session.mode === 'git') ? 'diff' : 'document',
+        additions: fi.additions || 0,
+        deletions: fi.deletions || 0,
+        lazy: true,
+        generated: !!fi.generated,
+        diffTooLarge: false,
+        diffLoaded: false,
+        fileHash: '',
+      };
+    });
+
+    return eagerFiles.concat(lazyFiles);
+  }
+
+  // Load a single file's content, comments, and diff from the API.
+  async function loadSingleFile(fi, scope) {
+    // Orphaned files have no content or diff — only fetch comments
+    if (fi.orphaned) {
+      const comments = await fetch('/api/file/comments?path=' + enc(fi.path))
+        .then(function(r) { return r.ok ? r.json() : []; })
+        .catch(function() { return []; });
+      return {
+        path: fi.path,
+        status: fi.status,
+        fileType: fi.file_type,
+        content: '',
+        previousContent: '',
+        comments: Array.isArray(comments) ? comments : [],
+        diffHunks: [],
+        lineBlocks: null,
+        previousLineBlocks: null,
+        tocItems: [],
+        collapsed: false,
+        viewMode: 'document',
+        additions: 0,
+        deletions: 0,
+        lazy: false,
+        orphaned: true,
+        generated: false,
+        diffTooLarge: false,
+        diffLoaded: false,
+        fileHash: '',
+      };
+    }
+    let diffUrl = '/api/file/diff?path=' + enc(fi.path);
+    if (scope && scope !== 'all') {
+      diffUrl += '&scope=' + enc(scope);
+    }
+    if (diffCommit) {
+      diffUrl += '&commit=' + enc(diffCommit);
+    }
+    if (ignoreWhitespace) {
+      diffUrl += '&w=1';
+    }
+    const [fileRes, commentsRes, diffRes] = await Promise.all([
+      fetch('/api/file?path=' + enc(fi.path)).then(function(r) { return r.ok ? r.json() : { content: '' }; }).catch(function() { return { content: '' }; }),
+      fetch('/api/file/comments?path=' + enc(fi.path)).then(function(r) { return r.ok ? r.json() : []; }).catch(function() { return []; }),
+      fetch(diffUrl).then(function(r) { return r.ok ? r.json() : { hunks: [] }; }).catch(function() { return { hunks: [] }; }),
+    ]);
+
+    const f = {
+      path: fi.path,
+      oldPath: fi.old_path || '',
+      status: fi.status,
+      fileType: fi.file_type,
+      content: fileRes.content || '',
+      previousContent: diffRes.previous_content || '',
+      comments: Array.isArray(commentsRes) ? commentsRes : [],
+      diffHunks: diffRes.hunks || [],
+      lineBlocks: null,
+      previousLineBlocks: null,
+      tocItems: [],
+      collapsed: fi.status === 'deleted' || fi.generated === true ||
+        (fi.status === 'renamed' && !fi.additions && !fi.deletions),
+      viewMode: (session.mode === 'git') ? 'diff' : 'document',
+      additions: fi.additions || 0,
+      deletions: fi.deletions || 0,
+      lazy: false,
+      orphaned: false,
+      generated: !!fi.generated,
+      fileHash: fileRes.file_hash || '',
+    };
+
+    // Mark large diffs for deferred rendering
+    let diffLineCount = 0;
+    for (let h = 0; h < f.diffHunks.length; h++) {
+      diffLineCount += (f.diffHunks[h].Lines || []).length;
+    }
+    f.diffTooLarge = diffLineCount > 1000;
+    f.diffLoaded = !f.diffTooLarge;
+
+    // Pre-highlight code and markdown files for diff rendering
+    if (f.fileType === 'code' || f.fileType === 'markdown') {
+      f.highlightCache = preHighlightFile(f);
+      f.lang = langFromPath(f.path);
+    }
+
+    // In file mode, build line blocks so code files render as document view
+    if (f.fileType === 'code' && session.mode !== 'git') {
+      f.lineBlocks = buildCodeLineBlocks(f);
+    }
+
+    // Parse markdown content into line blocks
+    if (f.fileType === 'markdown') {
+      const parsed = parseMarkdown(f.content);
+      f.lineBlocks = parsed.blocks;
+      f.tocItems = parsed.tocItems;
+      if (f.previousContent) {
+        f.previousLineBlocks = parseMarkdown(f.previousContent).blocks;
+      }
+    }
+
+    return f;
+  }
+
+  // ===== Viewed State =====
+  // Stable hash of the current file set — identifies this review's localStorage
+  // namespace. Shared by the viewed-state key and the auto-viewed applied marker
+  // so both live under the same identity.
+  function viewedIdentityHash() {
+    const paths = files.map(function(f) { return f.path; }).sort().join('\n');
+    let hash = 0;
+    for (let i = 0; i < paths.length; i++) {
+      hash = ((hash << 5) - hash + paths.charCodeAt(i)) | 0;
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function viewedStorageKey() {
+    return 'crit-viewed-' + viewedIdentityHash();
+  }
+
+  // Marker key recording that auto_viewed_patterns were already applied for this
+  // review. localStorage is origin-scoped (incl. port); crit uses random ports,
+  // so a new launch gets a fresh namespace and patterns apply once. A refresh on
+  // the same port sees this marker and skips re-applying — manual un-marks the
+  // user saved via toggleViewed therefore win. (issue #658)
+  function autoViewedMarkerKey() {
+    return 'crit-autoviewed-' + viewedIdentityHash();
+  }
+
+  // Apply auto_viewed_patterns ONCE per launch: mark matching files viewed +
+  // collapsed. Must run AFTER restoreViewedState() (so a prior refresh's manual
+  // un-marks are already loaded and not clobbered) and BEFORE first render.
+  function applyAutoViewedOnce(patterns) {
+    if (!patterns || !patterns.length) return;
+    const globMatch = window.crit && window.crit.globMatch;
+    if (!globMatch) return;
+    try {
+      if (localStorage.getItem(autoViewedMarkerKey())) return; // already applied this launch
+    } catch { return; }
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      if (f.viewed) continue; // respect existing/restored viewed state
+      if (globMatch.matchAny(f.path, patterns)) {
+        f.viewed = true;
+        f.collapsed = true;
+      }
+    }
+    saveViewedState();
+    try { localStorage.setItem(autoViewedMarkerKey(), '1'); } catch {}
+  }
+
+  function saveViewedState() {
+    const viewed = {};
+    for (let i = 0; i < files.length; i++) {
+      if (files[i].viewed) viewed[files[i].path] = true;
+    }
+    try { localStorage.setItem(viewedStorageKey(), JSON.stringify(viewed)); } catch {}
+  }
+
+  function restoreViewedState() {
+    try {
+      const data = JSON.parse(localStorage.getItem(viewedStorageKey()) || '{}');
+      for (let i = 0; i < files.length; i++) {
+        files[i].viewed = !!data[files[i].path];
+        if (files[i].viewed) files[i].collapsed = true;
+      }
+    } catch {}
+  }
+
+  function toggleViewed(filePath) {
+    const file = getFileByPath(filePath);
+    if (!file) return;
+    file.viewed = !file.viewed;
+    saveViewedState();
+    updateViewedCount();
+    updateTreeViewedState();
+    // Update the checkbox in the file header
+    const section = document.getElementById('file-section-' + filePath);
+    if (section) {
+      const cb = section.querySelector('.file-header-viewed input');
+      if (cb) cb.checked = file.viewed;
+      // Collapse when marking as viewed
+      if (file.viewed && section.open) {
+        if (section.getBoundingClientRect().top < 0) {
+          section.scrollIntoView({ behavior: 'instant' });
+        }
+        section.open = false;
+        file.collapsed = true;
+      }
+    }
+  }
+
+  // Wraps crit.shared.waitForSession with the app.js-specific UI:
+  // an elapsed-seconds "Initializing..." loader in #filesContainer, a
+  // server-disconnected message on network failure, and a body.message
+  // surfacing on HTTP 500. Returns the parsed JSON payload (matches
+  // the previous .then(r => r.json()) call sites at the seam).
+  async function fetchWhenReady(url) {
+    function renderLoading(text) {
+      const el = document.getElementById('filesContainer');
+      if (el) {
+        el.innerHTML =
+          '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
+          text + '</div>';
+      }
+    }
+    try {
+      return await window.crit.shared.waitForSession({
+        url: url,
+        intervalMs: 500,
+        maxWaitMs: 5 * 60 * 1000,
+        onProgress: function (elapsedMs) {
+          const elapsed = Math.round(elapsedMs / 1000);
+          renderLoading('Initializing\u2026 (' + elapsed + 's)');
+        },
+      });
+    } catch (err) {
+      if (err && err.status === 500 && err.response) {
+        let body = {};
+        try { body = await err.response.json(); } catch {}
+        const msg = body.message || 'Server initialization failed';
+        renderLoading(msg);
+        throw new Error(msg);
+      }
+      if (err && err.name === 'TypeError') {
+        // fetch() rejects with TypeError on network failure (server shutdown during init).
+        renderLoading('Server disconnected');
+        throw new Error('Server disconnected');
+      }
+      throw err;
+    }
+  }
+
+  // ===== Init =====
+  async function init() {
+    initTheme();
+    initWidth();
+    initSidebarWidths();
+
+    // Measure actual header height and set CSS variable for sticky offsets
+    function updateHeaderHeight() {
+      const h = document.querySelector('.header');
+      if (h) document.documentElement.style.setProperty('--header-height', h.getBoundingClientRect().height + 'px');
+    }
+    updateHeaderHeight();
+    window.addEventListener('resize', updateHeaderHeight);
+
+    document.getElementById('filesContainer').innerHTML =
+      '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
+
+    const [sessionRes, configRes] = await Promise.all([
+      fetchWhenReady('/api/session' + (diffScope ? '?scope=' + enc(diffScope) : '')),
+      fetchWhenReady('/api/config'),
+    ]);
+
+    session = sessionRes;
+    reviewComments = sessionRes.review_comments || [];
+
+    // Fire-and-forget: verify file list endpoint is available for @-mention autocomplete
+    fetch('/api/files/list')
+      .then(r => { if (r.ok) filePickerReady = true; })
+      .catch(() => { /* fire-and-forget */ });
+
+    // Config
+    shareURL = configRes.share_url || '';
+    autoViewedPatterns = Array.isArray(configRes.auto_viewed_patterns) ? configRes.auto_viewed_patterns : [];
+    authUserName = configRes.auth_user_name || '';
+    configAuthor = configRes.author || '';
+    agentEnabled = configRes.agent_cmd_enabled || false;
+    agentName = configRes.agent_name || 'agent';
+
+    // Build the shared Share controller (window.crit.share). It owns all share
+    // state internally; we pass the config from /api/config plus app.js-specific
+    // adapters (comment refresh, toast, escapeHtml, settings, icons).
+    //
+    // Share is available in files + preview review, but not vcs/diff (git):
+    // canShare = session.mode !== 'git'. The controller's reveal() shows the
+    // button iff (shareURL && canShare) and sets the 'shared' state when a
+    // hosted URL already exists.
+    shareCtl = window.crit.share.create({
+      shareURL: shareURL,
+      hostedURL: configRes.hosted_url || '',
+      deleteToken: configRes.delete_token || '',
+      hostedToken: configRes.hosted_token || '',
+      needsShareConsent: configRes.needs_consent || false,
+      authUserName: authUserName,
+      proxyAuth: !!configRes.proxy_auth,
+      reviewType: configRes.review_type || '',
+      sharedOrg: configRes.share_org
+        ? { slug: configRes.share_org, name: configRes.share_org_name || configRes.share_org }
+        : null,
+      sharedVisibility: configRes.share_org ? (configRes.share_visibility || '') : '',
+      shareBtnEl: document.getElementById('shareBtn'),
+      canShare: session.mode !== 'git',
+      onCommentsRefreshed: refreshAllComments,
+      toast: { show: showToast, dismiss: dismissToast },
+      escapeHtml: escapeHtml,
+      getSetting: getSetting,
+      setSetting: setSetting,
+      icons: { clipboard: ICON_CLIPBOARD, check: ICON_CHECK_SMALL },
+    });
+    shareCtl.reveal();
+
+    // Update notifications (brew upgrade + stale integrations)
+    pendingUpdates = [];
+    const hasBrew = configRes.latest_version && configRes.version && configRes.latest_version !== configRes.version;
+    if (hasBrew) {
+      pendingUpdates.push({
+        kind: 'brew',
+        version: configRes.latest_version,
+        label: 'Crit ' + configRes.latest_version + ' available',
+        labelUrl: 'https://github.com/tomasz-tomczyk/crit/releases/tag/v' + configRes.latest_version,
+        hint: 'brew update && brew upgrade crit'
+      });
+    }
+    if (configRes.stale_integrations) {
+      configRes.stale_integrations.forEach(function(si) {
+        // Capitalize agent name for display
+        const name = si.agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+        pendingUpdates.push({
+          kind: 'integration',
+          agent: si.agent,
+          hash: si.hash || '',
+          label: name + ' plugin outdated',
+          hint: si.hint
+        });
+      });
+    }
+    if (configRes.missing_integrations) {
+      configRes.missing_integrations.forEach(function(agent) {
+        const name = agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+        pendingUpdates.push({
+          kind: 'missing-integration',
+          agent: agent,
+          label: name + ' detected — install integration',
+          hint: 'crit install ' + agent
+        });
+      });
+    }
+
+    pendingUpdatesVersion = configRes.latest_version || configRes.version || '';
+    if (hasActivePendingUpdates()) {
+      document.getElementById('updateBtn').style.display = '';
+    }
+
+    // Header context: branch name in git mode, filename in single-file file mode
+    if (session.mode === 'git' && session.branch) {
+      document.getElementById('branchContext').style.display = '';
+      document.getElementById('branchName').textContent = session.branch;
+      const branchCopyBtn = document.createElement('button');
+      branchCopyBtn.className = 'header-copy-path';
+      branchCopyBtn.setAttribute('aria-label', 'Copy branch name');
+      branchCopyBtn.type = 'button';
+      branchCopyBtn.innerHTML = ICON_COPY_PATH;
+      branchCopyBtn.addEventListener('click', function() {
+        const originalLabel = branchCopyBtn.getAttribute('aria-label');
+        navigator.clipboard.writeText(session.branch).then(function() {
+          branchCopyBtn.innerHTML = ICON_COPY_PATH_CHECK;
+          branchCopyBtn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function() { branchCopyBtn.innerHTML = ICON_COPY_PATH; branchCopyBtn.setAttribute('aria-label', originalLabel); }, 1500);
+        }).catch(function() { /* best-effort */ });
+      });
+      document.getElementById('branchContext').appendChild(branchCopyBtn);
+      // Base branch picker: show in git mode when on a feature branch
+      if (session.base_ref) {
+        currentBaseBranch = session.base_branch_name || '';
+        document.getElementById('baseBranchLabel').textContent = currentBaseBranch || 'base';
+        document.getElementById('baseBranchArrow').style.display = '';
+        fetchBranches();
+      }
+    } else if (session.mode !== 'git' && session.files && session.files.length === 1) {
+      document.getElementById('branchContext').style.display = '';
+      document.querySelector('.branch-icon').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>';
+      document.getElementById('branchName').textContent = session.files[0].path.split('/').pop();
+      const headerCopyBtn = document.createElement('button');
+      headerCopyBtn.className = 'header-copy-path';
+      headerCopyBtn.setAttribute('aria-label', 'Copy file path');
+      headerCopyBtn.type = 'button';
+      headerCopyBtn.innerHTML = ICON_COPY_PATH;
+      headerCopyBtn.addEventListener('click', function() {
+        const originalLabel = headerCopyBtn.getAttribute('aria-label');
+        const abs = session.cwd ? session.cwd + '/' + session.files[0].path : session.files[0].path;
+        navigator.clipboard.writeText(abs).then(function() {
+          headerCopyBtn.innerHTML = ICON_COPY_PATH_CHECK;
+          headerCopyBtn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function() { headerCopyBtn.innerHTML = ICON_COPY_PATH; headerCopyBtn.setAttribute('aria-label', originalLabel); }, 1500);
+        }).catch(function() { /* best-effort */ });
+      });
+      document.getElementById('branchContext').appendChild(headerCopyBtn);
+    }
+
+    // PR overview panel toggle
+    if (configRes.pr_url && configRes.pr_number) {
+      prData = configRes;
+      const prToggle = document.getElementById('prToggle');
+      prToggle.style.display = '';
+      document.getElementById('prToggleNumber').textContent = '#' + configRes.pr_number;
+      if (configRes.pr_is_draft) prToggle.classList.add('pr-toggle-draft');
+    }
+
+    // Show diff mode toggle in git mode (always has diffs)
+    // In file mode, it gets shown later via updateDiffModeToggle() once diffs exist
+    if (session.mode === 'git') {
+      document.getElementById('diffModeToggle').style.display = '';
+      document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.mode === diffMode);
+      });
+      document.getElementById('tocToggle').style.display = 'none';
+
+      // Show scope toggle and hide unavailable scopes
+      const scopeToggle = document.getElementById('scopeToggle');
+      scopeToggle.style.display = '';
+      const scopes = session.available_scopes || ['all', 'staged', 'unstaged'];
+      scopeToggle.querySelectorAll('.toggle-btn').forEach(function(b) {
+        // Clear previous disabled state before re-evaluating
+        b.disabled = false;
+        b.classList.remove('disabled');
+        if (b.dataset.scope !== 'all' && scopes.indexOf(b.dataset.scope) === -1) {
+          b.disabled = true;
+          b.classList.add('disabled');
+        }
+      });
+      // Range focus pins the file list to BaseSHA..HeadSHA server-side;
+      // working-tree scopes (branch/staged/unstaged) don't apply. Skip
+      // the scope re-fetch — the initial /api/session response is already
+      // correct, and the scope toggle will be hidden once the range chrome
+      // renders.
+      const inRangeFocus = session.focus && session.focus.kind === 'range';
+      if (diffScope === null) {
+        // First launch — prefer "branch" (committed changes only) over "all"
+        // (which includes untracked files and can overwhelm large repos).
+        diffScope = scopes.indexOf('branch') !== -1 ? 'branch' : 'all';
+        if (diffScope !== 'all' && !inRangeFocus) {
+          const corrected = await fetchWhenReady('/api/session?scope=' + enc(diffScope));
+          session = corrected;
+          reviewComments = corrected.review_comments || [];
+        }
+      } else if (scopes.indexOf(diffScope) === -1) {
+        diffScope = 'all';
+        setSetting('diffScope', 'all');
+        // Re-fetch session with corrected scope — the initial fetch used the
+        // stale cookie value and may have returned an empty file list.
+        const corrected = await fetchWhenReady('/api/session?scope=all');
+        session = corrected;
+        reviewComments = corrected.review_comments || [];
+      }
+      scopeToggle.querySelectorAll('.toggle-btn').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.scope === diffScope);
+      });
+
+      // Commit dropdown: visible only for all/branch scope in git mode
+      if (diffScope === 'all' || diffScope === 'branch') {
+        fetchCommits();
+      } else {
+        commitDropdownEl.style.display = 'none';
+        selectedCommits.clear();
+        recomputeDiffCommit();
+      }
+    }
+
+    updateHeaderRound();
+    setDocumentTitle(session.mode === 'git'
+      ? 'Crit — ' + (session.branch || 'review')
+      : 'Crit — ' + (session.files || []).map(f => f.path).join(', '));
+
+    files = await loadAllFileData(session.files || [], diffScope);
+    hiddenUnresolved = session.hidden_unresolved || 0;
+
+    files.sort(fileSortComparator);
+
+    restoreViewedState();
+    applyAutoViewedOnce(autoViewedPatterns);
+    updateDiffModeToggle();
+    renderFileTree();
+    renderAllFiles();
+    buildToc();
+    updateCommentCount();
+    updateViewedCount();
+    restoreDrafts();
+    applyHideResolved();
+    scrollToHashHeading();
+  }
+
+  // Show/hide the Toggle Diff button and Split/Unified toggle in file mode
+  function updateDiffModeToggle() {
+    if (session.mode === 'git') return; // git mode handles this in init
+    const hasDiffs = files.some(function(f) {
+      return f.fileType === 'markdown' && f.previousLineBlocks && f.previousLineBlocks.length > 0;
+    });
+    const diffToggleBtn = document.getElementById('diffToggle');
+    if (diffToggleBtn) {
+      diffToggleBtn.style.display = hasDiffs ? '' : 'none';
+      diffToggleBtn.classList.toggle('active', diffActive);
+    }
+    // Show Split/Unified toggle only when diff view is active
+    document.getElementById('diffModeToggle').style.display = (hasDiffs && diffActive) ? '' : 'none';
+    if (hasDiffs && diffActive) {
+      document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.mode === diffMode);
+      });
+    }
+  }
+
+  // ===== Syntax Highlighting for Diffs =====
+  // Most extensions are resolved via hljs's built-in alias system
+  // (e.g. .feature → gherkin, .md → markdown, .tsx → typescript, .toml → ini,
+  // .scss → scss, .h/.hpp → c/cpp, .yml → yaml, .kt → kotlin, .rb → ruby,
+  // .dockerfile → dockerfile, .makefile → makefile). Only extensions that hljs
+  // does NOT cover via aliases need entries here.
+  const EXT_OVERRIDES = {
+    tf: 'hcl',         // Terraform — hljs has no .tf alias
+    htm: 'xml',        // hljs aliases html but not htm
+    svg: 'xml',
+    cs: 'csharp',
+    sh: 'bash',
+    zig: 'zig',        // not a built-in alias in our bundle
+    md: 'markdown',    // normalize: callers compare lang against 'markdown'
+    heex: 'heex',
+    leex: 'heex',
+  };
+  // Files identified by basename rather than extension.
+  const BASENAME_LANG = {
+    dockerfile: 'dockerfile',
+    makefile: 'makefile',
+    gemfile: 'ruby',
+    rakefile: 'ruby',
+  };
+  function langFromPath(filePath) {
+    if (!filePath) return null;
+    const base = filePath.split('/').pop() || '';
+    const baseLower = base.toLowerCase();
+    // Pure basename (no extension) — Dockerfile, Makefile, etc.
+    if (!baseLower.includes('.') && BASENAME_LANG[baseLower]) {
+      return BASENAME_LANG[baseLower];
+    }
+    const ext = baseLower.includes('.') ? baseLower.split('.').pop() : '';
+    if (ext && EXT_OVERRIDES[ext]) return EXT_OVERRIDES[ext];
+    if (ext && hljs.getLanguage(ext)) return ext;
+    // Fall back to basename match (catches Dockerfile.something edge cases too).
+    return BASENAME_LANG[baseLower] || null;
+  }
+
+  // Pre-highlight file content and return array of highlighted lines (1-indexed).
+  // highlightedLines[lineNum] = highlighted HTML for that line.
+  function preHighlightFile(file) {
+    if (!file.content) return null;
+    const lang = langFromPath(file.path);
+    if (!lang || !hljs.getLanguage(lang)) return null;
+    try {
+      const highlighted = hljs.highlight(file.content, { language: lang, ignoreIllegals: true }).value;
+      const htmlLines = splitHighlightedCode(highlighted);
+      const rawLines = file.content.split('\n');
+      // Return 1-indexed: result[1] = first line
+      const result = [null]; // index 0 unused
+      for (let i = 0; i < htmlLines.length; i++) {
+        result.push({ html: htmlLines[i], raw: rawLines[i] });
+      }
+      return result;
+    } catch {
+      return null;
+    }
+  }
+
+  // Get highlighted HTML for a single diff line.
+  // Uses pre-highlighted cache for new-side lines, falls back to per-line for old-side.
+  // The cache is keyed by working-tree line number, but in branch/staged/commit-pinned
+  // diffs the diff's NewNum may address a different revision. Verify the cached source
+  // line matches `content` before trusting the cache hit.
+  function highlightDiffLine(content, lineNum, side, highlightCache, lang) {
+    if (highlightCache && lineNum > 0 && side !== 'old') {
+      const entry = highlightCache[lineNum];
+      if (entry && entry.raw === content) return entry.html;
+    }
+    if (lang && hljs.getLanguage(lang)) {
+      try {
+        return hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
+      } catch {}
+    }
+    return escapeHtml(content);
+  }
+
+  // ===== Markdown Parsing =====
+  function parseMarkdown(content) {
+    headingSlugCounter.clear();
+    const tokens = documentMd.parse(content, {});
+    const blocks = buildLineBlocks(tokens, documentMd, content);
+    const tocItems = extractTocItems(tokens);
+    return { blocks, tocItems };
+  }
+
+  function extractTocItems(tokens) {
+    const items = [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i].type === 'heading_open' && tokens[i].map) {
+        const level = parseInt(tokens[i].tag.slice(1));
+        const inline = tokens[i + 1];
+        if (inline && inline.type === 'inline') {
+          items.push({ level, text: inline.content, startLine: tokens[i].map[0] + 1 });
+        }
+      }
+    }
+    return items;
+  }
+
+  // Line-block building — extracted to crit-line-blocks.js (window.crit.lineBlocks)
+  const splitHighlightedCode = window.crit.lineBlocks.splitHighlightedCode;
+  const buildCodeLineBlocks = window.crit.lineBlocks.buildCodeLineBlocks;
+  const buildLineBlocks = window.crit.lineBlocks.buildLineBlocks;
+
+  // ===== Utility Functions =====
+  function processTaskLists(html) {
+    return html.replace(
+      /(<li[^>]*class="task-list-item"[^>]*>)\s*<p>\[([ x])\]\s*/gi,
+      function(_, liTag, checked) {
+        const checkbox = checked === 'x'
+          ? '<input type="checkbox" checked disabled>'
+          : '<input type="checkbox" disabled>';
+        return liTag + '<p>' + checkbox;
+      }
+    ).replace(
+      /(<li[^>]*class="task-list-item"[^>]*>)\[([ x])\]\s*/gi,
+      function(_, liTag, checked) {
+        const checkbox = checked === 'x'
+          ? '<input type="checkbox" checked disabled>'
+          : '<input type="checkbox" disabled>';
+        return liTag + checkbox;
+      }
+    );
+  }
+
+  function rewriteImageSrcs(html) {
+    return html.replace(/(<img\s[^>]*src=")([^"]+)(")/gi, function(match, pre, src, post) {
+      if (/^https?:\/\/|^data:|^\//.test(src)) return match;
+      return pre + '/files/' + src + post;
+    });
+  }
+
+  // Pure rendering helpers live in crit-comment-card-helpers.js so live-mode
+  // rows render with the same primitives. The helpers module is loaded before
+  // app.js via index.html script order, so we reference it directly.
+  const _ccHelpers = window.crit.commentCardHelpers;
+  const escapeHtml = _ccHelpers.escapeHtml;
+  const relativeTime = _ccHelpers.relativeTime;
+  const formatTime = _ccHelpers.formatTime;
+
+  function getFileByPath(path) {
+    return files.find(f => f.path === path);
+  }
+
+  // ===== File Tree Sidebar =====
+  let activeTreePath = null;
+  let treeObserver = null;
+  let ignoreTreeObserverUntil = 0;
+  const treeFolderState = {}; // { 'src': true, 'src/components': false } — true = collapsed
+
+  function buildFileTree(fileList) {
+    // Build a nested tree from flat paths
+    const root = { children: {}, files: [] };
+    for (let i = 0; i < fileList.length; i++) {
+      const f = fileList[i];
+      const parts = f.path.split('/');
+      let node = root;
+      for (let j = 0; j < parts.length - 1; j++) {
+        const dirName = parts[j];
+        if (!node.children[dirName]) {
+          node.children[dirName] = { children: {}, files: [] };
+        }
+        node = node.children[dirName];
+      }
+      node.files.push(f);
+    }
+    return root;
+  }
+
+  function collapseCommonPrefixes(tree) {
+    // Collapse single-child directories: src/ -> components/ -> Foo.tsx becomes src/components/
+    const dirs = Object.keys(tree.children);
+    const result = { children: {}, files: tree.files };
+    for (let i = 0; i < dirs.length; i++) {
+      let name = dirs[i];
+      let child = tree.children[name];
+      // Recursively collapse child first
+      child = collapseCommonPrefixes(child);
+      // If child has exactly one subdirectory and no files, merge
+      let childDirs = Object.keys(child.children);
+      while (childDirs.length === 1 && child.files.length === 0) {
+        name = name + '/' + childDirs[0];
+        child = child.children[childDirs[0]];
+        child = collapseCommonPrefixes(child);
+        childDirs = Object.keys(child.children);
+      }
+      result.children[name] = child;
+    }
+    return result;
+  }
+
+  function renderFileTree() {
+    const panel = document.getElementById('fileTreePanel');
+    if (files.length <= 1 && session.mode !== 'git') {
+      panel.style.display = 'none';
+      renderMobileFilePicker();
+      return;
+    }
+    panel.style.display = '';
+
+    // Stats
+    let totalAdd = 0, totalDel = 0;
+    for (let i = 0; i < files.length; i++) { totalAdd += files[i].additions; totalDel += files[i].deletions; }
+    const statsEl = document.getElementById('fileTreeStats');
+    statsEl.innerHTML =
+      '<span>' + files.length + '</span>' +
+      (totalAdd ? ' <span class="tree-stat-add">+' + totalAdd + '</span>' : '') +
+      (totalDel ? ' <span class="tree-stat-del">-' + totalDel + '</span>' : '');
+
+    // Collapse/expand all button
+    const existingBtn = document.querySelector('.file-tree-collapse-btn');
+    if (existingBtn) existingBtn.remove();
+    if (files.length > 1) {
+      const collapseBtn = document.createElement('button');
+      collapseBtn.className = 'file-tree-collapse-btn';
+      collapseBtn.title = 'Collapse all files';
+      // Stacked chevron SVG
+      collapseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M4.22 3.22a.75.75 0 0 1 1.06 0L8 5.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 4.28a.75.75 0 0 1 0-1.06zm0 5a.75.75 0 0 1 1.06 0L8 10.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 9.28a.75.75 0 0 1 0-1.06z"/></svg>';
+      collapseBtn.addEventListener('click', function() {
+        const anyExpanded = files.some(function(f) { return !f.collapsed; });
+        for (let i = 0; i < files.length; i++) {
+          files[i].collapsed = anyExpanded;
+        }
+        const sections = document.querySelectorAll('.file-section');
+        for (let i = 0; i < sections.length; i++) {
+          sections[i].open = !anyExpanded;
+        }
+        collapseBtn.title = anyExpanded ? 'Expand all files' : 'Collapse all files';
+        collapseBtn.classList.toggle('all-collapsed', anyExpanded);
+      });
+      const headerEl = document.querySelector('.file-tree-header');
+      headerEl.appendChild(collapseBtn);
+    }
+
+    // Build and render tree
+    let tree = buildFileTree(files);
+    tree = collapseCommonPrefixes(tree);
+    const body = document.getElementById('fileTreeBody');
+    body.innerHTML = '';
+
+    // Review Conversation pseudo-row sits in its own section above FILES.
+    const conversationSection = document.getElementById('treeConversationSection');
+    conversationSection.innerHTML = '';
+    conversationSection.appendChild(buildReviewConversationTreeRow());
+
+    renderTreeNode(body, tree, 0, '');
+
+    // Set up intersection observer for active file tracking
+    setupTreeObserver();
+
+    renderMobileFilePicker();
+  }
+
+  // Mobile (≤768px) replaces the file-tree sidebar with a sticky <select>.
+  // Populates options from the current session files; clicking an option
+  // scrolls that file's section into view. No-op (and hidden) when there's
+  // only one file.
+  function renderMobileFilePicker() {
+    const bar = document.getElementById('mobileFilePickerBar');
+    const select = document.getElementById('mobileFilePicker');
+    if (!bar || !select) return;
+
+    if (files.length <= 1) {
+      bar.classList.add('mobile-file-picker-hidden');
+      return;
+    }
+    bar.classList.remove('mobile-file-picker-hidden');
+
+    const currentValue = select.value;
+    select.innerHTML = '';
+    for (let i = 0; i < files.length; i++) {
+      const opt = document.createElement('option');
+      opt.value = files[i].path;
+      opt.textContent = files[i].path;
+      select.appendChild(opt);
+    }
+
+    if (currentValue && files.some(function(f) { return f.path === currentValue; })) {
+      select.value = currentValue;
+    }
+
+    if (!select._mobilePickerBound) {
+      select._mobilePickerBound = true;
+      select.addEventListener('change', function() {
+        const sectionEl = document.getElementById('file-section-' + select.value);
+        if (sectionEl) {
+          sectionEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        }
+      });
+    }
+  }
+
+  function buildReviewConversationTreeRow() {
+    const row = document.createElement('div');
+    row.className = 'tree-conversation-row' + (activeTreePath === REVIEW_CONVERSATION_PATH ? ' active' : '');
+    row.dataset.treePath = REVIEW_CONVERSATION_PATH;
+    let inner =
+      '<span class="tree-conversation-icon">' + ICON_REVIEW_CONVERSATION + '</span>' +
+      '<span class="tree-conversation-name">Review conversation</span>';
+    const unresolved = reviewComments.filter(function(c) { return !c.resolved; }).length;
+    if (unresolved > 0) {
+      inner += '<span class="tree-conversation-badge">' + unresolved + '</span>';
+    }
+    row.innerHTML = inner;
+    row.addEventListener('click', scrollToReviewConversation);
+    return row;
+  }
+
+  function fileStatusIcon(status) {
+    // GitHub-style: document icon with colored +/- badge
+    const doc = '<path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/>';
+    if (status === 'added' || status === 'untracked') {
+      return '<svg class="tree-file-status-icon added" viewBox="0 0 16 16">' + doc +
+        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--crit-green)"/>' +
+        '<path d="M11.5 10v1.5H13v1h-1.5V14h-1v-1.5H9v-1h1.5V10z" fill="var(--crit-editor-bg-card)"/></svg>';
+    }
+    if (status === 'deleted') {
+      return '<svg class="tree-file-status-icon deleted" viewBox="0 0 16 16">' + doc +
+        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--crit-red)"/>' +
+        '<path d="M9.5 11.5h4v1h-4z" fill="var(--crit-editor-bg-card)"/></svg>';
+    }
+    if (status === 'modified') {
+      return '<svg class="tree-file-status-icon modified" viewBox="0 0 16 16">' + doc +
+        '<circle cx="11.5" cy="11.5" r="3.5" fill="var(--crit-yellow)"/>' +
+        '<circle cx="11.5" cy="11.5" r="1.5" fill="var(--crit-editor-bg-card)"/>' +
+        '</svg>';
+    }
+    if (status === 'removed') {
+      return '<svg class="tree-file-status-icon removed" viewBox="0 0 16 16">' + doc +
+        '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--crit-editor-fg-muted)"/>' +
+        '<path d="M10 10.5l3 3m0-3l-3 3" stroke="var(--crit-editor-bg-card)" stroke-width="1.2" fill="none"/></svg>';
+    }
+    // renamed or other
+    return '<svg class="tree-file-status-icon" viewBox="0 0 16 16">' + doc + '</svg>';
+  }
+
+  function renderTreeNode(container, node, depth, pathPrefix) {
+    const folderSVG = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z"/></svg>';
+
+    // Render subdirectories
+    const dirs = Object.keys(node.children).sort();
+    for (let d = 0; d < dirs.length; d++) {
+      const dirName = dirs[d];
+      const fullPath = pathPrefix ? pathPrefix + '/' + dirName : dirName;
+      const child = node.children[dirName];
+      const isCollapsed = treeFolderState[fullPath] === true;
+
+      const folder = document.createElement('div');
+      folder.className = 'tree-folder' + (isCollapsed ? ' collapsed' : '');
+      folder.dataset.folderPath = fullPath;
+
+      const row = document.createElement('div');
+      row.className = 'tree-folder-row';
+      row.style.paddingLeft = (8 + depth * 16) + 'px';
+
+      row.innerHTML =
+        '<span class="tree-folder-chevron">&#9662;</span>' +
+        '<span class="tree-folder-icon">' + folderSVG + '</span>' +
+        '<span class="tree-folder-name">' + escapeHtml(dirName) + '</span>';
+
+      (function(fp, folderEl) {
+        row.addEventListener('click', function() {
+          treeFolderState[fp] = !treeFolderState[fp];
+          folderEl.classList.toggle('collapsed');
+        });
+      })(fullPath, folder);
+
+      folder.appendChild(row);
+
+      const childContainer = document.createElement('div');
+      childContainer.className = 'tree-folder-children';
+      renderTreeNode(childContainer, child, depth + 1, fullPath);
+      folder.appendChild(childContainer);
+
+      container.appendChild(folder);
+    }
+
+    // Render files. In files mode preserve user-provided CLI order.
+    const sortedFiles = session.mode === 'files'
+      ? node.files.slice()
+      : node.files.slice().sort(function(a, b) { return pathCompare(a.path, b.path); });
+    for (let fi = 0; fi < sortedFiles.length; fi++) {
+      const f = sortedFiles[fi];
+      const fileName = f.path.split('/').pop();
+      const fileEl = document.createElement('div');
+      fileEl.className = 'tree-file' + (activeTreePath === f.path ? ' active' : '') + (f.viewed ? ' viewed' : '');
+      fileEl.dataset.treePath = f.path;
+      fileEl.style.paddingLeft = (24 + depth * 16) + 'px';
+
+      // In file mode, show plain file icon (no git status badge)
+      const iconHtml = session.mode === 'git' ? fileStatusIcon(f.status) : fileStatusIcon('');
+      let innerHtml =
+        '<span class="tree-file-icon">' + iconHtml + '</span>' +
+        '<span class="tree-file-name">' + escapeHtml(fileName) + '</span>';
+
+      if (f.viewed) {
+        innerHtml += '<span class="tree-viewed-check" title="Viewed">&#10003;</span>';
+      }
+      const unresolvedCount = f.comments.filter(function(c) { return !c.resolved; }).length;
+      if (unresolvedCount > 0) {
+        innerHtml += '<span class="tree-comment-badge">' + unresolvedCount + '</span>';
+      }
+
+      fileEl.innerHTML = innerHtml;
+
+      (function(path) {
+        fileEl.addEventListener('click', function() {
+          scrollToFile(path);
+        });
+      })(f.path);
+
+      container.appendChild(fileEl);
+    }
+  }
+
+  function updateTreeActive(filePath) {
+    if (filePath === activeTreePath) return;
+    activeTreePath = filePath;
+    const allRows = document.querySelectorAll('.tree-file, .tree-conversation-row');
+    for (let i = 0; i < allRows.length; i++) {
+      allRows[i].classList.toggle('active', allRows[i].dataset.treePath === filePath);
+    }
+    // Scroll active item into view within the tree panel (manual scroll
+    // to avoid scrollIntoView affecting ancestor scroll containers)
+    const activeEl = document.querySelector('.tree-file.active, .tree-conversation-row.active');
+    if (activeEl) {
+      const panel = document.getElementById('fileTreeBody');
+      const rect = activeEl.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      if (rect.top < panelRect.top) {
+        panel.scrollTop += rect.top - panelRect.top;
+      } else if (rect.bottom > panelRect.bottom) {
+        panel.scrollTop += rect.bottom - panelRect.bottom;
+      }
+    }
+  }
+
+  function updateTreeCommentBadges() {
+    const allFiles = document.querySelectorAll('.tree-file');
+    for (let i = 0; i < allFiles.length; i++) {
+      const el = allFiles[i];
+      const path = el.dataset.treePath;
+      const file = getFileByPath(path);
+      if (!file) continue;
+      let badge = el.querySelector('.tree-comment-badge');
+      const count = file.comments.filter(function(c) { return !c.resolved; }).length;
+      if (count > 0) {
+        if (badge) {
+          badge.textContent = count;
+        } else {
+          badge = document.createElement('span');
+          badge.className = 'tree-comment-badge';
+          badge.textContent = count;
+          el.appendChild(badge);
+        }
+      } else if (badge) {
+        badge.remove();
+      }
+    }
+  }
+
+  function updateTreeViewedState() {
+    const allFiles = document.querySelectorAll('.tree-file');
+    for (let i = 0; i < allFiles.length; i++) {
+      const el = allFiles[i];
+      const path = el.dataset.treePath;
+      const file = getFileByPath(path);
+      if (!file) continue;
+      el.classList.toggle('viewed', !!file.viewed);
+      let check = el.querySelector('.tree-viewed-check');
+      if (file.viewed) {
+        if (!check) {
+          check = document.createElement('span');
+          check.className = 'tree-viewed-check';
+          check.title = 'Viewed';
+          check.textContent = '\u2713';
+          // Insert before comment badge if present, else append
+          const badge = el.querySelector('.tree-comment-badge');
+          if (badge) el.insertBefore(check, badge);
+          else el.appendChild(check);
+        }
+      } else if (check) {
+        check.remove();
+      }
+    }
+  }
+
+  function setupTreeObserver() {
+    if (treeObserver) treeObserver.disconnect();
+    const sections = document.querySelectorAll('.file-section[id]');
+    const reviewSection = document.getElementById('reviewConversation');
+    if (sections.length === 0 && !reviewSection) return;
+
+    treeObserver = new IntersectionObserver(function(entries) {
+      // Skip observer updates briefly after a manual scrollToFile click
+      if (Date.now() < ignoreTreeObserverUntil) return;
+      // Find the topmost visible section
+      let bestPath = null;
+      let bestTop = Infinity;
+      for (let i = 0; i < entries.length; i++) {
+        if (entries[i].isIntersecting) {
+          const top = entries[i].boundingClientRect.top;
+          if (top < bestTop) {
+            bestTop = top;
+            const id = entries[i].target.id;
+            bestPath = id === 'reviewConversation'
+              ? REVIEW_CONVERSATION_PATH
+              : id.replace('file-section-', '');
+          }
+        }
+      }
+      if (bestPath) updateTreeActive(bestPath);
+    }, { rootMargin: '-60px 0px -70% 0px' });
+
+    if (reviewSection && !reviewSection.hidden) {
+      treeObserver.observe(reviewSection);
+    }
+    for (let i = 0; i < sections.length; i++) {
+      treeObserver.observe(sections[i]);
+    }
+  }
+
+  function scrollToFile(filePath) {
+    const sectionEl = document.getElementById('file-section-' + filePath);
+    if (!sectionEl) return;
+    // Uncollapse if collapsed
+    const file = getFileByPath(filePath);
+    if (file) file.collapsed = false;
+    sectionEl.open = true;
+    // Suppress IntersectionObserver for 200ms so it doesn't override our manual active state
+    ignoreTreeObserverUntil = Date.now() + 200;
+    sectionEl.scrollIntoView({ block: 'start', behavior: 'instant' });
+    updateTreeActive(filePath);
+  }
+
+  // ===== Render All File Sections =====
+  function renderAllFiles() {
+    const container = document.getElementById('filesContainer');
+    container.innerHTML = '';
+
+    for (const f of files) {
+      container.appendChild(renderFileSection(f));
+    }
+
+    // Render mermaid diagrams
+    renderMermaidBlocks();
+
+    // Render the inline Review Conversation section above filesContainer
+    renderReviewConversation();
+
+    // Re-attach intersection observer for file tree active tracking
+    setupTreeObserver();
+    rebuildNavList();
+    applyHideResolved();
+  }
+
+  function rebuildNavList() {
+    navElements = Array.from(document.querySelectorAll('.kb-nav'));
+    buildChangeGroups();
+    restoreKeyboardFocus();
+  }
+
+  function rememberKeyboardFocusTarget(target) {
+    if (!target || !target.filePath) return;
+    keyboardFocusTarget = target;
+  }
+
+  function rememberKeyboardFocusFromForm(formObj) {
+    if (!formObj || !formObj.filePath || formObj.scope === 'file') return;
+    const target = { filePath: formObj.filePath };
+    if (formObj.afterBlockIndex !== null && formObj.afterBlockIndex !== undefined) {
+      target.blockIndex = String(formObj.afterBlockIndex);
+    }
+    if (formObj.startLine) target.startLine = String(formObj.startLine);
+    if (formObj.endLine) target.endLine = String(formObj.endLine);
+    if (formObj.afterBlockIndex === null && formObj.startLine) {
+      target.diffLineNum = String(formObj.startLine);
+      target.diffSide = formObj.side || '';
+    }
+    rememberKeyboardFocusTarget(target);
+  }
+
+  function navFocusTargetFromElement(el) {
+    if (!el) return null;
+    if (el.classList.contains('diff-split-row')) {
+      const rightSide = el.querySelector('.diff-split-side.right:not(.empty)[data-diff-line-num], .diff-split-side.addition[data-diff-line-num]');
+      const leftSide = el.querySelector('.diff-split-side.left[data-diff-line-num], .diff-split-side.deletion[data-diff-line-num]');
+      const sideEl = rightSide || leftSide;
+      if (!sideEl) return null;
+      const fp = sideEl.dataset.diffFilePath;
+      if (!fp) return null;
+      return {
+        filePath: fp,
+        diffLineNum: sideEl.dataset.diffLineNum,
+        diffSide: sideEl.dataset.diffSide || '',
+      };
+    }
+    const fp = el.dataset.filePath || el.dataset.diffFilePath;
+    if (!fp) return null;
+    const target = { filePath: fp };
+    if (el.dataset.blockIndex !== undefined) {
+      target.blockIndex = el.dataset.blockIndex;
+      if (el.dataset.startLine) target.startLine = el.dataset.startLine;
+      if (el.dataset.endLine) target.endLine = el.dataset.endLine;
+      return target;
+    }
+    if (el.dataset.diffLineNum) {
+      target.diffLineNum = el.dataset.diffLineNum;
+      target.diffSide = el.dataset.diffSide || '';
+    }
+    return target;
+  }
+
+  function rememberKeyboardFocusFromNav(el) {
+    const target = navFocusTargetFromElement(el);
+    rememberKeyboardFocusTarget(target);
+  }
+
+  function clearKeyboardFocusTarget() {
+    keyboardFocusTarget = null;
+  }
+
+  function getKeyboardFocusTarget() {
+    if (keyboardFocusTarget) return keyboardFocusTarget;
+    if (!focusedFilePath && !focusedElement) return null;
+    if (focusedElement) {
+      const fromEl = navFocusTargetFromElement(focusedElement);
+      if (fromEl) return fromEl;
+    }
+    const fp = focusedFilePath || (focusedElement && (focusedElement.dataset.filePath || focusedElement.dataset.diffFilePath));
+    if (!fp) return null;
+    const target = { filePath: fp };
+    if (focusedBlockIndex !== null && focusedBlockIndex !== undefined && !isNaN(focusedBlockIndex)) {
+      target.blockIndex = String(focusedBlockIndex);
+    }
+    return target;
+  }
+
+  function findNavElementForFocusTarget(target) {
+    if (!target) return null;
+    for (let i = 0; i < navElements.length; i++) {
+      const n = navElements[i];
+      if (target.blockIndex !== undefined && n.dataset.filePath === target.filePath && n.dataset.blockIndex === target.blockIndex) {
+        return n;
+      }
+      if (target.startLine && n.dataset.filePath === target.filePath &&
+          n.dataset.startLine === target.startLine &&
+          (n.dataset.endLine || target.startLine) === (target.endLine || target.startLine)) {
+        return n;
+      }
+    }
+    if (!target.diffLineNum) return null;
+    const side = target.diffSide || '';
+    for (let i = 0; i < navElements.length; i++) {
+      const n = navElements[i];
+      if (n.classList.contains('diff-split-row')) {
+        const sides = n.querySelectorAll('.diff-split-side[data-diff-line-num]');
+        for (let si = 0; si < sides.length; si++) {
+          const sideEl = sides[si];
+          if (sideEl.dataset.diffFilePath !== target.filePath) continue;
+          if (sideEl.dataset.diffLineNum === target.diffLineNum &&
+              (sideEl.dataset.diffSide || '') === side) {
+            return n;
+          }
+        }
+        continue;
+      }
+      if (n.dataset.diffFilePath !== target.filePath) continue;
+      if (n.classList.contains('diff-line') &&
+          n.dataset.diffLineNum === target.diffLineNum &&
+          (n.dataset.diffSide || '') === side) {
+        return n;
+      }
+    }
+    return null;
+  }
+
+  function getFocusedCommentLocation() {
+    const target = getKeyboardFocusTarget();
+    if (target) {
+      return {
+        filePath: target.filePath,
+        blockIndex: target.blockIndex !== undefined ? parseInt(target.blockIndex) : undefined,
+        lineNum: target.diffLineNum ? parseInt(target.diffLineNum) :
+          (target.startLine ? parseInt(target.startLine) : undefined),
+        side: target.diffSide || '',
+      };
+    }
+    if (!focusedElement) return null;
+    const fromEl = navFocusTargetFromElement(focusedElement);
+    if (fromEl) {
+      return {
+        filePath: fromEl.filePath,
+        blockIndex: fromEl.blockIndex !== undefined ? parseInt(fromEl.blockIndex) : undefined,
+        lineNum: fromEl.diffLineNum ? parseInt(fromEl.diffLineNum) :
+          (fromEl.startLine ? parseInt(fromEl.startLine) : undefined),
+        side: fromEl.diffSide || '',
+      };
+    }
+    const filePath = focusedElement.dataset.filePath || focusedElement.dataset.diffFilePath;
+    if (!filePath) return null;
+    if (focusedElement.dataset.blockIndex !== undefined) {
+      return {
+        filePath: filePath,
+        blockIndex: parseInt(focusedElement.dataset.blockIndex),
+        lineNum: focusedElement.dataset.startLine ? parseInt(focusedElement.dataset.startLine) : undefined,
+        side: '',
+      };
+    }
+    if (focusedElement.dataset.diffLineNum) {
+      return {
+        filePath: filePath,
+        lineNum: parseInt(focusedElement.dataset.diffLineNum),
+        side: focusedElement.dataset.diffSide || '',
+      };
+    }
+    return null;
+  }
+
+  function restoreKeyboardFocus() {
+    const target = getKeyboardFocusTarget();
+    if (!target) return;
+    const match = findNavElementForFocusTarget(target);
+    if (!match) return;
+    document.querySelectorAll('.kb-nav.focused').forEach(function(el) { el.classList.remove('focused'); });
+    focusedElement = match;
+    match.classList.add('focused');
+    if (match.dataset.filePath) {
+      focusedFilePath = match.dataset.filePath;
+      focusedBlockIndex = parseInt(match.dataset.blockIndex);
+    } else {
+      const navTarget = navFocusTargetFromElement(match);
+      if (navTarget) {
+        focusedFilePath = navTarget.filePath;
+        focusedBlockIndex = null;
+      } else if (match.dataset.diffFilePath) {
+        focusedFilePath = match.dataset.diffFilePath;
+        focusedBlockIndex = null;
+      }
+    }
+  }
+
+  function buildChangeGroups() {
+    changeGroups = [];
+    // Document view: color-coded change blocks + deletion markers
+    const docEls = document.querySelectorAll('.line-block-added, .line-block-modified, .deletion-marker');
+    // Diff view: diff-added and diff-removed blocks in rendered diff (file mode)
+    const diffEls = document.querySelectorAll('.diff-view .line-block.diff-added, .diff-view .line-block.diff-removed, .diff-view-unified .line-block.diff-added, .diff-view-unified .line-block.diff-removed');
+    const all = docEls.length > 0 ? docEls : diffEls;
+    if (all.length === 0) { currentChangeIdx = -1; updateChangeCounters(); return; }
+    let group = null;
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      const fp = el.dataset.filePath;
+      // Start new group if file changes or elements aren't consecutive siblings
+      if (!group || group.filePath !== fp || !isConsecutiveSibling(group.elements[group.elements.length - 1], el)) {
+        group = { elements: [el], filePath: fp };
+        changeGroups.push(group);
+      } else {
+        group.elements.push(el);
+      }
+    }
+    currentChangeIdx = -1;
+    updateChangeCounters();
+  }
+
+  function isConsecutiveSibling(a, b) {
+    // Check if b immediately follows a, skipping comment elements between them
+    let node = a.nextElementSibling;
+    while (node && node !== b) {
+      // A non-changed line-block in between breaks the group
+      if (node.classList.contains('line-block') &&
+          !node.classList.contains('line-block-added') &&
+          !node.classList.contains('line-block-modified') &&
+          !node.classList.contains('diff-added') &&
+          !node.classList.contains('diff-removed')) return false;
+      // Deletion markers don't break the group
+      if (node.classList.contains('deletion-marker')) { node = node.nextElementSibling; continue; }
+      node = node.nextElementSibling;
+    }
+    return node === b;
+  }
+
+  function navigateToChange(dir) {
+    if (changeGroups.length === 0) return;
+    // Remove previous flash
+    document.querySelectorAll('.change-flash').forEach(function(el) { el.classList.remove('change-flash'); });
+
+    const viewCenter = window.innerHeight / 2;
+    const threshold = 50;
+    let targetIdx = -1;
+
+    // Check if the previously navigated change is still near viewport center
+    // (i.e. user hasn't scrolled away manually)
+    let currentIsCentered = false;
+    if (currentChangeIdx >= 0 && currentChangeIdx < changeGroups.length) {
+      const curRect = changeGroups[currentChangeIdx].elements[0].getBoundingClientRect();
+      const curCenter = (curRect.top + curRect.bottom) / 2;
+      currentIsCentered = Math.abs(curCenter - viewCenter) < threshold * 3;
+    }
+
+    if (currentIsCentered) {
+      // User hasn't scrolled away — use index-based next/prev with wrapping
+      if (dir > 0) {
+        targetIdx = (currentChangeIdx + 1) % changeGroups.length;
+      } else {
+        targetIdx = (currentChangeIdx - 1 + changeGroups.length) % changeGroups.length;
+      }
+    } else {
+      // User scrolled manually — find next/prev relative to viewport position
+      if (dir > 0) {
+        for (let i = 0; i < changeGroups.length; i++) {
+          const rect = changeGroups[i].elements[0].getBoundingClientRect();
+          const elCenter = (rect.top + rect.bottom) / 2;
+          if (elCenter > viewCenter + threshold) { targetIdx = i; break; }
+        }
+        if (targetIdx === -1) targetIdx = 0;
+      } else {
+        for (let i = changeGroups.length - 1; i >= 0; i--) {
+          const rect = changeGroups[i].elements[0].getBoundingClientRect();
+          const elCenter = (rect.top + rect.bottom) / 2;
+          if (elCenter < viewCenter - threshold) { targetIdx = i; break; }
+        }
+        if (targetIdx === -1) targetIdx = changeGroups.length - 1;
+      }
+    }
+
+    currentChangeIdx = targetIdx;
+    const group = changeGroups[currentChangeIdx];
+    group.elements[0].scrollIntoView({ block: 'center', behavior: 'instant' });
+    group.elements.forEach(function(el) { el.classList.add('change-flash'); });
+    focusedElement = group.elements[0];
+    focusedFilePath = group.filePath;
+    const bi = parseInt(group.elements[0].dataset.blockIndex);
+    if (!isNaN(bi)) focusedBlockIndex = bi;
+    updateChangeCounters();
+  }
+
+  function updateChangeCounters() {
+    const labels = document.querySelectorAll('.change-nav-label');
+    labels.forEach(function(label) {
+      const fp = label.dataset.filePath;
+      // Count groups for this file
+      const fileGroups = changeGroups.filter(function(g) { return g.filePath === fp; });
+      const total = fileGroups.length;
+      // Find current index within this file's groups
+      let current = 0;
+      if (currentChangeIdx >= 0) {
+        const globalGroup = changeGroups[currentChangeIdx];
+        if (globalGroup.filePath === fp) {
+          current = fileGroups.indexOf(globalGroup) + 1;
+        }
+      }
+      label.textContent = (current || '-') + ' / ' + total + ' change' + (total !== 1 ? 's' : '');
+    });
+  }
+
+  // Re-render only a single file section (preserves scroll position)
+  function saveOpenFormContent(filePath) {
+    const fileForms = getFormsForFile(filePath);
+    for (let i = 0; i < fileForms.length; i++) {
+      const ta = document.querySelector('.comment-form[data-form-key="' + fileForms[i].formKey + '"] textarea');
+      if (ta) fileForms[i].draftBody = ta.value;
+    }
+    // Save expanded reply form state before DOM re-render
+    const section = document.getElementById('file-section-' + filePath);
+    if (section) {
+      const expandedForms = section.querySelectorAll('.reply-form.expanded');
+      for (let i = 0; i < expandedForms.length; i++) {
+        const card = expandedForms[i].closest('.comment-card');
+        if (card && card.dataset.commentId) {
+          const ta = expandedForms[i].querySelector('.reply-textarea');
+          activeReplyForms.set(card.dataset.commentId, { text: ta ? ta.value : '' });
+        }
+      }
+    }
+  }
+
+  function renderFileByPath(filePath) {
+    const file = getFileByPath(filePath);
+    if (!file) return;
+    saveOpenFormContent(filePath);
+    const oldSection = document.getElementById('file-section-' + file.path);
+    if (!oldSection) { renderAllFiles(); return; }
+    oldSection.replaceWith(renderFileSection(file));
+    renderMermaidBlocks();
+    rebuildNavList();
+    applyHideResolved();
+  }
+
+  function renderFileSection(file) {
+    // Use native <details>/<summary> for collapse — browser handles scroll natively
+    const section = document.createElement('details');
+    section.className = 'file-section';
+    section.id = 'file-section-' + file.path;
+    if (!file.collapsed) section.open = true;
+
+    const header = document.createElement('summary');
+    header.className = 'file-header';
+
+    // Intercept click to fix scroll BEFORE collapse (avoids flicker)
+    header.addEventListener('click', function(e) {
+      if (e.target.closest('.file-header-toggle') || e.target.closest('.file-header-viewed')) {
+        e.preventDefault();
+        return;
+      }
+      if (section.open) {
+        // Collapsing: correct scroll before content disappears
+        e.preventDefault();
+        if (section.getBoundingClientRect().top < 0) {
+          section.scrollIntoView({ behavior: 'instant' });
+        }
+        section.open = false;
+        file.collapsed = true;
+      }
+      // Expanding: let native <details> handle it
+    });
+    section.addEventListener('toggle', function() {
+      file.collapsed = !section.open;
+    });
+
+    // Lazy file: load content on first expand
+    if (file.lazy) {
+      section.addEventListener('toggle', function onLazyExpand() {
+        if (!section.open || !file.lazy) return;
+        if (file._lazyLoading) return;
+        file._lazyLoading = true;
+        section.removeEventListener('toggle', onLazyExpand);
+        section.classList.add('file-section-loading');
+
+        loadSingleFile({
+          path: file.path,
+          old_path: file.oldPath,
+          status: file.status,
+          file_type: file.fileType,
+          additions: file.additions,
+          deletions: file.deletions,
+        }, diffScope).then(function(loaded) {
+          // Copy loaded data into the existing file object
+          file.oldPath = loaded.oldPath;
+          file.content = loaded.content;
+          file.previousContent = loaded.previousContent;
+          file.comments = loaded.comments;
+          file.diffHunks = loaded.diffHunks;
+          file._autoExpandDone = false;
+          file.lineBlocks = loaded.lineBlocks;
+          file.previousLineBlocks = loaded.previousLineBlocks;
+          file.tocItems = loaded.tocItems;
+          file.diffTooLarge = loaded.diffTooLarge;
+          file.diffLoaded = loaded.diffLoaded;
+          file.lazy = false;
+          file._lazyLoading = false;
+          if (loaded.highlightCache) file.highlightCache = loaded.highlightCache;
+          if (loaded.lang) file.lang = loaded.lang;
+
+          // Re-render this file section in place
+          section.classList.remove('file-section-loading');
+          const newSection = renderFileSection(file);
+          newSection.open = section.open;
+          section.replaceWith(newSection);
+
+          // Update UI state
+          renderFileTree();
+          updateCommentCount();
+          rebuildNavList();
+        }).catch(function() {
+          file._lazyLoading = false;
+          // Guard against stale DOM node: only re-attach if still in the document
+          if (!section.isConnected) return;
+          section.classList.remove('file-section-loading');
+          section.addEventListener('toggle', onLazyExpand);
+        });
+      });
+    }
+
+    const dirParts = file.path.split('/');
+    const fileName = dirParts.pop();
+    const dirPath = dirParts.length > 0 ? dirParts.join('/') + '/' : '';
+
+    // In file mode, hide the badge (status like "modified" is only meaningful in git mode)
+    // Exception: orphaned files always show their "Removed" badge
+    const showBadge = session.mode === 'git' || file.orphaned;
+    let badgeLabel = file.status.charAt(0).toUpperCase() + file.status.slice(1);
+    if (file.status === 'untracked') badgeLabel = 'New';
+    if (file.status === 'added') badgeLabel = 'New File';
+    if (file.status === 'removed') badgeLabel = 'Removed';
+    if (file.status === 'renamed') badgeLabel = 'Renamed';
+
+    // In single-file file mode, hide the file header (filename is shown in the header bar)
+    const singleFileMode = session.mode !== 'git' && files.length === 1;
+    if (singleFileMode) header.style.display = 'none';
+
+    const renameHeader = file.status === 'renamed' && file.oldPath
+      ? '<span class="rename-paths"><span class="rename-old">' + escapeHtml(file.oldPath) + '</span>' +
+        '<span class="rename-arrow"> → </span><span class="rename-new">' + escapeHtml(file.path) + '</span></span>'
+      : '<span class="dir">' + escapeHtml(dirPath) + '</span><span class="filename">' + escapeHtml(fileName) + '</span>';
+
+    header.innerHTML =
+      '<div class="file-header-chevron"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"/></svg></div>' +
+      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
+      '<span class="file-header-name">' + renameHeader +
+        '<button type="button" class="file-header-copy-path" aria-label="Copy file path">' + ICON_COPY_PATH + '</button>' +
+      '</span>' +
+      (showBadge ? '<span class="file-header-badge ' + escapeHtml(file.status) + '">' + escapeHtml(badgeLabel) + '</span>' : '') +
+      (file.additions || file.deletions ? '<span class="file-header-stats">' +
+        (file.additions ? '<span class="add">+' + file.additions + '</span>' : '') +
+        (file.deletions ? '<span class="del">-' + file.deletions + '</span>' : '') +
+      '</span>' : '') +
+      '';
+
+    (function(filePath) {
+      const copyPathBtn = header.querySelector('.file-header-copy-path');
+      copyPathBtn.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const originalLabel = copyPathBtn.getAttribute('aria-label');
+        const abs = session.cwd ? session.cwd + '/' + filePath : filePath;
+        navigator.clipboard.writeText(abs).then(function() {
+          copyPathBtn.innerHTML = ICON_COPY_PATH_CHECK;
+          copyPathBtn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function() { copyPathBtn.innerHTML = ICON_COPY_PATH; copyPathBtn.setAttribute('aria-label', originalLabel); }, 1500);
+        }).catch(function() { /* best-effort */ });
+      });
+    })(file.path);
+
+    // Add document/diff toggle for markdown files that have diff hunks
+    // Hide when diffActive is on (header-level rendered diff overrides per-file toggle)
+    if (file.fileType === 'markdown' && file.diffHunks && file.diffHunks.length > 0 && !diffActive) {
+      const toggle = document.createElement('div');
+      toggle.className = 'file-header-toggle';
+      toggle.innerHTML =
+        '<button type="button" class="toggle-btn' + (file.viewMode === 'document' ? ' active' : '') + '" data-mode="document">Document</button>' +
+        '<button type="button" class="toggle-btn' + (file.viewMode === 'diff' ? ' active' : '') + '" data-mode="diff">Diff</button>';
+      toggle.addEventListener('click', function(e) {
+        const btn = e.target.closest('.toggle-btn');
+        if (!btn) return;
+        e.preventDefault(); // Don't toggle the <details>
+        const fileForms = getFormsForFile(file.path);
+        fileForms.forEach(function(f) { removeForm(f.formKey); });
+        if (activeFilePath === file.path) {
+          selectionStart = null;
+          selectionEnd = null;
+        }
+        file.viewMode = btn.dataset.mode;
+        renderFileByPath(file.path);
+      });
+      header.appendChild(toggle);
+
+      // Change navigation widget (file mode, both document and diff view)
+      if (session.mode !== 'git') {
+        const changeNav = document.createElement('div');
+        changeNav.className = 'change-nav';
+        changeNav.innerHTML =
+          '<button class="change-nav-btn" data-dir="-1" title="Previous change (N)">&#9650;</button>' +
+          '<span class="change-nav-label" data-file-path="' + escapeHtml(file.path) + '"></span>' +
+          '<button class="change-nav-btn" data-dir="1" title="Next change (n)">&#9660;</button>';
+        changeNav.addEventListener('click', function(e) {
+          const btn = e.target.closest('.change-nav-btn');
+          if (!btn) return;
+          e.preventDefault();
+          e.stopPropagation();
+          navigateToChange(parseInt(btn.dataset.dir));
+        });
+        header.appendChild(changeNav);
+      }
+    }
+
+    // File comment button — not for orphaned files (no point adding comments to removed files)
+    if (!file.orphaned) {
+      const fileCommentBtn = document.createElement('button');
+      fileCommentBtn.className = 'file-comment-btn';
+      fileCommentBtn.title = 'Add file-level comment';
+      fileCommentBtn.setAttribute('aria-label', 'Add file-level comment');
+      fileCommentBtn.innerHTML = ICON_COMMENT;
+      fileCommentBtn.addEventListener('click', function(e) {
+        e.stopPropagation(); // Don't toggle the <details>
+        e.preventDefault();
+        openFileCommentForm(file.path);
+      });
+      header.appendChild(fileCommentBtn);
+    }
+
+    // Viewed checkbox
+    const viewedLabel = document.createElement('label');
+    viewedLabel.className = 'file-header-viewed';
+    viewedLabel.title = 'Viewed';
+    viewedLabel.innerHTML = '<input type="checkbox"' + (file.viewed ? ' checked' : '') + '><span>Viewed</span>';
+    viewedLabel.addEventListener('click', function(e) {
+      e.stopPropagation(); // Don't toggle the <details>
+    });
+    viewedLabel.querySelector('input').addEventListener('change', function() {
+      toggleViewed(file.path);
+    });
+    header.appendChild(viewedLabel);
+
+    section.appendChild(header);
+
+    // File-level comments container (between header and file body)
+    // For orphaned files, render ALL comments here (no line blocks to anchor to)
+    const isOrphaned = file.orphaned;
+    const fileComments = isOrphaned
+      ? file.comments
+      : file.comments.filter(function(c) { return c.scope === 'file'; });
+    const fileForm = getFormsForFile(file.path).find(function(f) { return f.scope === 'file'; });
+    if (fileComments.length > 0 || (fileForm && !isOrphaned)) {
+      const fileCommentsContainer = document.createElement('div');
+      fileCommentsContainer.className = 'file-comments';
+      for (let ci = 0; ci < fileComments.length; ci++) {
+        const comment = fileComments[ci];
+        let el;
+        if (comment.resolved) {
+          el = createResolvedElement(comment, file.path);
+        } else {
+          el = createCommentElement(comment, file.path);
+        }
+        if (isOrphaned) {
+          el.classList.add('outdated-comment');
+          const badge = document.createElement('span');
+          badge.className = 'outdated-badge';
+          badge.textContent = 'Outdated';
+          const headerLeft = el.querySelector('.comment-header-left');
+          if (headerLeft) headerLeft.appendChild(badge);
+        }
+        fileCommentsContainer.appendChild(el);
+      }
+      if (fileForm && !isOrphaned) {
+        fileCommentsContainer.appendChild(createFileCommentForm(fileForm));
+      }
+      section.appendChild(fileCommentsContainer);
+    }
+
+    // File body
+    const body = document.createElement('div');
+    body.className = 'file-body';
+
+    const showDiff = file.viewMode === 'diff' || (file.fileType === 'code' && session.mode === 'git');
+
+    if (file.orphaned) {
+      const placeholder = document.createElement('div');
+      placeholder.className = 'diff-deleted-placeholder orphaned-placeholder';
+      placeholder.textContent = 'This file is no longer part of the review.';
+      body.appendChild(placeholder);
+    } else if (file.status === 'deleted' && (!file.diffHunks || file.diffHunks.length === 0)) {
+      const deleted = document.createElement('div');
+      deleted.className = 'diff-deleted-placeholder';
+      deleted.textContent = 'This file was deleted.';
+      body.appendChild(deleted);
+    } else if (file.status === 'renamed' && (!file.diffHunks || file.diffHunks.length === 0)) {
+      const renamed = document.createElement('div');
+      renamed.className = 'diff-deleted-placeholder rename-placeholder';
+      renamed.textContent = 'File renamed without changes.';
+      body.appendChild(renamed);
+    } else if (showDiff && file.diffTooLarge && !file.diffLoaded) {
+      let diffLineCount = 0;
+      if (file.diffHunks) {
+        for (let h = 0; h < file.diffHunks.length; h++) {
+          diffLineCount += (file.diffHunks[h].Lines || []).length;
+        }
+      }
+      const placeholder = document.createElement('div');
+      placeholder.className = 'diff-large-placeholder';
+      placeholder.innerHTML =
+        '<p>Large diff not rendered by default.</p>' +
+        '<p class="diff-large-meta">' + diffLineCount.toLocaleString() + ' lines changed</p>' +
+        '<button class="btn btn-sm">Load diff</button>';
+      placeholder.querySelector('button').addEventListener('click', function() {
+        file.diffLoaded = true;
+        renderFileByPath(file.path);
+      });
+      body.appendChild(placeholder);
+    } else if (showDiff) {
+      body.appendChild(renderDiffHunks(file));
+    } else if (diffActive && file.previousLineBlocks && file.previousLineBlocks.length > 0) {
+      body.appendChild(diffMode === 'split' ? renderRenderedDiffSplit(file) : renderRenderedDiffUnified(file));
+    } else {
+      body.appendChild(renderDocumentView(file));
+    }
+
+    section.appendChild(body);
+    highlightQuotesInSection(section, file);
+    return section;
+  }
+
+  // ===== Rendered Diff View (Markdown, file mode) =====
+
+  // Build sets of added/removed line numbers from diff hunks
+  function buildDiffLineSetFromHunks(hunks) {
+    const added = new Set();
+    const removed = new Set();
+    for (let h = 0; h < hunks.length; h++) {
+      const lines = hunks[h].Lines || [];
+      for (let l = 0; l < lines.length; l++) {
+        if (lines[l].Type === 'add' && lines[l].NewNum) added.add(lines[l].NewNum);
+        if (lines[l].Type === 'del' && lines[l].OldNum) removed.add(lines[l].OldNum);
+      }
+    }
+    return { added: added, removed: removed };
+  }
+
+  // Classify a block as diff-added, diff-removed, or unchanged
+  function classifyBlock(block, changedLines) {
+    for (let ln = block.startLine; ln <= block.endLine; ln++) {
+      if (changedLines.has(ln)) return true;
+    }
+    return false;
+  }
+
+  function applyBlockSelectionState(el, filePath, startLine, endLine, blockIndex) {
+    const fileForms = getFormsForFile(filePath);
+    const hasForm = fileForms.some(function(f) {
+      return !f.editingId && startLine >= f.startLine && endLine <= f.endLine;
+    });
+    const inSelection = activeFilePath === filePath && selectionStart !== null && selectionEnd !== null &&
+      startLine >= selectionStart && endLine <= selectionEnd;
+    el.classList.toggle('selected', inSelection);
+    el.classList.toggle('form-selected', hasForm && !inSelection);
+
+    if (blockIndex !== undefined) {
+      if (focusedFilePath === filePath && focusedBlockIndex === blockIndex) {
+        el.classList.add('focused');
+      }
+    }
+  }
+
+  // Annotate blocks with isDiff flag based on changed line numbers
+  function annotateBlocks(blocks, changedLines) {
+    return blocks.map(function(b) {
+      return Object.assign({}, b, { isDiff: classifyBlock(b, changedLines) });
+    });
+  }
+
+  function renderRenderedDiffSplit(file) {
+    const container = document.createElement('div');
+    container.className = 'diff-view';
+
+    const lineSets = buildDiffLineSetFromHunks(file.diffHunks);
+    const prevBlocks = annotateBlocks(file.previousLineBlocks, lineSets.removed);
+    const currBlocks = annotateBlocks(file.lineBlocks, lineSets.added);
+
+    // Compute word-level diffs for paired changed blocks.
+    // Only apply when blocks are sufficiently similar (>30% token overlap) to avoid noise.
+    const prevDiffBlocks = prevBlocks.filter(function(b) { return b.isDiff; });
+    const currDiffBlocks = currBlocks.filter(function(b) { return b.isDiff; });
+    const pairCount = Math.min(prevDiffBlocks.length, currDiffBlocks.length);
+    for (let p = 0; p < pairCount; p++) {
+      applyWordDiffPair(prevDiffBlocks[p], currDiffBlocks[p]);
+    }
+
+    // Labels row
+    const leftLabel = document.createElement('div');
+    leftLabel.className = 'diff-view-side-label';
+    leftLabel.textContent = 'Previous round';
+    container.appendChild(leftLabel);
+    const rightLabel = document.createElement('div');
+    rightLabel.className = 'diff-view-side-label';
+    rightLabel.textContent = 'Current round';
+    container.appendChild(rightLabel);
+
+    // Two-pointer merge for horizontal alignment
+    const { commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+    let oldIdx = 0, newIdx = 0;
+
+    while (oldIdx < prevBlocks.length || newIdx < currBlocks.length) {
+      const leftCell = document.createElement('div');
+      leftCell.className = 'diff-view-cell';
+      const rightCell = document.createElement('div');
+      rightCell.className = 'diff-view-cell';
+
+      if (oldIdx >= prevBlocks.length) {
+        // Old exhausted — remaining new blocks are additions
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        newIdx++;
+      } else if (newIdx >= currBlocks.length) {
+        // New exhausted — remaining old blocks are deletions
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
+        oldIdx++;
+      } else if (prevBlocks[oldIdx].isDiff && currBlocks[newIdx].isDiff) {
+        // Both changed — paired change
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        oldIdx++;
+        newIdx++;
+      } else if (prevBlocks[oldIdx].isDiff) {
+        // Old removed only — spacer on right
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
+        oldIdx++;
+      } else if (currBlocks[newIdx].isDiff) {
+        // New added only — spacer on left
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        newIdx++;
+      } else {
+        // Both unchanged — render both, advance both
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], null, file, false, oldIdx, null, null));
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], null, file, true, newIdx, commentsMap, commentRangeSet));
+        oldIdx++;
+        newIdx++;
+      }
+
+      container.appendChild(leftCell);
+      container.appendChild(rightCell);
+    }
+
+    return container;
+  }
+
+  function buildContentClasses(block) {
+    let classes = 'line-content';
+    if (block.isEmpty) classes += ' empty-line';
+    if (block.cssClass) classes += ' ' + block.cssClass;
+    return classes;
+  }
+
+  // Render a single block for the unified diff view.
+  // When commentable=true, includes gutter, keyboard nav, comments. Otherwise read-only.
+  function renderUnifiedBlock(block, diffClass, file, commentable, blockIndex, commentsMap, commentRangeSet) {
+    const frag = document.createDocumentFragment();
+
+    const lineBlockEl = document.createElement('div');
+    lineBlockEl.className = 'line-block';
+    lineBlockEl.dataset.filePath = file.path;
+    if (commentable) {
+      lineBlockEl.classList.add('kb-nav');
+      lineBlockEl.dataset.blockIndex = blockIndex;
+      lineBlockEl.dataset.startLine = block.startLine;
+      lineBlockEl.dataset.endLine = block.endLine;
+    }
+    if (diffClass) lineBlockEl.classList.add(diffClass);
+
+    let blockComments = null;
+    if (commentable) {
+      blockComments = getCommentsForBlock(block, commentsMap);
+      let blockInCommentRange = false;
+      for (let ln = block.startLine; ln <= block.endLine; ln++) {
+        if (commentRangeSet.has(ln + ':')) { blockInCommentRange = true; break; }
+      }
+      if (blockInCommentRange) lineBlockEl.classList.add('has-comment');
+
+      applyBlockSelectionState(lineBlockEl, file.path, block.startLine, block.endLine, blockIndex);
+
+      const commentGutter = document.createElement('div');
+      commentGutter.className = 'line-comment-gutter';
+      commentGutter.dataset.startLine = block.startLine;
+      commentGutter.dataset.endLine = block.endLine;
+      commentGutter.dataset.filePath = file.path;
+      const lineAdd = document.createElement('span');
+      lineAdd.className = 'line-add';
+      lineAdd.textContent = '+';
+      commentGutter.appendChild(lineAdd);
+      commentGutter.addEventListener('mousedown', handleGutterMouseDown);
+      lineBlockEl.appendChild(commentGutter);
+    } else {
+      // Non-commentable block: still add gutter but mark as read-only
+      const roGutter = document.createElement('div');
+      roGutter.className = 'line-comment-gutter diff-no-comment';
+      lineBlockEl.appendChild(roGutter);
+    }
+
+    // Line number gutter
+    const gutter = document.createElement('div');
+    gutter.className = 'line-gutter';
+    const lineNum = document.createElement('span');
+    lineNum.className = 'line-num';
+    lineNum.textContent = block.startLine;
+    gutter.appendChild(lineNum);
+    lineBlockEl.insertBefore(gutter, lineBlockEl.firstChild);
+
+    const contentEl = document.createElement('div');
+    contentEl.className = buildContentClasses(block);
+    let html = block.wordDiffHtml || block.html;
+    html = processTaskLists(html);
+    html = rewriteImageSrcs(html);
+    contentEl.innerHTML = html;
+    lineBlockEl.appendChild(contentEl);
+
+    frag.appendChild(lineBlockEl);
+
+    // Comments after block (only on commentable/new side)
+    if (commentable && blockComments) {
+      for (let ci = 0; ci < blockComments.length; ci++) {
+        if (blockComments[ci].resolved) {
+          frag.appendChild(createResolvedElement(blockComments[ci], file.path));
+        } else {
+          frag.appendChild(createCommentElement(blockComments[ci], file.path));
+        }
+      }
+      const fileForms = getFormsForFile(file.path);
+      for (let fi = 0; fi < fileForms.length; fi++) {
+        if (!fileForms[fi].editingId && fileForms[fi].afterBlockIndex === blockIndex) {
+          frag.appendChild(createCommentForm(fileForms[fi]));
+        }
+      }
+    }
+
+    return frag;
+  }
+
+  function renderRenderedDiffUnified(file) {
+    const container = document.createElement('div');
+    container.className = 'diff-view-unified';
+
+    const lineSets = buildDiffLineSetFromHunks(file.diffHunks);
+    const oldBlocks = file.previousLineBlocks;
+    const newBlocks = file.lineBlocks;
+
+    const { commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+
+    // Two-pointer merge: walk both block lists simultaneously
+    let oldIdx = 0;
+    let newIdx = 0;
+
+    while (oldIdx < oldBlocks.length || newIdx < newBlocks.length) {
+      if (oldIdx >= oldBlocks.length) {
+        // Old exhausted — remaining new blocks are additions
+        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        newIdx++;
+      } else if (newIdx >= newBlocks.length) {
+        // New exhausted — remaining old blocks are deletions
+        container.appendChild(renderUnifiedBlock(oldBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
+        oldIdx++;
+      } else if (classifyBlock(oldBlocks[oldIdx], lineSets.removed)) {
+        // Collect consecutive removed blocks
+        const removedRun = [];
+        while (oldIdx < oldBlocks.length && classifyBlock(oldBlocks[oldIdx], lineSets.removed)) {
+          removedRun.push(oldIdx);
+          oldIdx++;
+        }
+        // Collect consecutive added blocks
+        const addedRun = [];
+        while (newIdx < newBlocks.length && classifyBlock(newBlocks[newIdx], lineSets.added)) {
+          addedRun.push(newIdx);
+          newIdx++;
+        }
+        // Pair removed/added blocks by similarity for word diff
+        const rmTexts = removedRun.map(function(idx) { return htmlToText(oldBlocks[idx].html); });
+        const adTexts = addedRun.map(function(idx) { return htmlToText(newBlocks[idx].html); });
+        const mdPairs = bestWordDiffPairing(rmTexts, adTexts);
+        for (let rp = 0; rp < mdPairs.length; rp++) {
+          applyWordDiffPair(oldBlocks[removedRun[mdPairs[rp][0]]], newBlocks[addedRun[mdPairs[rp][1]]]);
+        }
+        // Emit all removed then all added
+        for (let ri = 0; ri < removedRun.length; ri++) {
+          container.appendChild(renderUnifiedBlock(oldBlocks[removedRun[ri]], 'diff-removed', file, false, removedRun[ri], null, null));
+        }
+        for (let ai = 0; ai < addedRun.length; ai++) {
+          container.appendChild(renderUnifiedBlock(newBlocks[addedRun[ai]], 'diff-added', file, true, addedRun[ai], commentsMap, commentRangeSet));
+        }
+      } else if (classifyBlock(newBlocks[newIdx], lineSets.added)) {
+        // New block is added (no preceding removal) — emit with green highlight + comments
+        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        newIdx++;
+      } else {
+        // Both unchanged — emit new block once (with comments), advance both
+        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], null, file, true, newIdx, commentsMap, commentRangeSet));
+        newIdx++;
+        oldIdx++;
+      }
+    }
+
+    return container;
+  }
+
+  // ===== Change Detection (for inter-round diffs in document view) =====
+  // Returns { added: Set<NewNum>, modified: Set<NewNum>, deletionPoints: [{afterLine, count}] }
+  // added = pure additions (green), modified = changed lines (amber), deletionPoints = where lines were removed (red)
+  function getChangeInfo(file) {
+    if (!file.diffHunks || file.diffHunks.length === 0) return null;
+    const added = new Set();
+    const modified = new Set();
+    const deletionPoints = [];
+
+    for (let h = 0; h < file.diffHunks.length; h++) {
+      const lines = file.diffHunks[h].Lines || [];
+      let lastContextNewNum = file.diffHunks[h].NewStart > 0 ? file.diffHunks[h].NewStart - 1 : 0;
+      let i = 0;
+      while (i < lines.length) {
+        if (lines[i].Type === 'context') {
+          lastContextNewNum = lines[i].NewNum;
+          i++;
+        } else {
+          // Collect consecutive change group (dels then adds, or interleaved)
+          const dels = [], adds = [];
+          while (i < lines.length && lines[i].Type !== 'context') {
+            if (lines[i].Type === 'del') dels.push(lines[i]);
+            if (lines[i].Type === 'add') adds.push(lines[i]);
+            i++;
+          }
+          if (dels.length > 0 && adds.length > 0) {
+            // Modification: mark add lines as modified (amber)
+            for (let a = 0; a < adds.length; a++) {
+              if (adds[a].NewNum) modified.add(adds[a].NewNum);
+            }
+          } else if (adds.length > 0) {
+            // Pure addition (green)
+            for (let a = 0; a < adds.length; a++) {
+              if (adds[a].NewNum) added.add(adds[a].NewNum);
+            }
+          } else if (dels.length > 0) {
+            // Pure deletion — record where marker should appear
+            deletionPoints.push({ afterLine: lastContextNewNum, count: dels.length });
+          }
+          // Update last context position if we saw adds
+          if (adds.length > 0) {
+            lastContextNewNum = adds[adds.length - 1].NewNum;
+          }
+        }
+      }
+    }
+    if (added.size === 0 && modified.size === 0 && deletionPoints.length === 0) return null;
+    return { added: added, modified: modified, deletionPoints: deletionPoints };
+  }
+
+  // ===== Document View (Markdown) =====
+  function renderDocumentView(file) {
+    const container = document.createElement('div');
+    container.className = 'document-wrapper' + (file.fileType === 'code' ? ' code-document' : '');
+    if (!file.lineBlocks) return container;
+
+    const { commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+
+    const changeInfo = file.viewMode === 'document' ? getChangeInfo(file) : null;
+    // Build a map of afterLine -> deletion marker for quick lookup
+    const deletionMarkerMap = {};
+    if (changeInfo) {
+      for (let dp = 0; dp < changeInfo.deletionPoints.length; dp++) {
+        const pt = changeInfo.deletionPoints[dp];
+        deletionMarkerMap[pt.afterLine] = pt;
+      }
+    }
+
+    for (let bi = 0; bi < file.lineBlocks.length; bi++) {
+      const block = file.lineBlocks[bi];
+
+      const lineBlockEl = document.createElement('div');
+      lineBlockEl.className = 'line-block kb-nav';
+      lineBlockEl.dataset.blockIndex = bi;
+      lineBlockEl.dataset.startLine = block.startLine;
+      lineBlockEl.dataset.endLine = block.endLine;
+      lineBlockEl.dataset.filePath = file.path;
+
+      const blockComments = getCommentsForBlock(block, commentsMap);
+      // Highlight all blocks in the comment's line range
+      let blockInCommentRange = false;
+      for (let ln = block.startLine; ln <= block.endLine; ln++) {
+        if (commentRangeSet.has(ln + ':')) { blockInCommentRange = true; break; }
+      }
+      if (blockInCommentRange) lineBlockEl.classList.add('has-comment');
+
+      // Mark blocks that overlap inter-round changes (color-coded)
+      if (changeInfo) {
+        let blockChangeType = null;
+        for (let ln = block.startLine; ln <= block.endLine; ln++) {
+          if (changeInfo.modified.has(ln)) { blockChangeType = 'modified'; break; }
+          if (changeInfo.added.has(ln)) { blockChangeType = 'added'; }
+        }
+        if (blockChangeType === 'modified') lineBlockEl.classList.add('line-block-modified');
+        else if (blockChangeType === 'added') lineBlockEl.classList.add('line-block-added');
+      }
+
+      applyBlockSelectionState(lineBlockEl, file.path, block.startLine, block.endLine, bi);
+
+      // Line number gutter
+      const gutter = document.createElement('div');
+      gutter.className = 'line-gutter';
+      const lineNum = document.createElement('span');
+      lineNum.className = 'line-num';
+      lineNum.textContent = block.startLine;
+      gutter.appendChild(lineNum);
+
+      // Comment gutter (separate column between line numbers and content)
+      const commentGutter = document.createElement('div');
+      commentGutter.className = 'line-comment-gutter';
+      commentGutter.dataset.startLine = block.startLine;
+      commentGutter.dataset.endLine = block.endLine;
+      commentGutter.dataset.filePath = file.path;
+
+      // Drag indicators: + at endpoints, blue line between
+      if (dragState && dragState.filePath === file.path && selectionStart !== null && selectionEnd !== null) {
+        const isAnchorBlock = block.startLine <= dragState.anchorEndLine && block.endLine >= dragState.anchorStartLine;
+        const isCurrentBlock = block.startLine <= dragState.currentEndLine && block.endLine >= dragState.currentStartLine;
+        const inRange = block.startLine >= selectionStart && block.endLine <= selectionEnd;
+        if (isAnchorBlock || isCurrentBlock) commentGutter.classList.add('drag-endpoint');
+        if (inRange) {
+          commentGutter.classList.add('drag-range');
+          if (block.startLine === selectionStart) commentGutter.classList.add('drag-range-start');
+          if (block.endLine === selectionEnd) commentGutter.classList.add('drag-range-end');
+        }
+      }
+
+      const lineAdd = document.createElement('span');
+      lineAdd.className = 'line-add';
+      lineAdd.textContent = '+';
+      commentGutter.appendChild(lineAdd);
+      commentGutter.addEventListener('mousedown', handleGutterMouseDown);
+
+      // Content
+      const content = document.createElement('div');
+      content.className = buildContentClasses(block);
+      let html = block.html;
+      html = processTaskLists(html);
+      html = rewriteImageSrcs(html);
+      content.innerHTML = html;
+
+      gutter.appendChild(commentGutter);
+      lineBlockEl.appendChild(gutter);
+      lineBlockEl.appendChild(content);
+
+      // Insert deletion marker before this block if deletions occurred before it
+      if (changeInfo && bi === 0 && deletionMarkerMap[0]) {
+        const marker0 = document.createElement('div');
+        marker0.className = 'deletion-marker';
+        marker0.dataset.filePath = file.path;
+        marker0.textContent = '\u2212' + deletionMarkerMap[0].count + ' line' + (deletionMarkerMap[0].count !== 1 ? 's' : '');
+        container.appendChild(marker0);
+      }
+
+      container.appendChild(lineBlockEl);
+
+      // Insert deletion marker after this block if deletions occurred after it
+      if (changeInfo && deletionMarkerMap[block.endLine]) {
+        const marker = document.createElement('div');
+        marker.className = 'deletion-marker';
+        marker.dataset.filePath = file.path;
+        marker.textContent = '\u2212' + deletionMarkerMap[block.endLine].count + ' line' + (deletionMarkerMap[block.endLine].count !== 1 ? 's' : '');
+        container.appendChild(marker);
+      }
+
+      // Comments after block
+      for (const comment of blockComments) {
+        if (comment.resolved) {
+          container.appendChild(createResolvedElement(comment, file.path));
+        } else {
+          container.appendChild(createCommentElement(comment, file.path));
+        }
+      }
+
+      // Comment form
+      const fileForms = getFormsForFile(file.path);
+      for (let fi = 0; fi < fileForms.length; fi++) {
+        if (!fileForms[fi].editingId && fileForms[fi].afterBlockIndex === bi) {
+          container.appendChild(createCommentForm(fileForms[fi]));
+        }
+      }
+    }
+
+    return container;
+  }
+
+  // ===== Diff Hunk View (Code Files) =====
+  function renderDiffHunks(file) {
+    if (diffMode === 'split') return renderDiffSplit(file);
+    return renderDiffUnified(file);
+  }
+
+
+  // Word-level diff — extracted to crit-diff-renderer.js (window.crit.diffRenderer)
+  const bestWordDiffPairing = window.crit.diffRenderer.bestWordDiffPairing;
+  const wordDiff = window.crit.diffRenderer.wordDiff;
+  const applyWordDiffToHtml = window.crit.diffRenderer.applyWordDiffToHtml;
+  const htmlToText = window.crit.diffRenderer.htmlToText;
+  const applyWordDiffPair = window.crit.diffRenderer.applyWordDiffPair;
+  const buildHunkWordDiffs = window.crit.diffRenderer.buildHunkWordDiffs;
+  const buildSplitChangeRows = window.crit.diffRenderer.buildSplitChangeRows;
+
+
+  // ===== Diff Gutter Drag (multi-line comment selection) =====
+  let diffDragState = null; // { filePath, side, anchorLine, currentLine }
+
+  // Tag a diff line element with data attributes for drag detection + keyboard nav
+  // For split mode, navEl (the row) gets kb-nav only; el (the side) carries line attrs.
+  function tagDiffLine(el, filePath, lineNum, side, navEl) {
+    el.dataset.diffFilePath = filePath;
+    el.dataset.diffLineNum = lineNum;
+    el.dataset.diffSide = side || '';
+    const nav = navEl || el;
+    if (!nav.classList.contains('kb-nav')) {
+      nav.classList.add('kb-nav');
+    }
+    if (nav === el) {
+      nav.dataset.diffFilePath = filePath;
+      nav.dataset.diffLineNum = lineNum;
+      nav.dataset.diffSide = side || '';
+    }
+  }
+
+  // Creates a dedicated comment gutter column element with a + button.
+  // Returns the element to insert between line numbers and content.
+  function makeDiffCommentGutter(filePath, lineNum, side, visualIdx) {
+    const col = document.createElement('div');
+    col.className = 'diff-comment-gutter';
+    if (!lineNum) return col; // empty placeholder for lines without numbers
+
+    // During drag, show + at anchor and current line, blue line between
+    const sideMatch = diffMode === 'split' ? diffDragState && diffDragState.side === (side || '') : true;
+    if (diffDragState && diffDragState.filePath === filePath && sideMatch && selectionStart !== null && selectionEnd !== null) {
+      let isAnchor, isCurrent, inRange, isRangeStart, isRangeEnd;
+      if (diffMode !== 'split' && visualIdx !== undefined && unifiedVisualStart !== null) {
+        // Unified mode: use visual indices (old/new line numbers are in different spaces)
+        isAnchor = visualIdx === diffDragState.anchorVisualIdx;
+        isCurrent = visualIdx === diffDragState.currentVisualIdx;
+        inRange = visualIdx >= unifiedVisualStart && visualIdx <= unifiedVisualEnd;
+        isRangeStart = visualIdx === unifiedVisualStart;
+        isRangeEnd = visualIdx === unifiedVisualEnd;
+      } else {
+        isAnchor = lineNum === diffDragState.anchorLine;
+        isCurrent = lineNum === diffDragState.currentLine;
+        inRange = lineNum >= selectionStart && lineNum <= selectionEnd;
+        isRangeStart = lineNum === selectionStart;
+        isRangeEnd = lineNum === selectionEnd;
+      }
+      if (isAnchor || isCurrent) col.classList.add('drag-endpoint');
+      if (inRange) {
+        col.classList.add('drag-range');
+        if (isRangeStart) col.classList.add('drag-range-start');
+        if (isRangeEnd) col.classList.add('drag-range-end');
+      }
+    }
+
+    const btn = document.createElement('button');
+    btn.className = 'diff-comment-btn';
+    btn.textContent = '+';
+    btn.dataset.filePath = filePath;
+    btn.dataset.lineNum = lineNum;
+    btn.dataset.side = side || '';
+    if (visualIdx !== undefined) btn.dataset.visualIdx = visualIdx;
+    // Mouse drag-init is delegated once on the diff container
+    // (attachDiffMouseHandler) rather than attached per-button. A large diff
+    // can contain thousands of these buttons, and one mousedown listener per
+    // button stalled the main thread for several seconds on render (#657).
+    col.appendChild(btn);
+    return col;
+  }
+
+  // Shared drag-init used by both the desktop mousedown handler on
+  // .diff-comment-btn and the touch pointerdown handler on .diff-gutter-num
+  // (added in attachDiffTouchHandler below for F4 mobile reliability).
+  function beginDiffCommentDrag(fp, ln, s, vi) {
+    diffDragState = { filePath: fp, side: s, anchorLine: ln, currentLine: ln, anchorVisualIdx: vi, currentVisualIdx: vi };
+    activeFilePath = fp;
+    selectionStart = ln;
+    selectionEnd = ln;
+    if (diffMode !== 'split' && vi !== undefined) {
+      unifiedVisualStart = vi;
+      unifiedVisualEnd = vi;
+    }
+    renderFileByPath(fp);
+    document.body.classList.add('dragging');
+  }
+
+  // F4: on touch devices, the desktop .diff-comment-btn affordance is
+  // invisible (no hover ever fires) and the user instead sees the `+`
+  // prefix that F3 puts on .diff-gutter-num. Make .diff-gutter-num itself
+  // a touch-tap target by delegating pointerdown on the diff container.
+  // The button's data attrs are co-located on the sibling .diff-comment-btn
+  // inside the same row's .diff-comment-gutter.
+  function attachDiffTouchHandler(container) {
+    container.addEventListener('pointerdown', function(e) {
+      if (e.pointerType !== 'touch') return;
+      const num = e.target.closest('.diff-gutter-num');
+      if (!num) return;
+      const row = num.closest('.diff-line, .diff-split-side');
+      if (!row) return;
+      const btn = row.querySelector('.diff-comment-btn');
+      if (!btn) return; // line not commentable
+      e.preventDefault();
+      e.stopPropagation();
+      const fp = btn.dataset.filePath;
+      const ln = parseInt(btn.dataset.lineNum);
+      const s = btn.dataset.side || '';
+      const vi = btn.dataset.visualIdx !== undefined ? parseInt(btn.dataset.visualIdx) : undefined;
+      beginDiffCommentDrag(fp, ln, s, vi);
+      document.addEventListener('pointermove', handleDiffDragMove);
+      document.addEventListener('pointerup', handleDiffDragEnd);
+    });
+  }
+
+  // Desktop mouse path: delegate a single mousedown on the diff container
+  // instead of attaching one listener per .diff-comment-btn. On a large diff
+  // the per-button approach wired up thousands of listeners and stalled the
+  // main thread for several seconds on render (#657). One delegated handler is
+  // O(1) regardless of diff size. Mirrors attachDiffTouchHandler above.
+  function attachDiffMouseHandler(container) {
+    container.addEventListener('mousedown', function(e) {
+      const btn = e.target.closest('.diff-comment-btn');
+      if (!btn || !container.contains(btn)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const fp = btn.dataset.filePath;
+      const ln = parseInt(btn.dataset.lineNum);
+      const s = btn.dataset.side || '';
+      const vi = btn.dataset.visualIdx !== undefined ? parseInt(btn.dataset.visualIdx) : undefined;
+      beginDiffCommentDrag(fp, ln, s, vi);
+      document.addEventListener('mousemove', handleDiffDragMove);
+      document.addEventListener('mouseup', handleDiffDragEnd);
+    });
+  }
+
+  function handleDiffDragMove(e) {
+    if (!diffDragState) return;
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el) return;
+    // Find the nearest diff line with data attributes
+    const diffLine = el.closest('[data-diff-line-num]');
+    if (!diffLine || diffLine.dataset.diffFilePath !== diffDragState.filePath) return;
+    // In split mode, restrict to the same side; in unified, allow crossing add/del
+    if (diffMode === 'split') {
+      if ((diffLine.dataset.diffSide || '') !== diffDragState.side) return;
+    }
+
+    const hoverLine = parseInt(diffLine.dataset.diffLineNum);
+    if (isNaN(hoverLine) || hoverLine === 0) return;
+
+    diffDragState.currentLine = hoverLine;
+    selectionStart = Math.min(diffDragState.anchorLine, hoverLine);
+    selectionEnd = Math.max(diffDragState.anchorLine, hoverLine);
+
+    // Unified mode: track visual indices for cross-number-space drag
+    if (diffMode !== 'split' && diffLine.dataset.diffVisualIdx !== undefined) {
+      const hoverVisualIdx = parseInt(diffLine.dataset.diffVisualIdx);
+      diffDragState.currentVisualIdx = hoverVisualIdx;
+      unifiedVisualStart = Math.min(diffDragState.anchorVisualIdx, hoverVisualIdx);
+      unifiedVisualEnd = Math.max(diffDragState.anchorVisualIdx, hoverVisualIdx);
+    }
+    updateDragSelectionVisuals(diffDragState.filePath);
+  }
+
+  function handleDiffDragEnd() {
+    // Remove both mouse and pointer listeners — desktop attaches mouse
+    // listeners via the delegated mousedown handler on the diff container,
+    // touch attaches pointer listeners via attachDiffTouchHandler. Cleaning
+    // both is safe (removeEventListener is a no-op if not attached).
+    document.removeEventListener('mousemove', handleDiffDragMove);
+    document.removeEventListener('mouseup', handleDiffDragEnd);
+    document.removeEventListener('pointermove', handleDiffDragMove);
+    document.removeEventListener('pointerup', handleDiffDragEnd);
+    document.body.classList.remove('dragging');
+
+    if (!diffDragState) return;
+    const rangeStart = Math.min(diffDragState.anchorLine, diffDragState.currentLine);
+    const rangeEnd = Math.max(diffDragState.anchorLine, diffDragState.currentLine);
+
+    const fp = diffDragState.filePath;
+    const side = diffDragState.side;
+    diffDragState = null;
+    unifiedVisualStart = null;
+    unifiedVisualEnd = null;
+    openForm({
+      filePath: fp,
+      afterBlockIndex: null,
+      startLine: rangeStart,
+      endLine: rangeEnd,
+      editingId: null,
+      side: side,
+    });
+  }
+
+  // Pre-expand spacer gaps that contain comments so comments render inline
+  // instead of falling through to the "outdated" section. Modifies file.diffHunks in place.
+  function expandHunksForComments(file) {
+    const hunks = file.diffHunks;
+    if (!hunks || hunks.length < 2 || !file.content) return;
+    const comments = file.comments || [];
+    const lineComments = comments.filter(function(c) { return c.scope !== 'file'; });
+    if (lineComments.length === 0) return;
+
+    // Work backwards so splicing doesn't shift indices we haven't visited yet
+    for (let i = hunks.length - 1; i > 0; i--) {
+      const prevHunk = hunks[i - 1];
+      const nextHunk = hunks[i];
+      const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
+      const prevOldEnd = prevHunk.OldStart + prevHunk.OldCount;
+      const gap = nextHunk.NewStart - prevNewEnd;
+      if (gap <= 0) continue;
+
+      // Check if any comment targets a line in this gap
+      const hasComment = lineComments.some(function(c) {
+        if (c.side === 'old') {
+          // Old-side comment: check old line number range
+          const gapOldStart = prevOldEnd;
+          const gapOldEnd = nextHunk.OldStart - 1;
+          return c.end_line >= gapOldStart && c.end_line <= gapOldEnd;
+        }
+        // New-side comment: check new line number range
+        return c.end_line >= prevNewEnd && c.end_line < nextHunk.NewStart;
+      });
+      if (!hasComment) continue;
+
+      // Merge: same logic as the spacer click handler
+      const contextLines = buildContextLines(file, prevNewEnd, prevOldEnd, gap);
+      const merged = {
+        OldStart: prevHunk.OldStart,
+        NewStart: prevHunk.NewStart,
+        Header: prevHunk.Header,
+        Lines: prevHunk.Lines.concat(contextLines, nextHunk.Lines)
+      };
+      merged.OldCount = (nextHunk.OldStart + nextHunk.OldCount) - merged.OldStart;
+      merged.NewCount = (nextHunk.NewStart + nextHunk.NewCount) - merged.NewStart;
+      hunks.splice(i - 1, 2, merged);
+    }
+  }
+
+  // Helper: build context lines from file content for a range of line numbers
+  function buildContextLines(file, newStart, oldStart, count) {
+    const contentLines = file.content ? file.content.split('\n') : [];
+    const lines = [];
+    for (let i = 0; i < count; i++) {
+      const newLineNum = newStart + i;
+      const oldLineNum = oldStart + i;
+      const text = newLineNum <= contentLines.length ? contentLines[newLineNum - 1] : '';
+      lines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
+    }
+    return lines;
+  }
+
+  // Build a hunk header string from numeric fields, preserving any suffix
+  // (e.g. function name) from the original header.
+  function buildHunkHeader(oldStart, oldCount, newStart, newCount, origHeader) {
+    let suffix = '';
+    if (origHeader) {
+      const m = origHeader.match(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(.*)$/);
+      if (m) suffix = m[1];
+    }
+    return '@@ -' + oldStart + ',' + oldCount + ' +' + newStart + ',' + newCount + ' @@' + suffix;
+  }
+
+  // Expand N context lines downward from the previous hunk (top of gap).
+  // Inserts a bridge hunk after prevIdx.
+  function expandDown(file, prevIdx, count) {
+    if (!file.content) return;
+    const hunks = file.diffHunks;
+    const prevHunk = hunks[prevIdx];
+    const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
+    const prevOldEnd = prevHunk.OldStart + prevHunk.OldCount;
+
+    const lines = buildContextLines(file, prevNewEnd, prevOldEnd, count);
+    const bridge = {
+      OldStart: prevOldEnd,
+      OldCount: count,
+      NewStart: prevNewEnd,
+      NewCount: count,
+      Header: buildHunkHeader(prevOldEnd, count, prevNewEnd, count, ''),
+      Lines: lines
+    };
+    hunks.splice(prevIdx + 1, 0, bridge);
+    renderFileByPath(file.path);
+  }
+
+  // Expand N context lines upward from the next hunk (bottom of gap).
+  // Inserts a bridge hunk before nextIdx.
+  function expandUp(file, nextIdx, count) {
+    if (!file.content) return;
+    const hunks = file.diffHunks;
+    const nextHunk = hunks[nextIdx];
+    const startNew = nextHunk.NewStart - count;
+    const startOld = nextHunk.OldStart - count;
+
+    const lines = buildContextLines(file, startNew, startOld, count);
+    const bridge = {
+      OldStart: startOld,
+      OldCount: count,
+      NewStart: startNew,
+      NewCount: count,
+      Header: buildHunkHeader(startOld, count, startNew, count, ''),
+      Lines: lines
+    };
+    hunks.splice(nextIdx, 0, bridge);
+    renderFileByPath(file.path);
+  }
+
+  // Expand all remaining context lines in a gap, merging prev + context + next into one hunk.
+  function expandAll(file, prevIdx, nextIdx) {
+    if (!file.content) return;
+    const hunks = file.diffHunks;
+    const prevHunk = hunks[prevIdx];
+    const nextHunk = hunks[nextIdx];
+    const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
+    const prevOldEnd = prevHunk.OldStart + prevHunk.OldCount;
+    const gap = nextHunk.NewStart - prevNewEnd;
+
+    const contextLines = buildContextLines(file, prevNewEnd, prevOldEnd, gap);
+    const mergedOldCount = (nextHunk.OldStart + nextHunk.OldCount) - prevHunk.OldStart;
+    const mergedNewCount = (nextHunk.NewStart + nextHunk.NewCount) - prevHunk.NewStart;
+    const merged = {
+      OldStart: prevHunk.OldStart,
+      OldCount: mergedOldCount,
+      NewStart: prevHunk.NewStart,
+      NewCount: mergedNewCount,
+      Header: buildHunkHeader(prevHunk.OldStart, mergedOldCount, prevHunk.NewStart, mergedNewCount, prevHunk.Header),
+      Lines: prevHunk.Lines.concat(contextLines, nextHunk.Lines)
+    };
+    hunks.splice(prevIdx, nextIdx - prevIdx + 1, merged);
+    renderFileByPath(file.path);
+  }
+
+  const EXPAND_STEP = 20;
+
+  // SVG icon paths for expand controls (GitHub-style)
+  const ICON_EXPAND_DOWN = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 10.5a.75.75 0 0 1-.53-.22l-3.5-3.5a.75.75 0 0 1 1.06-1.06L8 8.69l2.97-2.97a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-.53.22z"/></svg>';
+  const ICON_EXPAND_UP = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a.75.75 0 0 1 .53.22l3.5 3.5a.75.75 0 0 1-1.06 1.06L8 7.31 5.03 10.28a.75.75 0 0 1-1.06-1.06l3.5-3.5A.75.75 0 0 1 8 5.5z"/></svg>';
+  const ICON_EXPAND_ALL = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8.177 14.323l2.896-2.896a.25.25 0 0 0-.177-.427H8.75V9.25a.75.75 0 0 0-1.5 0V11H5.104a.25.25 0 0 0-.177.427l2.896 2.896a.25.25 0 0 0 .354 0zM7.823 1.677L4.927 4.573a.25.25 0 0 0 .177.427H7.25V6.75a.75.75 0 0 0 1.5 0V5h2.146a.25.25 0 0 0 .177-.427L8.177 1.677a.25.25 0 0 0-.354 0z"/></svg>';
+
+  // Helper: create a single expand button element
+  function createExpandBtn(iconHtml, ariaLabel, handler) {
+    const btn = document.createElement('button');
+    btn.className = 'expand-btn';
+    btn.setAttribute('aria-label', ariaLabel);
+    btn.innerHTML = iconHtml;
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      handler();
+    });
+    return btn;
+  }
+
+  // Helper: build the spacer DOM structure with gutter + hunk text
+  function buildSpacerElement(className, hunkHeaderText, buttons) {
+    const spacer = document.createElement('div');
+    spacer.className = className;
+
+    const gutter = document.createElement('div');
+    gutter.className = 'expand-gutter';
+    for (let i = 0; i < buttons.length; i++) {
+      gutter.appendChild(buttons[i]);
+    }
+    spacer.appendChild(gutter);
+
+    const text = document.createElement('span');
+    text.className = 'spacer-hunk-text';
+    text.textContent = hunkHeaderText || '';
+    spacer.appendChild(text);
+
+    return spacer;
+  }
+
+  // Helper: render hunk spacer with incremental expansion (GitHub-style)
+  // prevIdx/nextIdx are indices into file.diffHunks
+  // Returns spacer element (embeds the next hunk's header text) or null
+  function renderDiffSpacer(prevHunk, nextHunk, file, prevIdx, nextIdx) {
+    const prevNewEnd = prevHunk.NewStart + prevHunk.NewCount;
+    const gap = nextHunk.NewStart - prevNewEnd;
+    if (gap <= 0) return null;
+
+    const buttons = [];
+
+    if (gap <= EXPAND_STEP) {
+      // Small gap: single bidirectional button expands all
+      buttons.push(createExpandBtn(ICON_EXPAND_ALL, 'Expand all ' + gap + ' lines', function() {
+        expandAll(file, prevIdx, nextIdx);
+      }));
+    } else {
+      // Large gap: two stacked buttons — down, up (GitHub-style)
+      buttons.push(createExpandBtn(ICON_EXPAND_DOWN, 'Expand ' + EXPAND_STEP + ' lines down', function() {
+        expandDown(file, prevIdx, EXPAND_STEP);
+      }));
+      buttons.push(createExpandBtn(ICON_EXPAND_UP, 'Expand ' + EXPAND_STEP + ' lines up', function() {
+        expandUp(file, nextIdx, EXPAND_STEP);
+      }));
+    }
+
+    return buildSpacerElement('diff-spacer', nextHunk.Header || '', buttons);
+  }
+
+  // Helper: render leading spacer (before first hunk when it doesn't start at line 1)
+  // Returns the spacer element (includes the first hunk's header text)
+  function renderLeadingSpacer(firstHunk, file) {
+    // Only show if the first hunk doesn't start at line 1
+    if (firstHunk.NewStart <= 1 && firstHunk.OldStart <= 1) return null;
+    // For pure insertion (OldCount===0) or pure deletion (NewCount===0), git uses
+    // position-after semantics for the zero-count side — ignore it for gap calculation.
+    const newGap = firstHunk.NewCount > 0 ? firstHunk.NewStart - 1 : Infinity;
+    const oldGap = firstHunk.OldCount > 0 ? firstHunk.OldStart - 1 : Infinity;
+    const gap = Math.min(newGap, oldGap);
+    if (gap <= 0 || gap === Infinity) return null;
+
+    const expandCount = Math.min(gap, EXPAND_STEP);
+
+    const buttons = [];
+    buttons.push(createExpandBtn(ICON_EXPAND_UP, 'Expand ' + expandCount + ' lines above', function() {
+      if (!file.content) return;
+      const contentLines = file.content.split('\n');
+      const hunks = file.diffHunks;
+      const hunk = hunks[0];
+
+      // Expand from the bottom of the gap upward (closest to the hunk first)
+      const startNewLine = hunk.NewCount > 0 ? hunk.NewStart - expandCount : hunk.NewStart;
+      const startOldLine = hunk.OldCount > 0 ? hunk.OldStart - expandCount : hunk.OldStart;
+      const contextLines = [];
+      for (let i = 0; i < expandCount; i++) {
+        const newLineNum = startNewLine + i;
+        const oldLineNum = startOldLine + i;
+        const text = newLineNum > 0 && newLineNum <= contentLines.length ? contentLines[newLineNum - 1] : '';
+        contextLines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
+      }
+
+      hunk.Lines = contextLines.concat(hunk.Lines);
+      hunk.OldStart = startOldLine;
+      hunk.NewStart = startNewLine;
+      hunk.OldCount += expandCount;
+      hunk.NewCount += expandCount;
+      hunk.Header = buildHunkHeader(hunk.OldStart, hunk.OldCount, hunk.NewStart, hunk.NewCount, hunk.Header);
+      renderFileByPath(file.path);
+    }));
+
+    return buildSpacerElement('diff-spacer diff-spacer-leading', firstHunk.Header || '', buttons);
+  }
+
+  // Helper: render trailing spacer (after last hunk when it doesn't reach EOF)
+  function renderTrailingSpacer(lastHunk, file) {
+    if (!file.content) return null;
+    const contentLines = file.content.split('\n');
+    let totalNewLines = contentLines.length;
+    if (totalNewLines > 0 && contentLines[totalNewLines - 1] === '') totalNewLines--;
+
+    const lastNewEnd = lastHunk.NewStart + lastHunk.NewCount;
+    const gap = totalNewLines - lastNewEnd + 1;
+    if (gap <= 0) return null;
+
+    const expandCount = Math.min(gap, EXPAND_STEP);
+
+    const buttons = [];
+    buttons.push(createExpandBtn(ICON_EXPAND_DOWN, 'Expand ' + expandCount + ' lines below', function() {
+      if (!file.content) return;
+      const lines = file.content.split('\n');
+      let totalLines = lines.length;
+      if (totalLines > 0 && lines[totalLines - 1] === '') totalLines--;
+      const hunks = file.diffHunks;
+      const hunk = hunks[hunks.length - 1];
+
+      const hunkNewEnd = hunk.NewStart + hunk.NewCount;
+      const hunkOldEnd = hunk.OldStart + hunk.OldCount;
+      const remaining = totalLines - hunkNewEnd + 1;
+      const count = Math.min(remaining, EXPAND_STEP);
+
+      const contextLines = [];
+      for (let i = 0; i < count; i++) {
+        const newLineNum = hunkNewEnd + i;
+        const oldLineNum = hunkOldEnd + i;
+        const text = newLineNum <= lines.length ? lines[newLineNum - 1] : '';
+        contextLines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
+      }
+
+      hunk.Lines = hunk.Lines.concat(contextLines);
+      hunk.OldCount += count;
+      hunk.NewCount += count;
+      hunk.Header = buildHunkHeader(hunk.OldStart, hunk.OldCount, hunk.NewStart, hunk.NewCount, hunk.Header);
+      renderFileByPath(file.path);
+    }));
+
+    return buildSpacerElement('diff-spacer diff-spacer-trailing', '', buttons);
+  }
+
+  // Helper: render hunk header
+  function renderDiffHunkHeader(hunk) {
+    const hunkHeader = document.createElement('div');
+    hunkHeader.className = 'diff-hunk-header';
+    hunkHeader.innerHTML = '<div class="hunk-gutter"></div><span class="hunk-text">' + escapeHtml(hunk.Header) + '</span>';
+    return hunkHeader;
+  }
+
+  // Helper: append comments for a given line number and side
+  function appendDiffComments(container, filePath, lineNum, side, commentsMap) {
+    const key = lineNum + ':' + (side || '');
+    const lineComments = commentsMap[key] || [];
+    for (const comment of lineComments) {
+      const el = comment.resolved
+        ? createResolvedElement(comment, filePath)
+        : createCommentElement(comment, filePath);
+      if (side === 'old') el.classList.add('diff-comment-left');
+      else el.classList.add('diff-comment-right');
+      container.appendChild(el);
+    }
+  }
+
+  // Helper: append comment form if it targets this line and side
+  function appendDiffForm(container, filePath, lineNum, side) {
+    const fileForms = getFormsForFile(filePath);
+    for (let fi = 0; fi < fileForms.length; fi++) {
+      const form = fileForms[fi];
+      const formSide = form.side || '';
+      if (!form.editingId && form.endLine === lineNum && formSide === (side || '')) {
+        const el = createCommentForm(form);
+        if (formSide === 'old') el.classList.add('diff-comment-left');
+        else el.classList.add('diff-comment-right');
+        container.appendChild(el);
+      }
+    }
+  }
+
+  // Helper: render comments whose line keys don't appear in any diff hunk.
+  // These are "outdated" — the comment exists but the line is gone from the current diff.
+  function appendOutdatedDiffComments(container, file, commentsMap, hunks) {
+    // Build set of all end_line:side keys present in the diff hunks
+    const renderedKeys = new Set();
+    for (const hunk of hunks) {
+      for (const line of hunk.Lines) {
+        if (line.Type === 'del' && line.OldNum) {
+          renderedKeys.add(line.OldNum + ':old');
+        }
+        if (line.Type === 'add' && line.NewNum) {
+          renderedKeys.add(line.NewNum + ':');
+        }
+        if (line.Type === 'context') {
+          if (line.OldNum) renderedKeys.add(line.OldNum + ':old');
+          if (line.NewNum) renderedKeys.add(line.NewNum + ':');
+        }
+      }
+    }
+
+    // Collect comments whose keys were not rendered
+    const outdatedComments = [];
+    for (const key of Object.keys(commentsMap)) {
+      if (!renderedKeys.has(key)) {
+        for (const comment of commentsMap[key]) {
+          if (comment.scope !== 'file') {
+            outdatedComments.push(comment);
+          }
+        }
+      }
+    }
+
+    if (outdatedComments.length === 0) return;
+
+    // Render outdated comments section at the bottom of the diff
+    const section = document.createElement('div');
+    section.className = 'outdated-diff-comments';
+
+    for (const comment of outdatedComments) {
+      const el = comment.resolved
+        ? createResolvedElement(comment, file.path)
+        : createCommentElement(comment, file.path);
+      el.classList.add('outdated-comment');
+      const headerLeft = el.querySelector('.comment-header-left');
+      if (headerLeft) {
+        const badge = document.createElement('span');
+        badge.className = 'outdated-badge';
+        badge.textContent = 'Outdated';
+        headerLeft.appendChild(badge);
+      }
+      section.appendChild(el);
+    }
+
+    container.appendChild(section);
+  }
+
+  // ===== Unified diff (interleaved lines, single pane) =====
+  // Pre-process diffHunks: merge adjacent hunks where the gap between them
+  // is ≤ 8 unchanged lines. This removes visual noise from tiny spacers.
+  // Mutates file.diffHunks in place so it only runs once per file.
+  function autoExpandSmallGaps(file) {
+    if (!file.content || !file.diffHunks || file.diffHunks.length < 2) return;
+    if (file._autoExpandDone) return;
+    file._autoExpandDone = true;
+
+    const contentLines = file.content.split('\n');
+    const hunks = file.diffHunks;
+    let i = 0;
+    while (i < hunks.length - 1) {
+      const prevNewEnd = hunks[i].NewStart + hunks[i].NewCount;
+      const prevOldEnd = hunks[i].OldStart + hunks[i].OldCount;
+      const gap = hunks[i + 1].NewStart - prevNewEnd;
+      if (gap > 0 && gap <= 8) {
+        // Build context lines to bridge the gap
+        const contextLines = [];
+        for (let j = 0; j < gap; j++) {
+          const newLineNum = prevNewEnd + j;
+          const oldLineNum = prevOldEnd + j;
+          const text = newLineNum <= contentLines.length ? contentLines[newLineNum - 1] : '';
+          contextLines.push({ Type: 'context', Content: text, OldNum: oldLineNum, NewNum: newLineNum });
+        }
+        // Merge: prev hunk + context lines + next hunk → single hunk
+        const merged = {
+          OldStart: hunks[i].OldStart,
+          NewStart: hunks[i].NewStart,
+          Header: hunks[i].Header,
+          Lines: hunks[i].Lines.concat(contextLines, hunks[i + 1].Lines)
+        };
+        merged.OldCount = (hunks[i + 1].OldStart + hunks[i + 1].OldCount) - merged.OldStart;
+        merged.NewCount = (hunks[i + 1].NewStart + hunks[i + 1].NewCount) - merged.NewStart;
+        // Replace both with merged — don't increment i to check merged against next
+        hunks.splice(i, 2, merged);
+      } else {
+        i++;
+      }
+    }
+  }
+
+  function renderDiffUnified(file) {
+    const container = document.createElement('div');
+    container.className = 'diff-container unified';
+    attachDiffTouchHandler(container);
+    attachDiffMouseHandler(container);
+
+    expandHunksForComments(file);
+
+    const hunks = file.diffHunks || [];
+    if (hunks.length === 0) {
+      container.innerHTML = '<div class="diff-no-changes">No changes</div>';
+      return container;
+    }
+
+    autoExpandSmallGaps(file);
+
+    const { diffCommentsMap: commentsMap } = buildCommentIndices(file.comments);
+    const commentVisualSet = buildUnifiedCommentVisualSet(hunks, file.comments);
+    let visualIdx = 0; // sequential index for unified drag (old/new nums are different spaces)
+
+    // Leading spacer before first hunk (includes hunk header text)
+    const leadingSpacer = renderLeadingSpacer(hunks[0], file);
+    if (leadingSpacer) container.appendChild(leadingSpacer);
+
+    for (let hi = 0; hi < hunks.length; hi++) {
+      const hunk = hunks[hi];
+      let spacerRendered = false;
+
+      if (hi > 0) {
+        const spacer = renderDiffSpacer(hunks[hi - 1], hunk, file, hi - 1, hi);
+        if (spacer) {
+          container.appendChild(spacer);
+          spacerRendered = true;
+        }
+      }
+
+      // Skip standalone hunk header when:
+      // - a spacer (which embeds the header) was rendered, or
+      // - the leading spacer covers the first hunk, or
+      // - this hunk is contiguous with the previous one (e.g. bridge hunks from expand)
+      const contiguous = hi > 0 && (hunks[hi - 1].NewStart + hunks[hi - 1].NewCount) >= hunk.NewStart;
+      if (!spacerRendered && !(hi === 0 && leadingSpacer) && !contiguous) {
+        container.appendChild(renderDiffHunkHeader(hunk));
+      }
+
+      const wordDiffMap = buildHunkWordDiffs(hunk);
+
+      for (let li = 0; li < hunk.Lines.length; li++) {
+        const line = hunk.Lines[li];
+        const lineEl = document.createElement('div');
+        lineEl.className = 'diff-line';
+        if (line.Type === 'add') lineEl.classList.add('addition');
+        if (line.Type === 'del') lineEl.classList.add('deletion');
+        lineEl.dataset.diffVisualIdx = visualIdx;
+
+        const commentLineNum = line.Type === 'del' ? line.OldNum : line.NewNum;
+        const lineSide = line.Type === 'del' ? 'old' : '';
+        if (commentVisualSet.has(visualIdx)) lineEl.classList.add('has-comment');
+
+        // Tag for drag detection and selection highlighting
+        if (commentLineNum) {
+          tagDiffLine(lineEl, file.path, commentLineNum, lineSide);
+          if (activeFilePath === file.path) {
+            const inCurrentDrag = diffDragState && unifiedVisualStart !== null && unifiedVisualEnd !== null &&
+                visualIdx >= unifiedVisualStart && visualIdx <= unifiedVisualEnd;
+            const formSide = activeForms.length > 0 ? (activeForms[activeForms.length - 1].side || '') : '';
+            // Match against the line's number in the form's space (OldNum for old-side, NewNum otherwise)
+            // so context lines participate in old-side range selections.
+            const relevantNum = formSide === 'old' ? line.OldNum : line.NewNum;
+            const inCurrentForm = !diffDragState && selectionStart !== null && selectionEnd !== null &&
+                relevantNum > 0 && relevantNum >= selectionStart && relevantNum <= selectionEnd;
+            const inCurrentSelUnified = inCurrentDrag || inCurrentForm;
+            const hasFormUnified = getFormsForFile(file.path).some(function(f) {
+              const fSide = f.side || '';
+              const fNum = fSide === 'old' ? line.OldNum : line.NewNum;
+              return !f.editingId && fNum > 0 && fNum >= f.startLine && fNum <= f.endLine;
+            });
+            if (inCurrentSelUnified) { lineEl.classList.add('selected'); }
+            if (hasFormUnified && !inCurrentSelUnified) { lineEl.classList.add('form-selected'); }
+          }
+        }
+
+        const gutter = document.createElement('div');
+        gutter.className = 'diff-gutter';
+
+        const oldNum = document.createElement('div');
+        oldNum.className = 'diff-gutter-num';
+        oldNum.textContent = line.OldNum || '';
+
+        const newNum = document.createElement('div');
+        newNum.className = 'diff-gutter-num';
+        newNum.textContent = line.NewNum || '';
+
+        gutter.appendChild(oldNum);
+        gutter.appendChild(newNum);
+
+        const commentGutter = makeDiffCommentGutter(file.path, commentLineNum, lineSide, visualIdx);
+
+        const sign = document.createElement('div');
+        sign.className = 'diff-gutter-sign';
+        sign.textContent = line.Type === 'add' ? '+' : line.Type === 'del' ? '-' : '';
+
+        const contentEl = document.createElement('div');
+        contentEl.className = 'diff-content';
+        const hlLine = highlightDiffLine(line.Content, line.Type === 'del' ? line.OldNum : line.NewNum, line.Type === 'del' ? 'old' : '', file.highlightCache, file.lang);
+        const wdInfo = wordDiffMap.get(li);
+        contentEl.innerHTML = wdInfo ? applyWordDiffToHtml(hlLine, wdInfo.ranges, wdInfo.cssClass) : hlLine;
+
+        lineEl.appendChild(gutter);
+        lineEl.appendChild(commentGutter);
+        lineEl.appendChild(sign);
+        lineEl.appendChild(contentEl);
+        container.appendChild(lineEl);
+
+        appendDiffComments(container, file.path, commentLineNum, lineSide, commentsMap);
+        appendDiffForm(container, file.path, commentLineNum, lineSide);
+        visualIdx++;
+      }
+    }
+
+    // Trailing spacer after last hunk
+    const trailingSpacerUnified = renderTrailingSpacer(hunks[hunks.length - 1], file);
+    if (trailingSpacerUnified) container.appendChild(trailingSpacerUnified);
+
+    appendOutdatedDiffComments(container, file, commentsMap, hunks);
+
+    return container;
+  }
+
+  // ===== Split diff (side-by-side: old on left, new on right) =====
+  function renderDiffSplit(file) {
+    const container = document.createElement('div');
+    container.className = 'diff-container split';
+    attachDiffTouchHandler(container);
+    attachDiffMouseHandler(container);
+
+    expandHunksForComments(file);
+
+    const hunks = file.diffHunks || [];
+    if (hunks.length === 0) {
+      container.innerHTML = '<div class="diff-no-changes">No changes</div>';
+      return container;
+    }
+
+    autoExpandSmallGaps(file);
+
+    const { diffCommentsMap: commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+
+    // Leading spacer before first hunk (includes hunk header text)
+    const leadingSpacerSplit = renderLeadingSpacer(hunks[0], file);
+    if (leadingSpacerSplit) container.appendChild(leadingSpacerSplit);
+
+    for (let hi = 0; hi < hunks.length; hi++) {
+      const hunk = hunks[hi];
+      let spacerRenderedSplit = false;
+
+      if (hi > 0) {
+        const spacer = renderDiffSpacer(hunks[hi - 1], hunk, file, hi - 1, hi);
+        if (spacer) {
+          container.appendChild(spacer);
+          spacerRenderedSplit = true;
+        }
+      }
+
+      // Skip standalone hunk header when:
+      // - a spacer (which embeds the header) was rendered, or
+      // - the leading spacer covers the first hunk, or
+      // - this hunk is contiguous with the previous one (e.g. bridge hunks from expand)
+      const contiguousSplit = hi > 0 && (hunks[hi - 1].NewStart + hunks[hi - 1].NewCount) >= hunk.NewStart;
+      if (!spacerRenderedSplit && !(hi === 0 && leadingSpacerSplit) && !contiguousSplit) {
+        container.appendChild(renderDiffHunkHeader(hunk));
+      }
+
+      // Group hunk lines into segments: runs of context, or runs of del+add (change pairs)
+      const segments = [];
+      let i = 0;
+      const lines = hunk.Lines;
+      while (i < lines.length) {
+        if (lines[i].Type === 'context') {
+          segments.push({ type: 'context', lines: [lines[i]] });
+          i++;
+        } else {
+          // Collect consecutive dels then adds
+          const dels = [];
+          const adds = [];
+          while (i < lines.length && lines[i].Type === 'del') { dels.push(lines[i]); i++; }
+          while (i < lines.length && lines[i].Type === 'add') { adds.push(lines[i]); i++; }
+          segments.push({ type: 'change', dels: dels, adds: adds });
+        }
+      }
+
+      for (const seg of segments) {
+        if (seg.type === 'context') {
+          const line = seg.lines[0];
+          const row = makeSplitRow(
+            { num: line.OldNum, content: line.Content, type: 'context' },
+            { num: line.NewNum, content: line.Content, type: 'context' },
+            file, commentRangeSet
+          );
+          container.appendChild(row.el);
+          // Context lines: form appears where clicked (left or right),
+          // but submitted comments always render on the right, like GitHub
+          const ctxComments = [
+            ...(commentsMap[line.OldNum + ':old'] || []),
+            ...(commentsMap[line.NewNum + ':'] || [])
+          ];
+          for (let ci = 0; ci < ctxComments.length; ci++) {
+            const el = ctxComments[ci].resolved
+              ? createResolvedElement(ctxComments[ci], file.path)
+              : createCommentElement(ctxComments[ci], file.path);
+            el.classList.add('diff-comment-right');
+            container.appendChild(el);
+          }
+          appendDiffForm(container, file.path, line.OldNum, 'old');
+          appendDiffForm(container, file.path, line.NewNum, '');
+        } else {
+          // Positional alignment (GitHub-style): del[i] beside add[i], surplus single-sided.
+          const splitRows = buildSplitChangeRows(seg.dels, seg.adds, wordDiff);
+
+          for (let j = 0; j < splitRows.length; j++) {
+            const sr = splitRows[j];
+            const del = sr.del;
+            const add = sr.add;
+            const wd = sr.wd;
+            const row = makeSplitRow(
+              del ? { num: del.OldNum, content: del.Content, type: 'del', wordRanges: wd ? wd.oldRanges : null } : null,
+              add ? { num: add.NewNum, content: add.Content, type: 'add', wordRanges: wd ? wd.newRanges : null } : null,
+              file, commentRangeSet
+            );
+            container.appendChild(row.el);
+            // Comments for both sides (different keys)
+            if (del) appendDiffComments(container, file.path, del.OldNum, 'old', commentsMap);
+            if (add) appendDiffComments(container, file.path, add.NewNum, '', commentsMap);
+            // Form: render for whichever side was clicked
+            if (del) appendDiffForm(container, file.path, del.OldNum, 'old');
+            if (add) appendDiffForm(container, file.path, add.NewNum, '');
+          }
+        }
+      }
+    }
+
+    // Trailing spacer after last hunk
+    const trailingSpacerSplit = renderTrailingSpacer(hunks[hunks.length - 1], file);
+    if (trailingSpacerSplit) container.appendChild(trailingSpacerSplit);
+
+    appendOutdatedDiffComments(container, file, commentsMap, hunks);
+
+    return container;
+  }
+
+  // Build one split row: left (old) side + right (new) side
+  // left/right: { num, content, type } or null for empty
+  function makeSplitRow(left, right, file, commentRangeSet) {
+    const row = document.createElement('div');
+    row.className = 'diff-split-row';
+
+    // Left side
+    const leftEl = document.createElement('div');
+    leftEl.className = 'diff-split-side left';
+    if (left && left.type === 'del') leftEl.classList.add('deletion');
+
+    const leftNum = document.createElement('div');
+    leftNum.className = 'diff-gutter-num';
+    leftNum.textContent = left ? (left.num || '') : '';
+
+    let leftCommentGutter;
+    if (left && left.num) {
+      leftCommentGutter = makeDiffCommentGutter(file.path, left.num, 'old');
+      tagDiffLine(leftEl, file.path, left.num, 'old', row);
+      if (commentRangeSet.has(left.num + ':old')) leftEl.classList.add('has-comment');
+      const selSide = diffDragState ? diffDragState.side : (activeForms.length > 0 ? activeForms[activeForms.length - 1].side : null);
+      const inCurrentSelLeft = activeFilePath === file.path && selectionStart !== null && selectionEnd !== null &&
+          left.num >= selectionStart && left.num <= selectionEnd && selSide === 'old';
+      const hasFormLeft = getFormsForFile(file.path).some(function(f) {
+        return !f.editingId && left.num >= f.startLine && left.num <= f.endLine && (f.side || '') === 'old';
+      });
+      if (inCurrentSelLeft) { leftEl.classList.add('selected'); }
+      if (hasFormLeft && !inCurrentSelLeft) { leftEl.classList.add('form-selected'); }
+    } else {
+      leftCommentGutter = makeDiffCommentGutter(file.path, 0, '');
+    }
+
+    const leftContent = document.createElement('div');
+    leftContent.className = 'diff-content';
+    if (left) {
+      const hlHtml = highlightDiffLine(left.content, left.num, 'old', file.highlightCache, file.lang);
+      leftContent.innerHTML = left.wordRanges ? applyWordDiffToHtml(hlHtml, left.wordRanges, 'diff-word-del') : hlHtml;
+    }
+    if (!left) leftEl.classList.add('empty');
+
+    leftEl.appendChild(leftNum);
+    leftEl.appendChild(leftCommentGutter);
+    leftEl.appendChild(leftContent);
+
+    // Right side
+    const rightEl = document.createElement('div');
+    rightEl.className = 'diff-split-side right';
+    if (right && right.type === 'add') rightEl.classList.add('addition');
+
+    const rightNum = document.createElement('div');
+    rightNum.className = 'diff-gutter-num';
+    rightNum.textContent = right ? (right.num || '') : '';
+
+    let rightCommentGutter;
+    if (right && right.num) {
+      if (right.type === 'add' || right.type === 'context') {
+        rightCommentGutter = makeDiffCommentGutter(file.path, right.num, '');
+      } else {
+        rightCommentGutter = makeDiffCommentGutter(file.path, 0, '');
+      }
+      tagDiffLine(rightEl, file.path, right.num, '', row);
+      if (commentRangeSet.has(right.num + ':')) rightEl.classList.add('has-comment');
+      const selSideR = diffDragState ? diffDragState.side : (activeForms.length > 0 ? activeForms[activeForms.length - 1].side : null);
+      const inCurrentSelRight = activeFilePath === file.path && selectionStart !== null && selectionEnd !== null &&
+          right.num >= selectionStart && right.num <= selectionEnd && (selSideR || '') === '';
+      const hasFormRight = getFormsForFile(file.path).some(function(f) {
+        return !f.editingId && right.num >= f.startLine && right.num <= f.endLine && (f.side || '') === '';
+      });
+      if (inCurrentSelRight) { rightEl.classList.add('selected'); }
+      if (hasFormRight && !inCurrentSelRight) { rightEl.classList.add('form-selected'); }
+    } else {
+      rightCommentGutter = makeDiffCommentGutter(file.path, 0, '');
+    }
+
+    const rightContent = document.createElement('div');
+    rightContent.className = 'diff-content';
+    if (right) {
+      const hlHtml = highlightDiffLine(right.content, right.num, right.type === 'del' ? 'old' : '', file.highlightCache, file.lang);
+      rightContent.innerHTML = right.wordRanges ? applyWordDiffToHtml(hlHtml, right.wordRanges, 'diff-word-add') : hlHtml;
+    }
+    if (!right) rightEl.classList.add('empty');
+
+    rightEl.appendChild(rightNum);
+    rightEl.appendChild(rightCommentGutter);
+    rightEl.appendChild(rightContent);
+
+    row.appendChild(leftEl);
+    row.appendChild(rightEl);
+
+    return { el: row };
+  }
+
+  // ===== Comment Helpers =====
+
+  // Single-pass builder that produces all three comment index structures:
+  //   commentsMap: { end_line → [comment] }          (document view)
+  //   diffCommentsMap: { "end_line:side" → [comment] } (diff view)
+  //   commentedRangeSet: Set<"line:side">              (highlight ranges)
+  function buildCommentIndices(comments) {
+    const commentsMap = {};
+    const diffCommentsMap = {};
+    const rangeSet = new Set();
+    const hideResolved = isHideResolved();
+    for (const c of comments) {
+      // commentsMap — keyed by end_line only
+      const lineKey = c.end_line;
+      if (!commentsMap[lineKey]) commentsMap[lineKey] = [];
+      commentsMap[lineKey].push(c);
+      // diffCommentsMap — keyed by "end_line:side"
+      const sideKey = c.end_line + ':' + (c.side || '');
+      if (!diffCommentsMap[sideKey]) diffCommentsMap[sideKey] = [];
+      diffCommentsMap[sideKey].push(c);
+      // commentedRangeSet — non-file-scope comments; skip resolved when the
+      // hide-resolved toggle is on so the line highlight tracks card visibility.
+      if (c.scope !== 'file' && !(hideResolved && c.resolved)) {
+        const side = c.side || '';
+        for (let ln = c.start_line; ln <= c.end_line; ln++) rangeSet.add(ln + ':' + side);
+      }
+    }
+    return { commentsMap: commentsMap, diffCommentsMap: diffCommentsMap, rangeSet: rangeSet };
+  }
+
+  // For unified diff: build a Set of visual indices that should have has-comment.
+  // Anchor strictly to the comment's side so unrelated lines elsewhere in the
+  // hunk that happen to share a number on the opposite side are not included.
+  // Lines between the anchored start/end are highlighted regardless of type
+  // (so deletions within a multi-line range still get highlighted).
+  function buildUnifiedCommentVisualSet(hunks, comments) {
+    if (!comments.length) return new Set();
+    const lines = [];
+    for (const hunk of hunks) {
+      for (const line of hunk.Lines) {
+        lines.push({ type: line.Type, oldNum: line.OldNum, newNum: line.NewNum });
+      }
+    }
+    const set = new Set();
+    const hideResolved = isHideResolved();
+    for (const c of comments) {
+      if (c.scope === 'file') continue;
+      if (hideResolved && c.resolved) continue;
+      const side = c.side || '';
+      // Only lines that *belong* to the comment's side can anchor. For new-side
+      // comments that means add/context lines (with a real NewNum); for old-side
+      // it means del/context lines (with a real OldNum).
+      let startIdx = -1, endIdx = -1;
+      for (let i = 0; i < lines.length; i++) {
+        const ln = lines[i];
+        const num = side === 'old' ? ln.oldNum : ln.newNum;
+        const onSide = side === 'old'
+          ? (ln.type === 'del' || ln.type === 'context')
+          : (ln.type === 'add' || ln.type === 'context');
+        if (!onSide || !num) continue;
+        if (startIdx === -1 && num === c.start_line) startIdx = i;
+        if (num === c.end_line) endIdx = i;
+      }
+      if (startIdx !== -1 && endIdx !== -1) {
+        for (let i = startIdx; i <= endIdx; i++) set.add(i);
+      }
+    }
+    return set;
+  }
+
+  function getCommentsForBlock(block, commentsMap) {
+    const result = [];
+    for (let ln = block.startLine; ln <= block.endLine; ln++) {
+      if (commentsMap[ln]) result.push(...commentsMap[ln]);
+    }
+    return result;
+  }
+
+  // ===== Visual Line Mode (vim-style) =====
+  // Anchors on the currently focused block; j/k extend the range; Esc clears it.
+  function enterVisualMode() {
+    if (!focusedElement) return false;
+    const navTarget = navFocusTargetFromElement(focusedElement);
+    const fp = focusedElement.dataset.filePath || focusedElement.dataset.diffFilePath ||
+      (navTarget && navTarget.filePath);
+    if (!fp) return false;
+
+    if (focusedElement.dataset.blockIndex !== undefined && focusedElement.dataset.startLine) {
+      const startLine = parseInt(focusedElement.dataset.startLine);
+      const endLine = parseInt(focusedElement.dataset.endLine);
+      visualMode = { kind: 'markdown', filePath: fp, anchorStartLine: startLine, anchorEndLine: endLine };
+      activeFilePath = fp;
+      selectionStart = startLine;
+      selectionEnd = endLine;
+      // Clear any stale unified-diff drag state so it can't bleed into render paths.
+      unifiedVisualStart = null;
+      unifiedVisualEnd = null;
+      document.body.classList.add('visual-mode');
+      refreshVisualSelectionVisuals(fp);
+      return true;
+    }
+    if (focusedElement.dataset.diffLineNum || focusedElement.classList.contains('diff-split-row')) {
+      // Split rows carry both sides on child .diff-split-side elements. Prefer
+      // right (new) side; fall back to left for deleted-only rows. Unified rows
+      // are single-side, so just read directly.
+      let lineNum, side;
+      if (focusedElement.classList.contains('diff-split-row')) {
+        const right = focusedElement.querySelector('.diff-split-side.right:not(.empty)');
+        if (right && right.dataset.diffLineNum) {
+          lineNum = parseInt(right.dataset.diffLineNum);
+          side = '';
+        } else {
+          const left = focusedElement.querySelector('.diff-split-side.left:not(.empty)');
+          if (!left || !left.dataset.diffLineNum) return false;
+          lineNum = parseInt(left.dataset.diffLineNum);
+          side = 'old';
+        }
+      } else {
+        lineNum = parseInt(focusedElement.dataset.diffLineNum);
+        side = focusedElement.dataset.diffSide || '';
+      }
+      visualMode = { kind: 'diff', filePath: fp, anchorStartLine: lineNum, anchorEndLine: lineNum, anchorSide: side };
+      activeFilePath = fp;
+      selectionStart = lineNum;
+      selectionEnd = lineNum;
+      document.body.classList.add('visual-mode');
+      refreshVisualSelectionVisuals(fp);
+      return true;
+    }
+    return false;
+  }
+
+  function exitVisualMode(clearSelection) {
+    if (!visualMode) return;
+    const fp = visualMode.filePath;
+    visualMode = null;
+    document.body.classList.remove('visual-mode');
+    if (clearSelection) {
+      selectionStart = null;
+      selectionEnd = null;
+      unifiedVisualStart = null;
+      unifiedVisualEnd = null;
+      activeFilePath = null;
+      if (fp) refreshVisualSelectionVisuals(fp);
+    }
+  }
+
+  // After j/k moves focus, extend the visual selection from the anchor to the new focus.
+  function extendVisualSelection() {
+    if (!visualMode || !focusedElement) return;
+    const navTarget = navFocusTargetFromElement(focusedElement);
+    const fp = visualMode.kind === 'markdown'
+      ? focusedElement.dataset.filePath
+      : (focusedElement.dataset.diffFilePath || (navTarget && navTarget.filePath));
+    if (fp !== visualMode.filePath) {
+      // Crossed file boundary — exit visual mode (focus already moved by j/k).
+      exitVisualMode(true);
+      return;
+    }
+    if (visualMode.kind === 'markdown') {
+      if (focusedElement.dataset.blockIndex === undefined) return;
+      const sLine = parseInt(focusedElement.dataset.startLine);
+      const eLine = parseInt(focusedElement.dataset.endLine);
+      selectionStart = Math.min(visualMode.anchorStartLine, sLine);
+      selectionEnd = Math.max(visualMode.anchorEndLine, eLine);
+    } else {
+      // Find the line number on the anchor side. Split rows carry both sides
+      // on child .diff-split-side elements, so query them directly.
+      // Rows with no line on the anchor side (e.g. a deleted-only row when
+      // we anchored on the right) are skipped silently — selection stays put,
+      // visual mode stays active, focus continues moving with j/k.
+      let ln = null;
+      if (focusedElement.classList.contains('diff-split-row')) {
+        const sideSel = visualMode.anchorSide === 'old'
+          ? '.diff-split-side.left:not(.empty)'
+          : '.diff-split-side.right:not(.empty)';
+        const sideEl = focusedElement.querySelector(sideSel);
+        if (sideEl && sideEl.dataset.diffLineNum) {
+          ln = parseInt(sideEl.dataset.diffLineNum);
+        }
+      } else if (focusedElement.dataset.diffLineNum) {
+        // Unified mode — single-side per element, must match anchor.
+        const side = focusedElement.dataset.diffSide || '';
+        if (side !== visualMode.anchorSide) return;
+        ln = parseInt(focusedElement.dataset.diffLineNum);
+      }
+      if (ln === null) return;
+      selectionStart = Math.min(visualMode.anchorStartLine, ln);
+      selectionEnd = Math.max(visualMode.anchorEndLine, ln);
+    }
+    // Update .selected classes incrementally rather than re-rendering the whole
+    // file — re-rendering invalidates the focusedElement reference and trips
+    // the j/k stale-ref recovery (which can mis-resolve when blockIndex values
+    // collide across files).
+    refreshVisualSelectionVisuals(visualMode.filePath);
+  }
+
+  function refreshVisualSelectionVisuals(filePath) {
+    const section = document.getElementById('file-section-' + filePath);
+    if (!section) return;
+    const blocks = section.querySelectorAll('.line-block.kb-nav[data-file-path="' + filePath + '"]');
+    for (let i = 0; i < blocks.length; i++) {
+      const lb = blocks[i];
+      const sLine = parseInt(lb.dataset.startLine);
+      const eLine = parseInt(lb.dataset.endLine);
+      const inSel = selectionStart !== null && selectionEnd !== null
+        && sLine >= selectionStart && eLine <= selectionEnd;
+      lb.classList.toggle('selected', inSel);
+    }
+    // Split-mode diff sides: each side has its own line numbers + side tag.
+    // .selected only applies on the anchor-matching side (matches the render
+    // path in makeSplitRow, lines 3730 / 3772).
+    const splitSides = section.querySelectorAll('.diff-split-side[data-diff-file-path="' + filePath + '"]');
+    const anchorSide = visualMode && visualMode.kind === 'diff' ? visualMode.anchorSide : null;
+    for (let i = 0; i < splitSides.length; i++) {
+      const sEl = splitSides[i];
+      if (sEl.classList.contains('empty') || !sEl.dataset.diffLineNum) {
+        sEl.classList.toggle('selected', false);
+        continue;
+      }
+      const ln = parseInt(sEl.dataset.diffLineNum);
+      const side = sEl.dataset.diffSide || '';
+      const sideMatches = anchorSide === null || side === anchorSide;
+      const inSel = sideMatches && selectionStart !== null && selectionEnd !== null
+        && ln >= selectionStart && ln <= selectionEnd;
+      sEl.classList.toggle('selected', inSel);
+    }
+    // Unified-mode diff lines: single-side per element, side matches anchor.
+    const unifiedLines = section.querySelectorAll('.diff-container.unified .diff-line[data-diff-file-path="' + filePath + '"]');
+    for (let i = 0; i < unifiedLines.length; i++) {
+      const ul = unifiedLines[i];
+      if (!ul.dataset.diffLineNum) continue;
+      const ln = parseInt(ul.dataset.diffLineNum);
+      const side = ul.dataset.diffSide || '';
+      const sideMatches = anchorSide === null || side === anchorSide;
+      const inSel = sideMatches && selectionStart !== null && selectionEnd !== null
+        && ln >= selectionStart && ln <= selectionEnd;
+      ul.classList.toggle('selected', inSel);
+    }
+  }
+
+  // ===== Gutter Drag Selection =====
+  let dragState = null;
+
+  function handleGutterMouseDown(e) {
+    e.preventDefault();
+    const gutter = e.currentTarget;
+    const startLine = parseInt(gutter.dataset.startLine);
+    const endLine = parseInt(gutter.dataset.endLine);
+    const filePath = gutter.dataset.filePath;
+    const blockEl = gutter.closest('.line-block') || gutter.closest('.diff-split-side') || gutter.parentElement;
+    const blockIndex = parseInt(blockEl.dataset.blockIndex);
+
+    // Shift+click: extend selection
+    if (e.shiftKey && selectionStart !== null && activeFilePath === filePath) {
+      const rangeStart = Math.min(selectionStart, startLine);
+      const rangeEnd = Math.max(selectionEnd, endLine);
+      const file = getFileByPath(filePath);
+      if (!file) return;
+      let lastBlockIndex = 0;
+      for (let i = 0; i < file.lineBlocks.length; i++) {
+        if (file.lineBlocks[i].startLine >= rangeStart && file.lineBlocks[i].endLine <= rangeEnd) {
+          lastBlockIndex = i;
+        }
+      }
+      openForm({ filePath: filePath, afterBlockIndex: lastBlockIndex, startLine: rangeStart, endLine: rangeEnd, editingId: null });
+      return;
+    }
+
+    dragState = {
+      filePath,
+      anchorStartLine: startLine, anchorEndLine: endLine,
+      anchorBlockIndex: blockIndex,
+      currentStartLine: startLine, currentEndLine: endLine,
+      currentBlockIndex: blockIndex,
+    };
+
+    activeFilePath = filePath;
+    selectionStart = startLine;
+    selectionEnd = endLine;
+    renderFileByPath(filePath);
+
+    document.body.classList.add('dragging');
+    document.addEventListener('mousemove', handleDragMove);
+    document.addEventListener('mouseup', handleDragEnd);
+  }
+
+  // Update drag selection CSS classes on existing DOM without full re-render.
+  // Handles both markdown line blocks and diff gutter elements.
+  function updateDragSelectionVisuals(filePath) {
+    const section = document.getElementById('file-section-' + filePath);
+    if (!section) return;
+
+    // Markdown line blocks: toggle .selected on line-block, update comment gutter drag classes
+    const lineBlocks = section.querySelectorAll('.line-block[data-file-path="' + filePath + '"]');
+    for (let i = 0; i < lineBlocks.length; i++) {
+      const lb = lineBlocks[i];
+      const startLine = parseInt(lb.dataset.startLine);
+      const endLine = parseInt(lb.dataset.endLine);
+      applyBlockSelectionState(lb, filePath, startLine, endLine);
+
+      // Update the comment gutter within this line block
+      const gutter = lb.querySelector('.line-comment-gutter');
+      if (gutter && dragState && dragState.filePath === filePath && selectionStart !== null) {
+        const isAnchorBlock = startLine <= dragState.anchorEndLine && endLine >= dragState.anchorStartLine;
+        const isCurrentBlock = startLine <= dragState.currentEndLine && endLine >= dragState.currentStartLine;
+        const gutterInRange = startLine >= selectionStart && endLine <= selectionEnd;
+        gutter.classList.toggle('drag-endpoint', isAnchorBlock || isCurrentBlock);
+        gutter.classList.toggle('drag-range', gutterInRange);
+        gutter.classList.toggle('drag-range-start', gutterInRange && startLine === selectionStart);
+        gutter.classList.toggle('drag-range-end', gutterInRange && endLine === selectionEnd);
+      }
+    }
+
+    // Diff line elements: toggle .selected on diff lines and drag-range on gutters
+    if (diffDragState && diffDragState.filePath === filePath) {
+      // Unified mode: toggle .selected on .diff-line elements
+      const unifiedLines = section.querySelectorAll('.diff-container.unified .diff-line[data-diff-visual-idx]');
+      for (let ui = 0; ui < unifiedLines.length; ui++) {
+        const uLine = unifiedLines[ui];
+        const uVisualIdx = parseInt(uLine.dataset.diffVisualIdx);
+        const uSelected = unifiedVisualStart !== null && unifiedVisualEnd !== null &&
+                        uVisualIdx >= unifiedVisualStart && uVisualIdx <= unifiedVisualEnd;
+        const uLineNum = parseInt(uLine.dataset.diffLineNum);
+        const uSide = uLine.dataset.diffSide || '';
+        const uHasForm = getFormsForFile(filePath).some(function(f) {
+          return !f.editingId && uLineNum >= f.startLine && uLineNum <= f.endLine && (f.side || '') === uSide;
+        });
+        uLine.classList.toggle('selected', uSelected);
+        uLine.classList.toggle('form-selected', uHasForm && !uSelected);
+      }
+
+      // Split mode: toggle .selected on .diff-split-side elements
+      const splitSides = section.querySelectorAll('.diff-container.split .diff-split-side[data-diff-line-num]');
+      for (let si = 0; si < splitSides.length; si++) {
+        const sSide = splitSides[si];
+        const sLineNum = parseInt(sSide.dataset.diffLineNum);
+        const sSideVal = sSide.dataset.diffSide || '';
+        const sSideMatch = diffDragState.side === sSideVal;
+        const sSelected = sSideMatch && selectionStart !== null && selectionEnd !== null &&
+                        sLineNum >= selectionStart && sLineNum <= selectionEnd;
+        const sHasForm = getFormsForFile(filePath).some(function(f) {
+          return !f.editingId && sLineNum >= f.startLine && sLineNum <= f.endLine && (f.side || '') === sSideVal;
+        });
+        sSide.classList.toggle('selected', sSelected);
+        sSide.classList.toggle('form-selected', sHasForm && !sSelected);
+      }
+    }
+
+    // Diff gutter elements: toggle drag-range classes
+    const diffGutters = section.querySelectorAll('.diff-comment-gutter');
+    for (let j = 0; j < diffGutters.length; j++) {
+      const col = diffGutters[j];
+      const btn = col.querySelector('.diff-comment-btn');
+      if (!btn) continue;
+      const lineNum = parseInt(btn.dataset.lineNum);
+      const side = btn.dataset.side || '';
+      const visualIdx = btn.dataset.visualIdx !== undefined ? parseInt(btn.dataset.visualIdx) : undefined;
+      if (!lineNum) continue;
+
+      const sideMatch = diffMode === 'split' ? (diffDragState && diffDragState.side === side) : true;
+      const isActive = diffDragState && diffDragState.filePath === filePath && sideMatch && selectionStart !== null && selectionEnd !== null;
+
+      if (isActive) {
+        let isAnchor, isCurrent, dgInRange, isRangeStart, isRangeEnd;
+        if (diffMode !== 'split' && visualIdx !== undefined && unifiedVisualStart !== null) {
+          isAnchor = visualIdx === diffDragState.anchorVisualIdx;
+          isCurrent = visualIdx === diffDragState.currentVisualIdx;
+          dgInRange = visualIdx >= unifiedVisualStart && visualIdx <= unifiedVisualEnd;
+          isRangeStart = visualIdx === unifiedVisualStart;
+          isRangeEnd = visualIdx === unifiedVisualEnd;
+        } else {
+          isAnchor = lineNum === diffDragState.anchorLine;
+          isCurrent = lineNum === diffDragState.currentLine;
+          dgInRange = lineNum >= selectionStart && lineNum <= selectionEnd;
+          isRangeStart = lineNum === selectionStart;
+          isRangeEnd = lineNum === selectionEnd;
+        }
+        col.classList.toggle('drag-endpoint', isAnchor || isCurrent);
+        col.classList.toggle('drag-range', dgInRange);
+        col.classList.toggle('drag-range-start', dgInRange && isRangeStart);
+        col.classList.toggle('drag-range-end', dgInRange && isRangeEnd);
+      } else {
+        col.classList.remove('drag-endpoint', 'drag-range', 'drag-range-start', 'drag-range-end');
+      }
+    }
+  }
+
+  function handleDragMove(e) {
+    if (!dragState) return;
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el) return;
+    const lineBlock = el.closest('.line-block');
+    if (!lineBlock || lineBlock.dataset.filePath !== dragState.filePath) return;
+
+    const hoverStartLine = parseInt(lineBlock.dataset.startLine);
+    const hoverEndLine = parseInt(lineBlock.dataset.endLine);
+    const hoverBlockIndex = parseInt(lineBlock.dataset.blockIndex);
+
+    dragState.currentStartLine = hoverStartLine;
+    dragState.currentEndLine = hoverEndLine;
+    dragState.currentBlockIndex = hoverBlockIndex;
+
+    selectionStart = Math.min(dragState.anchorStartLine, hoverStartLine);
+    selectionEnd = Math.max(dragState.anchorEndLine, hoverEndLine);
+    updateDragSelectionVisuals(dragState.filePath);
+  }
+
+  function handleDragEnd() {
+    document.removeEventListener('mousemove', handleDragMove);
+    document.removeEventListener('mouseup', handleDragEnd);
+    document.body.classList.remove('dragging');
+
+    if (!dragState) return;
+    const rangeStart = Math.min(dragState.anchorStartLine, dragState.currentStartLine);
+    const rangeEnd = Math.max(dragState.anchorEndLine, dragState.currentEndLine);
+
+    const file = getFileByPath(dragState.filePath);
+    let lastBlockIndex = dragState.currentBlockIndex;
+    if (file && file.lineBlocks) {
+      for (let i = 0; i < file.lineBlocks.length; i++) {
+        if (file.lineBlocks[i].startLine >= rangeStart && file.lineBlocks[i].endLine <= rangeEnd) {
+          lastBlockIndex = i;
+        }
+      }
+    }
+
+    const fp = dragState.filePath;
+    dragState = null;
+    openForm({
+      filePath: fp,
+      afterBlockIndex: lastBlockIndex,
+      startLine: rangeStart,
+      endLine: rangeEnd,
+      editingId: null,
+    });
+  }
+
+  // ===== Text Selection → Line Range Mapping =====
+
+  function getLineRangeFromSelection(selection) {
+    if (!selection || selection.isCollapsed || !selection.toString().trim()) return null;
+    if (selection.rangeCount === 0) return null;
+    const range = selection.getRangeAt(0);
+
+    // Walk every commentable element and keep those the range intersects.
+    // Direction-agnostic: avoids relying on anchorNode/focusNode, which can
+    // snap to non-commentable parent containers when a selection crosses a
+    // blank-line boundary (especially in backward drags).
+    const candidates = [];
+
+    document.querySelectorAll('.line-block[data-file-path]').forEach(function(el) {
+      if (el.closest('.comment-form-wrapper') || el.closest('.comment-card')) return;
+      if (!range.intersectsNode(el)) return;
+      candidates.push({
+        filePath: el.dataset.filePath,
+        startLine: parseInt(el.dataset.startLine),
+        endLine: parseInt(el.dataset.endLine),
+        blockIndex: el.dataset.blockIndex !== undefined ? parseInt(el.dataset.blockIndex) : null,
+        side: undefined,
+      });
+    });
+
+    document.querySelectorAll('[data-diff-line-num]').forEach(function(el) {
+      const ln = parseInt(el.dataset.diffLineNum);
+      if (!(ln > 0)) return;
+      if (el.closest('.comment-form-wrapper') || el.closest('.comment-card')) return;
+      if (!range.intersectsNode(el)) return;
+      candidates.push({
+        filePath: el.dataset.diffFilePath,
+        startLine: ln,
+        endLine: ln,
+        blockIndex: null,
+        side: el.dataset.diffSide || undefined,
+      });
+    });
+
+    if (candidates.length === 0) return null;
+
+    // All candidates must share filePath and side. If the selection straddles
+    // multiple files or diff sides, bail out rather than guess.
+    const filePath = candidates[0].filePath;
+    const side = candidates[0].side;
+    for (let i = 1; i < candidates.length; i++) {
+      if (candidates[i].filePath !== filePath) return null;
+      if (candidates[i].side !== side) return null;
+    }
+
+    let startLine = Infinity;
+    let endLine = -Infinity;
+    let afterBlockIndex = null;
+    for (const c of candidates) {
+      if (c.startLine < startLine) startLine = c.startLine;
+      if (c.endLine > endLine) endLine = c.endLine;
+      if (c.blockIndex !== null && (afterBlockIndex === null || c.blockIndex > afterBlockIndex)) {
+        afterBlockIndex = c.blockIndex;
+      }
+    }
+
+    return { filePath, startLine, endLine, afterBlockIndex, side };
+  }
+
+  function closeEmptyReviewForm() {
+    if (!reviewCommentFormActive || reviewCommentEditingId) return;
+    const ta = document.querySelector('#reviewConversation .comment-form textarea');
+    if (ta && ta.value.trim()) return;
+    cancelReviewCommentForm();
+  }
+
+  function closeEmptyForms(exceptKey) {
+    const toClose = [];
+    activeForms.forEach(function(f) {
+      if (f.formKey === exceptKey) return;
+      if (f.editingId) return; // never auto-close edit-in-progress forms
+      const ta = document.querySelector('.comment-form[data-form-key="' + f.formKey + '"] textarea');
+      const text = ta ? ta.value : (f.draftBody || '');
+      if (!text.trim()) toClose.push(f);
+    });
+    toClose.forEach(function(f) { cancelComment(f); });
+  }
+
+  function openForm(newForm) {
+    rememberKeyboardFocusFromForm(newForm);
+    const fk = formKey(newForm);
+    const existing = activeForms.find(function(f) { return f.formKey === fk; });
+    if (existing) {
+      activeFilePath = newForm.filePath;
+      selectionStart = newForm.startLine;
+      selectionEnd = newForm.endLine;
+      renderFileByPath(newForm.filePath);
+      focusCommentTextarea(existing.formKey);
+      return;
+    }
+    closeEmptyForms(fk);
+    closeEmptyReviewForm();
+    addForm(newForm);
+    activeFilePath = newForm.filePath;
+    selectionStart = newForm.startLine;
+    selectionEnd = newForm.endLine;
+    renderFileByPath(newForm.filePath);
+    focusCommentTextarea(newForm.formKey);
+  }
+
+  function openFileCommentForm(filePath) {
+    const newForm = {
+      filePath: filePath,
+      scope: 'file',
+      startLine: 0,
+      endLine: 0,
+      afterBlockIndex: null
+    };
+    const fk = formKey(newForm);
+    const existing = activeForms.find(function(f) { return f.formKey === fk; });
+    if (existing) {
+      renderFileByPath(filePath);
+      focusCommentTextarea(existing.formKey);
+      return;
+    }
+    closeEmptyForms(fk);
+    closeEmptyReviewForm();
+    addForm(newForm);
+    renderFileByPath(filePath);
+    focusCommentTextarea(newForm.formKey);
+  }
+
+  function createFileCommentForm(formObj) {
+    let initialBody = '';
+    if (formObj.editingId) {
+      const file = getFileByPath(formObj.filePath);
+      if (file) {
+        const existing = file.comments.find(function(c) { return c.id === formObj.editingId; });
+        if (existing) initialBody = existing.body;
+      }
+    } else if (formObj.draftBody) {
+      initialBody = formObj.draftBody;
+    }
+    return createCommentFormUI({
+      formObj: formObj,
+      headerText: formObj.editingId ? 'Editing comment' : 'Comment',
+      submitText: formObj.editingId ? 'Update' : 'Comment',
+      initialBody: initialBody,
+      autoFocus: false
+    });
+  }
+
+  function focusCommentTextarea(targetFormKey) {
+    requestAnimationFrame(() => {
+      if (targetFormKey) {
+        const ta = document.querySelector('.comment-form[data-form-key="' + targetFormKey + '"] textarea');
+        if (ta) { ta.focus(); return; }
+      }
+      const forms = document.querySelectorAll('.comment-form textarea');
+      if (forms.length > 0) forms[forms.length - 1].focus();
+    });
+  }
+
+  // ===== Comment Templates =====
+  // Template CRUD and bar DOM delegated to window.crit.commentTemplates (crit-comment-templates.js).
+
+  function attachTemplateUI(form, textarea, actions) {
+    const tmplModule = window.crit.commentTemplates;
+
+    const templateBar = tmplModule.buildTemplateBar({
+      onInsert: function(text) {
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        textarea.value = textarea.value.substring(0, start) + text + textarea.value.substring(end);
+        textarea.selectionStart = textarea.selectionEnd = start + text.length;
+        textarea.focus();
+        textarea.dispatchEvent(new Event('input'));
+      }
+    });
+
+    const saveTemplateBtn = document.createElement('button');
+    saveTemplateBtn.className = 'btn btn-sm';
+    saveTemplateBtn.textContent = '+ Template';
+    saveTemplateBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      showSaveTemplateDialog(textarea, templateBar);
+    });
+
+    const suggestBtn = document.createElement('button');
+    suggestBtn.className = 'btn btn-sm';
+    suggestBtn.textContent = '± Suggest';
+    suggestBtn.title = 'Insert the selected lines as a suggestion';
+    suggestBtn.addEventListener('click', function() { insertSuggestion(textarea); });
+
+    const leftGroup = document.createElement('div');
+    leftGroup.className = 'comment-form-actions-left';
+    leftGroup.appendChild(suggestBtn);
+    leftGroup.appendChild(saveTemplateBtn);
+
+    actions.insertBefore(leftGroup, actions.firstChild);
+    form.insertBefore(templateBar, form.querySelector('textarea'));
+  }
+
+  function showSaveTemplateDialog(textarea, templateBar) {
+    const text = textarea.value.trim();
+    if (!text) {
+      textarea.focus();
+      return;
+    }
+    const overlay = document.createElement('div');
+    overlay.className = 'save-template-overlay active';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'save-template-dialog';
+
+    const title = document.createElement('h3');
+    title.textContent = 'Save as template';
+    dialog.appendChild(title);
+
+    const desc = document.createElement('p');
+    desc.textContent = 'Edit the template text, then save.';
+    dialog.appendChild(desc);
+
+    const input = document.createElement('textarea');
+    input.className = 'save-template-input';
+    input.value = text;
+    input.rows = 3;
+    dialog.appendChild(input);
+
+    const btns = document.createElement('div');
+    btns.className = 'save-template-actions';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-sm';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', function() { overlay.remove(); textarea.focus(); });
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn-sm btn-primary';
+    saveBtn.textContent = 'Save';
+    saveBtn.addEventListener('click', function() {
+      const val = input.value.trim();
+      if (!val) return;
+      templateBar._saveNew(val);
+      overlay.remove();
+      textarea.focus();
+    });
+
+    btns.appendChild(cancelBtn);
+    btns.appendChild(saveBtn);
+    dialog.appendChild(btns);
+
+    bindSubmitCancelKeys(input, function() { saveBtn.click(); }, function() { cancelBtn.click(); }, { stopPropagation: false });
+
+    overlay.appendChild(dialog);
+    overlay.addEventListener('click', function(e) {
+      if (e.target === overlay) { overlay.remove(); textarea.focus(); }
+    });
+    document.body.appendChild(overlay);
+    requestAnimationFrame(function() { input.focus(); input.select(); });
+  }
+
+  // ===== File Picker Autocomplete =====
+
+  function attachFilePicker(textarea) {
+    let dropdown = null;
+    let activeIndex = -1;
+    let triggerStart = -1;
+    let navigated = false;
+    let suppressInput = false;
+
+    textarea.addEventListener('input', function() {
+      if (suppressInput) { suppressInput = false; return; }
+      const val = textarea.value;
+      const cursor = textarea.selectionStart;
+
+      // Find the '@' trigger: scan backwards from cursor
+      let atPos = -1;
+      for (let i = cursor - 1; i >= 0; i--) {
+        const ch = val[i];
+        if (ch === '@') {
+          // '@' must be at start of line or preceded by whitespace
+          if (i === 0 || /\s/.test(val[i - 1])) {
+            atPos = i;
+          }
+          break;
+        }
+        if (/\s/.test(ch)) break;
+      }
+
+      if (atPos === -1 || !filePickerReady) {
+        hideDropdown();
+        return;
+      }
+
+      triggerStart = atPos;
+      const query = val.substring(atPos + 1, cursor);
+
+      fetch('/api/files/list?q=' + encodeURIComponent(query))
+        .then(function(r) { return r.ok ? r.json() : []; })
+        .then(function(matches) {
+          if (matches.length === 0) {
+            hideDropdown();
+            return;
+          }
+          showDropdown(matches);
+        })
+        .catch(function() { hideDropdown(); });
+    });
+
+    textarea.addEventListener('keydown', function(e) {
+      if (!dropdown) return;
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        activeIndex = Math.min(activeIndex + 1, dropdown.children.length - 1);
+        navigated = true;
+        highlightItem();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        activeIndex = Math.max(activeIndex - 1, 0);
+        navigated = true;
+        highlightItem();
+      } else if ((e.key === 'Tab' || e.key === 'Enter') && navigated) {
+        if (activeIndex >= 0 && activeIndex < dropdown.children.length) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          selectItem(dropdown.children[activeIndex].dataset.path);
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        hideDropdown();
+      }
+    });
+
+    textarea.addEventListener('blur', function() {
+      setTimeout(hideDropdown, 200);
+    });
+
+    function showDropdown(matches) {
+      if (!dropdown) {
+        dropdown = document.createElement('div');
+        dropdown.className = 'file-picker-dropdown';
+        document.body.appendChild(dropdown);
+      }
+
+      // Position below the @ cursor line
+      const textareaRect = textarea.getBoundingClientRect();
+      const textBeforeCursor = textarea.value.substring(0, textarea.selectionStart);
+      const lineNumber = textBeforeCursor.split('\n').length;
+      const computedStyle = window.getComputedStyle(textarea);
+      const lineHeight = parseFloat(computedStyle.lineHeight) || 22.4;
+      const paddingTop = parseFloat(computedStyle.paddingTop) || 10;
+      const cursorY = textareaRect.top + paddingTop + (lineNumber * lineHeight) - textarea.scrollTop;
+      dropdown.style.left = textareaRect.left + 'px';
+      dropdown.style.width = textareaRect.width + 'px';
+      dropdown.style.top = cursorY + 'px';
+
+      dropdown.innerHTML = '';
+      activeIndex = 0;
+      navigated = false;
+
+      matches.forEach(function(filePath, idx) {
+        const item = document.createElement('div');
+        item.className = 'file-picker-item';
+        item.dataset.path = filePath;
+
+        const lastSlash = filePath.lastIndexOf('/');
+        if (lastSlash >= 0) {
+          const dirSpan = document.createElement('span');
+          dirSpan.className = 'file-picker-dir';
+          dirSpan.textContent = filePath.substring(0, lastSlash + 1);
+          item.appendChild(dirSpan);
+          item.appendChild(document.createTextNode(filePath.substring(lastSlash + 1)));
+        } else {
+          item.textContent = filePath;
+        }
+
+        item.addEventListener('mousedown', function(e) {
+          e.preventDefault();
+          selectItem(filePath);
+        });
+        item.addEventListener('mouseenter', function() {
+          activeIndex = idx;
+          highlightItem();
+        });
+        dropdown.appendChild(item);
+      });
+
+      highlightItem();
+    }
+
+    function highlightItem() {
+      if (!dropdown) return;
+      const items = dropdown.children;
+      for (let i = 0; i < items.length; i++) {
+        items[i].classList.toggle('active', i === activeIndex);
+      }
+      if (activeIndex >= 0 && items[activeIndex]) {
+        items[activeIndex].scrollIntoView({ block: 'nearest' });
+      }
+    }
+
+    function selectItem(filePath) {
+      const val = textarea.value;
+      const cursor = textarea.selectionStart;
+      const before = val.substring(0, triggerStart);
+      const after = val.substring(cursor);
+      const insertion = '@' + filePath + ' ';
+      textarea.value = before + insertion + after;
+      const newCursor = before.length + insertion.length;
+      textarea.selectionStart = textarea.selectionEnd = newCursor;
+      textarea.focus();
+      hideDropdown();
+      suppressInput = true;
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function hideDropdown() {
+      if (dropdown) {
+        dropdown.remove();
+        dropdown = null;
+        activeIndex = -1;
+        triggerStart = -1;
+      }
+    }
+  }
+
+  // ===== Image Paste =====
+  // Attach a paste handler to a comment textarea so screenshots and other
+  // images on the clipboard upload via POST /api/attachments and get
+  // inserted as markdown image references at the cursor.
+  //
+  // The inserted markdown carries the *relative* path returned by the
+  // server (`attachments/<uuid>.<ext>`) — that's the canonical form stored
+  // in review.json. The local UI's render-time hook (commentMd image rule
+  // above) rewrites it to /api/attachments/... at display time.
+  //
+  // While an upload is in flight a `![uploading…](crit-pending-N)`
+  // placeholder sits at the cursor; on success it's swapped for the real
+  // markdown reference, on failure for an italic _[image upload failed]_
+  // note. The placeholder tag is suffixed with a per-textarea counter so
+  // simultaneous pastes don't collide.
+  let pendingImagePasteSeq = 0;
+  function attachImagePaste(textarea) {
+    textarea.addEventListener('paste', function(event) {
+      const clipboard = event.clipboardData;
+      if (!clipboard) return;
+      const items = clipboard.items;
+      if (!items || items.length === 0) return;
+
+      const images = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file' && item.type && item.type.indexOf('image/') === 0) {
+          const file = item.getAsFile();
+          if (file) images.push(file);
+        }
+      }
+      if (images.length === 0) return;
+
+      // We're handling images — block the default paste so the raw bytes
+      // don't get dumped as garbage text into the textarea.
+      event.preventDefault();
+      images.forEach(function(file) { uploadAndInsertImage(textarea, file); });
+    });
+  }
+
+  // attachImageDragDrop wires drag-and-drop image uploads onto a textarea.
+  // Mirrors attachImagePaste's contract: filter for image/* files, route to
+  // uploadAndInsertImage, leave non-image drags to the browser's native
+  // text-drop behavior. dragover MUST preventDefault when we want to accept
+  // the drop — without it, the drop event never fires.
+  function attachImageDragDrop(textarea) {
+    function hasFiles(event) {
+      const dt = event.dataTransfer;
+      // dataTransfer.types is a DOMStringList; "Files" indicates an OS file
+      // drag. Text-only drags (selection drags, link drags) won't include it.
+      return !!(dt && dt.types && Array.prototype.indexOf.call(dt.types, 'Files') !== -1);
+    }
+
+    textarea.addEventListener('dragenter', function(event) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      textarea.classList.add('drag-active');
+    });
+
+    textarea.addEventListener('dragover', function(event) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+      textarea.classList.add('drag-active');
+    });
+
+    textarea.addEventListener('dragleave', function(event) {
+      // Only clear when the drag truly leaves the textarea (not when crossing
+      // an internal selection boundary — textareas have no children, so we
+      // can rely on a simple class toggle without ref-counting).
+      if (event.target === textarea) {
+        textarea.classList.remove('drag-active');
+      }
+    });
+
+    textarea.addEventListener('drop', function(event) {
+      const dt = event.dataTransfer;
+      if (!dt || !dt.files || dt.files.length === 0) {
+        textarea.classList.remove('drag-active');
+        return;
+      }
+      const images = [];
+      for (let i = 0; i < dt.files.length; i++) {
+        const file = dt.files[i];
+        if (file && file.type && file.type.indexOf('image/') === 0) {
+          images.push(file);
+        }
+      }
+      if (images.length === 0) {
+        textarea.classList.remove('drag-active');
+        return;
+      }
+      // We're handling at least one image — claim the drop so the browser
+      // doesn't try to navigate to the dropped file URL.
+      event.preventDefault();
+      textarea.classList.remove('drag-active');
+      textarea.focus();
+      images.forEach(function(file) { uploadAndInsertImage(textarea, file); });
+    });
+  }
+
+  // Wires both paste and drag-drop image uploads onto a textarea. Single
+  // entry point so every comment textarea (top-level, edit, reply, reply edit)
+  // gets the same upload behavior.
+  function attachImageUploads(textarea) {
+    attachImagePaste(textarea);
+    attachImageDragDrop(textarea);
+  }
+
+  function uploadAndInsertImage(textarea, file) {
+    const seq = ++pendingImagePasteSeq;
+    const placeholder = '![uploading…](crit-pending-' + seq + ')';
+    insertAtCursor(textarea, placeholder);
+
+    const formData = new FormData();
+    // Pass the original filename explicitly so it survives any clipboard
+    // that strips it from the File object. Server sanitizes server-side.
+    formData.append('file', file, file.name || '');
+
+    fetch('/api/attachments', { method: 'POST', body: formData })
+      .then(function(res) {
+        if (!res.ok) {
+          return res.text().then(function(msg) {
+            throw new Error(msg || ('Upload failed: ' + res.status));
+          });
+        }
+        return res.json();
+      })
+      .then(function(data) {
+        if (!data || !data.url) throw new Error('Malformed upload response');
+        const alt = (data.original_filename || '').trim();
+        replaceInTextarea(textarea, placeholder, '![' + alt + '](' + data.url + ')');
+      })
+      .catch(function(err) {
+        console.error('Image paste upload failed:', err);
+        replaceInTextarea(textarea, placeholder, '_[image upload failed]_');
+      });
+  }
+
+  function insertAtCursor(textarea, text) {
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const before = textarea.value.substring(0, start);
+    const after = textarea.value.substring(end);
+    textarea.value = before + text + after;
+    const cursor = start + text.length;
+    textarea.selectionStart = textarea.selectionEnd = cursor;
+    textarea.focus();
+    // Trigger input listeners (draft autosave, etc.)
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  function replaceInTextarea(textarea, needle, replacement) {
+    const idx = textarea.value.indexOf(needle);
+    if (idx === -1) return;
+    // Preserve cursor when the placeholder is not where the user is typing.
+    const selStart = textarea.selectionStart;
+    const selEnd = textarea.selectionEnd;
+    textarea.value = textarea.value.substring(0, idx) + replacement + textarea.value.substring(idx + needle.length);
+    const delta = replacement.length - needle.length;
+    if (selStart > idx + needle.length) {
+      textarea.selectionStart = selStart + delta;
+      textarea.selectionEnd = selEnd + delta;
+    } else if (selStart >= idx) {
+      // Cursor was inside the placeholder — drop it just after the replacement.
+      textarea.selectionStart = textarea.selectionEnd = idx + replacement.length;
+    }
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  // ===== Comment Form =====
+  function createCommentFormUI(opts) {
+    const formObj = opts.formObj;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'comment-form-wrapper';
+
+    const form = document.createElement('div');
+    form.className = 'comment-form';
+    form.dataset.formKey = formObj.formKey;
+
+    const header = document.createElement('div');
+    header.className = 'comment-form-header';
+    header.textContent = opts.headerText;
+
+    const textarea = document.createElement('textarea');
+    textarea.placeholder = 'Leave a review comment... (Ctrl+Enter to submit, Escape to cancel)';
+    textarea.dataset.formKey = formObj.formKey;
+    if (opts.initialBody) textarea.value = opts.initialBody;
+
+    attachFilePicker(textarea);
+    attachImageUploads(textarea);
+
+    const doSubmit = opts.onSubmit
+      ? function() { opts.onSubmit(textarea.value); }
+      : function() { submitComment(textarea.value, formObj); };
+    const doCancel = opts.onCancel
+      ? function() { opts.onCancel(); }
+      : function() { cancelComment(formObj); };
+    // Esc is ambiguous (could be a fat-finger), so gate it on a confirm if
+    // there's unsaved content. The Cancel button is an explicit, labeled
+    // discard action — no prompt there (matches GitHub).
+    const doCancelFromEsc = opts.onCancel
+      ? function() { if (confirmDiscardReviewCommentForm()) opts.onCancel(); }
+      : function() { if (confirmDiscardCommentForm(formObj)) cancelComment(formObj); };
+
+    bindSubmitCancelKeys(textarea, doSubmit, doCancelFromEsc);
+
+    if (!opts.onSubmit) {
+      textarea.addEventListener('input', function() { debouncedSaveDraft(textarea.value, formObj); });
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'comment-form-actions';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-sm';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', doCancel);
+
+    const submitBtn = document.createElement('button');
+    submitBtn.className = 'btn btn-sm btn-primary';
+    submitBtn.textContent = opts.submitText;
+    submitBtn.addEventListener('click', doSubmit);
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(submitBtn);
+
+    if (agentEnabled && !opts.editingId) {
+      const sendBtn = document.createElement('button');
+      sendBtn.className = 'btn btn-sm btn-agent';
+      sendBtn.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" style="vertical-align: -1px"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg> Send now';
+      sendBtn.title = 'Submit comment and send to agent';
+      sendBtn.addEventListener('click', async function() {
+        sendBtn.disabled = true;
+        submitBtn.disabled = true;
+        const fp = formObj.filePath;
+        const comment = await submitComment(textarea.value, formObj);
+        if (comment) {
+          pendingAgentRequests.add(comment.id);
+          renderFileByPath(fp);
+          try {
+            const res = await fetch('/api/agent/request', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ comment_id: comment.id, file_path: fp }),
+            });
+            if (!res.ok) throw new Error('Server returned ' + res.status);
+            showMiniToast('Sent to agent');
+          } catch (err) {
+            console.error('Error sending to agent:', err);
+            showMiniToast('Failed to send to agent');
+            pendingAgentRequests.delete(comment.id);
+            renderFileByPath(fp);
+          }
+        }
+      });
+      actions.appendChild(sendBtn);
+    }
+
+    form.appendChild(header);
+    form.appendChild(textarea);
+    form.appendChild(actions);
+    attachTemplateUI(form, textarea, actions);
+    wrapper.appendChild(form);
+
+    if (opts.autoFocus) {
+      requestAnimationFrame(function() { textarea.focus(); });
+    }
+
+    return wrapper;
+  }
+
+  function createCommentForm(formObj) {
+    const lineRef = formObj.startLine === formObj.endLine
+      ? 'Line ' + formObj.startLine
+      : 'Lines ' + formObj.startLine + '-' + formObj.endLine;
+    let initialBody = '';
+    if (formObj.editingId) {
+      const file = getFileByPath(formObj.filePath);
+      if (file) {
+        const existing = file.comments.find(function(c) { return c.id === formObj.editingId; });
+        if (existing) initialBody = existing.body;
+      }
+    } else if (formObj.draftBody) {
+      initialBody = formObj.draftBody;
+    }
+    return createCommentFormUI({
+      formObj: formObj,
+      headerText: (formObj.editingId ? 'Editing comment on ' : 'Comment on ') + lineRef,
+      submitText: formObj.editingId ? 'Update' : 'Comment',
+      initialBody: initialBody,
+      autoFocus: false
+    });
+  }
+
+  function getOldSideLinesFromHunks(file, startLine, endLine) {
+    const lines = [];
+    if (!file.diffHunks) return lines;
+    for (let h = 0; h < file.diffHunks.length; h++) {
+      const hunkLines = file.diffHunks[h].Lines || [];
+      for (let i = 0; i < hunkLines.length; i++) {
+        const dl = hunkLines[i];
+        if ((dl.Type === 'context' || dl.Type === 'del') && dl.OldNum >= startLine && dl.OldNum <= endLine) {
+          lines.push({ num: dl.OldNum, content: dl.Content });
+        }
+      }
+    }
+    lines.sort(function(a, b) { return a.num - b.num; });
+    return lines.map(function(l) { return l.content; });
+  }
+
+  function insertSuggestion(textarea) {
+    const key = textarea.dataset.formKey;
+    const formObj = activeForms.find(function(f) { return f.formKey === key; });
+    if (!formObj) return;
+    const file = getFileByPath(formObj.filePath);
+    if (!file) return;
+    let lines;
+    if (formObj.quote) {
+      lines = formObj.quote.split('\n');
+    } else if (formObj.side === 'old') {
+      lines = getOldSideLinesFromHunks(file, formObj.startLine, formObj.endLine);
+    } else {
+      lines = file.content.split('\n').slice(formObj.startLine - 1, formObj.endLine);
+    }
+    if (lines.length === 0) return;
+    const suggestion = '```suggestion\n' + lines.join('\n') + '\n```';
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    textarea.value = textarea.value.substring(0, start) + suggestion + textarea.value.substring(end);
+    const cursorPos = start + '```suggestion\n'.length;
+    textarea.selectionStart = cursorPos;
+    textarea.selectionEnd = cursorPos + lines.join('\n').length;
+    textarea.focus();
+  }
+
+  async function submitComment(body, formObj) {
+    if (!body.trim() || !formObj) return null;
+    rememberKeyboardFocusFromForm(formObj);
+    clearDraft(formObj);
+    let created;
+    const filePath = formObj.filePath;
+    const file = getFileByPath(filePath);
+    if (!file) return;
+
+    try {
+      if (formObj.editingId) {
+        const res = await fetch('/api/comment/' + formObj.editingId + '?path=' + enc(filePath), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: body.trim() })
+        });
+        if (!res.ok) throw new Error('Server returned ' + res.status);
+        const updated = await res.json();
+        const idx = file.comments.findIndex(c => c.id === formObj.editingId);
+        if (idx >= 0) file.comments[idx] = updated;
+        userActedThisRound = true;
+      } else {
+        const payload = {
+          body: body.trim()
+        };
+        if (formObj.scope === 'file') {
+          payload.scope = 'file';
+        } else {
+          payload.start_line = formObj.startLine;
+          payload.end_line = formObj.endLine;
+        }
+        if (formObj.quote) payload.quote = formObj.quote;
+        if (formObj.quoteOffset !== null && formObj.quoteOffset !== undefined) payload.quote_offset = formObj.quoteOffset;
+        if (formObj.side) payload.side = formObj.side;
+        if (configAuthor) payload.author = configAuthor;
+        const res = await fetch('/api/file/comments?path=' + enc(filePath), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) throw new Error('Server returned ' + res.status);
+        const newComment = await res.json();
+        file.comments.push(newComment);
+        created = newComment;
+        userActedThisRound = true;
+      }
+    } catch (err) {
+      console.error('Error saving comment:', err);
+      return null;
+    }
+
+    removeForm(formObj.formKey);
+    if (getFormsForFile(filePath).length === 0) {
+      if (activeFilePath === filePath) {
+        activeFilePath = null;
+        selectionStart = null;
+        selectionEnd = null;
+      }
+    }
+    renderFileByPath(filePath);
+    updateTreeCommentBadges();
+    updateCommentCount();
+    return created || null;
+  }
+
+  // Returns true if it's safe to discard the form (form is empty or user
+  // confirmed). Reads the textarea live so unsaved typing is respected even
+  // before the autosave debounce fires.
+  function confirmDiscardCommentForm(formObj) {
+    if (!formObj) return true;
+    const ta = document.querySelector('.comment-form[data-form-key="' + formObj.formKey + '"] textarea');
+    const text = ta ? ta.value : (formObj.draftBody || '');
+    if (!text.trim()) return true;
+    return window.confirm('Discard comment?');
+  }
+
+  function confirmDiscardReviewCommentForm() {
+    const ta = document.querySelector('#reviewConversation .comment-form textarea');
+    const text = ta ? ta.value : '';
+    if (!text.trim()) return true;
+    return window.confirm('Discard comment?');
+  }
+
+  function cancelComment(formObj) {
+    if (!formObj) return;
+    rememberKeyboardFocusFromForm(formObj);
+    clearDraft(formObj);
+    removeForm(formObj.formKey);
+    if (getFormsForFile(formObj.filePath).length === 0) {
+      if (activeFilePath === formObj.filePath) {
+        activeFilePath = null;
+        selectionStart = null;
+        selectionEnd = null;
+      }
+    }
+    renderFileByPath(formObj.filePath);
+  }
+
+  // ===== Draft Autosave (delegates to window.crit.draft) =====
+  const draftMod = window.crit.draft;
+
+  function saveDraft(body, formObj) {
+    if (!formObj) return;
+    draftMod.saveDraftImmediate(formObj.formKey, {
+      filePath: formObj.filePath,
+      startLine: formObj.startLine,
+      endLine: formObj.endLine,
+      afterBlockIndex: formObj.afterBlockIndex,
+      editingId: formObj.editingId,
+      side: formObj.side || '',
+      scope: formObj.scope || '',
+      body: body,
+      savedAt: Date.now()
+    });
+  }
+
+  function debouncedSaveDraft(body, formObj) {
+    if (!formObj) return;
+    draftMod.saveDraft(formObj.formKey, {
+      filePath: formObj.filePath,
+      startLine: formObj.startLine,
+      endLine: formObj.endLine,
+      afterBlockIndex: formObj.afterBlockIndex,
+      editingId: formObj.editingId,
+      side: formObj.side || '',
+      scope: formObj.scope || '',
+      body: body,
+      savedAt: Date.now()
+    });
+  }
+
+  function clearDraft(formObj) {
+    if (!formObj) return;
+    draftMod.clearDraft(formObj.formKey);
+  }
+
+  window.addEventListener('beforeunload', function() {
+    activeForms.forEach(function(formObj) {
+      const el = document.querySelector('.comment-form[data-form-key="' + formObj.formKey + '"] textarea');
+      if (el) saveDraft(el.value, formObj);
+    });
+    draftMod.flushAll();
+  });
+
+  function restoreDrafts() {
+    let restored = false;
+    const keysToProcess = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('crit-draft-')) keysToProcess.push(k);
+    }
+    for (let ki = 0; ki < keysToProcess.length; ki++) {
+      const key = keysToProcess[ki];
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const draft = JSON.parse(raw);
+
+        if (Date.now() - draft.savedAt > 24 * 60 * 60 * 1000) {
+          localStorage.removeItem(key);
+          continue;
+        }
+
+        const file = getFileByPath(draft.filePath);
+        if (!file) { localStorage.removeItem(key); continue; }
+
+        if (draft.scope !== 'file' && file.fileType === 'markdown' && file.content) {
+          const totalLines = file.content.split('\n').length;
+          if (draft.startLine < 1 || draft.endLine > totalLines) {
+            localStorage.removeItem(key);
+            continue;
+          }
+        }
+
+        if (draft.editingId) {
+          if (!file.comments.find(function(c) { return c.id === draft.editingId; })) {
+            localStorage.removeItem(key);
+            continue;
+          }
+        }
+
+        const formObj = {
+          filePath: file.path,
+          afterBlockIndex: draft.afterBlockIndex,
+          startLine: draft.startLine,
+          endLine: draft.endLine,
+          editingId: draft.editingId,
+          side: draft.side || '',
+          scope: draft.scope || '',
+          draftBody: draft.body || ''
+        };
+        formObj.formKey = formKey(formObj);
+        addForm(formObj);
+
+        restored = true;
+        localStorage.removeItem(key);
+      } catch {
+        localStorage.removeItem(key);
+      }
+    }
+    if (restored) {
+      // Render all files that have restored forms (deduplicated)
+      const renderedFiles = {};
+      activeForms.forEach(function(f) {
+        if (!renderedFiles[f.filePath]) {
+          renderedFiles[f.filePath] = true;
+          renderFileByPath(f.filePath);
+        }
+      });
+      showMiniToast('Draft restored');
+    }
+  }
+
+  // Thin wrapper kept for existing call sites; delegates to the unified
+  // crit.shared.showToast helper (defined in crit-shared.js, also used by
+  // live-mode.js).
+  function showMiniToast(message) {
+    if (window.crit && window.crit.shared && window.crit.shared.showToast) {
+      window.crit.shared.showToast(message);
+    }
+  }
+
+  // ===== Agent Button =====
+  function isLiveThread(comment) {
+    if (!agentEnabled) return false;
+    return !!comment.live;
+  }
+
+  function checkAgentReplies(comments) {
+    for (const c of comments) {
+      if (pendingAgentRequests.has(c.id) && c.replies && c.replies.length > 0) {
+        const lastReply = c.replies[c.replies.length - 1];
+        if (lastReply.author === agentName) {
+          pendingAgentRequests.delete(c.id);
+        }
+      }
+    }
+  }
+
+  // ===== Comment Display =====
+  function buildCommentEnv(comment, filePath) {
+    const env = {};
+    const file = getFileByPath(filePath);
+    if (file && file.content && comment.start_line && comment.end_line && !comment.side) {
+      env.originalLines = comment.quote
+        ? comment.quote.split('\n')
+        : file.content.split('\n').slice(comment.start_line - 1, comment.end_line);
+    }
+    return env;
+  }
+
+  // Shared helper for building comment card skeleton (header, body, replies).
+  // Code-review-internal callers pass a sparse opts object; this wrapper
+  // injects the module-scoped deps and the default override callbacks. The
+  // real implementation lives in frontend/crit-comment-card.js so live-mode
+  // can mount the same renderer with its own deps.
+  function buildCommentCard(comment, filePath, opts) {
+    opts = opts || {};
+    const merged = Object.assign({}, opts);
+    if (typeof merged.isPendingAgentRequest !== 'function') {
+      merged.isPendingAgentRequest = function (id) { return pendingAgentRequests.has(id); };
+    }
+    if (typeof merged.getCollapseOverride !== 'function') {
+      merged.getCollapseOverride = function (id) { return commentCollapseOverrides[id]; };
+    }
+    if (typeof merged.setCollapseOverride !== 'function') {
+      merged.setCollapseOverride = function (id, val) { commentCollapseOverrides[id] = val; };
+    }
+    if (typeof merged.isLiveThread !== 'function') {
+      merged.isLiveThread = isLiveThread;
+    }
+    merged.deps = Object.assign({
+      commentMd: commentMd,
+      formatTime: formatTime,
+      authorColorIndex: authorColorIndex,
+      getReviewRound: function () { return session && session.review_round; },
+      getAgentName: function () { return agentName; },
+      buildCommentEnv: buildCommentEnv,
+      renderReplyList: renderReplyList,
+      createReplyInput: createReplyInput,
+      iconChevron: ICON_CHEVRON,
+      linkifyDom: linkifyCommentRefsInDom,
+    }, opts.deps || {});
+    return window.crit.commentCard.buildCommentCard(comment, filePath, merged);
+  }
+
+  function createCommentElement(comment, filePath) {
+    if (findFormForEdit(comment.id)) {
+      return createInlineEditor(comment, filePath);
+    }
+
+    const parts = buildCommentCard(comment, filePath, {
+      wrapperClass: 'comment-block',
+      cardClassExtra: comment.carried_forward ? 'carried-forward' : '',
+      collapseDefault: false,
+      showLineRef: true,
+      showReplyInput: true,
+    });
+
+    const editBtn = document.createElement('button');
+    editBtn.title = 'Edit';
+    editBtn.innerHTML = ICON_EDIT;
+    editBtn.addEventListener('click', () => editComment(comment, filePath));
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'delete-btn';
+    deleteBtn.title = 'Delete';
+    deleteBtn.innerHTML = ICON_DELETE;
+    deleteBtn.addEventListener('click', () => deleteComment(comment.id, filePath));
+
+    const resolveBtn = document.createElement('button');
+    resolveBtn.className = 'resolve-btn';
+    resolveBtn.title = 'Resolve';
+    resolveBtn.setAttribute('aria-label', 'Resolve thread');
+    resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
+    resolveBtn.addEventListener('click', function() {
+      if (resolveBtn.disabled) return;
+      resolveBtn.disabled = true;
+      toggleResolveStatus(comment.id, 'file', 'resolve', filePath)
+        .finally(function() { resolveBtn.disabled = false; });
+    });
+
+    parts.actions.appendChild(resolveBtn);
+    parts.actions.appendChild(editBtn);
+    parts.actions.appendChild(deleteBtn);
+
+    return parts.wrapper;
+  }
+
+  // Build a reply list container for a comment's replies
+  function renderReplyList(comment, filePath, extraClass) {
+    const repliesContainer = document.createElement('div');
+    repliesContainer.className = 'comment-replies' + (extraClass ? ' ' + extraClass : '');
+    comment.replies.forEach(function(reply) {
+      const replyEl = document.createElement('div');
+      replyEl.className = 'comment-reply';
+      replyEl.dataset.replyId = reply.id;
+
+      const replyHeader = document.createElement('div');
+      replyHeader.className = 'reply-header';
+
+      const replyMeta = document.createElement('div');
+      replyMeta.className = 'reply-meta';
+      if (reply.author) {
+        const replyAuthorBadge = document.createElement('span');
+        replyAuthorBadge.className = 'comment-author-badge author-color-' + authorColorIndex(reply.author);
+        replyAuthorBadge.textContent = '@' + reply.author;
+        replyMeta.appendChild(replyAuthorBadge);
+      }
+      const replyTime = document.createElement('span');
+      replyTime.className = 'reply-time';
+      replyTime.textContent = formatTime(reply.created_at);
+      replyMeta.appendChild(replyTime);
+      if (reply.github_id) {
+        const ghBadge = document.createElement('span');
+        ghBadge.className = 'github-badge';
+        ghBadge.textContent = 'GitHub';
+        ghBadge.title = 'Synced from GitHub';
+        ghBadge.setAttribute('aria-label', 'Synced from GitHub');
+        replyMeta.appendChild(ghBadge);
+      }
+      replyHeader.appendChild(replyMeta);
+
+      const replyActions = document.createElement('div');
+      replyActions.className = 'reply-actions';
+      const replyEditBtn = document.createElement('button');
+      replyEditBtn.title = 'Edit';
+      replyEditBtn.innerHTML = ICON_EDIT;
+      replyEditBtn.addEventListener('click', function(e) { e.stopPropagation(); editReply(comment.id, reply.id, filePath); });
+      const replyDeleteBtn = document.createElement('button');
+      replyDeleteBtn.className = 'delete-btn';
+      replyDeleteBtn.title = 'Delete';
+      replyDeleteBtn.innerHTML = ICON_DELETE;
+      replyDeleteBtn.addEventListener('click', function(e) { e.stopPropagation(); deleteReply(comment.id, reply.id, filePath); });
+      replyActions.appendChild(replyEditBtn);
+      replyActions.appendChild(replyDeleteBtn);
+      replyHeader.appendChild(replyActions);
+
+      replyEl.appendChild(replyHeader);
+
+      const replyBody = document.createElement('div');
+      replyBody.className = 'reply-body';
+      replyBody.dataset.rawBody = reply.body;
+      replyBody.innerHTML = commentMd.render(reply.body);
+      linkifyCommentRefsInDom(replyBody);
+      replyEl.appendChild(replyBody);
+
+      repliesContainer.appendChild(replyEl);
+    });
+    return repliesContainer;
+  }
+
+  // ===== Quote Highlighting in Document/Diff Body =====
+
+  function highlightQuotesInSection(sectionEl, file) {
+    const quotedComments = file.comments.filter(function(c) { return c.quote && !c.resolved; });
+
+    // Also highlight quotes from open (unsaved) comment forms
+    const formQuotes = getFormsForFile(file.path)
+      .filter(function(f) { return f.quote && !f.editingId; })
+      .map(function(f) {
+        return { start_line: f.startLine, end_line: f.endLine, quote: f.quote, quote_offset: f.quoteOffset, id: 'draft-' + f.formKey, side: f.side };
+      });
+    const allQuoted = quotedComments.concat(formQuotes);
+    if (allQuoted.length === 0) return;
+
+    allQuoted.forEach(function(comment) {
+      // Find the content elements in this comment's line range
+      const contentEls = [];
+      for (let ln = comment.start_line; ln <= comment.end_line; ln++) {
+        // Document view: line-blocks with data-file-path
+        sectionEl.querySelectorAll('.line-block[data-file-path="' + CSS.escape(file.path) + '"]').forEach(function(el) {
+          const s = parseInt(el.dataset.startLine);
+          const e = parseInt(el.dataset.endLine);
+          if (s <= ln && e >= ln) {
+            // Get the content div (skip gutter)
+            const content = el.querySelector('.line-content');
+            if (content && contentEls.indexOf(content) === -1) contentEls.push(content);
+          }
+        });
+        // Diff view: diff lines with data-diff-line-num
+        // Filter by side to avoid matching the wrong line in unified diff
+        // (deleted and added lines can share the same line number)
+        const commentSide = comment.side || '';
+        sectionEl.querySelectorAll('[data-diff-file-path="' + CSS.escape(file.path) + '"][data-diff-line-num="' + ln + '"]').forEach(function(el) {
+          if (el.dataset.diffSide !== commentSide) return;
+          const content = el.querySelector('.diff-content');
+          if (content && contentEls.indexOf(content) === -1) contentEls.push(content);
+        });
+      }
+
+      if (contentEls.length === 0) return;
+
+      // Collect all text nodes across the content elements
+      const textNodes = [];
+      contentEls.forEach(function(el) {
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+          if (node.textContent.length > 0) textNodes.push(node);
+        }
+      });
+
+      if (textNodes.length === 0) return;
+
+      // Build concatenated text and find the quote within it.
+      // Normalize the quote: collapse whitespace/newlines so cross-line selections match.
+      const fullText = textNodes.map(function(n) { return n.textContent; }).join('');
+      const normalizedQuote = comment.quote.replace(/\s+/g, ' ');
+      const normalizedFull = fullText.replace(/\s+/g, ' ');
+      let quoteIdx = -1;
+      // Use quote_offset when available to disambiguate duplicate substrings
+      if (comment.quote_offset !== null && comment.quote_offset !== undefined) {
+        const candidateIdx = comment.quote_offset;
+        if (normalizedFull.slice(candidateIdx, candidateIdx + normalizedQuote.length) === normalizedQuote) {
+          quoteIdx = candidateIdx;
+        }
+      }
+      if (quoteIdx === -1) {
+        quoteIdx = normalizedFull.indexOf(normalizedQuote);
+      }
+      if (quoteIdx === -1) {
+        quoteIdx = normalizedFull.toLowerCase().indexOf(normalizedQuote.toLowerCase());
+      }
+      if (quoteIdx === -1) return;
+
+      // Map the normalized index back to the original fullText position.
+      // Walk the original text, skipping collapsed whitespace to find the real start.
+      let origIdx = 0, normIdx = 0;
+      while (normIdx < quoteIdx && origIdx < fullText.length) {
+        if (/\s/.test(fullText[origIdx])) {
+          // In normalized form, consecutive whitespace collapses to one space
+          while (origIdx < fullText.length && /\s/.test(fullText[origIdx])) origIdx++;
+          normIdx++;
+        } else {
+          origIdx++;
+          normIdx++;
+        }
+      }
+      quoteIdx = origIdx;
+      // Find the end position similarly
+      let matchLen = 0, ni = 0;
+      while (ni < normalizedQuote.length && (origIdx + matchLen) < fullText.length) {
+        if (/\s/.test(fullText[origIdx + matchLen])) {
+          while ((origIdx + matchLen) < fullText.length && /\s/.test(fullText[origIdx + matchLen])) matchLen++;
+          ni++;
+        } else {
+          matchLen++;
+          ni++;
+        }
+      }
+
+      // Walk text nodes to find which ones overlap with the quote range
+      const quoteEnd = quoteIdx + matchLen;
+      let pos = 0;
+      for (let i = 0; i < textNodes.length; i++) {
+        const node = textNodes[i];
+        const nodeEnd = pos + node.textContent.length;
+        if (nodeEnd <= quoteIdx) { pos = nodeEnd; continue; }
+        if (pos >= quoteEnd) break;
+
+        // This node overlaps with the quote range
+        const startInNode = Math.max(0, quoteIdx - pos);
+        const endInNode = Math.min(node.textContent.length, quoteEnd - pos);
+
+        // Skip wrapping whitespace-only matches (e.g. newlines between blocks)
+        const matchText = node.textContent.slice(startInNode, endInNode);
+        if (!matchText.trim()) { pos = nodeEnd; continue; }
+
+        if (startInNode === 0 && endInNode === node.textContent.length) {
+          // Wrap entire text node
+          const mark = document.createElement('mark');
+          mark.className = 'quote-highlight';
+          mark.dataset.commentId = comment.id;
+          node.parentNode.replaceChild(mark, node);
+          mark.appendChild(node);
+        } else {
+          // Split and wrap partial text
+          const before = node.textContent.slice(0, startInNode);
+          const middle = node.textContent.slice(startInNode, endInNode);
+          const after = node.textContent.slice(endInNode);
+          const frag = document.createDocumentFragment();
+          if (before) frag.appendChild(document.createTextNode(before));
+          const mark = document.createElement('mark');
+          mark.className = 'quote-highlight';
+          mark.dataset.commentId = comment.id;
+          mark.textContent = middle;
+          frag.appendChild(mark);
+          if (after) frag.appendChild(document.createTextNode(after));
+          node.parentNode.replaceChild(frag, node);
+        }
+        pos = nodeEnd;
+      }
+    });
+  }
+
+  function createInlineEditor(comment, filePath) {
+    const formObj = findFormForEdit(comment.id);
+    if (!formObj) return null;
+
+    let headerText;
+    if (comment.scope === 'file') {
+      headerText = 'Editing file comment';
+    } else {
+      const lineRef = comment.start_line === comment.end_line
+        ? 'Line ' + comment.start_line
+        : 'Lines ' + comment.start_line + '-' + comment.end_line;
+      headerText = 'Editing comment on ' + lineRef;
+    }
+    const formEl = createCommentFormUI({
+      formObj: formObj,
+      headerText: headerText,
+      submitText: 'Update Comment',
+      initialBody: comment.body,
+      autoFocus: true
+    });
+
+    // Keep replies visible below the edit form, inside the form's card
+    if (comment.replies && comment.replies.length > 0) {
+      const formCard = formEl.querySelector('.comment-form');
+      if (formCard) {
+        formCard.appendChild(renderReplyList(comment, filePath));
+      }
+    }
+    return formEl;
+  }
+
+  function editComment(comment, filePath) {
+    const form = {
+      filePath: filePath,
+      afterBlockIndex: null,
+      startLine: comment.start_line,
+      endLine: comment.end_line,
+      editingId: comment.id,
+    };
+    if (comment.scope === 'file') form.scope = 'file';
+    openForm(form);
+  }
+
+  async function deleteComment(id, filePath) {
+    const file = getFileByPath(filePath);
+    if (!file) return;
+    try {
+      await fetch('/api/comment/' + id + '?path=' + enc(filePath), { method: 'DELETE' });
+      file.comments = file.comments.filter(c => c.id !== id);
+      pendingAgentRequests.delete(id);
+      userActedThisRound = true;
+    } catch (err) {
+      console.error('Error deleting comment:', err);
+    }
+    if (navCommentId === id) navCommentId = null;
+    renderFileByPath(filePath);
+    updateTreeCommentBadges();
+    updateCommentCount();
+  }
+
+  // Shared resolve/unresolve handler for both file-level and review-level comments.
+  // `type` is 'file' or 'review'; `action` is 'resolve' or 'unresolve'.
+  async function toggleResolveStatus(commentId, type, action, filePath) {
+    const resolved = action === 'resolve';
+    const url = type === 'file'
+      ? '/api/comment/' + commentId + '/resolve?path=' + enc(filePath)
+      : '/api/review-comment/' + commentId + '/resolve';
+    try {
+      const res = await fetch(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resolved: resolved }),
+      });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+    } catch (err) {
+      console.error('Error ' + action + ':', err);
+      showMiniToast('Failed to ' + action + ' comment');
+      return;
+    }
+    userActedThisRound = true;
+    if (type === 'file') {
+      refreshFileComments(filePath);
+    } else {
+      await refreshReviewComments();
+      renderReviewConversation();
+      renderCommentsPanel();
+      renderFileTree();
+    }
+  }
+
+  // Re-fetch comments for a file from the API and re-render
+  async function refreshFileComments(filePath) {
+    const file = getFileByPath(filePath);
+    if (!file) return;
+    try {
+      const res = await fetch('/api/file/comments?path=' + enc(filePath));
+      if (res.ok) {
+        file.comments = await res.json();
+      }
+    } catch (err) {
+      console.error('Error refreshing comments:', err);
+    }
+    checkAgentReplies(file.comments);
+    renderFileByPath(filePath);
+    updateCommentCount();
+    updateTreeCommentBadges();
+    renderCommentsPanel();
+  }
+
+  // ===== Review-Level (General) Comments =====
+  let reviewCommentSubmitting = false;
+  async function addReviewComment(body) {
+    if (!body.trim() || reviewCommentSubmitting) return;
+    reviewCommentSubmitting = true;
+    try {
+      const res = await fetch('/api/comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: body.trim(), author: configAuthor })
+      });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      const newComment = await res.json();
+      reviewComments.push(newComment);
+      userActedThisRound = true;
+    } catch (err) {
+      console.error('Error adding review comment:', err);
+      showMiniToast('Failed to add comment');
+      reviewCommentSubmitting = false;
+      return;
+    }
+    reviewCommentSubmitting = false;
+    reviewCommentFormActive = false;
+    reviewCommentEditingId = null;
+    // Clear the just-submitted textarea so renderReviewConversation's draft
+    // snapshot (line ~5670) doesn't mistake it for in-progress typing and
+    // re-open the form pre-populated with the submitted text.
+    const submittedTa = document.querySelector('#reviewConversation .comment-form[data-form-key="review:new"] textarea');
+    if (submittedTa) submittedTa.value = '';
+    updateCommentCount();
+    renderReviewConversation();
+    renderCommentsPanel();
+    renderFileTree();
+  }
+
+  async function updateReviewComment(id, body) {
+    if (!body.trim()) return;
+    try {
+      const res = await fetch('/api/review-comment/' + id, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: body.trim() })
+      });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      const updated = await res.json();
+      const idx = reviewComments.findIndex(function(c) { return c.id === id; });
+      if (idx >= 0) reviewComments[idx] = updated;
+      userActedThisRound = true;
+    } catch (err) {
+      console.error('Error updating review comment:', err);
+      showMiniToast('Failed to update comment');
+      return;
+    }
+    reviewCommentFormActive = false;
+    reviewCommentEditingId = null;
+    updateCommentCount();
+    renderReviewConversation();
+    renderCommentsPanel();
+  }
+
+  async function deleteReviewComment(id) {
+    try {
+      const res = await fetch('/api/review-comment/' + id, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      reviewComments = reviewComments.filter(function(c) { return c.id !== id; });
+      userActedThisRound = true;
+    } catch (err) {
+      console.error('Error deleting review comment:', err);
+      showMiniToast('Failed to delete comment');
+      return;
+    }
+    if (navCommentId === id) navCommentId = null;
+    updateCommentCount();
+    renderReviewConversation();
+    renderCommentsPanel();
+    renderFileTree();
+  }
+
+  function openReviewCommentForm() {
+    // No-op if form is already open
+    if (reviewCommentFormActive && !reviewCommentEditingId) return;
+    closeEmptyForms(null);
+    reviewCommentFormActive = true;
+    reviewCommentEditingId = null;
+    renderReviewConversation();
+    renderCommentsPanel();
+    scrollToReviewConversation();
+    requestAnimationFrame(function() {
+      const ta = document.querySelector('#reviewConversation textarea');
+      if (ta) ta.focus();
+    });
+  }
+
+  function openReviewCommentEditForm(comment) {
+    reviewCommentFormActive = true;
+    reviewCommentEditingId = comment.id;
+    renderReviewConversation();
+    renderCommentsPanel();
+    scrollToReviewConversation();
+    requestAnimationFrame(function() {
+      const ta = document.querySelector('#reviewConversation textarea');
+      if (ta) ta.focus();
+    });
+  }
+
+  function cancelReviewCommentForm() {
+    reviewCommentFormActive = false;
+    reviewCommentEditingId = null;
+    renderReviewConversation();
+    renderCommentsPanel();
+  }
+
+  function createReviewCommentFormUI() {
+    const formObj = { scope: 'review', filePath: '', startLine: 0, endLine: 0, formKey: 'review:new' };
+    return createCommentFormUI({
+      formObj: formObj,
+      headerText: 'Comment',
+      submitText: 'Comment',
+      initialBody: '',
+      autoFocus: false,
+      onSubmit: function(body) { addReviewComment(body); },
+      onCancel: function() { cancelReviewCommentForm(); },
+    });
+  }
+
+  function createReviewCommentEditor(comment) {
+    const formObj = { scope: 'review', filePath: '', startLine: 0, endLine: 0, editingId: comment.id, formKey: 'review:' + comment.id };
+    const el = createCommentFormUI({
+      formObj: formObj,
+      headerText: 'Editing comment',
+      submitText: 'Save',
+      initialBody: comment.body,
+      autoFocus: true,
+      onSubmit: function(body) { updateReviewComment(comment.id, body); },
+      onCancel: function() { cancelReviewCommentForm(); },
+    });
+    el.classList.add('panel-comment-block');
+    return el;
+  }
+
+  async function refreshReviewComments() {
+    try {
+      const res = await fetch('/api/comments');
+      if (res.ok) {
+        reviewComments = await res.json();
+      }
+    } catch (err) {
+      console.error('Error refreshing review comments:', err);
+    }
+    updateCommentCount();
+  }
+
+  // ===== Inline Review Conversation Section (top of document) =====
+
+  const REVIEW_CONVERSATION_PATH = '__review_conversation__';
+  const ICON_REVIEW_CONVERSATION =
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6A1.5 1.5 0 0 1 12.5 11H8.5l-3 2.75V11H3.5A1.5 1.5 0 0 1 2 9.5Z"/>' +
+    '</svg>';
+
+  function createReviewConversationCard(comment) {
+    const isResolved = comment.resolved;
+    const cardClassExtra = [
+      isResolved ? 'resolved-card' : '',
+      comment.carried_forward ? 'carried-forward' : '',
+    ].filter(Boolean).join(' ');
+
+    const parts = buildCommentCard(comment, '', {
+      wrapperClass: 'comment-block',
+      cardClassExtra: cardClassExtra,
+      collapseDefault: isResolved,
+      showLineRef: false,
+      showReplyInput: true,
+    });
+
+    if (isResolved) {
+      const unresolveBtn = document.createElement('button');
+      unresolveBtn.className = 'resolve-btn resolve-btn--active';
+      unresolveBtn.title = 'Unresolve';
+      unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
+      unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
+      unresolveBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (unresolveBtn.disabled) return;
+        unresolveBtn.disabled = true;
+        toggleResolveStatus(comment.id, 'review', 'unresolve', null)
+          .finally(function() { unresolveBtn.disabled = false; });
+      });
+      parts.actions.appendChild(unresolveBtn);
+    } else {
+      const resolveBtn = document.createElement('button');
+      resolveBtn.className = 'resolve-btn';
+      resolveBtn.title = 'Resolve';
+      resolveBtn.setAttribute('aria-label', 'Resolve thread');
+      resolveBtn.innerHTML = ICON_RESOLVE + '<span>Resolve</span>';
+      resolveBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (resolveBtn.disabled) return;
+        resolveBtn.disabled = true;
+        toggleResolveStatus(comment.id, 'review', 'resolve', null)
+          .finally(function() { resolveBtn.disabled = false; });
+      });
+      parts.actions.appendChild(resolveBtn);
+    }
+
+    const editBtn = document.createElement('button');
+    editBtn.title = 'Edit';
+    editBtn.innerHTML = ICON_EDIT;
+    editBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      openReviewCommentEditForm(comment);
+    });
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'delete-btn';
+    deleteBtn.title = 'Delete';
+    deleteBtn.innerHTML = ICON_DELETE;
+    deleteBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      deleteReviewComment(comment.id);
+    });
+    parts.actions.appendChild(editBtn);
+    parts.actions.appendChild(deleteBtn);
+
+    return parts.wrapper;
+  }
+
+  // Collapse state — host preference, persisted via cookie like other view prefs.
+  function isReviewConversationCollapsed() {
+    return getSetting('reviewConvCollapsed', false);
+  }
+  function setReviewConversationCollapsed(collapsed) {
+    setSetting('reviewConvCollapsed', !!collapsed);
+  }
+
+  const ICON_CHEVRON_DOWN =
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">' +
+    '<path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+  function renderReviewConversation() {
+    const section = document.getElementById('reviewConversation');
+    if (!section) return;
+
+    // Hide entirely until session is loaded
+    if (!session || !Array.isArray(files)) {
+      section.hidden = true;
+      return;
+    }
+
+    // Snapshot any in-progress NEW review-comment draft text before we wipe
+    // the DOM. Empty drafts intentionally fall through to the discard
+    // behavior — only protect non-empty text so refreshAfterReplyChange and
+    // sibling state changes don't blow away the user's typing.
+    let pendingNewDraft = '';
+    const existingNewTa = section.querySelector('.comment-form[data-form-key="review:new"] textarea');
+    if (existingNewTa && existingNewTa.value && existingNewTa.value.trim()) {
+      pendingNewDraft = existingNewTa.value;
+    }
+
+    section.hidden = false;
+    section.innerHTML = '';
+
+    // Match doc layout: file mode centers `.document-wrapper`, so we center the
+    // section too. Git mode renders file-sections full-width, so left-anchor.
+    if (session.mode === 'files') {
+      section.dataset.docLayout = 'centered';
+    } else {
+      delete section.dataset.docLayout;
+    }
+
+    const collapsed = isReviewConversationCollapsed() && !reviewCommentFormActive;
+    section.classList.toggle('collapsed', collapsed);
+
+    // Header — chevron on the left, matching `.tree-folder` and `.comment-card`
+    // collapse conventions elsewhere in the UI.
+    const header = document.createElement('div');
+    header.className = 'review-conversation-header';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'review-conversation-toggle';
+    toggle.title = collapsed ? 'Expand review conversation' : 'Collapse review conversation';
+    toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    toggle.setAttribute('aria-label', toggle.title);
+    toggle.innerHTML = ICON_CHEVRON_DOWN;
+    toggle.addEventListener('click', function() {
+      setReviewConversationCollapsed(!isReviewConversationCollapsed());
+      renderReviewConversation();
+    });
+    header.appendChild(toggle);
+
+    const headerLabel = document.createElement('span');
+    headerLabel.className = 'icon';
+    headerLabel.innerHTML = ICON_REVIEW_CONVERSATION;
+    header.appendChild(headerLabel);
+
+    const labelText = document.createElement('span');
+    labelText.className = 'label';
+    labelText.textContent = 'Review conversation';
+    header.appendChild(labelText);
+
+    // Match the file-tree badge convention: count unresolved (the "needs attention" signal),
+    // not total. Resolved threads are visible but de-emphasised.
+    const unresolvedCount = reviewComments.filter(function(c) { return !c.resolved; }).length;
+    if (unresolvedCount > 0) {
+      const count = document.createElement('span');
+      count.className = 'count';
+      count.textContent = String(unresolvedCount);
+      header.appendChild(count);
+    }
+    section.appendChild(header);
+
+    if (collapsed) return;
+
+    const body = document.createElement('div');
+    body.className = 'review-conversation-body';
+    section.appendChild(body);
+
+    // Threads (existing comments first; the editor renders inline at the matching position)
+    for (const comment of reviewComments) {
+      if (reviewCommentEditingId === comment.id) {
+        body.appendChild(createReviewCommentEditor(comment));
+      } else {
+        body.appendChild(createReviewConversationCard(comment));
+      }
+    }
+
+    // Footer: new-comment form (when active) | "Add comment" ghost button.
+    // The same button is used for both empty and populated states.
+    // If a non-empty draft existed before the re-render, keep the form open
+    // even if the active flag was somehow cleared — the user is typing.
+    const showNewForm = (reviewCommentFormActive || !!pendingNewDraft) && !reviewCommentEditingId;
+    if (showNewForm) {
+      const formEl = createReviewCommentFormUI();
+      body.appendChild(formEl);
+      if (pendingNewDraft) {
+        const ta = formEl.querySelector('textarea');
+        if (ta) {
+          ta.value = pendingNewDraft;
+          // Match the "expanded" state the user was in (createCommentFormUI
+          // builds the textarea directly, so just place caret at the end).
+          // Restore focus too — the user was actively typing when the
+          // re-render fired (refreshAfterReplyChange, SSE), so dropping
+          // focus would force them to click back into the textarea.
+          try {
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+            ta.focus();
+          } catch {}
+        }
+      }
+    } else {
+      const addMore = document.createElement('button');
+      // .review-conversation-empty doubles as an E2E selector for the
+      // empty-state composer and is intentionally only added when the
+      // conversation has no comments.
+      const isEmpty = reviewComments.length === 0;
+      addMore.className = 'review-conversation-add-more' + (isEmpty ? ' review-conversation-empty' : '');
+      addMore.type = 'button';
+      addMore.textContent = 'Add comment';
+      addMore.addEventListener('click', function() { openReviewCommentForm(); });
+      body.appendChild(addMore);
+    }
+  }
+
+  function scrollToReviewConversation() {
+    // If the user collapsed it, expand on navigate so the target is visible.
+    if (isReviewConversationCollapsed()) {
+      setReviewConversationCollapsed(false);
+      renderReviewConversation();
+    }
+    const section = document.getElementById('reviewConversation');
+    if (!section) return;
+    ignoreTreeObserverUntil = Date.now() + 200;
+    // Only scroll if the section isn't already comfortably in view —
+    // otherwise clicking the in-view "Add comment" button feels jarring.
+    const rect = section.getBoundingClientRect();
+    const headerOffset = (document.querySelector('.app-header') || {}).offsetHeight || 0;
+    if (rect.top < headerOffset || rect.top > window.innerHeight) {
+      section.scrollIntoView({ block: 'start', behavior: 'instant' });
+    }
+    updateTreeActive(REVIEW_CONVERSATION_PATH);
+  }
+
+  // Scroll to and flash a specific review-level comment card. Mirrors scrollToComment.
+  function scrollToReviewComment(commentId) {
+    if (isReviewConversationCollapsed()) {
+      setReviewConversationCollapsed(false);
+      renderReviewConversation();
+    }
+    const section = document.getElementById('reviewConversation');
+    if (!section) return;
+    const card = section.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
+    if (!card) {
+      scrollToReviewConversation();
+      return;
+    }
+    ignoreTreeObserverUntil = Date.now() + 200;
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.remove('comment-card-highlight');
+    void card.offsetWidth;
+    card.classList.add('comment-card-highlight');
+    card.addEventListener('animationend', function() {
+      card.classList.remove('comment-card-highlight');
+    }, { once: true });
+    updateTreeActive(REVIEW_CONVERSATION_PATH);
+  }
+
+  // Build the URL for a reply mutation (edit or delete). filePath empty → review-level.
+  function replyMutationUrl(commentId, replyId, filePath) {
+    return filePath
+      ? '/api/comment/' + commentId + '/replies/' + replyId + '?path=' + enc(filePath)
+      : '/api/review-comment/' + commentId + '/replies/' + replyId;
+  }
+
+  async function refreshAfterReplyChange(filePath) {
+    if (filePath) {
+      refreshFileComments(filePath);
+    } else {
+      await refreshReviewComments();
+      renderReviewConversation();
+      renderCommentsPanel();
+      renderFileTree();
+    }
+  }
+
+  async function editReply(commentId, replyId, filePath) {
+    const replyEl = document.querySelector('[data-reply-id="' + replyId + '"]');
+    if (!replyEl) return;
+    const bodyEl = replyEl.querySelector('.reply-body');
+    if (!bodyEl) return;
+    // Use raw markdown if available, fall back to textContent
+    const currentText = bodyEl.dataset.rawBody || bodyEl.textContent;
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'comment-textarea';
+    textarea.value = currentText;
+    textarea.rows = 3;
+    bodyEl.replaceWith(textarea);
+    attachImageUploads(textarea);
+    textarea.focus();
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn-sm btn-primary';
+    saveBtn.textContent = 'Save';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-sm';
+    cancelBtn.textContent = 'Cancel';
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'reply-edit-actions';
+    btnRow.appendChild(saveBtn);
+    btnRow.appendChild(cancelBtn);
+    replyEl.appendChild(btnRow);
+
+    cancelBtn.addEventListener('click', () => refreshAfterReplyChange(filePath));
+    saveBtn.addEventListener('click', async () => {
+      const newBody = textarea.value.trim();
+      if (!newBody) return;
+      try {
+        const res = await fetch(replyMutationUrl(commentId, replyId, filePath), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: newBody })
+        });
+        if (!res.ok) throw new Error('Server returned ' + res.status);
+      } catch (err) {
+        console.error('Error editing reply:', err);
+        showMiniToast('Failed to edit reply');
+        return;
+      }
+      userActedThisRound = true;
+      refreshAfterReplyChange(filePath);
+    });
+
+    bindSubmitCancelKeys(textarea, function() { saveBtn.click(); }, function() { cancelBtn.click(); });
+  }
+
+  async function deleteReply(commentId, replyId, filePath) {
+    try {
+      const res = await fetch(replyMutationUrl(commentId, replyId, filePath), {
+        method: 'DELETE'
+      });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      userActedThisRound = true;
+    } catch (err) {
+      console.error('Error deleting reply:', err);
+    }
+    refreshAfterReplyChange(filePath);
+  }
+
+  function createReplyInput(commentId, filePath) {
+    const form = document.createElement('div');
+    form.className = 'reply-form';
+
+    // Check if this comment is pending agent response
+    const isPending = pendingAgentRequests.has(commentId);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'reply-input';
+    input.placeholder = isPending ? 'Waiting for @' + agentName + '\u2026' : 'Write a reply\u2026';
+    if (isPending) input.disabled = true;
+    form.appendChild(input);
+
+    // Expanded state elements (hidden initially)
+    const textarea = document.createElement('textarea');
+    textarea.className = 'reply-textarea';
+    textarea.placeholder = isPending ? 'Waiting for @' + agentName + '\u2026' : 'Write a reply\u2026';
+    textarea.rows = 3;
+    if (isPending) textarea.disabled = true;
+
+    const buttons = document.createElement('div');
+    buttons.className = 'reply-form-buttons';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-sm';
+    cancelBtn.textContent = 'Cancel';
+
+    const submitBtn = document.createElement('button');
+    submitBtn.className = 'btn btn-sm btn-primary';
+    submitBtn.textContent = 'Reply';
+
+    buttons.appendChild(cancelBtn);
+    buttons.appendChild(submitBtn);
+
+    attachFilePicker(textarea);
+    attachImageUploads(textarea);
+
+    function expand() {
+      if (form.classList.contains('expanded')) return;
+      closeEmptyReviewForm();
+      closeEmptyForms(null);
+      form.classList.add('expanded');
+      textarea.value = input.value;
+      input.replaceWith(textarea);
+      form.appendChild(buttons);
+      textarea.focus();
+      activeReplyForms.set(commentId, { text: textarea.value });
+    }
+
+    function collapse() {
+      if (!form.classList.contains('expanded')) return;
+      form.classList.remove('expanded');
+      textarea.replaceWith(input);
+      input.value = '';
+      if (buttons.parentNode) buttons.remove();
+      activeReplyForms.delete(commentId);
+    }
+
+    input.addEventListener('focus', expand);
+
+    // Keep reply form state in sync for surviving re-renders
+    textarea.addEventListener('input', function() {
+      activeReplyForms.set(commentId, { text: textarea.value });
+    });
+
+    cancelBtn.addEventListener('click', collapse);
+
+    // Collapse on blur if empty (with delay to allow button clicks)
+    textarea.addEventListener('blur', function() {
+      setTimeout(function() {
+        if (form.classList.contains('expanded') && !textarea.value.trim() && !form.contains(document.activeElement)) {
+          collapse();
+        }
+      }, 150);
+    });
+
+    submitBtn.addEventListener('click', async function() {
+      const body = textarea.value.trim();
+      if (!body) return;
+      submitBtn.disabled = true;
+      try {
+        const payload = { body: body };
+        if (configAuthor) payload.author = configAuthor;
+        const url = filePath
+          ? '/api/comment/' + commentId + '/replies?path=' + enc(filePath)
+          : '/api/review-comment/' + commentId + '/replies';
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error('Server returned ' + res.status);
+        userActedThisRound = true;
+
+        // Live-thread agent dispatch only applies to file-scoped comments.
+        if (filePath) {
+          const file = getFileByPath(filePath);
+          const comment = file && file.comments ? file.comments.find(function(c) { return c.id === commentId; }) : null;
+          if (comment && (isLiveThread(comment) || pendingAgentRequests.has(commentId))) {
+            pendingAgentRequests.add(commentId);
+            fetch('/api/agent/request', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ comment_id: commentId, file_path: filePath }),
+            }).catch(function(err) {
+              console.error('Error sending reply to agent:', err);
+              pendingAgentRequests.delete(commentId);
+              showMiniToast('Failed to send to agent');
+            });
+          }
+        }
+
+        activeReplyForms.delete(commentId);
+        collapse();
+        refreshAfterReplyChange(filePath);
+      } catch (err) {
+        console.error('Failed to add reply:', err);
+        showMiniToast('Failed to save reply');
+        submitBtn.disabled = false;
+      }
+    });
+
+    textarea.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        e.stopPropagation();
+        submitBtn.click();
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!textarea.value.trim()) {
+          collapse();
+        }
+      }
+    });
+
+    // Restore saved reply form state after DOM re-render
+    const saved = activeReplyForms.get(commentId);
+    if (saved && saved.text) {
+      form.classList.add('expanded');
+      textarea.value = saved.text;
+      input.replaceWith(textarea);
+      form.appendChild(buttons);
+    }
+
+    return form;
+  }
+
+  function createResolvedElement(comment, filePath) {
+    const parts = buildCommentCard(comment, filePath, {
+      wrapperClass: 'comment-block',
+      cardClassExtra: 'resolved-card',
+      collapseDefault: true,
+      showLineRef: true,
+      showReplyInput: true,
+    });
+
+    const unresolveBtn = document.createElement('button');
+    unresolveBtn.className = 'resolve-btn resolve-btn--active';
+    unresolveBtn.title = 'Unresolve';
+    unresolveBtn.setAttribute('aria-label', 'Unresolve thread');
+    unresolveBtn.innerHTML = ICON_UNRESOLVE + '<span>Unresolve</span>';
+    unresolveBtn.addEventListener('click', function() {
+      if (unresolveBtn.disabled) return;
+      unresolveBtn.disabled = true;
+      toggleResolveStatus(comment.id, 'file', 'unresolve', filePath)
+        .finally(function() { unresolveBtn.disabled = false; });
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'delete-btn';
+    deleteBtn.title = 'Delete';
+    deleteBtn.innerHTML = ICON_DELETE;
+    deleteBtn.addEventListener('click', function() { deleteComment(comment.id, filePath); });
+
+    parts.actions.appendChild(unresolveBtn);
+    parts.actions.appendChild(deleteBtn);
+
+    return parts.wrapper;
+  }
+
+  // ===== Comment Count =====
+  function updateCommentCount() {
+    let unresolved = 0, resolved = 0;
+    for (const f of files) {
+      for (const c of f.comments) {
+        if (c.resolved) resolved++; else unresolved++;
+      }
+    }
+    for (const c of reviewComments) {
+      if (c.resolved) resolved++; else unresolved++;
+    }
+    const total = unresolved + resolved;
+    window.crit.shared.updateCommentCountIndicator({ totalCount: total, openCount: unresolved });
+    renderCommentsPanel();
+    if (uiState === 'reviewing') {
+      const openTotal = unresolved + hiddenUnresolved;
+      document.getElementById('finishBtn').textContent = openTotal === 0 ? 'Approve' : 'Finish Review';
+    }
+  }
+
+  function updateTocPosition() {
+    const toc = document.getElementById('toc');
+    const commentsPanel = document.getElementById('commentsPanel');
+    const prPanel = document.getElementById('prPanel');
+    if (!toc) return;
+    const commentsOpen = commentsPanel && !commentsPanel.classList.contains('comments-panel-hidden');
+    const prOpen = prPanel && !prPanel.classList.contains('pr-panel-hidden');
+    const tocBaseRight = 16;
+    let panelWidth = 0;
+    if (commentsOpen && commentsPanel) panelWidth = commentsPanel.offsetWidth;
+    if (prOpen && prPanel) panelWidth = prPanel.offsetWidth;
+    toc.style.right = panelWidth > 0 ? (panelWidth + tocBaseRight) + 'px' : '';
+  }
+
+  function toggleCommentsPanel() {
+    const panel = document.getElementById('commentsPanel');
+    const isHidden = panel.classList.contains('comments-panel-hidden');
+    panel.classList.toggle('comments-panel-hidden');
+    if (isHidden) {
+      // Close PR panel when opening comments
+      document.getElementById('prPanel').classList.add('pr-panel-hidden');
+      renderCommentsPanel();
+    }
+    updateTocPosition();
+  }
+
+  function createPanelCommentCard(comment, filePath) {
+    // Build a real comment card for the panel, but without reply input/buttons
+    const isGeneral = !filePath;
+    const isResolved = comment.resolved;
+
+    const cardClassExtra = [
+      isResolved ? 'resolved-card' : '',
+      comment.carried_forward ? 'carried-forward' : '',
+    ].filter(Boolean).join(' ');
+
+    const parts = buildCommentCard(comment, filePath || '', {
+      wrapperClass: 'comment-block panel-comment-block',
+      cardClassExtra: cardClassExtra,
+      collapseDefault: isResolved,
+      showLineRef: !isGeneral,
+      repliesExtraClass: 'panel-replies',
+      showReplyInput: false,
+    });
+
+    // Resolve/unresolve button — works for both file and review comments
+    const scope = isGeneral ? 'review' : 'file';
+    const resolveAction = isResolved ? 'unresolve' : 'resolve';
+    const resolveBtn = document.createElement('button');
+    resolveBtn.className = 'resolve-btn' + (isResolved ? ' resolve-btn--active' : '');
+    resolveBtn.title = isResolved ? 'Unresolve' : 'Resolve';
+    resolveBtn.setAttribute('aria-label', isResolved ? 'Unresolve thread' : 'Resolve thread');
+    resolveBtn.innerHTML = (isResolved ? ICON_UNRESOLVE : ICON_RESOLVE) + '<span>' + (isResolved ? 'Unresolve' : 'Resolve') + '</span>';
+    resolveBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (resolveBtn.disabled) return;
+      resolveBtn.disabled = true;
+      toggleResolveStatus(comment.id, scope, resolveAction, filePath || null)
+        .finally(function() { resolveBtn.disabled = false; });
+    });
+    parts.actions.appendChild(resolveBtn);
+
+    if (isGeneral) {
+      parts.wrapper.style.cursor = 'pointer';
+      parts.wrapper.addEventListener('click', function(e) {
+        if (e.target.closest('.comment-actions')) return;
+        scrollToReviewComment(comment.id);
+      });
+    } else {
+      // File comments are clickable to scroll to inline location
+      parts.wrapper.style.cursor = 'pointer';
+      parts.wrapper.addEventListener('click', function(e) {
+        // Don't scroll if clicking action buttons
+        if (e.target.closest('.comment-actions')) return;
+        scrollToComment(comment.id, filePath);
+      });
+    }
+
+    return parts.wrapper;
+  }
+
+  // Track active filter: 'all', 'open', 'resolved'. In-memory only —
+  // sticky filter would hide new open comments on a new review session.
+  let commentsActiveFilter = 'all';
+
+  function renderCommentsPanel() {
+    const panel = document.getElementById('commentsPanel');
+    if (panel.classList.contains('comments-panel-hidden')) return;
+
+    const body = document.getElementById('commentsPanelBody');
+    const savedScroll = body.scrollTop;
+    body.innerHTML = '';
+
+    // Compute counts
+    const allFileComments = files.reduce(function(acc, f) { return acc.concat(f.comments); }, []);
+    const allComments = reviewComments.concat(allFileComments);
+    const totalCount = allComments.length;
+    const openCount = allComments.filter(function(c) { return !c.resolved; }).length;
+    const resolvedCount = allComments.filter(function(c) { return c.resolved; }).length;
+
+    // Update count badge
+    const badge = document.getElementById('commentsPanelCountBadge');
+    if (badge) badge.textContent = totalCount;
+
+    // Update pill counts and sync active-state to persisted filter
+    const pillBtns = document.querySelectorAll('#commentsFilterPill .toggle-btn');
+    pillBtns.forEach(function(btn) {
+      const f = btn.dataset.filter;
+      const isActive = f === commentsActiveFilter;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-checked', isActive ? 'true' : 'false');
+      btn.setAttribute('tabindex', isActive ? '0' : '-1');
+      const countEl = btn.querySelector('.filter-count');
+      if (!countEl) return;
+      if (f === 'all') countEl.textContent = totalCount;
+      else if (f === 'open') countEl.textContent = openCount;
+      else if (f === 'resolved') countEl.textContent = resolvedCount;
+    });
+
+    // Filter function based on active pill
+    const visibleFilter = function(c) {
+      if (commentsActiveFilter === 'open') return !c.resolved;
+      if (commentsActiveFilter === 'resolved') return c.resolved;
+      return true;
+    };
+
+    let hasComments = false;
+
+    // Render review-level (general) comments first.
+    // Note: the compose/edit form is rendered in the inline Review Conversation
+    // section at the top of the document (see renderReviewConversation), not here.
+    // Cards in the panel are read-only mirrors that link back to the inline section.
+    const visibleReviewComments = reviewComments.filter(visibleFilter);
+    if (visibleReviewComments.length > 0) {
+      hasComments = true;
+      const group = document.createElement('div');
+      group.className = 'comments-panel-file-group';
+
+      group.appendChild(createFileGroupHeader('Review conversation', visibleReviewComments.length, group));
+
+      const cards = document.createElement('div');
+      cards.className = 'comments-panel-file-cards';
+      for (let j = 0; j < visibleReviewComments.length; j++) {
+        const comment = visibleReviewComments[j];
+        cards.appendChild(createPanelCommentCard(comment, null));
+      }
+      group.appendChild(cards);
+      body.appendChild(group);
+    }
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const visibleComments = file.comments.filter(visibleFilter);
+      if (visibleComments.length === 0) continue;
+      hasComments = true;
+
+      visibleComments.sort(function(a, b) { return a.start_line - b.start_line; });
+
+      const group = document.createElement('div');
+      group.className = 'comments-panel-file-group';
+
+      // File name header (only in multi-file mode)
+      if (files.length > 1) {
+        group.appendChild(createFileGroupHeader(file.path, visibleComments.length, group));
+      }
+
+      const cards = document.createElement('div');
+      cards.className = 'comments-panel-file-cards';
+      for (let j = 0; j < visibleComments.length; j++) {
+        const comment = visibleComments[j];
+        cards.appendChild(createPanelCommentCard(comment, file.path));
+      }
+      group.appendChild(cards);
+      body.appendChild(group);
+    }
+
+    if (!hasComments && !reviewCommentFormActive) {
+      const empty = document.createElement('div');
+      empty.className = 'comments-panel-empty';
+      const emptyMsg = commentsActiveFilter === 'open' ? 'No open comments' : commentsActiveFilter === 'resolved' ? 'No resolved comments' : 'No comments yet';
+      empty.textContent = emptyMsg;
+      body.appendChild(empty);
+    }
+    body.scrollTop = savedScroll;
+    updateExpandAllLabel();
+  }
+
+  function createFileGroupHeader(label, count, groupEl) {
+    const groupName = document.createElement('div');
+    groupName.className = 'comments-panel-file-name';
+    groupName.setAttribute('role', 'button');
+    groupName.setAttribute('tabindex', '0');
+    groupName.setAttribute('aria-expanded', 'true');
+
+    const chevron = document.createElement('span');
+    chevron.className = 'comments-panel-file-chevron';
+    chevron.textContent = '\u25BC';
+    chevron.setAttribute('aria-hidden', 'true');
+    groupName.appendChild(chevron);
+
+    const nameText = document.createElement('span');
+    nameText.className = 'comments-panel-file-name-text';
+    nameText.textContent = label;
+    nameText.title = label;
+    groupName.appendChild(nameText);
+
+    const countEl = document.createElement('span');
+    countEl.className = 'comments-panel-file-count';
+    countEl.textContent = count;
+    groupName.appendChild(countEl);
+
+    groupName.addEventListener('click', function() {
+      groupEl.classList.toggle('collapsed');
+      const expanded = !groupEl.classList.contains('collapsed');
+      groupName.setAttribute('aria-expanded', String(expanded));
+    });
+
+    groupName.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        groupName.click();
+      }
+    });
+
+    return groupName;
+  }
+
+  // All comment cards across the inline document/diff views and the side panel.
+  function getAllCommentCards() {
+    const panelCards = document.querySelectorAll('#commentsPanelBody .comment-card');
+    const inlineCards = document.querySelectorAll('.comment-block:not(.panel-comment-block) .comment-card');
+    return Array.from(panelCards).concat(Array.from(inlineCards));
+  }
+
+  function updateExpandAllLabel() {
+    const btn = document.getElementById('commentsPanelExpandAll');
+    if (!btn) return;
+    const allCards = getAllCommentCards();
+    const anyExpanded = allCards.some(function(c) { return !c.classList.contains('collapsed'); });
+    btn.textContent = anyExpanded ? 'Collapse all' : 'Expand all';
+    btn.setAttribute('aria-pressed', String(anyExpanded));
+  }
+
+  function toggleExpandAllComments() {
+    const allCards = getAllCommentCards();
+    const anyExpanded = allCards.some(function(c) { return !c.classList.contains('collapsed'); });
+
+    allCards.forEach(function(card) {
+      if (anyExpanded) {
+        card.classList.add('collapsed');
+      } else {
+        card.classList.remove('collapsed');
+      }
+      const id = card.dataset.commentId;
+      if (id) commentCollapseOverrides[id] = anyExpanded;
+    });
+
+    updateExpandAllLabel();
+  }
+
+
+  function scrollToComment(commentId, filePath) {
+    // 1. Find the file section and expand if collapsed
+    const section = document.getElementById('file-section-' + filePath);
+    if (!section) return;
+    if (!section.open) section.open = true;
+
+    // 2. Find the inline comment card by comment ID
+    const commentCard = section.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
+    if (!commentCard) return;
+
+    // 3. Scroll into view
+    commentCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    // 4. Flash highlight
+    commentCard.classList.remove('comment-card-highlight');
+    void commentCard.offsetWidth;
+    commentCard.classList.add('comment-card-highlight');
+    commentCard.addEventListener('animationend', function() {
+      commentCard.classList.remove('comment-card-highlight');
+    }, { once: true });
+
+  }
+
+  // ===== PR Overview Panel =====
+  function togglePRPanel() {
+    const panel = document.getElementById('prPanel');
+    const isHidden = panel.classList.contains('pr-panel-hidden');
+    panel.classList.toggle('pr-panel-hidden');
+    // Close comments panel if opening PR panel
+    if (isHidden) {
+      document.getElementById('commentsPanel').classList.add('comments-panel-hidden');
+      renderPRPanel();
+    }
+    updateTocPosition();
+  }
+
+  function renderPRPanel() {
+    const panel = document.getElementById('prPanel');
+    if (panel.classList.contains('pr-panel-hidden')) return;
+    const pr = prData;
+    if (!pr) return;
+
+    const body = document.getElementById('prPanelBody');
+    body.innerHTML = '';
+
+    // PR title row with close button
+    const linkSection = document.createElement('div');
+    linkSection.className = 'pr-panel-link-section';
+
+    const prLink = document.createElement('a');
+    prLink.className = 'pr-panel-pr-link';
+    prLink.href = pr.pr_url;
+    prLink.target = '_blank';
+    prLink.rel = 'noopener noreferrer';
+    prLink.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z"/></svg>' +
+      '<span class="pr-panel-pr-title-text">' + escapeHtml(pr.pr_title || 'Pull Request') + ' <span class="pr-panel-pr-number">#' + pr.pr_number + '</span></span>';
+    linkSection.appendChild(prLink);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'pr-panel-close';
+    closeBtn.title = 'Close';
+    closeBtn.setAttribute('aria-label', 'Close PR panel');
+    closeBtn.innerHTML = '&#x2715;';
+    closeBtn.addEventListener('click', function() {
+      document.getElementById('prPanel').classList.add('pr-panel-hidden');
+      updateTocPosition();
+    });
+    linkSection.appendChild(closeBtn);
+
+    body.appendChild(linkSection);
+
+    // State badge + meta
+    const metaSection = document.createElement('div');
+    metaSection.className = 'pr-panel-meta';
+
+    const stateLabel = (pr.pr_state || 'OPEN').toUpperCase();
+    let stateClass = 'pr-panel-state';
+    if (stateLabel === 'MERGED') stateClass += ' pr-panel-state-merged';
+    else if (stateLabel === 'CLOSED') stateClass += ' pr-panel-state-closed';
+    else stateClass += ' pr-panel-state-open';
+    if (pr.pr_is_draft) stateClass += ' pr-panel-state-draft';
+
+    const stateBadge = document.createElement('span');
+    stateBadge.className = stateClass;
+    stateBadge.textContent = pr.pr_is_draft ? 'Draft' : stateLabel.charAt(0) + stateLabel.slice(1).toLowerCase();
+    metaSection.appendChild(stateBadge);
+
+    if (pr.pr_author) {
+      const authorEl = document.createElement('span');
+      authorEl.className = 'pr-panel-author';
+      authorEl.textContent = pr.pr_author;
+      metaSection.appendChild(authorEl);
+    }
+
+    body.appendChild(metaSection);
+
+    // Branch info
+    if (pr.pr_head_ref && pr.pr_base_ref) {
+      const branchInfo = document.createElement('div');
+      branchInfo.className = 'pr-panel-branches';
+      branchInfo.innerHTML =
+        '<span class="pr-panel-branch">' + escapeHtml(pr.pr_head_ref) + '</span>' +
+        '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" class="pr-panel-arrow"><path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z"/></svg>' +
+        '<span class="pr-panel-branch">' + escapeHtml(pr.pr_base_ref) + '</span>';
+      body.appendChild(branchInfo);
+    }
+
+    // Stats
+    const statsSection = document.createElement('div');
+    statsSection.className = 'pr-panel-stats';
+
+    if (pr.pr_changed_files !== undefined) {
+      const filesStat = document.createElement('span');
+      filesStat.className = 'pr-panel-stat';
+      filesStat.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
+        pr.pr_changed_files + ' file' + (pr.pr_changed_files !== 1 ? 's' : '');
+      statsSection.appendChild(filesStat);
+    }
+
+    if (pr.pr_additions !== undefined || pr.pr_deletions !== undefined) {
+      const diffStat = document.createElement('span');
+      diffStat.className = 'pr-panel-stat';
+      diffStat.innerHTML =
+        '<span class="pr-panel-additions">+' + (pr.pr_additions || 0) + '</span>' +
+        '<span class="pr-panel-deletions">-' + (pr.pr_deletions || 0) + '</span>';
+      statsSection.appendChild(diffStat);
+    }
+
+    body.appendChild(statsSection);
+
+    // Description (PR body)
+    if (pr.pr_body && pr.pr_body.trim()) {
+      const descSection = document.createElement('div');
+      descSection.className = 'pr-panel-description';
+
+      const descTitle = document.createElement('div');
+      descTitle.className = 'pr-panel-section-title';
+      descTitle.textContent = 'Description';
+      descSection.appendChild(descTitle);
+
+      const descBody = document.createElement('div');
+      descBody.className = 'pr-panel-description-body';
+      descBody.innerHTML = commentMd.render(pr.pr_body);
+      linkifyCommentRefsInDom(descBody);
+      descSection.appendChild(descBody);
+
+      body.appendChild(descSection);
+    }
+  }
+
+  function updateViewedCount() {
+    let viewed = 0;
+    for (let i = 0; i < files.length; i++) {
+      if (files[i].viewed) viewed++;
+    }
+    const el = document.getElementById('viewedCount');
+    if (files.length <= 1) { el.textContent = ''; return; }
+    el.textContent = viewed + ' / ' + files.length + ' files viewed';
+    el.classList.toggle('all-viewed', viewed === files.length);
+  }
+
+  // ===== Waiting Modal Tips =====
+  function startTipRotation() {
+    const extra = [];
+    if (!agentEnabled) {
+      extra.push('Set <kbd>agent_cmd</kbd> in your config to send comments directly to your AI agent for immediate feedback.');
+    }
+    if (shareURL && !authUserName) {
+      extra.push('Run <kbd>crit auth login</kbd> to link shared reviews with your account.');
+    }
+    if (shareURL) {
+      extra.push('Create a team on <kbd>' + shareURL.replace(/^https?:\/\//, '') + '</kbd> to group and secure your shared reviews.');
+    }
+    window.crit.shared.startTipRotation(extra);
+  }
+
+  function stopTipRotation() {
+    window.crit.shared.stopTipRotation();
+  }
+
+  // ===== UI State =====
+  function updateHeaderRound() {
+    const el = document.getElementById('headerNotify');
+    if (session.review_round > 1) {
+      el.textContent = 'Round #' + session.review_round;
+    }
+  }
+
+  function setUIState(state) {
+    uiState = state;
+    if (state === 'reviewing') { waitingNotApproved = false; stopTipRotation(); }
+    const finishBtn = document.getElementById('finishBtn');
+    const waitingOverlay = document.getElementById('waitingOverlay');
+
+    switch (state) {
+      case 'reviewing':
+        let unresolvedComments = 0;
+        for (let fi = 0; fi < files.length; fi++) {
+          if (files[fi].comments) unresolvedComments += files[fi].comments.filter(function(c) { return !c.resolved; }).length;
+        }
+        unresolvedComments += reviewComments.filter(function(c) { return !c.resolved; }).length;
+        unresolvedComments += hiddenUnresolved;
+        finishBtn.textContent = unresolvedComments === 0 ? 'Approve' : 'Finish Review';
+        finishBtn.disabled = false;
+        finishBtn.classList.add('btn-primary');
+        document.getElementById('waitingEdits').textContent = '';
+        waitingOverlay.classList.remove('active');
+        break;
+      case 'waiting':
+        finishBtn.textContent = 'Waiting...';
+        finishBtn.disabled = true;
+        finishBtn.classList.remove('btn-primary');
+        document.getElementById('waitingEdits').textContent = '';
+        document.getElementById('promptCopyRow').style.display = '';
+        document.getElementById('waitingDivider').style.display = '';
+        document.getElementById('tipSection').style.display = '';
+        startTipRotation();
+        waitingOverlay.classList.add('active');
+        break;
+    }
+  }
+
+  // ===== General Comment Button (in panel header) =====
+
+  // ===== Finish Review =====
+  // The DOM/clipboard/animation logic lives in crit.shared.runFinishReview;
+  // this thin wrapper preserves the app.js-specific waitingNotApproved flag
+  // and uiState transition (live-mode wires its own state machine).
+  async function doFinishReview() {
+    return await window.crit.shared.runFinishReview({
+      onApproved: function () { waitingNotApproved = false; setUIState('waiting'); },
+      onWaiting: function () { waitingNotApproved = true; setUIState('waiting'); },
+      onError: function (err) {
+        console.error('Error finishing review:', err);
+        showMiniToast('Failed to finish review');
+      },
+    });
+  }
+
+  async function resolveAllAndFinish() {
+    // Resolve all unresolved file comments
+    for (let fi = 0; fi < files.length; fi++) {
+      const fileComments = files[fi].comments || [];
+      for (let ci = 0; ci < fileComments.length; ci++) {
+        if (!fileComments[ci].resolved) {
+          try {
+            await fetch('/api/comment/' + fileComments[ci].id + '/resolve?path=' + enc(files[fi].path), {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ resolved: true }),
+            });
+          } catch {}
+        }
+      }
+    }
+    // Resolve all unresolved review comments
+    for (let ri = 0; ri < reviewComments.length; ri++) {
+      if (!reviewComments[ri].resolved) {
+        try {
+          await fetch('/api/review-comment/' + reviewComments[ri].id + '/resolve', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolved: true }),
+          });
+        } catch {}
+      }
+    }
+    await doFinishReview();
+  }
+
+  function showNoChangesConfirm() {
+    document.getElementById('noChangesOverlay').classList.add('active');
+  }
+
+  function hideNoChangesConfirm() {
+    document.getElementById('noChangesOverlay').classList.remove('active');
+  }
+
+  document.getElementById('noChangesResolveAll').addEventListener('click', async function() {
+    hideNoChangesConfirm();
+    await resolveAllAndFinish();
+  });
+
+  document.getElementById('noChangesSendAnyway').addEventListener('click', async function() {
+    hideNoChangesConfirm();
+    await doFinishReview();
+  });
+
+  document.getElementById('noChangesGoBack').addEventListener('click', function() {
+    hideNoChangesConfirm();
+  });
+
+  document.getElementById('finishBtn').addEventListener('click', async function() {
+    if (uiState !== 'reviewing') return;
+
+    // Check if user took no action but there are unresolved comments.
+    // Only warn when ALL unresolved comments are carried-forward (from a previous round)
+    // and the user hasn't added, edited, resolved, or replied to anything this round.
+    let unresolvedCount = 0;
+    let hasNewComments = false;
+    for (let fi = 0; fi < files.length; fi++) {
+      if (!files[fi].comments) continue;
+      for (let ci = 0; ci < files[fi].comments.length; ci++) {
+        const c = files[fi].comments[ci];
+        if (!c.resolved) unresolvedCount++;
+        if (!c.carried_forward) hasNewComments = true;
+      }
+    }
+    for (let ri = 0; ri < reviewComments.length; ri++) {
+      if (!reviewComments[ri].resolved) unresolvedCount++;
+      if (!reviewComments[ri].carried_forward) hasNewComments = true;
+    }
+
+    if (!userActedThisRound && !hasNewComments && unresolvedCount > 0) {
+      showNoChangesConfirm();
+      return;
+    }
+
+    await doFinishReview();
+  });
+
+  document.getElementById('backToEditing').addEventListener('click', function() {
+    setUIState('reviewing');
+  });
+
+  document.getElementById('waitingOverlay').addEventListener('click', function(e) {
+    if (e.target === this) setUIState('reviewing');
+  });
+
+  document.getElementById('waitingClipboard').addEventListener('click', async function() {
+    const prompt = document.getElementById('waitingPrompt').textContent;
+    try {
+      await navigator.clipboard.writeText(prompt);
+      const el = document.getElementById('waitingClipboard');
+      const label = el.querySelector('.copy-label');
+      label.textContent = 'Copied';
+      el.classList.add('copied');
+      el.setAttribute('aria-label', 'Copied');
+      announceCopy();
+      setTimeout(function() {
+        label.textContent = 'Copy';
+        el.classList.remove('copied');
+        el.setAttribute('aria-label', 'Copy prompt to clipboard');
+      }, 2000);
+    } catch {}
+  });
+
+  // ===== SSE Client =====
+
+  function connectSSE() {
+    let sseErrorCount = 0;
+
+    const conn = window.crit.sse.createSSE('/api/events', {
+      'file-changed': async function() {
+      try {
+        // Reset action tracking for new round
+        userActedThisRound = false;
+
+        // Capture per-file user state before rebuilding
+        const prevState = {};
+        for (let pi = 0; pi < files.length; pi++) {
+          prevState[files[pi].path] = {
+            viewMode: files[pi].viewMode,
+            collapsed: files[pi].collapsed,
+            diffLoaded: files[pi].diffLoaded,
+            viewed: files[pi].viewed,
+            fileHash: files[pi].fileHash,
+          };
+        }
+
+        // Clear commit filter on round-complete
+        selectedCommits.clear();
+        recomputeDiffCommit();
+
+        // Re-fetch everything on file-changed (round complete)
+        const sessionRes = await fetch('/api/session?scope=' + enc(diffScope)).then(r => r.json());
+        session = sessionRes;
+        reviewComments = sessionRes.review_comments || [];
+
+        // Reload all files
+        files = await loadAllFileData(session.files || [], diffScope);
+        hiddenUnresolved = session.hidden_unresolved || 0;
+
+        // Restore per-file user state from previous round
+        for (let fi = 0; fi < files.length; fi++) {
+          const prev = prevState[files[fi].path];
+          if (prev) {
+            const contentChanged = prev.fileHash && files[fi].fileHash && prev.fileHash !== files[fi].fileHash;
+            files[fi].viewMode = prev.viewMode;
+            // Lazy files must stay collapsed — they have no content to render
+            if (!files[fi].lazy && !contentChanged) files[fi].collapsed = prev.collapsed;
+            if (prev.diffLoaded) files[fi].diffLoaded = prev.diffLoaded;
+            if (prev.viewed && !contentChanged) files[fi].viewed = true;
+          }
+        }
+
+        files.sort(fileSortComparator);
+
+        activeForms = [];
+        activeReplyForms.clear();
+        activeFilePath = null;
+        selectionStart = null;
+        selectionEnd = null;
+        focusedBlockIndex = null;
+        focusedFilePath = null;
+        focusedElement = null;
+        diffActive = false;
+        reviewCommentFormActive = false;
+        reviewCommentEditingId = null;
+        navCommentId = null;
+
+        saveViewedState();
+        updateHeaderRound();
+        updateDiffModeToggle();
+        renderFileTree();
+        renderAllFiles();
+        buildToc();
+        updateCommentCount();
+        updateViewedCount();
+        updateTreeViewedState();
+        setUIState('reviewing');
+        // Signal "ready" in the tab bar if the user has tabbed away.
+        // Cleared by the visibilitychange listener when they return.
+        if (document.visibilityState !== 'visible') setTabBadge();
+      } catch (err) {
+        console.error('Error handling file-changed:', err);
+      }
+      },
+      'edit-detected': function(data) {
+      try {
+        const count = parseInt(data.content, 10);
+        const el = document.getElementById('waitingEdits');
+        if (el && uiState === 'waiting') {
+          el.innerHTML = '<span class="waiting-edits-badge"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><line x1="12" y1="7" x2="12" y2="11"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>' + count + ' edit' + (count === 1 ? '' : 's') + '</span>';
+          // Hide prompt copy row and divider once agent starts making edits
+          const copyRow = document.getElementById('promptCopyRow');
+          const divider = document.getElementById('waitingDivider');
+          if (copyRow) copyRow.style.display = 'none';
+          if (divider) divider.style.display = 'none';
+          if (waitingNotApproved) {
+            document.getElementById('waitingMessage').textContent = 'Waiting for your agent to finish...';
+          }
+        }
+      } catch {}
+      },
+      'comments-changed': async function() {
+      try {
+        // Only re-fetch comments data, not file content or diffs (those only
+        // change on file-changed events). This reduces O(3N) to O(N) requests.
+        await Promise.all(files.map(async function(f) {
+          return fetch('/api/file/comments?path=' + enc(f.path))
+            .then(function(r) { return r.ok ? r.json() : []; })
+            .then(function(comments) { f.comments = Array.isArray(comments) ? comments : []; })
+            .catch(function() { /* ignore fetch errors */ });
+        }));
+        // Also refresh review-level comments
+        try {
+          const rcRes = await fetch('/api/comments');
+          if (rcRes.ok) reviewComments = await rcRes.json();
+        } catch {}
+        // Save form drafts and focused element before re-render
+        let focusedFormKey = null;
+        let focusedSelStart = 0;
+        let focusedSelEnd = 0;
+        const activeEl = document.activeElement;
+        if (activeEl && activeEl.tagName === 'TEXTAREA') {
+          const formEl = activeEl.closest('.comment-form');
+          if (formEl) {
+            focusedFormKey = formEl.dataset.formKey;
+            focusedSelStart = activeEl.selectionStart;
+            focusedSelEnd = activeEl.selectionEnd;
+          }
+        }
+        for (let i = 0; i < files.length; i++) {
+          checkAgentReplies(files[i].comments);
+          saveOpenFormContent(files[i].path);
+        }
+        renderAllFiles();
+        updateCommentCount();
+        updateTreeCommentBadges();
+        // Restore focus
+        if (focusedFormKey) {
+          const ta = document.querySelector('.comment-form[data-form-key="' + focusedFormKey + '"] textarea');
+          if (ta) {
+            ta.focus();
+            ta.selectionStart = focusedSelStart;
+            ta.selectionEnd = focusedSelEnd;
+          }
+        }
+      } catch (err) {
+        console.error('Error handling comments-changed:', err);
+      }
+      },
+      'base-changed': function() {
+      reloadForScope();
+      fetchCommits();
+      },
+      'focus-changed': function(data) {
+      try {
+        // Server SSE wraps every event in {type, filename, content} where
+        // `content` is a JSON string carrying the actual payload. Parse the
+        // SSE envelope first, then the inner content for the focus object.
+        const envelope = data || {};
+        const inner = envelope.content ? JSON.parse(envelope.content) : envelope;
+        const focus = inner && inner.focus;
+        if (focus) {
+          if (session) {
+            session.focus = focus;
+            // last_range_focus may flip on every focus transition (server
+            // stashes the old range when leaving range mode). Mirror the
+            // server snapshot so renderResumePill sees the latest value.
+            session.last_range_focus = inner.last_range_focus || null;
+          }
+          applyFocusToHeader(focus);
+          // Re-fetch the stack on any range focus transition — the new
+          // focus may live in a different stack, and the breadcrumb's
+          // visibility uses stack.length (not is_stacked) so we need the
+          // server's view either way. Cheap (cached server-side for 60s).
+          if (session && session.mode === 'git' && focus.kind === 'range') {
+            loadStackFromPicker();
+          }
+        }
+      } catch (err) {
+        console.error('focus-changed parse:', err);
+      }
+      // Reuse the same refresh path as base-changed.
+      reloadForScope();
+      fetchCommits();
+      },
+      'server-shutdown': function() {
+      conn.close();
+      showDisconnected();
+      },
+    }, {
+      onError: function() {
+        sseErrorCount++;
+        if (sseErrorCount >= 3) {
+          showMiniToast('Connection lost \u2014 retrying\u2026');
+        }
+      },
+    });
+
+    // Reset error count on successful events by wrapping source listeners
+    conn.source.addEventListener('message', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('file-changed', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('comments-changed', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('base-changed', function() { sseErrorCount = 0; });
+  }
+
+  function showDisconnected() {
+    window.crit.shared.showDisconnected();
+  }
+
+  // ===== Share =====
+  // The full Share flow (button states, modals, org picker, pull/re-share,
+  // unpublish, popup relay) lives in crit-share.js (window.crit.share) and is
+  // wired up via shareCtl in init(). refreshAllComments (below) stays here \u2014
+  // it's app.js-specific (files[] + renderCommentsPanel) and is passed to the
+  // controller as the onCommentsRefreshed adapter.
+
+  // After /api/comments/merge updates the local review file, re-fetch each
+  // file's comments and re-render in place. Uses the existing per-file
+  // refresh + render-panel path — preserves scroll position, expanded
+  // threads, and unsubmitted drafts (no location.reload).
+  async function refreshAllComments() {
+    await Promise.all(files.map(async function(f) {
+      try {
+        const r = await fetch('/api/file/comments?path=' + enc(f.path));
+        if (r.ok) {
+          f.comments = await r.json();
+        }
+      } catch { /* per-file refresh is best-effort */ }
+    }));
+    renderCommentsPanel();
+    updateCommentCount();
+    updateTreeCommentBadges();
+  }
+
+  // Announce copy action to screen readers via live region. Used by the
+  // finish-review copy flow and the settings overlay (crit-share.js has its
+  // own internal copy for the share modal's clipboard buttons).
+  function announceCopy() {
+    const el = document.getElementById('copyStatus');
+    if (el) { el.textContent = ''; el.textContent = 'Copied to clipboard'; }
+  }
+
+  // ===== Toast System =====
+  function showToast(id, type, content, opts) {
+    dismissToast(id);
+    const container = document.getElementById('toastContainer');
+    const el = document.createElement('div');
+    el.className = 'toast toast-' + type;
+    el.id = 'toast-' + id;
+    el.innerHTML = content;
+    container.appendChild(el);
+    if (opts && opts.autoDismiss) {
+      setTimeout(function() { dismissToast(id); }, 4000);
+    }
+    return el;
+  }
+
+  function dismissToast(id) {
+    const el = document.getElementById('toast-' + id);
+    if (!el) return;
+    el.classList.add('toast-out');
+    el.addEventListener('animationend', function() { el.remove(); }, { once: true });
+  }
+
+  // Event delegation for toast dismiss buttons (replaces inline onclick)
+  document.getElementById('toastContainer').addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-dismiss-toast]');
+    if (btn) dismissToast(btn.dataset.dismissToast);
+  });
+
+  // ===== Table of Contents =====
+  function buildToc() {
+    const tocEl = document.getElementById('toc');
+    const listEl = tocEl.querySelector('.toc-list');
+    const toggleBtn = document.getElementById('tocToggle');
+    listEl.innerHTML = '';
+
+    function hideToc() {
+      toggleBtn.style.display = 'none';
+      tocEl.classList.add('toc-hidden');
+    }
+
+    // TOC only for single-file markdown reviews
+    if (session.mode === 'git' || files.length > 1) {
+      hideToc();
+      return;
+    }
+
+    // Gather TOC from all markdown files
+    const allItems = [];
+    for (const f of files) {
+      if (f.tocItems && f.tocItems.length > 0) {
+        for (const item of f.tocItems) {
+          allItems.push({ ...item, filePath: f.path });
+        }
+      }
+    }
+
+    // A single-heading TOC has nothing to navigate to — hide it.
+    if (allItems.length < 2) {
+      hideToc();
+      return;
+    }
+    toggleBtn.style.display = '';
+
+    // Restore TOC open/closed state from cookie
+    if (getSetting('toc', 'closed') === 'open') {
+      tocEl.classList.remove('toc-hidden');
+    }
+
+    const minLevel = Math.min(...allItems.map(i => i.level));
+    for (const item of allItems) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = '#';
+      a.textContent = item.text;
+      a.dataset.startLine = item.startLine;
+      a.dataset.filePath = item.filePath;
+      a.style.paddingLeft = (12 + (item.level - minLevel) * 10) + 'px';
+      a.addEventListener('click', function(e) {
+        e.preventDefault();
+        // Uncollapse the file section first
+        const sectionEl = document.getElementById('file-section-' + item.filePath);
+        if (sectionEl) {
+          const file = getFileByPath(item.filePath);
+          if (file) file.collapsed = false;
+          sectionEl.open = true;
+        }
+        // Find the line block matching this heading's start line
+        const target = sectionEl && sectionEl.querySelector('.line-block[data-start-line="' + item.startLine + '"]');
+        if (target) {
+          const mainHeader = document.querySelector('.header');
+          const offset = (mainHeader ? mainHeader.offsetHeight : 49) + 8;
+          const y = target.getBoundingClientRect().top + window.scrollY - offset;
+          window.scrollTo({ top: y, behavior: 'smooth' });
+        } else {
+          scrollToFile(item.filePath);
+        }
+      });
+      li.appendChild(a);
+      listEl.appendChild(li);
+    }
+
+    // Scrollspy: highlight current heading in TOC
+    setupTocScrollspy(allItems);
+  }
+
+  let tocScrollHandler = null;
+  function setupTocScrollspy(items) {
+    if (tocScrollHandler) {
+      window.removeEventListener('scroll', tocScrollHandler);
+      tocScrollHandler = null;
+    }
+    if (!items || items.length === 0) return;
+
+    tocScrollHandler = function() {
+      const headerHeight = (document.querySelector('.header')?.offsetHeight || 49) + 16;
+      let activeItem = null;
+
+      for (const item of items) {
+        const sectionEl = document.getElementById('file-section-' + item.filePath);
+        const block = sectionEl && sectionEl.querySelector('.line-block[data-start-line="' + item.startLine + '"]');
+        if (!block) continue;
+        const rect = block.getBoundingClientRect();
+        if (rect.top <= headerHeight) {
+          activeItem = item;
+        }
+      }
+
+      const tocLinks = document.querySelectorAll('.toc-list a');
+      for (const link of tocLinks) {
+        const isActive = activeItem &&
+          link.dataset.startLine === String(activeItem.startLine) &&
+          link.dataset.filePath === activeItem.filePath;
+        link.classList.toggle('toc-active', !!isActive);
+      }
+    };
+
+    window.addEventListener('scroll', tocScrollHandler, { passive: true });
+    tocScrollHandler();
+  }
+
+  // ===== Hash Navigation (heading anchors) =====
+  function scrollToHashHeading() {
+    const hash = window.location.hash;
+    if (!hash || hash === '#') return;
+    const target = document.getElementById(decodeURIComponent(hash.slice(1)));
+    if (!target) return;
+    const headerHeight = (document.querySelector('.header')?.offsetHeight || 49) + 8;
+    const y = target.getBoundingClientRect().top + window.scrollY - headerHeight;
+    window.scrollTo({ top: y, behavior: 'instant' });
+  }
+  window.addEventListener('hashchange', scrollToHashHeading);
+
+  document.addEventListener('click', function(e) {
+    const anchor = e.target.closest('.heading-anchor');
+    if (!anchor) return;
+    e.preventDefault();
+    const hash = anchor.getAttribute('href');
+    const url = anchor.href;
+    history.replaceState(null, '', hash);
+    scrollToHashHeading();
+    navigator.clipboard.writeText(url).then(function() {
+      anchor.classList.add('heading-anchor-copied');
+      setTimeout(function() { anchor.classList.remove('heading-anchor-copied'); }, 1500);
+    }).catch(function() {});
+  });
+
+  // ===== Mermaid =====
+  function getMermaidTheme() {
+    const dataTheme = document.documentElement.getAttribute('data-theme');
+    if (dataTheme === 'light') return 'default';
+    if (dataTheme === 'dark') return 'dark';
+    // System theme: check prefers-color-scheme
+    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'default' : 'dark';
+  }
+
+  function renderMermaidBlocks() {
+    if (typeof mermaid === 'undefined') return;
+    mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
+    const codes = document.querySelectorAll('code.language-mermaid');
+    codes.forEach(function(code) {
+      const pre = code.parentElement;
+      if (!pre || pre.tagName !== 'PRE') return;
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = code.textContent;
+      pre.replaceWith(container);
+    });
+    try { mermaid.run(); } catch {}
+  }
+
+  // ===== Theme =====
+  function initTheme() {
+    const saved = getSetting('theme', 'system');
+    applyTheme(saved);
+  }
+
+  window.applyTheme = function(choice) {
+    setSetting('theme', choice);
+    if (choice === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    else if (choice === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+    else document.documentElement.removeAttribute('data-theme');
+
+    // Re-initialize mermaid diagrams with updated theme
+    if (typeof mermaid !== 'undefined') {
+      mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
+      try { mermaid.run(); } catch {}
+    }
+  };
+
+  // ===== Width =====
+  function initWidth() {
+    const saved = getSetting('width', 'default');
+    applyWidth(saved);
+  }
+
+  function applyWidth(choice) {
+    setSetting('width', choice);
+    if (choice === 'compact') document.documentElement.setAttribute('data-width', 'compact');
+    else if (choice === 'wide') document.documentElement.setAttribute('data-width', 'wide');
+    else document.documentElement.setAttribute('data-width', 'default');
+  }
+
+  // ===== Sidebar Resize =====
+  // File-tree and comments-panel widths are user-resizable via drag handles.
+  // Persisted as numeric pixels in the consolidated `crit-settings` cookie;
+  // absent = use the CSS default.
+  // Only a minimum is enforced (keeps the handle reachable and the panel usable).
+  // No upper bound — ultrawide users may legitimately want very wide sidebars,
+  // and overflow just adds a horizontal scrollbar.
+  const SIDEBAR_RESIZE = [
+    { handleId: 'fileTreeResizer',     targetId: 'fileTreePanel',  settingKey: 'fileTreeWidth',     min: 180, edge: 'right' },
+    { handleId: 'commentsPanelResizer', targetId: 'commentsPanel', settingKey: 'commentsPanelWidth', min: 300, edge: 'left'  },
+  ];
+
+  function initSidebarWidths() {
+    SIDEBAR_RESIZE.forEach(function(cfg) {
+      const target = document.getElementById(cfg.targetId);
+      if (!target) return;
+      const handle = document.getElementById(cfg.handleId);
+      if (!handle) return;
+      // Pointer capture, body.sidebar-resizing class, persistence, min clamp,
+      // and keyboard a11y all live in the shared helper. Both code-review
+      // handles (file-tree, comments-panel) and live-mode's comments-panel
+      // share the implementation so cursor-locking and keyboard nudge stay
+      // in lockstep across modes.
+      window.crit.shared.installSidebarResize(handle, target, {
+        settingKey: cfg.settingKey,
+        min: cfg.min,
+        edge: cfg.edge,
+      });
+    });
+  }
+
+  // ===== Update Button =====
+  document.getElementById('updateBtn').addEventListener('click', function() {
+    openSettingsPanel('settings');
+  });
+
+  // ===== Diff Mode Toggle (Split / Unified) =====
+  document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      const mode = btn.dataset.mode;
+      if (mode === diffMode) return;
+      diffMode = mode;
+      setSetting('diffMode', mode);
+      document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.mode === mode);
+      });
+      renderAllFiles();
+    });
+  });
+
+  // ===== Toggle Diff (rendered diff view for file mode) =====
+  document.getElementById('diffToggle').addEventListener('click', function() {
+    diffActive = !diffActive;
+    updateDiffModeToggle();
+    renderAllFiles();
+  });
+
+  // ===== Commit Picker (sidebar dropdown) =====
+  const commitDropdownEl = document.getElementById('commitDropdown');
+
+  async function fetchCommits() {
+    try {
+      const res = await fetch('/api/commits');
+      if (!res.ok) { commitDropdownEl.style.display = 'none'; return; }
+      commitList = await res.json();
+      if (!commitList || commitList.length < 2) {
+        commitDropdownEl.style.display = 'none';
+        selectedCommits.clear();
+        recomputeDiffCommit();
+        return;
+      }
+      // Drop any selected SHA that's no longer present in the new commit list,
+      // then recompute the derived backend param.
+      const present = new Set(commitList.map(function(c) { return c.sha; }));
+      selectedCommits.forEach(function(sha) {
+        if (!present.has(sha)) selectedCommits.delete(sha);
+      });
+      recomputeDiffCommit();
+      commitDropdownEl.style.display = '';
+      renderCommitPicker();
+    } catch {
+      commitDropdownEl.style.display = 'none';
+    }
+  }
+
+  // Recompute the derived diffCommit backend param from selectedCommits.
+  // commitList is newest-first, so the smallest index is the newest (head)
+  // and the largest index is the oldest. For a 2+ range the base is the
+  // PARENT of the oldest selected commit (commitList[oldestIdx + 1].sha) or
+  // session.base_ref when the oldest selected commit is the first commit.
+  // Emits FULL 40-char SHAs (the backend validates hex 4-40): commitList SHAs
+  // come from /api/commits, and session.base_ref is a merge-base SHA — both are
+  // guaranteed present and hex whenever the picker is interactive, because
+  // GetCommits returns nil (→ commitList empty → picker hidden) when base_ref
+  // is unset. The empty-base guard below is belt-and-suspenders for that
+  // invariant: never emit a malformed "..<head>" range that would silently
+  // fall back to the full unscoped diff on the backend.
+  function recomputeDiffCommit() {
+    if (selectedCommits.size === 0) {
+      diffCommit = '';
+      return;
+    }
+    if (selectedCommits.size === 1) {
+      diffCommit = selectedCommits.values().next().value;
+      return;
+    }
+    let newestIdx = Infinity;
+    let oldestIdx = -1;
+    commitList.forEach(function(c, i) {
+      if (selectedCommits.has(c.sha)) {
+        if (i < newestIdx) newestIdx = i;
+        if (i > oldestIdx) oldestIdx = i;
+      }
+    });
+    const head = commitList[newestIdx].sha;
+    const base = commitList[oldestIdx + 1]
+      ? commitList[oldestIdx + 1].sha
+      : (session.base_ref || '');
+    // Defensive: if base is somehow unavailable, fall back to the newest
+    // selected commit alone rather than a broken range.
+    diffCommit = base ? base + '..' + head : head;
+  }
+
+  function renderCommitPicker() {
+    const list = document.getElementById('commitDropdownList');
+    const allItem = document.querySelector('.commit-picker-item[data-commit=""]');
+    const label = document.getElementById('commitDropdownLabel');
+
+    // Compute the contiguous in-range span [newestIdx, oldestIdx] so commits
+    // between two checked commits show an "in range" indicator even when not
+    // themselves checked (the diff includes them).
+    let newestIdx = Infinity;
+    let oldestIdx = -1;
+    if (selectedCommits.size >= 2) {
+      commitList.forEach(function(c, i) {
+        if (selectedCommits.has(c.sha)) {
+          if (i < newestIdx) newestIdx = i;
+          if (i > oldestIdx) oldestIdx = i;
+        }
+      });
+    }
+
+    // "All commits" is active when nothing is checked.
+    if (selectedCommits.size === 0) {
+      if (allItem) allItem.classList.add('active');
+      if (label) label.textContent = 'All commits';
+    } else {
+      if (allItem) allItem.classList.remove('active');
+      if (selectedCommits.size === 1) {
+        const sel = commitList.find(function(c) { return selectedCommits.has(c.sha); });
+        if (sel && label) label.textContent = sel.short_sha + ' ' + (sel.message.length > 30 ? sel.message.slice(0, 30) + '\u2026' : sel.message);
+      } else if (label) {
+        // The diff spans the whole contiguous range, so count commits in the
+        // span (oldestIdx - newestIdx + 1) \u2014 not just the checked ones \u2014 so the
+        // label stays honest when in-between commits are included.
+        const spanCount = oldestIdx - newestIdx + 1;
+        label.textContent = spanCount + ' commits';
+      }
+    }
+
+    list.innerHTML = commitList.map(function(c, i) {
+      const checked = selectedCommits.has(c.sha);
+      const inRange = !checked && i > newestIdx && i < oldestIdx;
+      const cls = 'commit-picker-item' + (checked ? ' active' : '') + (inRange ? ' in-range' : '');
+      const time = c.date ? '<span class="commit-picker-item-time">' + relativeTime(c.date) + '</span>' : '';
+      const rangeHint = inRange ? '<span class="commit-picker-item-range">in range</span>' : '';
+      return '<div class="' + cls + '" data-commit="' + c.sha + '">'
+        + '<input type="checkbox" class="commit-picker-item-check"' + (checked ? ' checked' : '')
+        + ' aria-label="Select commit ' + escapeHtml(c.short_sha) + '">'
+        + '<span class="commit-picker-item-sha">' + escapeHtml(c.short_sha) + '</span>'
+        + '<span class="commit-picker-item-msg">' + escapeHtml(c.message.length > 40 ? c.message.slice(0, 40) + '\u2026' : c.message) + '</span>'
+        + rangeHint
+        + time
+        + '</div>';
+    }).join('');
+  }
+
+  // Toggle dropdown open/close
+  document.getElementById('commitDropdownBtn').addEventListener('click', function() {
+    commitDropdownEl.classList.toggle('open');
+  });
+
+  // Close on outside click
+  document.addEventListener('click', function(e) {
+    if (!commitDropdownEl.contains(e.target)) {
+      commitDropdownEl.classList.remove('open');
+    }
+  });
+
+  // Close on Escape (only when open)
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && commitDropdownEl.classList.contains('open')) {
+      commitDropdownEl.classList.remove('open');
+      e.stopImmediatePropagation();
+    }
+  });
+
+  // Item selection (delegate from dropdown menu). Multi-select: clicking a row
+  // toggles its checkbox and keeps the dropdown OPEN. Clicking the checkbox
+  // directly is handled by the same path (we drive the Set, not the input's
+  // own checked state) so there's no double-toggle. The "All commits" row
+  // (data-commit="") clears the entire selection.
+  document.getElementById('commitDropdownMenu').addEventListener('click', function(e) {
+    const item = e.target.closest('.commit-picker-item');
+    if (!item) return;
+    // renderCommitPicker() below replaces #commitDropdownList's innerHTML,
+    // orphaning the clicked node. Without this, the click bubbles to the
+    // document outside-click handler, where commitDropdownEl.contains(e.target)
+    // is false for the now-detached node and the dropdown closes — defeating
+    // multi-select stay-open. Stop propagation so the menu owns this click.
+    e.stopPropagation();
+    const sha = item.dataset.commit;
+    const prevDiffCommit = diffCommit;
+    if (sha === '') {
+      selectedCommits.clear();
+    } else if (selectedCommits.has(sha)) {
+      selectedCommits.delete(sha);
+    } else {
+      selectedCommits.add(sha);
+    }
+    recomputeDiffCommit();
+    renderCommitPicker();
+    // Only reload if the derived range actually changed (e.g. checking a commit
+    // already inside the in-range span doesn't change the diff).
+    if (diffCommit !== prevDiffCommit) reloadForScope();
+  });
+
+  // The "All commits" row (data-commit="") has no focusable child — unlike the
+  // dynamic commit rows, whose checkbox is keyboard-operable — so it carries
+  // role="button" tabindex="0". Route Enter/Space through the same click path
+  // so clearing the selection is keyboard-reachable.
+  document.getElementById('commitDropdownMenu').addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+    const item = e.target.closest('.commit-picker-item[data-commit=""]');
+    if (!item) return;
+    e.preventDefault();
+    item.click();
+  });
+
+  // ===== Scope Toggle (All / Branch / Staged / Unstaged) =====
+  document.getElementById('scopeToggle').addEventListener('click', async function(e) {
+    const btn = e.target.closest('.toggle-btn');
+    if (!btn || btn.disabled || btn.classList.contains('active')) return;
+    const scope = btn.dataset.scope;
+    diffScope = scope;
+    navCommentId = null;
+    setSetting('diffScope', scope);
+    if (scope !== 'all' && scope !== 'branch') {
+      selectedCommits.clear();
+      recomputeDiffCommit();
+      commitDropdownEl.style.display = 'none';
+    } else {
+      fetchCommits();
+    }
+    document.querySelectorAll('#scopeToggle .toggle-btn').forEach(function(b) {
+      b.classList.toggle('active', b.dataset.scope === scope);
+    });
+    await reloadForScope();
+  });
+
+  let reloadInFlight = null;
+  // Tracks the (scope, commit) the in-flight reload was started for. If a new
+  // reloadForScope() call happens with different inputs while the previous one
+  // is still running, we chain a follow-up rather than collapsing onto the
+  // stale promise — otherwise the caller awaits a fetch for the OLD scope and
+  // the new scope is never requested. Surfaced as a Windows-only e2e flake:
+  // slower file I/O made loadAllFileData() outlast the next click handler, so
+  // clicks that swapped scope returned the previous scope's in-flight promise.
+  let reloadInFlightKey = null;
+  async function reloadForScope() {
+    const key = diffScope + '\0' + diffCommit;
+    if (reloadInFlight && reloadInFlightKey === key) return reloadInFlight;
+    if (reloadInFlight) {
+      // Different inputs — chain after the in-flight reload finishes so we
+      // don't tear down filesContainer mid-render. The previous reload's
+      // finally clears reloadInFlight; we then re-enter reloadForScope().
+      const prev = reloadInFlight;
+      const chained = prev.then(function() { return reloadForScope(); }, function() { return reloadForScope(); });
+      return chained;
+    }
+    reloadInFlightKey = key;
+    reloadInFlight = (async function() {
+      try {
+        activeReplyForms.clear();
+        document.getElementById('filesContainer').innerHTML =
+          '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
+
+        let sessionUrl = '/api/session?scope=' + enc(diffScope);
+        if (diffCommit) sessionUrl += '&commit=' + enc(diffCommit);
+        const sessionRes = await fetch(sessionUrl).then(function(r) { return r.json(); });
+        session = sessionRes;
+        reviewComments = sessionRes.review_comments || [];
+
+        // Update base branch label if it changed
+        if (session.base_branch_name) {
+          currentBaseBranch = session.base_branch_name;
+          document.getElementById('baseBranchLabel').textContent = currentBaseBranch;
+        }
+
+        if (!session.files || session.files.length === 0) {
+          document.getElementById('filesContainer').innerHTML =
+            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">No ' + diffScope + ' changes</div>';
+          files = [];
+          renderFileTree();
+          updateCommentCount();
+          updateViewedCount();
+          return;
+        }
+
+        files = await loadAllFileData(session.files, diffScope);
+        hiddenUnresolved = session.hidden_unresolved || 0;
+        files.sort(fileSortComparator);
+        restoreViewedState();
+        renderFileTree();
+        renderAllFiles();
+        buildToc();
+        updateCommentCount();
+        updateViewedCount();
+      } finally {
+        reloadInFlight = null;
+        reloadInFlightKey = null;
+      }
+    })();
+    return reloadInFlight;
+  }
+
+  // ===== Base Branch Picker =====
+  const baseBranchPickerEl = document.getElementById('baseBranchPicker');
+  const baseBranchBtnEl = document.getElementById('baseBranchBtn');
+  let baseBranches = [];
+  let currentBaseBranch = ''; // display name of the current base branch
+  const branchPicker = { highlightedIdx: -1 }; // keyboard-highlighted item index
+
+  async function fetchBranches() {
+    try {
+      const res = await fetch('/api/branches');
+      if (!res.ok) return;
+      // /api/branches returns JSON `null` when the repo has no remote
+      // branches (server marshals a nil Go slice as null). Coerce to [] so
+      // every consumer can rely on baseBranches being array-shaped —
+      // applyFocusToHeader reads baseBranches.length unconditionally on
+      // every focus update, and a null here threw a TypeError that
+      // short-circuited init's promise chain (which silently skipped the
+      // subsequent `.then(connectSSE)` step, leaving the page without any
+      // SSE listeners attached).
+      const parsed = await res.json();
+      baseBranches = Array.isArray(parsed) ? parsed : [];
+      if (baseBranches.length < 2) {
+        baseBranchPickerEl.classList.remove('open');
+        baseBranchPickerEl.style.display = 'none';
+        if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
+        return;
+      }
+      baseBranchPickerEl.style.display = '';
+      renderBaseBranchList();
+    } catch {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchPickerEl.style.display = 'none';
+      if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
+    }
+  }
+
+  function getVisibleItems() {
+    return Array.from(document.getElementById('baseBranchList').querySelectorAll('.base-branch-item'));
+  }
+
+  function updateHighlight() {
+    const items = getVisibleItems();
+    items.forEach(function(el, i) {
+      el.classList.toggle('highlighted', i === branchPicker.highlightedIdx);
+    });
+    if (branchPicker.highlightedIdx >= 0 && branchPicker.highlightedIdx < items.length) {
+      items[branchPicker.highlightedIdx].scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function renderBaseBranchList(filter) {
+    const list = document.getElementById('baseBranchList');
+    let filtered = baseBranches;
+    if (filter) {
+      const lower = filter.toLowerCase();
+      filtered = baseBranches.filter(function(b) { return b.toLowerCase().indexOf(lower) !== -1; });
+    }
+    list.innerHTML = filtered.map(function(b) {
+      const active = b === currentBaseBranch ? ' active' : '';
+      return '<div class="base-branch-item' + active + '" data-branch="' + escapeHtml(b) + '">' + escapeHtml(b) + '</div>';
+    }).join('');
+    if (filtered.length === 0) {
+      list.innerHTML = '<div style="padding: 8px 10px; font-size: 12px; color: var(--crit-editor-fg-muted);">No matching branches</div>';
+    }
+    branchPicker.highlightedIdx = -1;
+  }
+
+  async function selectBaseBranch(branch) {
+    if (branch === currentBaseBranch) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    baseBranchPickerEl.classList.remove('open');
+    baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    const previousBranch = currentBaseBranch;
+    const previousLabel = document.getElementById('baseBranchLabel').textContent;
+    document.getElementById('baseBranchLabel').textContent = branch;
+    currentBaseBranch = branch;
+    try {
+      const res = await fetch('/api/base-branch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ branch: branch }),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error('Failed to change base branch:', errText);
+        currentBaseBranch = previousBranch;
+        document.getElementById('baseBranchLabel').textContent = previousLabel;
+        return;
+      }
+      // Reload immediately for responsiveness; SSE 'base-changed' will also
+      // call reloadForScope() but the dedup guard collapses double-calls.
+      await reloadForScope();
+      fetchCommits();
+    } catch (err) {
+      console.error('Error changing base branch:', err);
+      currentBaseBranch = previousBranch;
+      document.getElementById('baseBranchLabel').textContent = previousLabel;
+    }
+  }
+
+  // Toggle dropdown
+  document.getElementById('baseBranchBtn').addEventListener('click', function() {
+    baseBranchPickerEl.classList.toggle('open');
+    const isOpen = baseBranchPickerEl.classList.contains('open');
+    baseBranchBtnEl.setAttribute('aria-expanded', String(isOpen));
+    if (isOpen) {
+      const search = document.getElementById('baseBranchSearch');
+      search.value = '';
+      branchPicker.highlightedIdx = -1;
+      renderBaseBranchList();
+      search.focus();
+    }
+  });
+
+  // Filter on typing
+  document.getElementById('baseBranchSearch').addEventListener('input', function(e) {
+    renderBaseBranchList(e.target.value);
+  });
+
+  // Keyboard navigation in search input
+  document.getElementById('baseBranchSearch').addEventListener('keydown', function(e) {
+    e.stopPropagation();
+    const items = getVisibleItems();
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      branchPicker.highlightedIdx = Math.min(branchPicker.highlightedIdx + 1, items.length - 1);
+      updateHighlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (branchPicker.highlightedIdx > 0) {
+        branchPicker.highlightedIdx--;
+        updateHighlight();
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (branchPicker.highlightedIdx >= 0 && branchPicker.highlightedIdx < items.length) {
+        const branch = items[branchPicker.highlightedIdx].dataset.branch;
+        if (branch) selectBaseBranch(branch);
+      }
+    } else if (e.key === 'Escape') {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  // Close on outside click
+  document.addEventListener('click', function(e) {
+    if (!baseBranchPickerEl.contains(e.target)) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  // Close on Escape (only when open)
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && baseBranchPickerEl.classList.contains('open')) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+      e.stopImmediatePropagation();
+    }
+  });
+
+  // Item selection via click
+  document.getElementById('baseBranchList').addEventListener('click', function(e) {
+    const item = e.target.closest('.base-branch-item');
+    if (!item) return;
+    const branch = item.dataset.branch;
+    if (branch) selectBaseBranch(branch);
+  });
+
+  // ===== TOC Toggle =====
+  document.getElementById('tocToggle').addEventListener('click', function() {
+    const tocEl = document.getElementById('toc');
+    tocEl.classList.toggle('toc-hidden');
+    setSetting('toc', tocEl.classList.contains('toc-hidden') ? 'closed' : 'open');
+    buildToc();
+  });
+
+  document.querySelector('.toc-close').addEventListener('click', function() {
+    document.getElementById('toc').classList.add('toc-hidden');
+    setSetting('toc', 'closed');
+  });
+
+  // ===== Comment Navigation =====
+  let navCommentId = null;
+  let navHighlightTimer;
+
+  function navigateToComment(direction) {
+    const panel = document.getElementById('commentsPanel');
+    const container = document.querySelector('.main-content');
+    const cards = Array.from(container.querySelectorAll('.comment-card')).filter(function(card) {
+      return !panel || !panel.contains(card);
+    });
+    if (cards.length === 0) return;
+
+    const header = document.querySelector('.header');
+    const headerHeight = header ? header.offsetHeight : 52;
+
+    // Find current position by stored comment ID (immune to smooth-scroll race conditions)
+    let idx = -1;
+    if (navCommentId) {
+      for (let i = 0; i < cards.length; i++) {
+        if (cards[i].dataset.commentId === navCommentId) { idx = i; break; }
+      }
+    }
+
+    let targetIdx;
+    if (direction === 1) {
+      if (idx < 0) {
+        // First use: pick first card below the header area by viewport position
+        targetIdx = -1;
+        for (let j = 0; j < cards.length; j++) {
+          if (cards[j].getBoundingClientRect().top > headerHeight + 8) { targetIdx = j; break; }
+        }
+        if (targetIdx < 0) targetIdx = 0;
+      } else {
+        targetIdx = idx >= cards.length - 1 ? 0 : idx + 1;
+      }
+    } else {
+      targetIdx = idx <= 0 ? cards.length - 1 : idx - 1;
+    }
+
+    const target = cards[targetIdx];
+    navCommentId = target.dataset.commentId;
+
+    if (navHighlightTimer) {
+      clearTimeout(navHighlightTimer);
+      document.querySelectorAll('.comment-nav-highlight').forEach(function(el) {
+        el.classList.remove('comment-nav-highlight');
+      });
+    }
+
+    const rect = target.getBoundingClientRect();
+    const fileSection = target.closest('.file-section');
+    const fileHeader = fileSection ? fileSection.querySelector('.file-header') : null;
+    const fileHeaderHeight = fileHeader ? fileHeader.offsetHeight : 0;
+    window.scrollTo({ top: rect.top + window.scrollY - headerHeight - fileHeaderHeight - 16, behavior: 'smooth' });
+    target.classList.add('comment-nav-highlight');
+    navHighlightTimer = setTimeout(function() { target.classList.remove('comment-nav-highlight'); navHighlightTimer = null; }, 1000);
+  }
+
+  document.getElementById('commentNavPrev').addEventListener('click', function() { navigateToComment(-1); });
+  document.getElementById('commentNavNext').addEventListener('click', function() { navigateToComment(1); });
+
+  // ===== Comments Panel Toggle =====
+  document.getElementById('commentCount').addEventListener('click', function() {
+    toggleCommentsPanel();
+  });
+  document.getElementById('commentCount').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCommentsPanel(); }
+  });
+
+  document.querySelector('.comments-panel-close').addEventListener('click', function() {
+    document.getElementById('commentsPanel').classList.add('comments-panel-hidden');
+    updateTocPosition();
+  });
+
+  document.getElementById('prToggle').addEventListener('click', function() {
+    togglePRPanel();
+  });
+
+  // Segmented pill filter (radiogroup with roving tabindex)
+  const filterPillEl = document.getElementById('commentsFilterPill');
+  function activateFilterBtn(btn, focus) {
+    if (!btn) return;
+    commentsActiveFilter = btn.dataset.filter;
+    filterPillEl.querySelectorAll('.toggle-btn').forEach(function(b) {
+      const active = b === btn;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-checked', active ? 'true' : 'false');
+      b.setAttribute('tabindex', active ? '0' : '-1');
+    });
+    if (focus) btn.focus();
+    renderCommentsPanel();
+  }
+  filterPillEl.addEventListener('click', function(e) {
+    const btn = e.target.closest('.toggle-btn');
+    if (!btn) return;
+    activateFilterBtn(btn, false);
+  });
+  filterPillEl.addEventListener('keydown', function(e) {
+    const btns = Array.from(filterPillEl.querySelectorAll('.toggle-btn'));
+    const currentIdx = btns.findIndex(function(b) { return b === document.activeElement; });
+    if (currentIdx === -1) return;
+    let nextIdx;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+      nextIdx = (currentIdx + 1) % btns.length;
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      nextIdx = (currentIdx - 1 + btns.length) % btns.length;
+    } else if (e.key === 'Home') {
+      nextIdx = 0;
+    } else if (e.key === 'End') {
+      nextIdx = btns.length - 1;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    activateFilterBtn(btns[nextIdx], true);
+  });
+
+  // Expand all / Collapse all
+  document.getElementById('commentsPanelExpandAll').addEventListener('click', function() {
+    toggleExpandAllComments();
+  });
+
+  // ===== Settings Panel =====
+  // Open/close, focus trap, sliding underline, Esc/?, tab keyboard nav and
+  // click delegation are all owned by the shared settings-overlay shell
+  // (crit-settings-overlay.js). This file only supplies pane-render hooks
+  // (cfg fetch + renderSettingsPane/AboutPane/ShortcutsPane).
+  let settingsCtl = null;
+  function getSettingsCtl() {
+    if (settingsCtl) return settingsCtl;
+    const overlay = document.getElementById('settingsOverlay');
+    const toggle = document.getElementById('settingsToggle');
+    const closeBtn = document.getElementById('settingsClose');
+    if (!overlay || !window.crit || !window.crit.settingsOverlay) return null;
+    settingsCtl = window.crit.settingsOverlay.install({
+      overlay: overlay,
+      toggle: toggle,
+      closeBtn: closeBtn,
+      initialTab: 'settings',
+      onOpen: function (tab) {
+        settingsPanelOpen = true;
+        settingsPanelTab = tab || 'settings';
+        if (!cachedConfig) {
+          fetch('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
+            cachedConfig = cfg;
+            renderSettingsPane(cfg);
+            renderAboutPane(cfg);
+          });
+        }
+        renderShortcutsPane();
+      },
+      onTabSwitch: function (tab) { settingsPanelTab = tab; },
+      onClose: function () { settingsPanelOpen = false; },
+    });
+    return settingsCtl;
+  }
+  function openSettingsPanel(tab) {
+    settingsPanelTab = tab || 'settings';
+    settingsPanelOpen = true;
+    const ctl = getSettingsCtl();
+    if (ctl) ctl.open(settingsPanelTab);
+  }
+
+  function applyHideResolved() {
+    // State -> CSS via body class. Visibility rules live in style.css under
+    // `body.hide-resolved .comment-block:has(.resolved-card)`. No DOM walk.
+    document.body.classList.toggle('hide-resolved', isHideResolved());
+  }
+
+  function updatePillIndicator(indicatorId, values, current) {
+    const indicator = document.getElementById(indicatorId);
+    if (!indicator) return;
+    const idx = values.indexOf(current);
+    if (idx >= 0) {
+      indicator.style.left = (idx * (100 / values.length)) + '%';
+      indicator.style.width = (100 / values.length) + '%';
+    }
+  }
+
+  function renderSettingsPane(cfg) {
+    const pane = document.getElementById('settingsPane');
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderSettingsTab) {
+      const isGit = session.mode === 'git';
+      const hooks = {
+        applyTheme: window.applyTheme,
+        applyWidth: applyWidth,
+        getHideResolved: isHideResolved,
+        setHideResolved: setHideResolved,
+        onHideResolvedChange: function () { renderAllFiles(); },
+        hasActivePendingUpdates: hasActivePendingUpdates,
+        announceCopy: announceCopy,
+        escape: escapeHtml,
+      };
+      // Ignore-whitespace only applies to code diffs (git mode). Providing the
+      // hooks + show flag only in git mode keeps the toggle out of file/preview
+      // review, where there are no git diffs to recompute.
+      if (isGit) {
+        hooks.getIgnoreWhitespace = function () { return ignoreWhitespace; };
+        hooks.setIgnoreWhitespace = function (v) { ignoreWhitespace = !!v; setSetting('ignoreWhitespace', ignoreWhitespace); };
+        hooks.onIgnoreWhitespaceChange = function () { reloadForScope(); };
+      }
+      shared.renderSettingsTab(pane, {
+        mode: 'code-review',
+        cfg: cfg,
+        show: isGit ? { ignoreWhitespace: true } : undefined,
+        hooks: hooks,
+      });
+      return;
+    }
+    // Fallback (shared module not loaded — should never happen since
+    // crit-settings-panes.js is loaded before app.js).
+    const currentTheme = getSetting('theme', 'system');
+    const currentWidth = getSetting('width', 'default');
+    let html = '';
+    html += '<div class="settings-section-label">Display</div>';
+    html += '<div class="settings-display-group">';
+
+    // Theme row
+    html += '<div class="settings-display-row">';
+    html += '<span class="settings-display-label">Theme</span>';
+    html += '<div class="settings-pill settings-pill--theme" id="settingsThemePill" role="group" aria-label="Theme">';
+    html += '<div class="settings-pill-indicator" id="settingsThemeIndicator"></div>';
+    const themeIcons = {
+      system: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M2 4.25A2.25 2.25 0 0 1 4.25 2h7.5A2.25 2.25 0 0 1 14 4.25v5.5A2.25 2.25 0 0 1 11.75 12h-1.312c.1.128.21.248.328.36a.75.75 0 0 1 .234.545v.345a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1-.75-.75v-.345a.75.75 0 0 1 .234-.545c.118-.111.228-.232.328-.36H4.25A2.25 2.25 0 0 1 2 9.75v-5.5Zm2.25-.75a.75.75 0 0 0-.75.75v4.5c0 .414.336.75.75.75h7.5a.75.75 0 0 0 .75-.75v-4.5a.75.75 0 0 0-.75-.75h-7.5Z" clip-rule="evenodd"/></svg>',
+      light: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 1ZM10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0ZM12.95 4.11a.75.75 0 1 0-1.06-1.06l-1.062 1.06a.75.75 0 0 0 1.061 1.062l1.06-1.061ZM15 8a.75.75 0 0 1-.75.75h-1.5a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 15 8ZM11.89 12.95a.75.75 0 0 0 1.06-1.06l-1.06-1.062a.75.75 0 0 0-1.062 1.061l1.061 1.06ZM8 12a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 12ZM5.172 11.89a.75.75 0 0 0-1.061-1.062L3.05 11.89a.75.75 0 1 0 1.06 1.06l1.06-1.06ZM4 8a.75.75 0 0 1-.75.75h-1.5a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 4 8ZM4.11 5.172A.75.75 0 0 0 5.173 4.11L4.11 3.05a.75.75 0 1 0-1.06 1.06l1.06 1.06Z"/></svg>',
+      dark: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M14.438 10.148c.19-.425-.321-.787-.748-.601A5.5 5.5 0 0 1 6.453 2.31c.186-.427-.176-.938-.6-.748a6.501 6.501 0 1 0 8.585 8.586Z"/></svg>'
+    };
+    ['system', 'light', 'dark'].forEach(function(theme) {
+      const active = theme === currentTheme ? ' active' : '';
+      html += '<button type="button" class="settings-pill-btn' + active + '" data-settings-theme="' + theme + '" title="' + theme.charAt(0).toUpperCase() + theme.slice(1) + ' theme">' + themeIcons[theme] + '</button>';
+    });
+    html += '</div></div>';
+
+    // Width row
+    html += '<div class="settings-display-row">';
+    html += '<span class="settings-display-label">Content Width <span style="font-weight:400;color:var(--crit-editor-fg-muted)">(file mode)</span></span>';
+    html += '<div class="settings-pill settings-pill--width" id="settingsWidthPill" role="group" aria-label="Content width">';
+    html += '<div class="settings-pill-indicator" id="settingsWidthIndicator"></div>';
+    ['compact', 'default', 'wide'].forEach(function(w) {
+      const active = w === currentWidth ? ' active' : '';
+      html += '<button type="button" class="settings-pill-btn' + active + '" data-settings-width="' + w + '">' + w.charAt(0).toUpperCase() + w.slice(1) + '</button>';
+    });
+    html += '</div></div>';
+
+    // Hide resolved row
+    const hideResolved = isHideResolved();
+    html += '<div class="settings-display-row">';
+    html += '<span class="settings-display-label">Hide resolved comments</span>';
+    html += '<label class="comments-panel-switch">';
+    html += '<input type="checkbox" id="hideResolvedToggle" aria-label="Hide resolved comments"' + (hideResolved ? ' checked' : '') + '>';
+    html += '<span class="comments-panel-switch-track"><span class="comments-panel-switch-thumb"></span></span>';
+    html += '</label>';
+    html += '</div>';
+
+    html += '</div>'; // close settings-display-group
+
+    // Configuration section
+    html += '<div class="settings-section-label">Configuration</div>';
+    html += '<div class="config-cards">';
+
+    // Update card (shown only when an update is available)
+    if (cfg.latest_version && cfg.version && cfg.latest_version !== cfg.version && !cfg.no_update_check) {
+      const upgradeCmd = 'brew update && brew upgrade crit';
+      const releaseUrl = 'https://github.com/tomasz-tomczyk/crit/releases/tag/v' + escapeHtml(cfg.latest_version);
+      const alreadyDismissed = getSetting('updatesDismissed', '') === cfg.latest_version;
+      html += '<div class="config-card config-card--orange"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#11014;</span>';
+      html += '<span class="config-card-title">Update available</span>';
+      html += '<span class="config-card-value">v' + escapeHtml(cfg.latest_version) + '</span>';
+      html += '</div>';
+      html += '<div class="config-card-cmd"><span>$ ' + escapeHtml(upgradeCmd) + '</span><button class="config-card-copy" data-copy="' + escapeHtml(upgradeCmd) + '">Copy</button></div>';
+      html += '<div class="config-card-body" id="updateCardBody">';
+      html += '<div class="config-card-actions">';
+      html += '<a class="about-link" href="' + releaseUrl + '" target="_blank" rel="noopener">Release notes</a>';
+      if (alreadyDismissed) {
+        html += '<span class="config-card-dismissed" id="updateDismissedNote">Dismissed — will remind you on next version</span>';
+      } else {
+        html += '<button type="button" class="config-card-dismiss" id="updateDismissBtn" data-dismiss-version="' + escapeHtml(cfg.latest_version) + '">Don\'t remind me until next version</button>';
+      }
+      html += '</div>';
+      html += '</div>';
+      html += '</div>';
+    }
+
+    // Account card (only show if sharing is enabled)
+    if (cfg.share_url) {
+      if (cfg.auth_logged_in) {
+        const display = cfg.auth_user_email || cfg.auth_user_name || 'Logged in';
+        html += '<div class="config-card config-card--green"><div class="config-card-header">';
+        html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
+        html += '<span class="config-card-title">Account</span>';
+        html += '<span class="config-card-value">' + escapeHtml(display) + '</span>';
+        html += '</div></div>';
+      } else {
+        html += '<div class="config-card config-card--red config-card--unconfigured"><div class="config-card-header">';
+        html += '<span class="config-card-icon" style="color:var(--crit-red)">&#9675;</span>';
+        html += '<span class="config-card-title">Account</span>';
+        html += '</div>';
+        html += '<div class="config-card-body">Not logged in. Sign in to link reviews to your account and track review history.</div>';
+        html += '<div class="config-card-cmd"><span>$ crit auth login</span><button class="config-card-copy" data-copy="crit auth login">Copy</button></div>';
+        html += '</div>';
+      }
+    }
+
+    // Agent Command card
+    if (cfg.agent_cmd_enabled) {
+      html += '<div class="config-card config-card--green"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
+      html += '<span class="config-card-title">Agent Command</span>';
+      html += '</div>';
+      html += '<div class="config-card-cmd-value"><code>' + escapeHtml(cfg.agent_cmd || cfg.agent_name || '') + '</code></div>';
+      html += '</div>';
+    } else {
+      html += '<div class="config-card config-card--orange config-card--unconfigured"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#9675;</span>';
+      html += '<span class="config-card-title">Agent Command</span>';
+      html += '</div>';
+      html += '<div class="config-card-body">Edit <code>~/.crit.config.json</code> and set <code>agent_cmd</code> to send comments directly to your AI agent. <a href="https://github.com/tomasz-tomczyk/crit#send-to-agent-experimental" target="_blank" rel="noopener" style="color:var(--crit-brand)">Learn more</a></div>';
+      html += '<div class="config-card-snippet">{"agent_cmd": "claude -p"}\n// Also: "opencode ask", "aider --message"</div>';
+      html += '</div>';
+    }
+
+    // Integration card (hidden if no_integration_check)
+    if (!cfg.no_integration_check) {
+      const integrations = cfg.integrations || [];
+      const anyInstalled = cfg.any_integration_installed;
+      if (anyInstalled) {
+        const current = integrations.filter(function(i) { return i.status === 'current'; });
+        const stale = integrations.filter(function(i) { return i.status === 'stale'; });
+        if (stale.length > 0) {
+          const si = stale[0];
+          const name = si.agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+          const dismissedMap = getSetting('dismissedIntegrations', {}) || {};
+          const intAlreadyDismissed = !!si.hash && dismissedMap[si.agent] === si.hash;
+          html += '<div class="config-card config-card--yellow"><div class="config-card-header">';
+          html += '<span class="config-card-icon" style="color:var(--crit-yellow)">&#9888;</span>';
+          html += '<span class="config-card-title">AI Integration</span>';
+          html += '<span class="config-card-value">' + escapeHtml(name) + ' (update available)</span>';
+          html += '</div>';
+          const hintLines = si.hint.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+          hintLines.forEach(function(line) {
+            const parts = line.split('|');
+            let label = '';
+            let cmd = line.replace(/^Run:\s*/i, '');
+            if (parts.length === 2) {
+              label = parts[0];
+              cmd = parts[1];
+            }
+            html += '<div class="config-card-cmd">';
+            if (label) html += '<span class="config-card-cmd-label">' + escapeHtml(label) + '</span>';
+            html += '<span>$ ' + escapeHtml(cmd) + '</span><button class="config-card-copy" data-copy="' + escapeHtml(cmd) + '">Copy</button></div>';
+          });
+          if (si.hash) {
+            html += '<div class="config-card-body" id="integrationCardBody">';
+            html += '<div class="config-card-actions config-card-actions--end">';
+            if (intAlreadyDismissed) {
+              html += '<span class="config-card-dismissed" id="integrationDismissedNote">Dismissed — will remind you when this integration changes</span>';
+            } else {
+              html += '<button type="button" class="config-card-dismiss" id="integrationDismissBtn" data-agent="' + escapeHtml(si.agent) + '" data-hash="' + escapeHtml(si.hash) + '">Don\'t remind me until next version</button>';
+            }
+            html += '</div>';
+            html += '</div>';
+          }
+          html += '</div>';
+        } else if (current.length > 0) {
+          const name = current[0].agent.replace(/\b\w/g, function(c) { return c.toUpperCase(); }).replace(/-/g, ' ');
+          html += '<div class="config-card config-card--green"><div class="config-card-header">';
+          html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
+          html += '<span class="config-card-title">AI Integration</span>';
+          html += '<span class="config-card-value">' + escapeHtml(name) + ' (up to date)</span>';
+          html += '</div></div>';
+        }
+      } else {
+        const available = (cfg.integrations_available || []).join(' \u00b7 ');
+        html += '<div class="config-card config-card--blue config-card--unconfigured"><div class="config-card-header">';
+        html += '<span class="config-card-icon" style="color:var(--crit-brand)">&#128161;</span>';
+        html += '<span class="config-card-title">AI Integration</span>';
+        html += '<span class="config-card-badge">Recommended</span>';
+        html += '</div>';
+        html += '<div class="config-card-body">Install a plugin so your AI agent can launch crit, read comments, and iterate.</div>';
+        html += '<div class="config-card-cmd"><span>$ crit install claude-code</span><button class="config-card-copy" data-copy="crit install claude-code">Copy</button></div>';
+        if (available) html += '<div class="config-card-agents">Also: ' + escapeHtml(available) + '</div>';
+        html += '</div>';
+      }
+    }
+
+    // Share card
+    if (cfg.share_url) {
+      let hostname;
+      try { hostname = new URL(cfg.share_url).hostname; } catch { hostname = cfg.share_url; }
+      html += '<div class="config-card config-card--green"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
+      html += '<span class="config-card-title">Sharing enabled</span>';
+      html += '<span class="config-card-value">' + escapeHtml(hostname) + '</span>';
+      html += '</div></div>';
+    } else {
+      html += '<div class="config-card config-card--gray config-card--unconfigured"><div class="config-card-header">';
+      html += '<span class="config-card-icon" style="color:var(--crit-editor-fg-muted)">&mdash;</span>';
+      html += '<span class="config-card-title">Share</span>';
+      html += '<span class="config-card-value">Disabled</span>';
+      html += '</div></div>';
+    }
+    html += '</div>'; // close config-cards
+
+    pane.innerHTML = html;
+
+    // Wire up theme pill clicks
+    pane.querySelectorAll('[data-settings-theme]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const theme = btn.dataset.settingsTheme;
+        applyTheme(theme);
+        pane.querySelectorAll('[data-settings-theme]').forEach(function(b) { b.classList.toggle('active', b.dataset.settingsTheme === theme); });
+        updatePillIndicator('settingsThemeIndicator', ['system', 'light', 'dark'], theme);
+      });
+    });
+    updatePillIndicator('settingsThemeIndicator', ['system', 'light', 'dark'], currentTheme);
+
+    // Wire up width pill clicks
+    pane.querySelectorAll('[data-settings-width]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const w = btn.dataset.settingsWidth;
+        applyWidth(w);
+        pane.querySelectorAll('[data-settings-width]').forEach(function(b) { b.classList.toggle('active', b.dataset.settingsWidth === w); });
+        updatePillIndicator('settingsWidthIndicator', ['compact', 'default', 'wide'], w);
+      });
+    });
+    updatePillIndicator('settingsWidthIndicator', ['compact', 'default', 'wide'], currentWidth);
+
+    // Wire up hide-resolved toggle
+    const hideResolvedToggle = pane.querySelector('#hideResolvedToggle');
+    if (hideResolvedToggle) {
+      hideResolvedToggle.addEventListener('change', function() {
+        setHideResolved(hideResolvedToggle.checked);
+        renderAllFiles();
+      });
+    }
+
+    // Wire up "Don't remind me" button on the update card
+    const dismissBtn = pane.querySelector('#updateDismissBtn');
+    if (dismissBtn) {
+      dismissBtn.addEventListener('click', function() {
+        const version = dismissBtn.dataset.dismissVersion || '';
+        setSetting('updatesDismissed', version);
+        const updateBtn = document.getElementById('updateBtn');
+        if (updateBtn && !hasActivePendingUpdates()) updateBtn.style.display = 'none';
+        const body = pane.querySelector('#updateCardBody');
+        if (body) {
+          dismissBtn.outerHTML = '<span class="config-card-dismissed" id="updateDismissedNote">Dismissed — will remind you on next version</span>';
+        }
+      });
+    }
+
+    // Wire up "Don't remind me" button on the AI Integration card
+    const integrationDismissBtn = pane.querySelector('#integrationDismissBtn');
+    if (integrationDismissBtn) {
+      integrationDismissBtn.addEventListener('click', function() {
+        const agent = integrationDismissBtn.dataset.agent || '';
+        const hash = integrationDismissBtn.dataset.hash || '';
+        if (!agent || !hash) return;
+        const map = getSetting('dismissedIntegrations', {}) || {};
+        map[agent] = hash;
+        setSetting('dismissedIntegrations', map);
+        const updateBtn = document.getElementById('updateBtn');
+        if (updateBtn && !hasActivePendingUpdates()) updateBtn.style.display = 'none';
+        integrationDismissBtn.outerHTML = '<span class="config-card-dismissed" id="integrationDismissedNote">Dismissed — will remind you when this integration changes</span>';
+      });
+    }
+
+    // Wire up copy buttons
+    pane.querySelectorAll('.config-card-copy').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const text = btn.dataset.copy;
+        navigator.clipboard.writeText(text).then(function() {
+          btn.textContent = '\u2713 Copied';
+          btn.setAttribute('aria-label', 'Copied');
+          announceCopy();
+          btn.classList.add('copied');
+          setTimeout(function() {
+            btn.textContent = 'Copy';
+            btn.setAttribute('aria-label', 'Copy');
+            btn.classList.remove('copied');
+          }, 1500);
+        });
+      });
+    });
+  }
+
+  function renderShortcutsPane() {
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderShortcutsPane) {
+      shared.renderShortcutsPane(document.getElementById('shortcutsPane'), { mode: 'code-review' });
+    }
+  }
+
+  function renderAboutPane(cfg) {
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderAboutPane) {
+      shared.renderAboutPane(document.getElementById('aboutPane'), cfg, session);
+    }
+  }
+
+  // Settings overlay shell (open/close/Esc/?/focus-trap/sliding-underline/
+  // tab click + arrow nav) is owned by crit-settings-overlay.js.
+  getSettingsCtl();
+
+  document.getElementById('noChangesOverlay').addEventListener('click', function(e) {
+    if (e.target === this) hideNoChangesConfirm();
+  });
+
+  document.addEventListener('keydown', function(e) {
+    const tag = document.activeElement.tagName;
+    if (tag === 'TEXTAREA' || tag === 'INPUT' || document.activeElement.isContentEditable) {
+      if (e.key === 'Escape' && activeForms.length > 0) {
+        e.preventDefault();
+        const ta = document.activeElement;
+        if (ta && ta.dataset && ta.dataset.formKey) {
+          const form = activeForms.find(function(f) { return f.formKey === ta.dataset.formKey; });
+          if (form && confirmDiscardCommentForm(form)) cancelComment(form);
+        }
+      }
+      return;
+    }
+
+    if (document.getElementById('noChangesOverlay').classList.contains('active')) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideNoChangesConfirm();
+      }
+      return;
+    }
+
+    // Esc/? while settings overlay is open are owned by crit-settings-overlay.js;
+    // short-circuit the rest of the keymap so we don't double-handle.
+    if (settingsPanelOpen) return;
+
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    switch (e.key) {
+      case 'j': case 'k': {
+        e.preventDefault();
+        const allNav = navElements;
+        if (allNav.length === 0) return;
+        let curIdx = focusedElement ? allNav.indexOf(focusedElement) : -1;
+        if (curIdx === -1) {
+          const match = findNavElementForFocusTarget(getKeyboardFocusTarget());
+          if (match) curIdx = allNav.indexOf(match);
+        }
+        if (curIdx === -1) {
+          curIdx = e.key === 'j' ? 0 : allNav.length - 1;
+        } else {
+          if (e.key === 'j' && curIdx < allNav.length - 1) curIdx++;
+          if (e.key === 'k' && curIdx > 0) curIdx--;
+        }
+        document.querySelectorAll('.kb-nav.focused').forEach(function(el) { el.classList.remove('focused'); });
+        focusedElement = allNav[curIdx];
+        focusedElement.classList.add('focused');
+        focusedElement.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        // Sync legacy state
+        if (focusedElement.dataset.filePath) {
+          focusedFilePath = focusedElement.dataset.filePath;
+          focusedBlockIndex = parseInt(focusedElement.dataset.blockIndex);
+        } else {
+          const navTarget = navFocusTargetFromElement(focusedElement);
+          if (navTarget) {
+            focusedFilePath = navTarget.filePath;
+            focusedBlockIndex = null;
+          }
+        }
+        rememberKeyboardFocusFromNav(focusedElement);
+        if (visualMode) extendVisualSelection();
+        break;
+      }
+      case 'V': {
+        e.preventDefault();
+        if (visualMode) {
+          // Toggle off — preserve the focus on the current expansion point.
+          exitVisualMode(true);
+        } else {
+          enterVisualMode();
+        }
+        break;
+      }
+      case 'c': {
+        e.preventDefault();
+        // Visual mode: comment on the active selection.
+        if (visualMode && selectionStart !== null && selectionEnd !== null) {
+          const fp = visualMode.filePath;
+          if (visualMode.kind === 'markdown') {
+            const file = getFileByPath(fp);
+            if (file && file.lineBlocks) {
+              let lastBlockIndex = -1;
+              for (let i = 0; i < file.lineBlocks.length; i++) {
+                if (file.lineBlocks[i].startLine >= selectionStart && file.lineBlocks[i].endLine <= selectionEnd) {
+                  lastBlockIndex = i;
+                }
+              }
+              if (lastBlockIndex >= 0) {
+                visualMode = null;
+                document.body.classList.remove('visual-mode');
+                openForm({ filePath: fp, afterBlockIndex: lastBlockIndex, startLine: selectionStart, endLine: selectionEnd, editingId: null });
+              }
+            }
+          } else {
+            const side = visualMode.anchorSide;
+            visualMode = null;
+            document.body.classList.remove('visual-mode');
+            openForm({ filePath: fp, afterBlockIndex: null, startLine: selectionStart, endLine: selectionEnd, editingId: null, side: side || undefined });
+          }
+          return;
+        }
+        // If text is selected, comment on the selection (with quote).
+        // Otherwise fall back to the focused block.
+        if (tryOpenFormFromSelection()) return;
+        if (!focusedElement) return;
+        // Markdown line block
+        if (focusedElement.dataset.filePath && focusedElement.dataset.blockIndex !== undefined) {
+          const fp = focusedElement.dataset.filePath;
+          const bi = parseInt(focusedElement.dataset.blockIndex);
+          const file = getFileByPath(fp);
+          if (!file || !file.lineBlocks) return;
+          const block = file.lineBlocks[bi];
+          openForm({ filePath: fp, afterBlockIndex: bi, startLine: block.startLine, endLine: block.endLine, editingId: null });
+        }
+        // Diff line
+        else {
+          const loc = getFocusedCommentLocation();
+          if (!loc || loc.lineNum === undefined) return;
+          openForm({ filePath: loc.filePath, afterBlockIndex: null, startLine: loc.lineNum, endLine: loc.lineNum, editingId: null, side: loc.side || undefined });
+        }
+        break;
+      }
+      case 'e':
+      case 'd': {
+        e.preventDefault();
+        const loc = getFocusedCommentLocation();
+        if (!loc) return;
+        const file = getFileByPath(loc.filePath);
+        if (!file || !file.comments || file.comments.length === 0) return;
+        // Find comments for the focused line
+        let comment = null;
+        if (loc.blockIndex !== undefined && !isNaN(loc.blockIndex)) {
+          const block = file.lineBlocks[loc.blockIndex];
+          if (block) {
+            comment = file.comments.find(function(c) { return c.end_line >= block.startLine && c.end_line <= block.endLine; });
+          }
+        } else if (loc.lineNum !== undefined) {
+          comment = file.comments.find(function(c) { return c.end_line === loc.lineNum && (c.side || '') === loc.side; });
+        }
+        if (!comment) return;
+        if (e.key === 'e') editComment(comment, loc.filePath);
+        else deleteComment(comment.id, loc.filePath);
+        break;
+      }
+      case 'F': {
+        e.preventDefault();
+        if (uiState !== 'reviewing') return;
+        document.getElementById('finishBtn').click();
+        break;
+      }
+      case 'G': {
+        e.preventDefault();
+        openReviewCommentForm();
+        break;
+      }
+      case 'C': {
+        e.preventDefault();
+        toggleCommentsPanel();
+        break;
+      }
+      case 'h': {
+        e.preventDefault();
+        setHideResolved(!isHideResolved());
+        renderAllFiles();
+        const ht = document.getElementById('hideResolvedToggle');
+        if (ht) ht.checked = isHideResolved();
+        break;
+      }
+      case 't': {
+        const tocBtn = document.getElementById('tocToggle');
+        if (tocBtn.style.display === 'none') return;
+        e.preventDefault();
+        tocBtn.click();
+        break;
+      }
+      case ']': {
+        e.preventDefault();
+        navigateToComment(1);
+        break;
+      }
+      case '[': {
+        e.preventDefault();
+        navigateToComment(-1);
+        break;
+      }
+      case 'n': {
+        if (changeGroups.length === 0) break;
+        e.preventDefault();
+        navigateToChange(1);
+        break;
+      }
+      case 'N': {
+        if (changeGroups.length === 0) break;
+        e.preventDefault();
+        navigateToChange(-1);
+        break;
+      }
+      case '!': case '@': case '#': case '$': {
+        if (session.mode !== 'git') break;
+        const scopeMap = { '!': 'all', '@': 'branch', '#': 'staged', '$': 'unstaged' };
+        const scope = scopeMap[e.key];
+        const btn = document.querySelector('#scopeToggle .toggle-btn[data-scope="' + scope + '"]');
+        if (btn && !btn.disabled && !btn.classList.contains('active')) {
+          e.preventDefault();
+          btn.click();
+        }
+        break;
+      }
+      case '?': {
+        if (settingsPanelOpen) break;
+        e.preventDefault();
+        openSettingsPanel('shortcuts');
+        break;
+      }
+      case 'Escape': {
+        e.preventDefault();
+        if (reviewCommentFormActive) {
+          if (confirmDiscardReviewCommentForm()) cancelReviewCommentForm();
+        }
+        else if (activeForms.length > 0) {
+          const form = activeForms[activeForms.length - 1];
+          if (confirmDiscardCommentForm(form)) cancelComment(form);
+        }
+        else if (visualMode) {
+          exitVisualMode(true);
+        }
+        else if (selectionStart !== null) {
+          const clearPath = activeFilePath;
+          selectionStart = null;
+          selectionEnd = null;
+          activeFilePath = null;
+          if (clearPath) renderFileByPath(clearPath);
+        } else if (focusedElement) {
+          document.querySelectorAll('.kb-nav.focused').forEach(function(el) { el.classList.remove('focused'); });
+          focusedBlockIndex = null;
+          focusedFilePath = null;
+          focusedElement = null;
+          clearKeyboardFocusTarget();
+        }
+        break;
+      }
+    }
+  });
+
+  // ===== Select-to-Comment helper =====
+  // Selection alone never opens the form — copying text stays unhindered.
+  // The user presses `c` after selecting to comment on the selection.
+  // Returns true if a form was opened from an active selection.
+  function tryOpenFormFromSelection() {
+    const selection = window.getSelection();
+    const range = getLineRangeFromSelection(selection);
+    if (!range) return false;
+
+    // Capture the selected text for the quote field.
+    // If the selection covers the full text of the line range, skip the quote.
+    let quote = null;
+    let quoteOffset = null;
+    try {
+      let selectedText = selection.toString().trim();
+      if (selectedText) {
+        // Strip diff gutter markers (+/-) from the start of each line
+        selectedText = selectedText.replace(/^[+\-]/gm, '').trim();
+
+        let fullText = '';
+        const contentEls = [];
+        for (let ln = range.startLine; ln <= range.endLine; ln++) {
+          document.querySelectorAll('.line-block[data-file-path]').forEach(function(el) {
+            if (el.dataset.filePath !== range.filePath) return;
+            const s = parseInt(el.dataset.startLine), endLn = parseInt(el.dataset.endLine);
+            if (s <= ln && endLn >= ln) {
+              const content = el.querySelector('.line-content');
+              if (content && contentEls.indexOf(content) === -1) {
+                fullText += (fullText ? '\n' : '') + content.textContent.trim();
+                contentEls.push(content);
+              }
+            }
+          });
+          const selSide = range.side || '';
+          document.querySelectorAll('[data-diff-file-path][data-diff-line-num="' + ln + '"]').forEach(function(el) {
+            if (el.dataset.diffFilePath !== range.filePath) return;
+            if (el.dataset.diffSide !== selSide) return;
+            const content = el.querySelector('.diff-content');
+            if (content && contentEls.indexOf(content) === -1) {
+              fullText += (fullText ? '\n' : '') + content.textContent.trim();
+              contentEls.push(content);
+            }
+          });
+        }
+        const normalizedSelected = selectedText.replace(/\s+/g, ' ');
+        const normalizedFull = fullText.trim().replace(/\s+/g, ' ');
+        if (normalizedSelected !== normalizedFull && selectedText.length <= 300) {
+          quote = selectedText;
+
+          // Compute quote_offset: character index of the selection start within
+          // the normalized full text. Disambiguates duplicate substrings.
+          try {
+            const selRange = selection.getRangeAt(0);
+            const startContainer = selRange.startContainer;
+            const startOff = selRange.startOffset;
+
+            let charsBefore = 0;
+            let foundEl = false;
+            for (let ci = 0; ci < contentEls.length; ci++) {
+              if (contentEls[ci].contains(startContainer)) {
+                const walker = document.createTreeWalker(contentEls[ci], NodeFilter.SHOW_TEXT, null);
+                let tn;
+                while ((tn = walker.nextNode())) {
+                  if (tn === startContainer) {
+                    charsBefore += startOff;
+                    break;
+                  }
+                  charsBefore += tn.textContent.length;
+                }
+                foundEl = true;
+                break;
+              }
+              charsBefore += contentEls[ci].textContent.length;
+            }
+
+            if (foundEl) {
+              let rawAll = '';
+              const rawUpTo = charsBefore;
+              for (let ri = 0; ri < contentEls.length; ri++) {
+                rawAll += contentEls[ri].textContent;
+                if (contentEls[ri].contains(startContainer)) break;
+              }
+              const textBefore = rawAll.slice(0, rawUpTo);
+              quoteOffset = textBefore.replace(/\s+/g, ' ').trimStart().length;
+            }
+          } catch { /* offset is a nice-to-have */ }
+        }
+      }
+    } catch { /* quote is a nice-to-have, don't break form opening */ }
+
+    selection.removeAllRanges();
+    openForm({
+      filePath: range.filePath,
+      afterBlockIndex: range.afterBlockIndex,
+      startLine: range.startLine,
+      endLine: range.endLine,
+      editingId: null,
+      side: range.side,
+      quote: quote,
+      quoteOffset: quoteOffset
+    });
+    return true;
+  }
+
+  // ===== Stack breadcrumb + working-tree pill =====
+  //
+  // Replaces the old multi-section focus picker popover with a flatter UI:
+  //   - Stack breadcrumb (in-stack PR navigation) — only when focus is a
+  //     stacked range. Inline DOM, not a popover.
+  //   - Working-tree pill — always visible in range focus (git mode).
+  //
+  // Other PRs / Remote branches are deliberately dropped. The CLI is the
+  // only entry point into range mode from working tree (`crit --pr <N>` or
+  // `crit --range A..B`). See printHelp().
+  const stackChipEl = document.getElementById('stackChip');
+  const stackChipBtnEl = document.getElementById('stackChipBtn');
+  const stackChipLabelEl = document.getElementById('stackChipLabel');
+  const stackPopoverEl = document.getElementById('stackPopover');
+  const stackChipExitEl = document.getElementById('stackChipExit');
+  const resumePrPillEl = document.getElementById('resumePrPill');
+  const compareRailEl = document.getElementById('compareRail');
+  const baseBranchArrowEl = document.getElementById('baseBranchArrow');
+  const wtScopeToggleEl = document.getElementById('scopeToggle');
+
+  // Cached /api/picker.stack array. We only consume `stack` now — `other_prs`
+  // and `branches` are intentionally unused. Refreshed on focus-changed SSE.
+  let stackCache = null;
+  // Repo's literal default branch name (e.g. "master" / "main"). Cached
+  // from /api/picker so the popover root marker reflects what the repo
+  // actually calls its default branch instead of hardcoding "main".
+  let defaultBranchNameCache = '';
+  let pickerLoadInFlight = null;
+
+  // Truncate a label so the chip and popover entries stay readable.
+  function truncateLabel(s, max) {
+    if (!s) return '';
+    if (s.length <= max) return s;
+    return s.slice(0, max - 1) + '\u2026';
+  }
+
+  // entryLabel formats a stack entry as "#<num>: <title>" or "<short branch>".
+  function entryLabel(entry, max) {
+    if (!entry) return '';
+    if (max === undefined || max === null) max = 30;
+    if (entry.pr_number) {
+      let suffix = '';
+      const m = (entry.label || '').match(/^PR #\d+:\s*(.+)$/);
+      if (m && m[1]) suffix = ': ' + m[1];
+      return truncateLabel('#' + entry.pr_number + suffix, max);
+    }
+    return truncateLabel(entry.label || (entry.head_sha ? entry.head_sha.slice(0, 7) : ''), max);
+  }
+
+  // Build the focus payload for switching to a different stack entry.
+  function focusPayloadFromStackEntry(entry, currentFocus) {
+    const fallbackDefault = currentFocus && currentFocus.default_sha ? currentFocus.default_sha : '';
+    const focus = {
+      kind: 'range',
+      base_sha: entry.base_sha,
+      head_sha: entry.head_sha,
+      diff_scope: 'layer',
+      is_stacked: true,
+    };
+    if (entry.pr_number) focus.pr_number = entry.pr_number;
+    if (entry.base_ref_name) focus.base_ref_name = entry.base_ref_name;
+    if (!entry.pr_number && entry.label) focus.label = entry.label;
+    const defaultSHA = entry.default_sha || fallbackDefault;
+    if (defaultSHA) focus.default_sha = defaultSHA;
+    return focus;
+  }
+
+  // ----- Stack chip + popover -----
+  //
+  // Replaces the old horizontal breadcrumb. The chip shows the current
+  // entry's label; clicking it opens a vertical tree popover with all
+  // stack entries plus a default-branch entry that flips diff_scope to
+  // full_stack. Scales to any depth without ellipsising the middle.
+  function chipLabelForFocus(focus) {
+    if (!focus || focus.kind !== 'range') return '';
+    if (Array.isArray(stackCache)) {
+      const cur = stackCache.find(function(e) { return e.head_sha === focus.head_sha; });
+      if (cur) return entryLabel(cur, 24);
+    }
+    // No stack data yet (the /api/picker round-trip may take 2+ seconds
+    // because of `gh pr list`). Fall back to fields already on Focus so
+    // the chip's label is correct on first paint.
+    if (focus.pr_number) return '#' + focus.pr_number;
+    if (focus.head_ref_name) return truncateLabel(focus.head_ref_name, 24);
+    if (focus.label) return truncateLabel(focus.label, 24);
+    if (focus.head_sha) return focus.head_sha.slice(0, 7);
+    return 'Stack';
+  }
+
+  function isStackChipOpen() {
+    return stackChipEl && stackChipEl.classList.contains('open');
+  }
+  // Returns interactive popover items in DOM order. Excludes the
+  // non-interactive root marker and any disabled scope option.
+  function focusableStackPopoverItems() {
+    if (!stackPopoverEl) return [];
+    return Array.from(stackPopoverEl.querySelectorAll('button:not(:disabled)'));
+  }
+  function closeStackChip() {
+    if (!stackChipEl) return;
+    const wasOpen = stackChipEl.classList.contains('open');
+    stackChipEl.classList.remove('open');
+    if (stackChipBtnEl) stackChipBtnEl.setAttribute('aria-expanded', 'false');
+    // Return focus to the chip so keyboard users don't lose their place.
+    // Only when we just closed an open popover that has focus inside it.
+    if (wasOpen && stackPopoverEl && stackPopoverEl.contains(document.activeElement) && stackChipBtnEl) {
+      stackChipBtnEl.focus();
+    }
+  }
+  function openStackChip() {
+    if (!stackChipEl) return;
+    stackChipEl.classList.add('open');
+    if (stackChipBtnEl) stackChipBtnEl.setAttribute('aria-expanded', 'true');
+    // Move focus to the first interactive popover item so the menu is
+    // immediately keyboard-navigable. Defer to the next frame so the
+    // popover render has flushed and items exist.
+    requestAnimationFrame(function() {
+      const items = focusableStackPopoverItems();
+      if (items.length > 0) items[0].focus();
+    });
+  }
+
+  // renderStackChip decides whether the chip is visible and paints the
+  // popover contents. The chip hides when stack is < 2 (no navigation
+  // possible). The popover renders a vertical ASCII-tree of all entries.
+  function renderStackChip(focus, stack) {
+    if (!stackChipEl) return;
+    const inRange = focus && focus.kind === 'range';
+    if (!inRange) {
+      stackChipEl.style.display = 'none';
+      stackPopoverEl.innerHTML = '';
+      closeStackChip();
+      return;
+    }
+    // Show the chip immediately from focus data — don't wait for the
+    // /api/picker fetch (which may take 2+ seconds against `gh pr list`).
+    // Three popover states based on stack data:
+    //   stack === null/undefined     → fetch still in flight, show "Loading…"
+    //   stack length ≤ 1             → no surrounding stack to navigate
+    //                                  (e.g. `crit --range A..B` with no
+    //                                  ancestor branches, or an unstacked PR)
+    //   stack length > 1             → render the full tree
+    stackChipEl.style.display = '';
+    if (stackChipLabelEl) stackChipLabelEl.textContent = chipLabelForFocus(focus);
+    if (!Array.isArray(stack)) {
+      stackPopoverEl.innerHTML = '<div class="stack-popover-title">Stack</div>' +
+        '<div class="stack-popover-loading" role="status" aria-live="polite">Loading stack…</div>';
+      return;
+    }
+    if (stack.length <= 1) {
+      // Loaded but no surrounding stack. Render a minimal popover so the
+      // user understands the chip's role (and Escape/click-outside still
+      // close it) without misleading them into thinking there's
+      // somewhere to navigate.
+      stackPopoverEl.innerHTML = '<div class="stack-popover-title">Stack</div>' +
+        '<div class="stack-popover-loading" role="status">No surrounding stack — this is a standalone range.</div>';
+      return;
+    }
+
+    const ordered = stack.slice();
+    const defaultBranchName = defaultBranchNameCache || (ordered[0] && ordered[0].base_ref_name) || 'main';
+
+    const parts = [];
+    parts.push('<div class="stack-popover-title">Stack</div>');
+
+    // Stack entries — head→base (newest at top), with ├─ / └─ prefixes.
+    ordered.forEach(function(entry, i) {
+      const isLast = i === ordered.length - 1;
+      const tree = isLast ? '\u2514\u2500 ' : '\u251C\u2500 ';
+      const isCurrent = entry.head_sha === focus.head_sha;
+      const label = entryLabel(entry, 34);
+      const shortSha = entry.head_sha ? entry.head_sha.slice(0, 7) : '';
+      if (isCurrent) {
+        parts.push('<span class="stack-popover-item stack-popover-current" aria-current="page" role="menuitem"' +
+          ' data-head-sha="' + escapeHtml(entry.head_sha || '') + '">' +
+          '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
+          '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
+          (shortSha ? '<span class="stack-popover-sha">' + escapeHtml(shortSha) + '</span>' : '') +
+          '</span>');
+      } else {
+        const payload = focusPayloadFromStackEntry(entry, focus);
+        const aria = entry.pr_number ? ('Switch to PR #' + entry.pr_number) : ('Switch to ' + label);
+        parts.push('<button type="button" class="stack-popover-item" role="menuitem"' +
+          ' data-action="switch"' +
+          ' data-head-sha="' + escapeHtml(entry.head_sha || '') + '"' +
+          ' data-focus-payload="' + escapeHtml(JSON.stringify(payload)) + '"' +
+          ' aria-label="' + escapeHtml(aria) + '">' +
+          '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
+          '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
+          (shortSha ? '<span class="stack-popover-sha">' + escapeHtml(shortSha) + '</span>' : '') +
+          '</button>');
+      }
+    });
+
+    // Base marker — non-interactive root at the bottom of the tree.
+    parts.push('<span class="stack-popover-item stack-popover-root stack-popover-default" role="presentation">' +
+      '<span class="stack-popover-tree" aria-hidden="true">  </span>' +
+      '<span class="stack-popover-label">base: ' + escapeHtml(defaultBranchName) + '</span>' +
+      '</span>');
+
+    // "Compare against" radio section. Lives inside the popover so the
+    // page header doesn't need a second toolbar row for what is a
+    // relatively rare action. One-line subcopy explains what each scope
+    // means — first-time users always ask "wait, what does This commit mean?"
+    // Scope rows are always rendered in range mode — "This commit" is the
+    // canonical default. Full stack is disabled (with explanation) when
+    // default_sha is missing, which keeps the option discoverable so the
+    // user understands why they can't reach it rather than wondering
+    // where the option went.
+    {
+      const activeScope = focus.diff_scope || 'layer';
+      const fullStackEnabled = !!focus.default_sha;
+      // Subcopy mirrors what full-stack diffs against: the literal
+      // default branch tip.
+      const fullStackBaseName = defaultBranchName || 'default';
+      parts.push('<div class="stack-popover-divider" role="separator"></div>');
+      parts.push('<div class="stack-popover-title">Compare against</div>');
+      parts.push(
+        '<button type="button" class="stack-popover-scope' + (activeScope === 'layer' ? ' is-active' : '') + '"' +
+        ' role="menuitemradio" aria-checked="' + (activeScope === 'layer') + '"' +
+        ' data-action="scope" data-diff-scope="layer">' +
+          '<span class="stack-popover-scope-radio" aria-hidden="true"></span>' +
+          '<span class="stack-popover-scope-text">' +
+            '<span class="stack-popover-scope-name">This commit</span>' +
+            '<span class="stack-popover-scope-sub">Only changes in this commit</span>' +
+          '</span>' +
+        '</button>'
+      );
+      parts.push(
+        '<button type="button" class="stack-popover-scope' + (activeScope === 'full_stack' ? ' is-active' : '') + '"' +
+        ' role="menuitemradio" aria-checked="' + (activeScope === 'full_stack') + '"' +
+        (fullStackEnabled ? '' : ' disabled aria-disabled="true" title="Requires resolved default branch SHA"') +
+        ' data-action="scope" data-diff-scope="full_stack">' +
+          '<span class="stack-popover-scope-radio" aria-hidden="true"></span>' +
+          '<span class="stack-popover-scope-text">' +
+            '<span class="stack-popover-scope-name">Full stack</span>' +
+            '<span class="stack-popover-scope-sub">All changes from ' + escapeHtml(fullStackBaseName) + ' to here</span>' +
+          '</span>' +
+        '</button>'
+      );
+    }
+
+    stackPopoverEl.innerHTML = parts.join('');
+  }
+
+  function renderStackChipExit(focus, mode) {
+    if (!stackChipExitEl) return;
+    const show = mode === 'git' && focus && focus.kind === 'range';
+    stackChipExitEl.style.display = show ? '' : 'none';
+  }
+
+  // renderResumePill shows a "Resume PR #N" (or "Resume A..B" for ranges
+  // without a PR number) affordance whenever the user is in working_tree
+  // mode AND there's a stashed last range focus on the session.
+  function renderResumePill(focus, lastRange, mode) {
+    if (!resumePrPillEl) return;
+    const inWT = focus && (focus.kind === 'working_tree' || !focus.kind);
+    const show = mode === 'git' && inWT && lastRange && lastRange.kind === 'range';
+    if (!show) {
+      resumePrPillEl.style.display = 'none';
+      return;
+    }
+    let label;
+    if (lastRange.pr_number) {
+      label = 'Resume PR #' + lastRange.pr_number;
+    } else if (lastRange.head_ref_name) {
+      label = 'Resume stack: ' + lastRange.head_ref_name;
+    } else {
+      const b = lastRange.base_sha ? lastRange.base_sha.slice(0, 7) : '?';
+      const h = lastRange.head_sha ? lastRange.head_sha.slice(0, 7) : '?';
+      label = 'Resume ' + b + '..' + h;
+    }
+    resumePrPillEl.textContent = label;
+    resumePrPillEl.setAttribute('aria-label', label);
+    resumePrPillEl.style.display = '';
+  }
+
+  function applyFocusToHeader(focus) {
+    const mode = session && session.mode;
+    renderStackChip(focus, stackCache);
+    renderStackChipExit(focus, mode);
+    renderResumePill(focus, session && session.last_range_focus, mode);
+    // Base-branch picker is meaningful only in working-tree mode — range
+    // mode pins BaseSHA..HeadSHA and ignores Session.BaseRef entirely, so
+    // changing the base branch would be a no-op. Hide it (and its chevron)
+    // when a range focus is active; restore visibility otherwise, but only
+    // if there's actually more than one branch to choose from (the
+    // fetchBranches path already enforces that on initial load).
+    const inRange = focus && focus.kind === 'range';
+    if (baseBranchPickerEl) {
+      if (inRange) {
+        baseBranchPickerEl.classList.remove('open');
+        baseBranchPickerEl.style.display = 'none';
+        if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
+      } else if (Array.isArray(baseBranches) && baseBranches.length >= 2) {
+        baseBranchPickerEl.style.display = '';
+        if (baseBranchArrowEl) baseBranchArrowEl.style.display = '';
+      }
+    }
+    // Toggle compare-rail mode class — drives the segmented-composite
+    // visual merge of branch chip + stack chip in stack mode.
+    if (compareRailEl) compareRailEl.classList.toggle('is-stack', !!inRange);
+    // Diff-scope (Layer / Full stack) lives inside the stack popover
+    // (see "Compare against" section in renderStackChip).
+    // Working-tree scope toggle (All / Branch / Staged / Unstaged)
+    // filters by working-tree state vs baseRef — meaningless when the
+    // diff is pinned to BaseSHA..HeadSHA. Hide it in range mode to
+    // prevent confusing half-baked interactions where the file list
+    // gets working-tree-filtered but diffs stay range-pinned. Restore
+    // visibility when leaving range mode in git mode (clicking the ✕
+    // exits to working tree without re-running init's setup, so
+    // without this branch the toggle stays hidden until next reload).
+    if (wtScopeToggleEl) {
+      if (inRange) {
+        wtScopeToggleEl.style.display = 'none';
+      } else if (mode === 'git') {
+        wtScopeToggleEl.style.display = '';
+      }
+    }
+  }
+
+  // Fetch /api/picker and cache the stack array. Concurrent calls share
+  // the in-flight promise so init + focus-changed SSE don't double-fetch,
+  // but a transition that arrives WHILE a previous fetch is still pending
+  // schedules a follow-up refresh — without this, focus A→B→C where A is
+  // still loading would never refetch C-side data and the popover would
+  // stay stale until the next external trigger. The /api/picker endpoint
+  // is server-cached for 60s so the extra round-trip is essentially free.
+  let pickerRefetchQueued = false;
+  async function loadStackFromPicker() {
+    if (pickerLoadInFlight) {
+      pickerRefetchQueued = true;
+      return pickerLoadInFlight;
+    }
+    pickerLoadInFlight = (async function() {
+      try {
+        const res = await fetch('/api/picker');
+        if (!res.ok) {
+          // Stamp an empty cache so the popover transitions out of the
+          // "Loading…" placeholder state. Otherwise a transient picker
+          // failure leaves the user staring at a stuck spinner.
+          if (!Array.isArray(stackCache)) stackCache = [];
+          applyFocusToHeader((session && session.focus) || { kind: 'working_tree' });
+          return;
+        }
+        const data = await res.json();
+        stackCache = Array.isArray(data.stack) ? data.stack : [];
+        defaultBranchNameCache = data.default_branch_name || '';
+        applyFocusToHeader((session && session.focus) || { kind: 'working_tree' });
+      } catch (err) {
+        console.error('picker fetch failed:', err);
+        if (!Array.isArray(stackCache)) stackCache = [];
+        applyFocusToHeader((session && session.focus) || { kind: 'working_tree' });
+      } finally {
+        pickerLoadInFlight = null;
+      }
+    })();
+    const result = pickerLoadInFlight;
+    result.then(function() {
+      if (pickerRefetchQueued) {
+        pickerRefetchQueued = false;
+        loadStackFromPicker();
+      }
+    });
+    return result;
+  }
+
+  async function postFocus(focus) {
+    try {
+      const res = await fetch('/api/focus', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(focus),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        console.error('Focus switch failed:', text);
+      }
+    } catch (err) {
+      console.error('Focus switch error:', err);
+    }
+  }
+
+  if (stackChipBtnEl) {
+    stackChipBtnEl.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (isStackChipOpen()) closeStackChip();
+      else openStackChip();
+    });
+    // ArrowDown / ArrowUp on the chip button opens the popover with
+    // focus already on the first item — standard menu-button pattern.
+    stackChipBtnEl.addEventListener('keydown', function(e) {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      e.preventDefault();
+      if (!isStackChipOpen()) openStackChip();
+    });
+  }
+  if (stackPopoverEl) {
+    stackPopoverEl.addEventListener('click', function(e) {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn || btn.hasAttribute('disabled')) return;
+      const action = btn.getAttribute('data-action');
+      const focus = session && session.focus;
+      if (!focus || focus.kind !== 'range') return;
+      if (action === 'switch') {
+        const payloadAttr = btn.getAttribute('data-focus-payload');
+        closeStackChip();
+        if (!payloadAttr) return;
+        try {
+          postFocus(JSON.parse(payloadAttr));
+        } catch (err) {
+          console.error('Failed to parse stack popover payload:', err);
+        }
+      } else if (action === 'scope') {
+        const newScope = btn.getAttribute('data-diff-scope');
+        if (!newScope || newScope === (focus.diff_scope || 'layer')) return;
+        closeStackChip();
+        postFocus(Object.assign({}, focus, { diff_scope: newScope }));
+      }
+    });
+    // Arrow-key navigation between popover items + Home/End jumps. Tab
+    // continues to work natively (escapes the menu), Escape closes the
+    // popover via the document-level handler.
+    stackPopoverEl.addEventListener('keydown', function(e) {
+      const navKeys = ['ArrowDown', 'ArrowUp', 'Home', 'End'];
+      if (navKeys.indexOf(e.key) === -1) return;
+      const items = focusableStackPopoverItems();
+      if (items.length === 0) return;
+      const currentIdx = items.indexOf(document.activeElement);
+      let nextIdx = currentIdx;
+      if (e.key === 'ArrowDown') {
+        nextIdx = currentIdx < 0 ? 0 : (currentIdx + 1) % items.length;
+      } else if (e.key === 'ArrowUp') {
+        nextIdx = currentIdx <= 0 ? items.length - 1 : currentIdx - 1;
+      } else if (e.key === 'Home') {
+        nextIdx = 0;
+      } else if (e.key === 'End') {
+        nextIdx = items.length - 1;
+      }
+      e.preventDefault();
+      items[nextIdx].focus();
+    });
+  }
+  // Click-outside + Escape close the popover.
+  document.addEventListener('click', function(e) {
+    if (!isStackChipOpen()) return;
+    if (stackChipEl && !stackChipEl.contains(e.target)) closeStackChip();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && isStackChipOpen()) {
+      closeStackChip();
+      e.stopImmediatePropagation();
+    }
+  });
+
+  if (stackChipExitEl) {
+    stackChipExitEl.addEventListener('click', function(e) {
+      e.stopPropagation();
+      closeStackChip();
+      postFocus({ kind: 'working_tree' });
+    });
+  }
+
+  if (resumePrPillEl) {
+    resumePrPillEl.addEventListener('click', function() {
+      const last = session && session.last_range_focus;
+      if (!last || last.kind !== 'range') return;
+      // Build a minimal range-focus payload from the stashed Focus.
+      const payload = {
+        kind: 'range',
+        base_sha: last.base_sha,
+        head_sha: last.head_sha,
+        diff_scope: last.diff_scope || 'layer',
+      };
+      if (last.pr_number) payload.pr_number = last.pr_number;
+      if (last.default_sha) payload.default_sha = last.default_sha;
+      if (last.is_stacked) payload.is_stacked = true;
+      if (last.label) payload.label = last.label;
+      if (last.base_ref_name) payload.base_ref_name = last.base_ref_name;
+      if (last.head_ref_name) payload.head_ref_name = last.head_ref_name;
+      postFocus(payload);
+    });
+  }
+
+  // ===== Start =====
+  init()
+    .then(function() {
+      if (session) applyFocusToHeader(session.focus || { kind: 'working_tree' });
+      // Pre-fetch /api/picker.stack so the breadcrumb has data without
+      // waiting for the user to do anything. Fire for any range focus in
+      // git mode — the breadcrumb's visibility decision uses stack.length,
+      // not is_stacked, so we need the stack data to know whether to render.
+      const f = session && session.focus;
+      if (session && session.mode === 'git' && f && f.kind === 'range') {
+        loadStackFromPicker();
+      }
+    })
+    .then(connectSSE)
+    .then(function() {
+      // Register as InlineContentRenderer
+      if (window.crit && window.crit.renderer) {
+        // eslint-disable-next-line no-unused-vars
+        let annotationIntentCb = null;
+
+        window.crit.renderer.register({
+          scrollToAnchor: function (anchor) {
+            if (anchor.type !== 'line') return Promise.resolve();
+            const section = document.getElementById('file-section-' + anchor.filePath);
+            if (!section) return Promise.resolve();
+            if (!section.open) section.open = true;
+            const el = section.querySelector('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"][data-end-line="' + anchor.endLine + '"]');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return Promise.resolve();
+          },
+
+          highlightAnchor: function (anchor) {
+            if (anchor.type !== 'line') return Promise.resolve();
+            const section = document.getElementById('file-section-' + anchor.filePath);
+            if (!section) return Promise.resolve();
+            const blocks = section.querySelectorAll('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"]');
+            blocks.forEach(function (el) {
+              const start = parseInt(el.dataset.startLine);
+              const end = parseInt(el.dataset.endLine);
+              if (start >= anchor.startLine && end <= anchor.endLine) {
+                el.classList.remove('comment-card-highlight');
+                void el.offsetWidth;
+                el.classList.add('comment-card-highlight');
+                el.addEventListener('animationend', function () {
+                  el.classList.remove('comment-card-highlight');
+                }, { once: true });
+              }
+            });
+            return Promise.resolve();
+          },
+
+          clearHighlight: function () {
+            document.querySelectorAll('.line-block.comment-card-highlight').forEach(function (el) {
+              el.classList.remove('comment-card-highlight');
+            });
+          },
+
+          onAnnotationIntent: function (callback) {
+            annotationIntentCb = callback;
+            return function () { annotationIntentCb = null; };
+          },
+
+          getMode: function () {
+            return (session && session.mode) || 'files';
+          },
+
+          getAnchorType: function () {
+            return 'line';
+          },
+        });
+      }
+    })
+    .catch(function(err) {
+      console.error('Init failed:', err.message);
+    });
+
+})();

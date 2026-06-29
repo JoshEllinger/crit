@@ -9,11 +9,11 @@
   },
   "scripts": {
     "update-deps": "bun run copy-deps.js",
-    "test:frontend": "node cmd/crit/frontend/__tests__/markdown-patch.test.mjs && node cmd/crit/frontend/__tests__/crit-diff-renderer.test.js && node cmd/crit/frontend/test-diff-render.mjs"
+    "test:frontend": "node web/__tests__/markdown-patch.test.mjs && node web/__tests__/crit-diff-renderer.test.js && node web/test-diff-render.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.28.0",
-    "eslint": "^10.4.1",
-    "stylelint": "^17.12.0"
+    "esbuild": "^0.28.1",
+    "eslint": "^10.5.0",
+    "stylelint": "^17.13.0"
   }
 }
