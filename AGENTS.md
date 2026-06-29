@@ -433,7 +433,8 @@ Pushing the tag triggers the workflow, which:
 2. Cross-compiles binaries for darwin/linux (arm64/amd64) with the version injected via ldflags
 3. Generates SHA256 checksums
 4. Creates a GitHub release with auto-generated notes and all binaries attached
-5. Updates the Homebrew tap formula (`tomasz-tomczyk/homebrew-tap`)
+
+(This fork does **not** push a Homebrew tap — upstream's `homebrew-tap` step is intentionally stripped from `release.yml`.)
 
 The version string lives in `main.go` as `var version = "dev"` and is overridden at build time. The tag is the single source of truth.
 
@@ -459,3 +460,12 @@ gh release edit v0.x.y --notes "$(cat <<'EOF2'
 EOF2
 )"
 ```
+
+### Sync the marketplace plugin
+
+The crit Claude Code plugin (`/crit` + `crit-cli` skills + the plan-hook) is distributed through the **`lucidworks/lucidworks-claude-marketplace`** repo, which references this repo's `integrations/claude-code/` directory via a pinned `git-subdir` source. After cutting a release, bump that pin so the marketplace serves the new version:
+
+1. In `lucidworks/lucidworks-claude-marketplace`, edit `.claude-plugin/marketplace.json` → the `crit` plugin entry → `source.ref` → `v0.x.y`.
+2. Open a PR (the marketplace requires review); merging publishes the update to Claude Code users.
+
+Do **not** bump the marketplace's top-level `version` for this — that repo bumps versions only when explicitly intended, and it isn't required for plugin discovery.
