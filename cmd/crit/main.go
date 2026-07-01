@@ -5,8 +5,6 @@ import (
 
 	integrationassets "github.com/tomasz-tomczyk/crit/integrations"
 	"github.com/tomasz-tomczyk/crit/internal/clicmd"
-	"github.com/tomasz-tomczyk/crit/internal/live"
-	"github.com/tomasz-tomczyk/crit/internal/preview"
 	"github.com/tomasz-tomczyk/crit/internal/session"
 	webassets "github.com/tomasz-tomczyk/crit/web"
 )
@@ -30,13 +28,5 @@ func main() {
 		return
 	}
 	args := resolveAtPrefixedArgs(os.Args[1:])
-	if live.LooksLikeLiveArgs(args) {
-		runLive(args)
-		return
-	}
-	if preview.LooksLikePreviewArgs(args) {
-		runPreview(args)
-		return
-	}
-	clicmd.Exit(session.RunReview(args))
+	runPositionalCLI(args)
 }
