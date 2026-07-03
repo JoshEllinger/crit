@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,11 +14,38 @@ import (
 	"github.com/tomasz-tomczyk/crit/internal/testutil"
 )
 
+func daemonFlagValue(args []string, flag string) (string, bool) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
+func assertDaemonFlag(t *testing.T, args []string, flag, want string) {
+	t.Helper()
+	got, ok := daemonFlagValue(args, flag)
+	if !ok {
+		t.Fatalf("args %v missing flag %q", args, flag)
+	}
+	switch flag {
+	case "--output", "--plan-dir":
+		if filepath.Clean(got) != filepath.Clean(want) {
+			t.Fatalf("flag %q = %q, want %q", flag, got, want)
+		}
+	default:
+		if got != want {
+			t.Fatalf("flag %q = %q, want %q", flag, got, want)
+		}
+	}
+}
+
 func TestReconnectDeadSession_MissingReview(t *testing.T) {
 	home := t.TempDir()
 	testutil.SetHome(t, home)
 
-	_, err := reconnectDeadSession("839f3b4cd5d6")
+	_, err := reconnectDeadSession("839f3b4cd5d6", daemon.SessionEntry{})
 	if err == nil {
 		t.Fatal("expected error for missing review")
 	}
@@ -41,7 +69,7 @@ func TestReconnectDeadSession_InvalidJSON(t *testing.T) {
 	}
 	writeFile(t, critPath, "not json")
 
-	_, err = reconnectDeadSession(key)
+	_, err = reconnectDeadSession(key, daemon.SessionEntry{})
 	if err == nil {
 		t.Fatal("expected parse error")
 	}
@@ -83,7 +111,7 @@ func TestReconnectDeadSession_RestartsDaemon(t *testing.T) {
 	t.Cleanup(func() { startDaemonForReconnect = orig })
 
 	stderr := captureStderr(t, func() {
-		entry, err := reconnectDeadSession(key)
+		entry, err := reconnectDeadSession(key, daemon.SessionEntry{})
 		if err != nil {
 			t.Fatalf("reconnectDeadSession: %v", err)
 		}
@@ -140,6 +168,156 @@ func TestRunReview_SessionByID_ReconnectsDeadDaemon(t *testing.T) {
 
 	if err := RunReview(nil); err != nil {
 		t.Fatalf("RunReview: %v", err)
+	}
+}
+
+func TestReconnectDeadSession_OutputReviewPath(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	key := "839f3b4cd5d6"
+
+	outputDir := filepath.Join(t.TempDir(), "out")
+	revDir := filepath.Join(outputDir, ".crit")
+	cj := CritJSON{CliArgs: []string{"a.md"}}
+	if err := SaveCritJSON(revDir, cj); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := daemon.SessionEntry{ReviewPath: revDir}
+	orig := startDaemonForReconnect
+	startDaemonForReconnect = func(gotKey string, args []string) (daemon.SessionEntry, error) {
+		if gotKey != key {
+			t.Fatalf("key = %q, want %q", gotKey, key)
+		}
+		want := []string{"--session-key", key, "--quiet", "a.md", "--output", outputDir}
+		if len(args) != len(want) {
+			t.Fatalf("args = %v, want %v", args, want)
+		}
+		for i := range want {
+			if want[i] == outputDir {
+				if filepath.Clean(args[i]) != filepath.Clean(outputDir) {
+					t.Fatalf("args = %v, want %v", args, want)
+				}
+				continue
+			}
+			if args[i] != want[i] {
+				t.Fatalf("args = %v, want %v", args, want)
+			}
+		}
+		return daemon.SessionEntry{PID: 42, Port: 3001}, nil
+	}
+	t.Cleanup(func() { startDaemonForReconnect = orig })
+
+	if _, err := reconnectDeadSession(key, stale); err != nil {
+		t.Fatalf("reconnectDeadSession: %v", err)
+	}
+}
+
+func TestDaemonArgsForReconnect_OutputAndPublicURL(t *testing.T) {
+	key := "839f3b4cd5d6"
+	outputDir := filepath.Join(os.TempDir(), "review-out")
+	revDir := filepath.Join(outputDir, ".crit")
+	stale := daemon.SessionEntry{
+		ReviewPath: revDir,
+		PublicURL:  "https://crit.example.com",
+	}
+	args := daemonArgsForReconnect(key, []string{"doc.md"}, stale, revDir)
+	assertDaemonFlag(t, args, "--output", outputDir)
+	assertDaemonFlag(t, args, "--public-url", "https://crit.example.com")
+	if !containsArg(args, "doc.md") {
+		t.Fatalf("args %v missing doc.md", args)
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestResolveReconnectReviewDir_MissingStaleReview(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), ".crit")
+	_, err := resolveReconnectReviewDir("839f3b4cd5d6", daemon.SessionEntry{ReviewPath: missing})
+	if err == nil {
+		t.Fatal("expected error for missing stale review_path")
+	}
+	if !strings.Contains(err.Error(), "no review found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestResolveReconnectReviewDir_UsesStalePath(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	outputDir := filepath.Join(t.TempDir(), "out")
+	revDir := filepath.Join(outputDir, ".crit")
+	if err := SaveCritJSON(revDir, CritJSON{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveReconnectReviewDir("839f3b4cd5d6", daemon.SessionEntry{ReviewPath: revDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(got) != filepath.Clean(revDir) {
+		t.Fatalf("got %q, want %q", got, revDir)
+	}
+}
+
+func TestAppendReconnectPathFlags_PlanDir(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	key := "839f3b4cd5d6"
+	planStorage := filepath.Join(home, ".crit", "plans", "auth-flow")
+	reviewDir := filepath.Join(planStorage, ".crit")
+	args := appendReconnectPathFlags(key, []string{"--session-key", key}, reviewDir)
+	assertDaemonFlag(t, args, "--plan-dir", planStorage)
+	assertDaemonFlag(t, args, "--name", "auth-flow")
+}
+
+func TestAppendReconnectPathFlags_DefaultLayout(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	key := "839f3b4cd5d6"
+	defaultDir, err := daemon.ReviewFilePath(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := appendReconnectPathFlags(key, []string{"--session-key", key}, defaultDir)
+	if _, ok := daemonFlagValue(args, "--output"); ok {
+		t.Fatalf("default layout should not add --output: %v", args)
+	}
+	if _, ok := daemonFlagValue(args, "--plan-dir"); ok {
+		t.Fatalf("default layout should not add --plan-dir: %v", args)
+	}
+}
+
+func TestDaemonArgsForReconnect_Host(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	key := "839f3b4cd5d6"
+	defaultDir, err := daemon.ReviewFilePath(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := daemon.SessionEntry{Host: "0.0.0.0"}
+	args := daemonArgsForReconnect(key, nil, stale, defaultDir)
+	assertDaemonFlag(t, args, "--host", "0.0.0.0")
+}
+
+func TestReconnectDeadSession_StalePathMissing(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	key := "839f3b4cd5d6"
+	missing := filepath.Join(t.TempDir(), ".crit")
+	_, err := reconnectDeadSession(key, daemon.SessionEntry{ReviewPath: missing})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "no review found") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
