@@ -1156,6 +1156,16 @@ func (s *Server) handleMergeComments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	critPath := sess.CritJSONPath()
+	if _, err := os.Stat(review.ReviewPathsFor(critPath).Review); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		if os.IsNotExist(err) {
+			json.NewEncoder(w).Encode(map[string]string{"error": "review file not found"})
+		} else {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		}
+		return
+	}
 	data, err := session.ReadFileShared(review.ReviewPathsFor(critPath).Review)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1173,6 +1183,9 @@ func (s *Server) handleMergeComments(w http.ResponseWriter, r *http.Request) {
 
 	newComments, replyUpdates := dedupWebComments(cj, req.Comments)
 	if len(newComments) == 0 && len(replyUpdates) == 0 {
+		// Comments may already be on disk from a prior pull while memory is
+		// still stale (e.g. pendingWrite blocked the file watcher).
+		sess.SyncCommentsFromDisk()
 		writeJSON(w, map[string]any{"merged": 0, "replies_updated": 0})
 		return
 	}
@@ -1182,6 +1195,11 @@ func (s *Server) handleMergeComments(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	// mergeWebComments writes review.json outside WriteFiles; sync in-memory
+	// state immediately so /api/file/comments and the UI refresh path see
+	// pulled comments without waiting for the 1s file watcher tick (which can
+	// also miss same-second mtime updates).
+	sess.SyncCommentsFromDisk()
 	writeJSON(w, map[string]any{"merged": len(newComments), "replies_updated": len(replyUpdates)})
 }
 
