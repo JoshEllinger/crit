@@ -7294,7 +7294,7 @@
     navigator.clipboard.writeText(url).then(function() {
       anchor.classList.add('heading-anchor-copied');
       setTimeout(function() { anchor.classList.remove('heading-anchor-copied'); }, 1500);
-    }).catch(function() {});
+    }).catch(function() { return; });
   });
 
   // ===== Mermaid =====
@@ -7798,9 +7798,9 @@
     const lower = q.toLowerCase();
 
     if (compareTargetTab === 'commits') {
-      let commits = commitList;
+      let commits = commitList.filter(function(c) { return !c.virtual; });
       if (lower) {
-        commits = commitList.filter(function(c) {
+        commits = commits.filter(function(c) {
           return c.short_sha.toLowerCase().indexOf(lower) !== -1
             || c.sha.toLowerCase().indexOf(lower) === 0
             || c.message.toLowerCase().indexOf(lower) !== -1;
@@ -9153,8 +9153,8 @@
         start = Math.min(targetIdx, baseIdx);
         end = Math.max(targetIdx, baseIdx);
       }
-      const inRange = i >= start && i <= end;
-      return { inRange: inRange };
+      const isInRange = i >= start && i <= end;
+      return { inRange: isInRange };
     }
 
     const parts = [];
