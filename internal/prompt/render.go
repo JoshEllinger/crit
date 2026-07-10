@@ -75,6 +75,61 @@ func ResolveFinishTemplate(globalPrompts, projectPrompts map[string]string, proj
 	return nil, nil
 }
 
+// ResolveFinishTemplateSpecific is like ResolveFinishTemplate, but does not
+// fall back from a mode-specific hook to the generic hook. Pass mode="" to
+// resolve only the generic hook.
+func ResolveFinishTemplateSpecific(globalPrompts, projectPrompts map[string]string, projectDir, homeDir, hook, mode string, useProject bool) (*ResolvedTemplate, error) {
+	key := hook
+	if mode != "" {
+		key, _ = ResolveHookKey(hook, mode)
+	}
+	if v, ok := projectPrompts[key]; ok && strings.TrimSpace(v) != "" && useProject {
+		text, err := LoadTemplate(v, projectDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: loading project prompt %s: %v\n", key, err)
+		} else {
+			return &ResolvedTemplate{
+				Text:   text,
+				Hook:   key,
+				Source: TemplateSource(string(LayerProject), v),
+				Layer:  LayerProject,
+			}, nil
+		}
+	}
+	if v, ok := globalPrompts[key]; ok && strings.TrimSpace(v) != "" {
+		text, err := LoadTemplate(v, homeDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: loading global prompt %s: %v\n", key, err)
+			return nil, nil
+		}
+		return &ResolvedTemplate{
+			Text:   text,
+			Hook:   key,
+			Source: TemplateSource(string(LayerGlobal), v),
+			Layer:  LayerGlobal,
+		}, nil
+	}
+	if useProject {
+		if text, source, ok := DiscoverPromptFileSpecific(projectDir, hook, mode, LayerProject); ok {
+			return &ResolvedTemplate{
+				Text:   text,
+				Hook:   key,
+				Source: source,
+				Layer:  LayerProject,
+			}, nil
+		}
+	}
+	if text, source, ok := DiscoverPromptFileSpecific(homeDir, hook, mode, LayerGlobal); ok {
+		return &ResolvedTemplate{
+			Text:   text,
+			Hook:   key,
+			Source: source,
+			Layer:  LayerGlobal,
+		}, nil
+	}
+	return nil, nil
+}
+
 // FinishResult holds the rendered finish prompt (stdout, modal, and API).
 type FinishResult struct {
 	Prompt string
@@ -103,7 +158,49 @@ func RenderFinish(globalPrompts, projectPrompts map[string]string, projectDir, h
 	}
 }
 
+// HookResult holds a rendered non-finish hook (e.g. on_story_generate).
+type HookResult struct {
+	Text string
+	Meta *Meta
+}
+
+// RenderHook resolves and renders a mode-less hook (no :mode split) through
+// the same 5-level precedence as finish hooks: project config -> global
+// config -> project .crit/prompts/ file -> global ~/.crit/prompts/ file ->
+// stock. data supplies the template variables (snake_case keys, as returned
+// by a TemplateData()-shaped map).
+func RenderHook(globalPrompts, projectPrompts map[string]string, projectDir, homeDir string, useProject bool, hook string, data map[string]any) (HookResult, error) {
+	text, source, hookKey := resolveTemplateText(globalPrompts, projectPrompts, projectDir, homeDir, hook, "", useProject)
+	if text == "" {
+		return HookResult{}, fmt.Errorf("no template found for hook %q", hook)
+	}
+	rendered, err := RenderData(text, data)
+	if err != nil {
+		return HookResult{}, fmt.Errorf("rendering prompt %s: %w", hookKey, err)
+	}
+	return HookResult{
+		Text: rendered,
+		Meta: &Meta{Hook: hookKey, TemplateSource: source},
+	}, nil
+}
+
 func resolveTemplateText(globalPrompts, projectPrompts map[string]string, projectDir, homeDir, hook, mode string, useProject bool) (text, source, hookKey string) {
+	if mode == "story" {
+		if resolved, _ := ResolveFinishTemplateSpecific(globalPrompts, projectPrompts, projectDir, homeDir, hook, mode, useProject); resolved != nil {
+			return resolved.Text, resolved.Source, resolved.Hook
+		}
+		if stockText, stockSource, ok := LoadStockTemplateSpecific(hook, mode); ok {
+			specific, _ := ResolveHookKey(hook, mode)
+			return stockText, stockSource, specific
+		}
+		if resolved, _ := ResolveFinishTemplateSpecific(globalPrompts, projectPrompts, projectDir, homeDir, hook, "", useProject); resolved != nil {
+			return resolved.Text, resolved.Source, resolved.Hook
+		}
+		if stockText, stockSource, ok := LoadStockTemplateSpecific(hook, ""); ok {
+			return stockText, stockSource, hook
+		}
+		return "", "", ""
+	}
 	if resolved, _ := ResolveFinishTemplate(globalPrompts, projectPrompts, projectDir, homeDir, hook, mode, useProject); resolved != nil {
 		return resolved.Text, resolved.Source, resolved.Hook
 	}

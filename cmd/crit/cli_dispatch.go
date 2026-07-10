@@ -29,6 +29,7 @@ var commandDispatch = map[string]func([]string){
 	"preview":   runPreview,
 	"plan":      runPlan,
 	"plan-hook": runPlanHookCommand,
+	"story":     runStory,
 	"auth":      runAuth,
 	"stop":      runStop,
 	"status":    runStatus,
@@ -52,6 +53,7 @@ Review:
   crit --pr <num|url>                        Review a GitHub pull request
   crit --range <base>..<head>                Review a commit range
   crit plan --name <slug> <file>             Review a plan file
+  crit story                                 Generate and review a story-mode diff
   crit --session <id>                        Reconnect to an existing review session
 
 Comments:
