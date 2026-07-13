@@ -2,6 +2,7 @@ package share
 
 import (
 	"encoding/json"
+	"errors"
 	"image/color"
 	"io"
 	"net/http"
@@ -52,6 +53,77 @@ func TestDecodeJSONOrHTMLHint_InvalidJSON(t *testing.T) {
 	err := decodeJSONOrHTMLHint(resp, &v)
 	if err == nil || !strings.Contains(err.Error(), "decode share response") {
 		t.Errorf("got %v, want decode error", err)
+	}
+}
+
+func TestCheckProxyAuthCLIAllowed_Blocked(t *testing.T) {
+	homeDir := t.TempDir()
+	testutil.SetHome(t, homeDir)
+	if err := os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"proxy_auth":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := checkProxyAuthCLIAllowed("crit share")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"proxy_auth", "Crit's browser interface"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestCheckProxyAuthCLIAllowed_Allowed(t *testing.T) {
+	homeDir := t.TempDir()
+	testutil.SetHome(t, homeDir)
+	if err := checkProxyAuthCLIAllowed("crit share"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunShare_BlockedByProxyAuth(t *testing.T) {
+	homeDir := t.TempDir()
+	testutil.SetHome(t, homeDir)
+	if err := os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"proxy_auth":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "plan.md"), []byte("# Plan\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	err := RunShare([]string{"plan.md"})
+	if err == nil || !strings.Contains(err.Error(), "proxy_auth") {
+		t.Fatalf("got %v, want proxy_auth block error", err)
+	}
+}
+
+func TestRunFetch_BlockedByProxyAuth(t *testing.T) {
+	homeDir := t.TempDir()
+	testutil.SetHome(t, homeDir)
+	if err := os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"proxy_auth":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := RunFetch(nil)
+	if err == nil || !strings.Contains(err.Error(), "proxy_auth") {
+		t.Fatalf("got %v, want proxy_auth block error", err)
+	}
+}
+
+func TestRunUnpublish_BlockedByProxyAuth(t *testing.T) {
+	homeDir := t.TempDir()
+	testutil.SetHome(t, homeDir)
+	if err := os.WriteFile(filepath.Join(homeDir, ".crit.config.json"), []byte(`{"proxy_auth":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := RunUnpublish(nil)
+	if err == nil || !strings.Contains(err.Error(), "proxy_auth") {
+		t.Fatalf("got %v, want proxy_auth block error", err)
 	}
 }
 
@@ -238,18 +310,15 @@ func TestFetchWebComments(t *testing.T) {
 		}
 	})
 
-	t.Run("404 returns no comments without error", func(t *testing.T) {
+	t.Run("404 reports deleted remote share", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 		}))
 		defer srv.Close()
 
-		result, err := fetchWebComments(srv.URL+"/r/gone", nil, nil, nil, "")
-		if err != nil {
-			t.Fatalf("unexpected error for 404: %v", err)
-		}
-		if result.NewComments != nil {
-			t.Errorf("expected nil for 404, got %v", result.NewComments)
+		_, err := fetchWebComments(srv.URL+"/r/gone", nil, nil, nil, "")
+		if !errors.Is(err, ErrShareNotFound) {
+			t.Fatalf("err = %v, want ErrShareNotFound", err)
 		}
 	})
 
@@ -613,6 +682,27 @@ func TestUpsertShareToWeb_CallsPUTOnChange(t *testing.T) {
 	}
 }
 
+func TestUpsertShareToWeb_RemoteDeleted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/reviews/tok" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cfg := CritJSON{
+		ShareURL:      srv.URL + "/r/tok",
+		DeleteToken:   "dt",
+		LastShareHash: "old-hash",
+		ReviewRound:   1,
+	}
+	_, err := upsertShareToWeb(cfg, []ShareFile{{Path: "plan.md", Content: "# changed"}}, []shareComment{}, "")
+	if !errors.Is(err, ErrShareNotFound) {
+		t.Fatalf("err = %v, want ErrShareNotFound", err)
+	}
+}
+
 func TestUpsertShareToWeb_SkipsPUTWhenUnchanged(t *testing.T) {
 	putCalled := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -764,6 +854,166 @@ func TestLoadExistingShareCfg_ScopeMismatch(t *testing.T) {
 	}
 	if cfg.ShareURL != "https://crit.md/r/old" {
 		t.Errorf("expected URL for matching scope, got %q", cfg.ShareURL)
+	}
+}
+
+func TestRunShareExisting_RemoteDeletedCreatesFreshShare(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+
+	dir := t.TempDir()
+	critPath := filepath.Join(dir, ".crit")
+	filePath := filepath.Join(dir, "plan.md")
+	if err := os.WriteFile(filePath, []byte("# Plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var postCount int
+	var baseURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/reviews/oldtoken/comments":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/reviews":
+			postCount++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"url":          baseURL + "/r/newtoken",
+				"delete_token": "new-delete-token",
+			})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	baseURL = srv.URL
+
+	cj := CritJSON{
+		ShareURL:    srv.URL + "/r/oldtoken",
+		DeleteToken: "old-delete-token",
+		ShareScope:  ShareScope([]string{"plan.md"}),
+		LastShareHash: ComputeShareHash(
+			[]ShareFile{{Path: "plan.md", Content: "# Plan\n"}},
+			nil,
+		),
+		ReviewRound: 1,
+		Files:       map[string]CritJSONFile{"plan.md": {}},
+	}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	if err := os.WriteFile(session.MustMkdirAll(review.ReviewPathsFor(critPath).Review), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runShareExisting(
+		cj,
+		critPath,
+		[]ShareFile{{Path: "plan.md", Content: "# Plan\n"}},
+		[]string{"plan.md"},
+		srv.URL,
+		"",
+		"",
+		"",
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("runShareExisting: %v", err)
+	}
+	if postCount != 1 {
+		t.Fatalf("POST /api/reviews count = %d, want 1", postCount)
+	}
+
+	updated, ok, err := loadExistingShareCfg(critPath, []string{"plan.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected fresh share state")
+	}
+	if updated.ShareURL != srv.URL+"/r/newtoken" {
+		t.Fatalf("share_url = %q, want fresh URL", updated.ShareURL)
+	}
+	if updated.DeleteToken != "new-delete-token" {
+		t.Fatalf("delete_token = %q, want fresh token", updated.DeleteToken)
+	}
+}
+
+func TestRunShareExisting_UpsertRemoteDeletedCreatesFreshShare(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+
+	dir := t.TempDir()
+	critPath := filepath.Join(dir, ".crit")
+
+	var putCount int
+	var postCount int
+	var baseURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/reviews/oldtoken/comments":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
+		case r.Method == http.MethodPut && r.URL.Path == "/api/reviews/oldtoken":
+			putCount++
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/reviews":
+			postCount++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"url":          baseURL + "/r/newtoken",
+				"delete_token": "new-delete-token",
+			})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	baseURL = srv.URL
+
+	cj := CritJSON{
+		ShareURL:      srv.URL + "/r/oldtoken",
+		DeleteToken:   "old-delete-token",
+		ShareScope:    ShareScope([]string{"plan.md"}),
+		LastShareHash: "old-hash",
+		ReviewRound:   1,
+		Files:         map[string]CritJSONFile{"plan.md": {}},
+	}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	if err := os.WriteFile(session.MustMkdirAll(review.ReviewPathsFor(critPath).Review), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runShareExisting(
+		cj,
+		critPath,
+		[]ShareFile{{Path: "plan.md", Content: "# changed\n"}},
+		[]string{"plan.md"},
+		srv.URL,
+		"",
+		"",
+		"",
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("runShareExisting: %v", err)
+	}
+	if putCount != 1 {
+		t.Fatalf("PUT /api/reviews/oldtoken count = %d, want 1", putCount)
+	}
+	if postCount != 1 {
+		t.Fatalf("POST /api/reviews count = %d, want 1", postCount)
+	}
+
+	updated, ok, err := loadExistingShareCfg(critPath, []string{"plan.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected fresh share state")
+	}
+	if updated.ShareURL != srv.URL+"/r/newtoken" {
+		t.Fatalf("share_url = %q, want fresh URL", updated.ShareURL)
 	}
 }
 
@@ -1570,6 +1820,37 @@ func TestMergeWebComments(t *testing.T) {
 	}
 	if result.ReviewComments[0].Body != "review note" {
 		t.Errorf("review comment body = %q", result.ReviewComments[0].Body)
+	}
+}
+
+func TestMergeWebComments_PreviewPinPreservesDOMAnchor(t *testing.T) {
+	dir := t.TempDir()
+	critPath := filepath.Join(dir, ".crit")
+	cj := CritJSON{ReviewRound: 1, Files: map[string]CritJSONFile{}}
+	data, _ := json.MarshalIndent(cj, "", "  ")
+	os.WriteFile(session.MustMkdirAll(review.ReviewPathsFor(critPath).Review), data, 0644)
+
+	anchor := &session.DOMAnchor{Pathname: "/preview-content", CSSSelector: "h1"}
+	newComments := []WebComment{{
+		Body:              "imported pin",
+		FilePath:          session.PreviewMainHTMLKey,
+		DOMAnchor:         anchor,
+		AuthorDisplayName: "Alice",
+	}}
+	if err := MergeWebComments(critPath, newComments, nil); err != nil {
+		t.Fatalf("MergeWebComments: %v", err)
+	}
+
+	data, _ = os.ReadFile(review.ReviewPathsFor(critPath).Review)
+	var result CritJSON
+	json.Unmarshal(data, &result)
+
+	stored := result.Files[session.PreviewMainHTMLKey].Comments
+	if len(stored) != 1 {
+		t.Fatalf("expected 1 comment under %s, got %d", session.PreviewMainHTMLKey, len(stored))
+	}
+	if stored[0].DOMAnchor == nil || stored[0].DOMAnchor.Pathname != "/preview-content" {
+		t.Fatalf("dom_anchor not preserved: %+v", stored[0].DOMAnchor)
 	}
 }
 

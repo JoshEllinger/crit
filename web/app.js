@@ -338,6 +338,7 @@
   // (window.crit.share). The controller is created in init() once /api/config
   // resolves, and stored here so other code can call reveal()/closeModal().
   let shareCtl = null;
+  let promptTrustConfig = { project_prompts_untrusted: false };
 
   let uiState = 'reviewing';
   let waitingNotApproved = false;
@@ -416,15 +417,15 @@
     document.body.classList.toggle('hide-resolved', hideResolvedState);
   }
 
-  // diffCommit is the DERIVED backend param string (kept so the existing
-  // &commit= append sites and the reloadForScope key work unchanged):
-  //   0 selected      -> ''                  (all commits)
-  //   exactly 1       -> '<full sha>'         (single-commit path)
-  //   2+ selected     -> '<baseSHA>..<headSHA>' (git range)
-  // selectedCommits holds the user-checked full SHAs; diffCommit is recomputed
-  // from it via recomputeDiffCommit() whenever the selection changes.
+  // diffCommit is the DERIVED backend param for /api/session?commit=:
+  //   no pins          -> ''           (full range)
+  //   from only        -> '<sha>'      (single commit)
+  //   from + through   -> '<from>..<through>'
+  const VIRTUAL_WORKING_COMMIT = '__crit_virtual_working_tree__';
   let diffCommit = '';
-  const selectedCommits = new Set();
+  let commitFrom = '';
+  let commitThrough = '';
+  let virtualCommitSelected = false;
   let commitList = [];
   let diffActive = false; // rendered diff view toggle for file mode
 
@@ -831,11 +832,15 @@
     document.getElementById('filesContainer').innerHTML =
       '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
 
-    const [sessionRes, configRes] = await Promise.all([
+    const initialResponses = await Promise.all([
       fetchWhenReady('/api/session' + (diffScope ? '?scope=' + enc(diffScope) : '')),
       fetchWhenReady('/api/config'),
     ]);
+    let sessionRes = initialResponses[0];
+    const configRes = initialResponses[1];
 
+    sessionRes = await hydrateStoryIfMissing(sessionRes);
+    sessionRes = await hydrateFullSessionForStoryIfNeeded(sessionRes);
     session = sessionRes;
     reviewComments = sessionRes.review_comments || [];
 
@@ -883,6 +888,14 @@
       icons: { clipboard: ICON_CLIPBOARD, check: ICON_CHECK_SMALL },
     });
     shareCtl.reveal();
+
+    promptTrustConfig = {
+      project_prompts_untrusted: !!configRes.project_prompts_untrusted,
+      project_prompt_sources: configRes.project_prompt_sources || [],
+      project_prompt_preview: configRes.project_prompt_preview || '',
+      project_prompt_content_hash: configRes.project_prompt_content_hash || '',
+    };
+    window.crit.shared.applyProjectPromptTrustUI(promptTrustConfig, document.getElementById('finishBtn'));
 
     // Update notifications (brew upgrade + stale integrations)
     pendingUpdates = [];
@@ -946,10 +959,9 @@
       document.getElementById('branchContext').appendChild(branchCopyBtn);
       // Base branch picker: show in git mode when on a feature branch
       if (session.base_ref) {
-        currentBaseBranch = session.base_branch_name || '';
-        document.getElementById('baseBranchLabel').textContent = currentBaseBranch || 'base';
+        currentCompareTarget = session.base_branch_name || '';
+        document.getElementById('baseBranchLabel').textContent = compareTargetChipLabel(currentCompareTarget) || 'base';
         document.getElementById('baseBranchArrow').style.display = '';
-        fetchBranches();
       }
     } else if (session.mode !== 'git' && session.files && session.files.length === 1) {
       document.getElementById('branchContext').style.display = '';
@@ -1009,12 +1021,17 @@
       // correct, and the scope toggle will be hidden once the range chrome
       // renders.
       const inRangeFocus = session.focus && session.focus.kind === 'range';
-      if (diffScope === null) {
+      // Working-tree scopes (branch/staged/unstaged) filter against HEAD;
+      // range focus diffs are pinned to BaseSHA..HeadSHA server-side.
+      if (inRangeFocus) {
+        diffScope = 'all';
+      } else if (diffScope === null) {
         // First launch — prefer "branch" (committed changes only) over "all"
         // (which includes untracked files and can overwhelm large repos).
         diffScope = scopes.indexOf('branch') !== -1 ? 'branch' : 'all';
-        if (diffScope !== 'all' && !inRangeFocus) {
-          const corrected = await fetchWhenReady('/api/session?scope=' + enc(diffScope));
+        if (diffScope !== 'all') {
+          let corrected = await hydrateStoryIfMissing(await fetchWhenReady('/api/session?scope=' + enc(diffScope)));
+          corrected = await hydrateFullSessionForStoryIfNeeded(corrected);
           session = corrected;
           reviewComments = corrected.review_comments || [];
         }
@@ -1023,7 +1040,7 @@
         setSetting('diffScope', 'all');
         // Re-fetch session with corrected scope — the initial fetch used the
         // stale cookie value and may have returned an empty file list.
-        const corrected = await fetchWhenReady('/api/session?scope=all');
+        const corrected = await hydrateStoryIfMissing(await fetchWhenReady('/api/session?scope=all'));
         session = corrected;
         reviewComments = corrected.review_comments || [];
       }
@@ -1031,14 +1048,7 @@
         b.classList.toggle('active', b.dataset.scope === diffScope);
       });
 
-      // Commit dropdown: visible only for all/branch scope in git mode
-      if (diffScope === 'all' || diffScope === 'branch') {
-        fetchCommits();
-      } else {
-        commitDropdownEl.style.display = 'none';
-        selectedCommits.clear();
-        recomputeDiffCommit();
-      }
+      updateCompareAndCommitChrome();
     }
 
     updateHeaderRound();
@@ -1046,7 +1056,7 @@
       ? 'Crit — ' + (session.branch || 'review')
       : 'Crit — ' + (session.files || []).map(f => f.path).join(', '));
 
-    files = await loadAllFileData(session.files || [], diffScope);
+    files = await loadAllFileData(session.files || [], currentFileDataScope());
     hiddenUnresolved = session.hidden_unresolved || 0;
 
     files.sort(fileSortComparator);
@@ -1062,10 +1072,20 @@
     restoreDrafts();
     applyHideResolved();
     scrollToHashHeading();
+    // Story layer (opt-in). No-op when session.story is absent.
+    applyStoryPresence();
+    updateDiffModeToggle();
   }
 
   // Show/hide the Toggle Diff button and Split/Unified toggle in file mode
   function updateDiffModeToggle() {
+    if (storyActive()) {
+      document.getElementById('diffModeToggle').style.display = '';
+      document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.mode === diffMode);
+      });
+      return;
+    }
     if (session.mode === 'git') return; // git mode handles this in init
     const hasDiffs = files.some(function(f) {
       return f.fileType === 'markdown' && f.previousLineBlocks && f.previousLineBlocks.length > 0;
@@ -1100,6 +1120,7 @@
     md: 'markdown',    // normalize: callers compare lang against 'markdown'
     heex: 'heex',
     leex: 'heex',
+    rake: 'ruby',      // hljs has no .rake alias (Rakefiles are Ruby)
   };
   // Files identified by basename rather than extension.
   const BASENAME_LANG = {
@@ -1211,10 +1232,24 @@
     );
   }
 
-  function rewriteImageSrcs(html) {
+  function resolveImagePath(filePath, src) {
+    const fileDir = filePath.includes('/') ? filePath.replace(/\/[^/]*$/, '') : '';
+    const combined = fileDir ? fileDir + '/' + src : src;
+    const parts = combined.split('/');
+    const stack = [];
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (!p || p === '.') continue;
+      if (p === '..') { if (stack.length) stack.pop(); }
+      else stack.push(p);
+    }
+    return stack.join('/');
+  }
+
+  function rewriteImageSrcs(html, filePath) {
     return html.replace(/(<img\s[^>]*src=")([^"]+)(")/gi, function(match, pre, src, post) {
       if (/^https?:\/\/|^data:|^\//.test(src)) return match;
-      return pre + '/files/' + src + post;
+      return pre + '/files/' + resolveImagePath(filePath || '', src) + post;
     });
   }
 
@@ -1493,6 +1528,20 @@
 
       (function(path) {
         fileEl.addEventListener('click', function() {
+          // In story view, clicking a file activates its owning chapter and
+          // scrolls to its hunk group; otherwise use the flat-view scroll.
+          const chipPage = storyState && storyState.fileChapters.has(path)
+            ? storyPageId(storyState.pages[Array.from(storyState.fileChapters.get(path))[0]])
+            : null;
+          if (storyActive() && chipPage) {
+            showStory(chipPage);
+            requestAnimationFrame(function () {
+              const pane = document.getElementById('storyPane');
+              const group = pane && pane.querySelector('.crit-story-file-group[data-story-file="' + CSS.escape(path) + '"]');
+              if (group) group.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            });
+            return;
+          }
           scrollToFile(path);
         });
       })(f.path);
@@ -1968,12 +2017,30 @@
     const file = getFileByPath(filePath);
     if (!file) return;
     saveOpenFormContent(filePath);
+    if (storyActive()) {
+      if (!renderStoryFileByPath(filePath)) renderStory();
+      return;
+    }
     const oldSection = document.getElementById('file-section-' + file.path);
     if (!oldSection) { renderAllFiles(); return; }
     oldSection.replaceWith(renderFileSection(file));
     renderMermaidBlocks();
     rebuildNavList();
     applyHideResolved();
+  }
+
+  function currentRenderedFileSection(filePath) {
+    if (storyActive()) {
+      const page = storyPageById(storyView);
+      if (page) {
+        const view = document.getElementById('crit-story-view-' + storyPageId(page));
+        if (view) {
+          const storySection = view.querySelector('.crit-story-file-group[data-story-file="' + CSS.escape(filePath) + '"]');
+          if (storySection) return storySection;
+        }
+      }
+    }
+    return document.getElementById('file-section-' + filePath);
   }
 
   function renderFileSection(file) {
@@ -2023,7 +2090,7 @@
           file_type: file.fileType,
           additions: file.additions,
           deletions: file.deletions,
-        }, diffScope).then(function(loaded) {
+        }, effectiveDiffScope()).then(function(loaded) {
           // Copy loaded data into the existing file object
           file.oldPath = loaded.oldPath;
           file.content = loaded.content;
@@ -2456,7 +2523,7 @@
     contentEl.className = buildContentClasses(block);
     let html = block.wordDiffHtml || block.html;
     html = processTaskLists(html);
-    html = rewriteImageSrcs(html);
+    html = rewriteImageSrcs(html, file.path);
     contentEl.innerHTML = html;
     lineBlockEl.appendChild(contentEl);
 
@@ -2685,7 +2752,7 @@
       content.className = buildContentClasses(block);
       let html = block.html;
       html = processTaskLists(html);
-      html = rewriteImageSrcs(html);
+      html = rewriteImageSrcs(html, file.path);
       content.innerHTML = html;
 
       gutter.appendChild(commentGutter);
@@ -3358,11 +3425,11 @@
         const merged = {
           OldStart: hunks[i].OldStart,
           NewStart: hunks[i].NewStart,
-          Header: hunks[i].Header,
           Lines: hunks[i].Lines.concat(contextLines, hunks[i + 1].Lines)
         };
         merged.OldCount = (hunks[i + 1].OldStart + hunks[i + 1].OldCount) - merged.OldStart;
         merged.NewCount = (hunks[i + 1].NewStart + hunks[i + 1].NewCount) - merged.NewStart;
+        merged.Header = buildHunkHeader(merged.OldStart, merged.OldCount, merged.NewStart, merged.NewCount, hunks[i].Header);
         // Replace both with merged — don't increment i to check merged against next
         hunks.splice(i, 2, merged);
       } else {
@@ -4003,7 +4070,7 @@
   // Update drag selection CSS classes on existing DOM without full re-render.
   // Handles both markdown line blocks and diff gutter elements.
   function updateDragSelectionVisuals(filePath) {
-    const section = document.getElementById('file-section-' + filePath);
+    const section = currentRenderedFileSection(filePath);
     if (!section) return;
 
     // Markdown line blocks: toggle .selected on line-block, update comment gutter drag classes
@@ -6511,27 +6578,45 @@
   }
 
 
-  function scrollToComment(commentId, filePath) {
-    // 1. Find the file section and expand if collapsed
-    const section = document.getElementById('file-section-' + filePath);
-    if (!section) return;
-    if (!section.open) section.open = true;
-
-    // 2. Find the inline comment card by comment ID
-    const commentCard = section.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
-    if (!commentCard) return;
-
-    // 3. Scroll into view
+  function flashCommentCard(commentCard) {
     commentCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-    // 4. Flash highlight
     commentCard.classList.remove('comment-card-highlight');
     void commentCard.offsetWidth;
     commentCard.classList.add('comment-card-highlight');
     commentCard.addEventListener('animationend', function() {
       commentCard.classList.remove('comment-card-highlight');
     }, { once: true });
+  }
 
+  function scrollToComment(commentId, filePath) {
+    // Story view: the comment renders inside its owning chapter, not a
+    // file-section. Activate that chapter first (chapter-aware navigation),
+    // then locate + flash the card within the story pane on the next frame.
+    if (storyActive()) {
+      const file = getFileByPath(filePath);
+      let line = null;
+      if (file && file.comments) {
+        const c = file.comments.find(function (x) { return x.id === commentId; });
+        if (c) line = c.end_line;
+      }
+      const navigated = line !== null ? storyActivatePageForLine(filePath, line) : false;
+      const locate = function () {
+        const pane = document.getElementById('storyPane');
+        if (!pane) return;
+        const card = pane.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
+        if (card) flashCommentCard(card);
+      };
+      if (navigated) requestAnimationFrame(locate); else locate();
+      return;
+    }
+
+    // Flat view: original behavior.
+    const section = document.getElementById('file-section-' + filePath);
+    if (!section) return;
+    if (!section.open) section.open = true;
+    const commentCard = section.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
+    if (!commentCard) return;
+    flashCommentCard(commentCard);
   }
 
   // ===== PR Overview Panel =====
@@ -6714,7 +6799,9 @@
         unresolvedComments += reviewComments.filter(function(c) { return !c.resolved; }).length;
         unresolvedComments += hiddenUnresolved;
         finishBtn.textContent = unresolvedComments === 0 ? 'Approve' : 'Finish Review';
-        finishBtn.disabled = false;
+        if (!promptTrustConfig.project_prompts_untrusted) {
+          finishBtn.disabled = false;
+        }
         finishBtn.classList.add('btn-primary');
         document.getElementById('waitingEdits').textContent = '';
         waitingOverlay.classList.remove('active');
@@ -6741,6 +6828,15 @@
   // and uiState transition (live-mode wires its own state machine).
   async function doFinishReview() {
     return await window.crit.shared.runFinishReview({
+      checkConsent: function () {
+        return window.crit.shared.ensureProjectPromptTrust(promptTrustConfig).then(function (ok) {
+          if (ok) {
+            window.crit.shared.applyProjectPromptTrustUI(promptTrustConfig, document.getElementById('finishBtn'));
+            if (uiState === 'reviewing') setUIState('reviewing');
+          }
+          return ok;
+        });
+      },
       onApproved: function () { waitingNotApproved = false; setUIState('waiting'); },
       onWaiting: function () { waitingNotApproved = true; setUIState('waiting'); },
       onError: function (err) {
@@ -6882,16 +6978,16 @@
         }
 
         // Clear commit filter on round-complete
-        selectedCommits.clear();
-        recomputeDiffCommit();
+        clearCommitPins();
 
         // Re-fetch everything on file-changed (round complete)
-        const sessionRes = await fetch('/api/session?scope=' + enc(diffScope)).then(r => r.json());
+        let sessionRes = await hydrateStoryIfMissing(await fetchWhenReady('/api/session?scope=' + enc(currentSessionFetchScope())));
+        sessionRes = await hydrateFullSessionForStoryIfNeeded(sessionRes);
         session = sessionRes;
         reviewComments = sessionRes.review_comments || [];
 
         // Reload all files
-        files = await loadAllFileData(session.files || [], diffScope);
+        files = await loadAllFileData(session.files || [], currentFileDataScope());
         hiddenUnresolved = session.hidden_unresolved || 0;
 
         // Restore per-file user state from previous round
@@ -6931,6 +7027,10 @@
         updateCommentCount();
         updateViewedCount();
         updateTreeViewedState();
+        // Re-render the story layer against the fresh file data (or tear it
+        // down if the round dropped the story). Preserves position when the
+        // current chapter still exists (storyFromHash re-reads the hash).
+        applyStoryPresence();
         setUIState('reviewing');
         // Signal "ready" in the tab bar if the user has tabbed away.
         // Cleared by the visibilitychange listener when they return.
@@ -6960,6 +7060,10 @@
       try {
         // Only re-fetch comments data, not file content or diffs (those only
         // change on file-changed events). This reduces O(3N) to O(N) requests.
+        const previousCommentSignatures = new Map();
+        for (let i = 0; i < files.length; i++) {
+          previousCommentSignatures.set(files[i].path, JSON.stringify(files[i].comments || []));
+        }
         await Promise.all(files.map(async function(f) {
           return fetch('/api/file/comments?path=' + enc(f.path))
             .then(function(r) { return r.ok ? r.json() : []; })
@@ -6988,9 +7092,18 @@
           checkAgentReplies(files[i].comments);
           saveOpenFormContent(files[i].path);
         }
-        renderAllFiles();
+        if (storyActive()) {
+          for (let i = 0; i < files.length; i++) {
+            const before = previousCommentSignatures.get(files[i].path) || '[]';
+            const after = JSON.stringify(files[i].comments || []);
+            if (before !== after) renderStoryFileByPath(files[i].path);
+          }
+        } else {
+          renderAllFiles();
+        }
         updateCommentCount();
         updateTreeCommentBadges();
+        renderCommentsPanel();
         // Restore focus
         if (focusedFormKey) {
           const ta = document.querySelector('.comment-form[data-form-key="' + focusedFormKey + '"] textarea');
@@ -7024,6 +7137,11 @@
             // server snapshot so renderResumePill sees the latest value.
             session.last_range_focus = inner.last_range_focus || null;
           }
+          if (focus.kind === 'range') {
+            diffScope = 'all';
+          } else {
+            restoreWorkingTreeDiffScope();
+          }
           applyFocusToHeader(focus);
           // Re-fetch the stack on any range focus transition — the new
           // focus may live in a different stack, and the breadcrumb's
@@ -7039,6 +7157,31 @@
       // Reuse the same refresh path as base-changed.
       reloadForScope();
       fetchCommits();
+      },
+      'story-updated': function(data) {
+      try {
+        // Envelope: {type, filename, content} where content is JSON {story:...}.
+        const envelope = data || {};
+        const inner = envelope.content ? JSON.parse(envelope.content) : envelope;
+        const nextStory = (inner && 'story' in inner) ? inner.story : null;
+        if (session) session.story = nextStory;
+        // A fresh ingest must always surface the story view — clear any prior
+        // "Hide story view" state. (A null story clears storyHidden inside
+        // applyStoryPresence via the no-story branch.)
+        if (nextStory) {
+          storyCleared = false;
+          storyHidden = false;
+          storyExpandedFileCache.clear();
+          reloadForScope();
+        } else {
+          storyCleared = true;
+          storyHidden = false;
+          storyExpandedFileCache.clear();
+          applyStoryPresence();
+        }
+      } catch (err) {
+        console.error('story-updated parse:', err);
+      }
       },
       'server-shutdown': function() {
       conn.close();
@@ -7260,7 +7403,7 @@
     navigator.clipboard.writeText(url).then(function() {
       anchor.classList.add('heading-anchor-copied');
       setTimeout(function() { anchor.classList.remove('heading-anchor-copied'); }, 1500);
-    }).catch(function() {});
+    }).catch(function() { return; });
   });
 
   // ===== Mermaid =====
@@ -7328,6 +7471,7 @@
   // and overflow just adds a horizontal scrollbar.
   const SIDEBAR_RESIZE = [
     { handleId: 'fileTreeResizer',     targetId: 'fileTreePanel',  settingKey: 'fileTreeWidth',     min: 180, edge: 'right' },
+    { handleId: 'storyRailResizer',    targetId: 'storyRail',      settingKey: 'storyRailWidth',    min: 180, edge: 'right' },
     { handleId: 'commentsPanelResizer', targetId: 'commentsPanel', settingKey: 'commentsPanelWidth', min: 300, edge: 'left'  },
   ];
 
@@ -7365,7 +7509,7 @@
       document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(b) {
         b.classList.toggle('active', b.dataset.mode === mode);
       });
-      renderAllFiles();
+      if (storyActive()) renderStory(); else renderAllFiles();
     });
   });
 
@@ -7376,186 +7520,618 @@
     renderAllFiles();
   });
 
-  // ===== Commit Picker (sidebar dropdown) =====
+  // ===== Compare chrome (target + commit range) =====
   const commitDropdownEl = document.getElementById('commitDropdown');
+  const baseBranchPickerEl = document.getElementById('baseBranchPicker');
+  const baseBranchBtnEl = document.getElementById('baseBranchBtn');
+  const compareTargetTabsEl = document.getElementById('compareTargetTabs');
+  const compareTargetUseCustomEl = document.getElementById('compareTargetUseCustom');
+  const commitClearThroughEl = document.getElementById('commitClearThrough');
 
-  async function fetchCommits() {
-    try {
-      const res = await fetch('/api/commits');
-      if (!res.ok) { commitDropdownEl.style.display = 'none'; return; }
-      commitList = await res.json();
-      if (!commitList || commitList.length < 2) {
-        commitDropdownEl.style.display = 'none';
-        selectedCommits.clear();
-        recomputeDiffCommit();
-        return;
-      }
-      // Drop any selected SHA that's no longer present in the new commit list,
-      // then recompute the derived backend param.
-      const present = new Set(commitList.map(function(c) { return c.sha; }));
-      selectedCommits.forEach(function(sha) {
-        if (!present.has(sha)) selectedCommits.delete(sha);
+  let compareTargets = { vcs: 'git', detected: '', local: [], remote: [] };
+  let compareTargetTab = 'refs';
+  let currentCompareTarget = '';
+  const compareTargetPicker = { highlightedIdx: -1 };
+  let compareTargetsFetchGen = 0;
+  let commitsFetchGen = 0;
+
+  function sessionInRangeFocus() {
+    return !!(session && session.focus && session.focus.kind === 'range');
+  }
+
+  // Scope passed to /api/file and /api/file/diff. Working-tree scopes are
+  // meaningless in range (PR) focus — the file list and hunks are pinned to
+  // BaseSHA..HeadSHA server-side.
+  function effectiveDiffScope() {
+    return sessionInRangeFocus() ? 'all' : diffScope;
+  }
+
+  function sessionFocusIsRange(s) {
+    return !!(s && s.focus && s.focus.kind === 'range');
+  }
+
+  function currentFileDataScope() {
+    return storyHasContent(session && session.story) && !storyHidden ? 'all' : effectiveDiffScope();
+  }
+
+  function currentSessionFetchScope() {
+    return storyHasContent(session && session.story) && !storyHidden ? 'all' : effectiveDiffScope();
+  }
+
+  function restoreWorkingTreeDiffScope() {
+    if (!session || session.mode !== 'git' || sessionInRangeFocus()) return;
+    const scopes = session.available_scopes || ['all', 'staged', 'unstaged'];
+    const saved = getSetting('diffScope');
+    if (saved && scopes.indexOf(saved) !== -1) {
+      diffScope = saved;
+    } else if (scopes.indexOf(diffScope) === -1) {
+      diffScope = scopes.indexOf('branch') !== -1 ? 'branch' : 'all';
+    }
+    const scopeToggle = document.getElementById('scopeToggle');
+    if (scopeToggle) {
+      scopeToggle.querySelectorAll('.toggle-btn').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.scope === diffScope);
       });
-      recomputeDiffCommit();
-      commitDropdownEl.style.display = '';
-      renderCommitPicker();
-    } catch {
-      commitDropdownEl.style.display = 'none';
     }
   }
 
-  // Recompute the derived diffCommit backend param from selectedCommits.
-  // commitList is newest-first, so the smallest index is the newest (head)
-  // and the largest index is the oldest. For a 2+ range the base is the
-  // PARENT of the oldest selected commit (commitList[oldestIdx + 1].sha) or
-  // session.base_ref when the oldest selected commit is the first commit.
-  // Emits FULL 40-char SHAs (the backend validates hex 4-40): commitList SHAs
-  // come from /api/commits, and session.base_ref is a merge-base SHA — both are
-  // guaranteed present and hex whenever the picker is interactive, because
-  // GetCommits returns nil (→ commitList empty → picker hidden) when base_ref
-  // is unset. The empty-base guard below is belt-and-suspenders for that
-  // invariant: never emit a malformed "..<head>" range that would silently
-  // fall back to the full unscoped diff on the backend.
+  function compareTargetChromeVisible() {
+    if (!session || session.mode !== 'git') return false;
+    if (sessionInRangeFocus()) return false;
+    return diffScope === 'all' || diffScope === 'branch';
+  }
+
+  function commitRangeChromeVisible() {
+    if (!session || session.mode !== 'git') return false;
+    if (sessionInRangeFocus()) return false;
+    if (diffScope === 'staged' || diffScope === 'unstaged') return false;
+    return true;
+  }
+
+  function looksLikeShaRef(ref) {
+    return /^[0-9a-f]{4,}$/i.test(ref);
+  }
+
+  function compareTargetChipLabel(ref) {
+    if (!ref) return 'base';
+    return looksLikeShaRef(ref) ? ref.slice(0, 7) : ref;
+  }
+
+  function isRevishQuery(q) {
+    const t = q.trim();
+    if (!t) return false;
+    if (/^[0-9a-f]{7,40}$/i.test(t)) return true;
+    if (/^HEAD(?:[~^]\d+)?$/i.test(t)) return true;
+    if (t === '@' || /^@[-a-z0-9]+$/i.test(t)) return true;
+    return false;
+  }
+
+  function commitIndexForSha(sha) {
+    for (let i = 0; i < commitList.length; i++) {
+      if (commitList[i].sha === sha) return i;
+    }
+    return -1;
+  }
+
+  function normalizeCommitPins() {
+    if (!commitList) commitList = [];
+    if (commitFrom && commitThrough && commitFrom === commitThrough) {
+      commitThrough = '';
+    }
+    if (commitFrom && commitThrough) {
+      const fromIdx = commitIndexForSha(commitFrom);
+      const throughIdx = commitIndexForSha(commitThrough);
+      if (fromIdx >= 0 && throughIdx >= 0 && fromIdx < throughIdx) {
+        const tmp = commitFrom;
+        commitFrom = commitThrough;
+        commitThrough = tmp;
+      }
+    }
+    const present = new Set(commitList.map(function(c) { return c.sha; }));
+    if (commitFrom && !present.has(commitFrom)) commitFrom = '';
+    if (commitThrough && !present.has(commitThrough)) commitThrough = '';
+    if (!commitFrom) commitThrough = '';
+    if (virtualCommitSelected) {
+      const hasVirtual = commitList.some(function(c) { return !!c.virtual; });
+      if (!hasVirtual) virtualCommitSelected = false;
+    }
+  }
+
   function recomputeDiffCommit() {
-    if (selectedCommits.size === 0) {
+    normalizeCommitPins();
+    if (virtualCommitSelected && !commitFrom && !commitThrough) {
+      diffCommit = VIRTUAL_WORKING_COMMIT;
+      return;
+    }
+    if (!commitFrom && !commitThrough) {
       diffCommit = '';
       return;
     }
-    if (selectedCommits.size === 1) {
-      diffCommit = selectedCommits.values().next().value;
+    if (commitFrom && !commitThrough) {
+      diffCommit = commitFrom;
       return;
     }
-    let newestIdx = Infinity;
-    let oldestIdx = -1;
-    commitList.forEach(function(c, i) {
-      if (selectedCommits.has(c.sha)) {
-        if (i < newestIdx) newestIdx = i;
-        if (i > oldestIdx) oldestIdx = i;
+    if (commitFrom && commitThrough) {
+      diffCommit = commitFrom + '..' + commitThrough;
+      return;
+    }
+    diffCommit = '';
+  }
+
+  function clearCommitPins() {
+    commitFrom = '';
+    commitThrough = '';
+    virtualCommitSelected = false;
+    recomputeDiffCommit();
+  }
+
+  function updateCompareAndCommitChrome() {
+    if (compareTargetChromeVisible()) {
+      fetchCompareTargets();
+    } else if (baseBranchPickerEl) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchPickerEl.style.display = 'none';
+      if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
+    }
+    if (commitRangeChromeVisible()) {
+      fetchCommits();
+    } else if (commitDropdownEl) {
+      commitDropdownEl.style.display = 'none';
+      clearCommitPins();
+    }
+  }
+
+  async function fetchCommits() {
+    if (!commitRangeChromeVisible()) {
+      if (commitDropdownEl) commitDropdownEl.style.display = 'none';
+      return;
+    }
+    const gen = ++commitsFetchGen;
+    try {
+      const res = await fetch('/api/commits');
+      if (gen !== commitsFetchGen || !commitRangeChromeVisible()) return;
+      if (!res.ok) {
+        commitDropdownEl.style.display = 'none';
+        return;
       }
-    });
-    const head = commitList[newestIdx].sha;
-    const base = commitList[oldestIdx + 1]
-      ? commitList[oldestIdx + 1].sha
-      : (session.base_ref || '');
-    // Defensive: if base is somehow unavailable, fall back to the newest
-    // selected commit alone rather than a broken range.
-    diffCommit = base ? base + '..' + head : head;
+      commitList = (await res.json()) || [];
+      if (gen !== commitsFetchGen || !commitRangeChromeVisible()) return;
+      if (!commitList || commitList.length < 2) {
+        commitDropdownEl.style.display = 'none';
+        const prevDiffCommit = diffCommit;
+        clearCommitPins();
+        if (diffCommit !== prevDiffCommit) reloadForScope();
+        return;
+      }
+      const prevDiffCommit = diffCommit;
+      normalizeCommitPins();
+      recomputeDiffCommit();
+      if (gen !== commitsFetchGen || !commitRangeChromeVisible()) return;
+      commitDropdownEl.style.display = '';
+      renderCommitPicker();
+      if (diffCommit !== prevDiffCommit) reloadForScope();
+    } catch {
+      if (gen !== commitsFetchGen) return;
+      commitDropdownEl.style.display = 'none';
+    }
   }
 
   function renderCommitPicker() {
     const list = document.getElementById('commitDropdownList');
     const allItem = document.querySelector('.commit-picker-item[data-commit=""]');
     const label = document.getElementById('commitDropdownLabel');
+    const clearThroughBtn = commitClearThroughEl;
 
-    // Compute the contiguous in-range span [newestIdx, oldestIdx] so commits
-    // between two checked commits show an "in range" indicator even when not
-    // themselves checked (the diff includes them).
-    let newestIdx = Infinity;
-    let oldestIdx = -1;
-    if (selectedCommits.size >= 2) {
-      commitList.forEach(function(c, i) {
-        if (selectedCommits.has(c.sha)) {
-          if (i < newestIdx) newestIdx = i;
-          if (i > oldestIdx) oldestIdx = i;
-        }
-      });
-    }
-
-    // "All commits" is active when nothing is checked.
-    if (selectedCommits.size === 0) {
-      if (allItem) allItem.classList.add('active');
-      if (label) label.textContent = 'All commits';
+    if (!commitFrom && !commitThrough) {
+      if (allItem) allItem.classList.toggle('active', !virtualCommitSelected);
+      if (label) label.textContent = virtualCommitSelected ? 'Working changes' : 'All commits';
     } else {
       if (allItem) allItem.classList.remove('active');
-      if (selectedCommits.size === 1) {
-        const sel = commitList.find(function(c) { return selectedCommits.has(c.sha); });
-        if (sel && label) label.textContent = sel.short_sha + ' ' + (sel.message.length > 30 ? sel.message.slice(0, 30) + '\u2026' : sel.message);
-      } else if (label) {
-        // The diff spans the whole contiguous range, so count commits in the
-        // span (oldestIdx - newestIdx + 1) \u2014 not just the checked ones \u2014 so the
-        // label stays honest when in-between commits are included.
-        const spanCount = oldestIdx - newestIdx + 1;
-        label.textContent = spanCount + ' commits';
+      if (label) {
+        if (commitFrom && !commitThrough) {
+          const sel = commitList.find(function(c) { return c.sha === commitFrom; });
+          label.textContent = sel
+            ? (sel.virtual ? sel.message : (sel.short_sha + ' only'))
+            : compareTargetChipLabel(commitFrom) + ' only';
+        } else if (commitFrom && commitThrough) {
+          const a = commitList.find(function(c) { return c.sha === commitFrom; });
+          const b = commitList.find(function(c) { return c.sha === commitThrough; });
+          const aLabel = a ? (a.virtual ? a.message : a.short_sha) : compareTargetChipLabel(commitFrom);
+          const bLabel = b ? (b.virtual ? b.message : b.short_sha) : compareTargetChipLabel(commitThrough);
+          label.textContent = aLabel + ' \u2192 ' + bLabel;
+        }
       }
     }
 
-    list.innerHTML = commitList.map(function(c, i) {
-      const checked = selectedCommits.has(c.sha);
-      const inRange = !checked && i > newestIdx && i < oldestIdx;
-      const cls = 'commit-picker-item' + (checked ? ' active' : '') + (inRange ? ' in-range' : '');
+    if (clearThroughBtn) {
+      clearThroughBtn.style.display = commitThrough ? '' : 'none';
+    }
+
+    list.innerHTML = commitList.map(function(c) {
+      const isFrom = c.sha === commitFrom;
+      const isThrough = c.sha === commitThrough;
+      const isVirtualActive = c.virtual && virtualCommitSelected && !commitFrom && !commitThrough;
+      let cls = 'commit-picker-item';
+      if (isFrom) cls += ' is-from';
+      if (isThrough) cls += ' is-through';
+      if (c.virtual) cls += ' is-virtual';
+      if (isVirtualActive) cls += ' active';
       const time = c.date ? '<span class="commit-picker-item-time">' + relativeTime(c.date) + '</span>' : '';
-      const rangeHint = inRange ? '<span class="commit-picker-item-range">in range</span>' : '';
-      return '<div class="' + cls + '" data-commit="' + c.sha + '">'
-        + '<input type="checkbox" class="commit-picker-item-check"' + (checked ? ' checked' : '')
-        + ' aria-label="Select commit ' + escapeHtml(c.short_sha) + '">'
+      const fromPin = isFrom ? '<span class="commit-pin-from">from</span>' : '';
+      const throughPin = isThrough ? '<span class="commit-pin-through">through</span>' : '';
+      const virtualPill = c.virtual ? '<span class="commit-picker-item-time">virtual</span>' : '';
+      return '<div class="' + cls + '" data-commit="' + c.sha + '" role="button" tabindex="0">'
+        + fromPin + throughPin
         + '<span class="commit-picker-item-sha">' + escapeHtml(c.short_sha) + '</span>'
         + '<span class="commit-picker-item-msg">' + escapeHtml(c.message.length > 40 ? c.message.slice(0, 40) + '\u2026' : c.message) + '</span>'
-        + rangeHint
+        + virtualPill
         + time
         + '</div>';
     }).join('');
   }
 
-  // Toggle dropdown open/close
   document.getElementById('commitDropdownBtn').addEventListener('click', function() {
     commitDropdownEl.classList.toggle('open');
   });
 
-  // Close on outside click
   document.addEventListener('click', function(e) {
-    if (!commitDropdownEl.contains(e.target)) {
+    if (commitDropdownEl && !commitDropdownEl.contains(e.target)) {
       commitDropdownEl.classList.remove('open');
     }
   });
 
-  // Close on Escape (only when open)
   document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && commitDropdownEl.classList.contains('open')) {
+    if (e.key === 'Escape' && commitDropdownEl && commitDropdownEl.classList.contains('open')) {
       commitDropdownEl.classList.remove('open');
       e.stopImmediatePropagation();
     }
   });
 
-  // Item selection (delegate from dropdown menu). Multi-select: clicking a row
-  // toggles its checkbox and keeps the dropdown OPEN. Clicking the checkbox
-  // directly is handled by the same path (we drive the Set, not the input's
-  // own checked state) so there's no double-toggle. The "All commits" row
-  // (data-commit="") clears the entire selection.
   document.getElementById('commitDropdownMenu').addEventListener('click', function(e) {
+    if (e.target.closest('#commitClearThrough')) {
+      e.stopPropagation();
+      const prev = diffCommit;
+      commitThrough = '';
+      recomputeDiffCommit();
+      renderCommitPicker();
+      if (diffCommit !== prev) reloadForScope();
+      return;
+    }
     const item = e.target.closest('.commit-picker-item');
     if (!item) return;
-    // renderCommitPicker() below replaces #commitDropdownList's innerHTML,
-    // orphaning the clicked node. Without this, the click bubbles to the
-    // document outside-click handler, where commitDropdownEl.contains(e.target)
-    // is false for the now-detached node and the dropdown closes — defeating
-    // multi-select stay-open. Stop propagation so the menu owns this click.
     e.stopPropagation();
     const sha = item.dataset.commit;
     const prevDiffCommit = diffCommit;
+    if (item.classList.contains('is-virtual')) {
+      commitFrom = '';
+      commitThrough = '';
+      virtualCommitSelected = true;
+      recomputeDiffCommit();
+      renderCommitPicker();
+      if (diffCommit !== prevDiffCommit) reloadForScope();
+      return;
+    }
     if (sha === '') {
-      selectedCommits.clear();
-    } else if (selectedCommits.has(sha)) {
-      selectedCommits.delete(sha);
+      clearCommitPins();
+    } else if (e.altKey) {
+      virtualCommitSelected = false;
+      if (commitThrough === sha) {
+        commitThrough = '';
+      } else {
+        commitThrough = sha;
+        if (!commitFrom) commitFrom = sha;
+      }
+    } else if (commitFrom === sha && !commitThrough) {
+      virtualCommitSelected = false;
+      commitFrom = '';
+    } else if (commitFrom === sha) {
+      virtualCommitSelected = false;
+      commitFrom = commitThrough || '';
+      commitThrough = '';
     } else {
-      selectedCommits.add(sha);
+      virtualCommitSelected = false;
+      commitFrom = sha;
     }
     recomputeDiffCommit();
     renderCommitPicker();
-    // Only reload if the derived range actually changed (e.g. checking a commit
-    // already inside the in-range span doesn't change the diff).
     if (diffCommit !== prevDiffCommit) reloadForScope();
   });
 
-  // The "All commits" row (data-commit="") has no focusable child — unlike the
-  // dynamic commit rows, whose checkbox is keyboard-operable — so it carries
-  // role="button" tabindex="0". Route Enter/Space through the same click path
-  // so clearing the selection is keyboard-reachable.
   document.getElementById('commitDropdownMenu').addEventListener('keydown', function(e) {
     if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
-    const item = e.target.closest('.commit-picker-item[data-commit=""]');
+    const item = e.target.closest('.commit-picker-item');
     if (!item) return;
     e.preventDefault();
-    item.click();
+    if (e.altKey) {
+      item.dispatchEvent(new MouseEvent('click', { bubbles: true, altKey: true }));
+    } else {
+      item.click();
+    }
+  });
+
+  if (commitClearThroughEl) {
+    commitClearThroughEl.addEventListener('click', function(e) {
+      e.stopPropagation();
+    });
+  }
+
+  async function fetchCompareTargets() {
+    if (!compareTargetChromeVisible()) return;
+    const gen = ++compareTargetsFetchGen;
+    try {
+      const res = await fetch('/api/branches');
+      if (gen !== compareTargetsFetchGen || !compareTargetChromeVisible()) return;
+      if (!res.ok) return;
+      let parsed = await res.json();
+      if (parsed === null || parsed === undefined) {
+        parsed = { vcs: 'git', detected: '', local: [], remote: [] };
+      }
+      if (gen !== compareTargetsFetchGen || !compareTargetChromeVisible()) return;
+      if (Array.isArray(parsed)) {
+        compareTargets = { vcs: 'git', detected: currentCompareTarget, local: [], remote: parsed };
+      } else {
+        compareTargets = {
+          vcs: parsed.vcs || 'git',
+          detected: parsed.detected || '',
+          local: Array.isArray(parsed.local) ? parsed.local : [],
+          remote: Array.isArray(parsed.remote) ? parsed.remote : [],
+        };
+      }
+      if (gen !== compareTargetsFetchGen || !compareTargetChromeVisible()) return;
+      const hasTargets = compareTargets.local.length + compareTargets.remote.length > 0;
+      baseBranchPickerEl.style.display = '';
+      if (baseBranchArrowEl && !sessionInRangeFocus()) baseBranchArrowEl.style.display = '';
+      if (!hasTargets && compareTargetTabsEl) {
+        compareTargetTab = 'refs';
+      }
+      renderCompareTargetList(document.getElementById('baseBranchSearch').value);
+    } catch {
+      if (gen !== compareTargetsFetchGen) return;
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchPickerEl.style.display = 'none';
+      if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
+    }
+  }
+
+  function compareTargetGroupLabel(kind) {
+    if (compareTargets.vcs === 'jj') {
+      return kind === 'local' ? 'Bookmarks' : 'Remote bookmarks';
+    }
+    return kind === 'local' ? 'Local' : 'Remote';
+  }
+
+  function getCompareTargetVisibleItems() {
+    return Array.from(document.getElementById('baseBranchList').querySelectorAll('.base-branch-item'));
+  }
+
+  function updateCompareTargetHighlight() {
+    const items = getCompareTargetVisibleItems();
+    items.forEach(function(el, i) {
+      el.classList.toggle('highlighted', i === compareTargetPicker.highlightedIdx);
+    });
+    if (compareTargetPicker.highlightedIdx >= 0 && compareTargetPicker.highlightedIdx < items.length) {
+      items[compareTargetPicker.highlightedIdx].scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function renderCompareTargetList(filter) {
+    const list = document.getElementById('baseBranchList');
+    const q = (filter || '').trim();
+    const lower = q.toLowerCase();
+
+    if (compareTargetTab === 'commits') {
+      let commits = commitList.filter(function(c) { return !c.virtual; });
+      if (lower) {
+        commits = commits.filter(function(c) {
+          return c.short_sha.toLowerCase().indexOf(lower) !== -1
+            || c.sha.toLowerCase().indexOf(lower) === 0
+            || c.message.toLowerCase().indexOf(lower) !== -1;
+        });
+      }
+      if (commits.length === 0) {
+        list.innerHTML = '<div style="padding: 8px 10px; font-size: 12px; color: var(--crit-editor-fg-muted);">No matching commits</div>';
+      } else {
+        list.innerHTML = commits.map(function(c) {
+          const message = c.virtual ? (c.message + ' (virtual)') : c.message;
+          const active = c.sha === currentCompareTarget ? ' active' : '';
+          return '<div class="base-branch-item' + active + '" data-branch="' + escapeHtml(c.sha) + '">'
+            + '<span class="commit-picker-item-sha">' + escapeHtml(c.short_sha) + '</span> '
+            + escapeHtml(message.length > 36 ? message.slice(0, 36) + '\u2026' : message)
+            + '</div>';
+        }).join('');
+      }
+      compareTargetPicker.highlightedIdx = -1;
+      updateCompareTargetUseCustom(q);
+      return;
+    }
+
+    function filterRefs(refs) {
+      if (!lower) return refs;
+      return refs.filter(function(r) { return r.toLowerCase().indexOf(lower) !== -1; });
+    }
+
+    const parts = [];
+    [['local', filterRefs(compareTargets.local)], ['remote', filterRefs(compareTargets.remote)]].forEach(function(pair) {
+      const kind = pair[0];
+      const refs = pair[1];
+      if (refs.length === 0) return;
+      parts.push('<div class="compare-target-group-label">' + escapeHtml(compareTargetGroupLabel(kind)) + '</div>');
+      refs.forEach(function(ref) {
+        const active = ref === currentCompareTarget ? ' active' : '';
+        const detected = ref === compareTargets.detected ? '<span class="compare-target-detected">detected</span>' : '';
+        parts.push('<div class="base-branch-item' + active + '" data-branch="' + escapeHtml(ref) + '">'
+          + escapeHtml(ref) + detected + '</div>');
+      });
+    });
+
+    if (parts.length === 0 && !isRevishQuery(q)) {
+      list.innerHTML = '<div style="padding: 8px 10px; font-size: 12px; color: var(--crit-editor-fg-muted);">No matching refs</div>';
+    } else {
+      list.innerHTML = parts.join('');
+    }
+    compareTargetPicker.highlightedIdx = -1;
+    updateCompareTargetUseCustom(q);
+  }
+
+  function updateCompareTargetUseCustom(q) {
+    if (!compareTargetUseCustomEl) return;
+    const trimmed = (q || '').trim();
+    if (!trimmed || !isRevishQuery(trimmed)) {
+      compareTargetUseCustomEl.style.display = 'none';
+      compareTargetUseCustomEl.innerHTML = '';
+      return;
+    }
+    const inList = compareTargets.local.indexOf(trimmed) !== -1
+      || compareTargets.remote.indexOf(trimmed) !== -1
+      || commitList.some(function(c) { return c.sha === trimmed || c.short_sha === trimmed; });
+    if (inList) {
+      compareTargetUseCustomEl.style.display = 'none';
+      compareTargetUseCustomEl.innerHTML = '';
+      return;
+    }
+    compareTargetUseCustomEl.style.display = '';
+    compareTargetUseCustomEl.innerHTML =
+      '<button type="button" data-rev="' + escapeHtml(trimmed) + '">Use <span style="font-family:var(--crit-mono,monospace)">' + escapeHtml(trimmed) + '</span> as base</button>';
+  }
+
+  async function selectCompareTarget(ref) {
+    if (ref === currentCompareTarget) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    baseBranchPickerEl.classList.remove('open');
+    baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    const previous = currentCompareTarget;
+    const previousLabel = document.getElementById('baseBranchLabel').textContent;
+    currentCompareTarget = ref;
+    document.getElementById('baseBranchLabel').textContent = compareTargetChipLabel(ref);
+    try {
+      const res = await fetch('/api/base-branch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: ref }),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error('Failed to change compare target:', errText);
+        currentCompareTarget = previous;
+        document.getElementById('baseBranchLabel').textContent = previousLabel;
+        return;
+      }
+      clearCommitPins();
+      await reloadForScope();
+      fetchCommits();
+    } catch (err) {
+      console.error('Error changing compare target:', err);
+      currentCompareTarget = previous;
+      document.getElementById('baseBranchLabel').textContent = previousLabel;
+    }
+  }
+
+  if (compareTargetTabsEl) {
+    compareTargetTabsEl.addEventListener('click', function(e) {
+      const tab = e.target.closest('.compare-target-tab');
+      if (!tab) return;
+      compareTargetTab = tab.dataset.tab || 'refs';
+      compareTargetTabsEl.querySelectorAll('.compare-target-tab').forEach(function(btn) {
+        btn.classList.toggle('active', btn === tab);
+      });
+      if (compareTargetTab === 'commits' && commitList.length === 0) fetchCommits();
+      renderCompareTargetList(document.getElementById('baseBranchSearch').value);
+    });
+  }
+
+  if (compareTargetUseCustomEl) {
+    compareTargetUseCustomEl.addEventListener('click', function(e) {
+      const btn = e.target.closest('button[data-rev]');
+      if (!btn) return;
+      selectCompareTarget(btn.getAttribute('data-rev'));
+    });
+  }
+
+  document.getElementById('baseBranchBtn').addEventListener('click', function() {
+    baseBranchPickerEl.classList.toggle('open');
+    const isOpen = baseBranchPickerEl.classList.contains('open');
+    baseBranchBtnEl.setAttribute('aria-expanded', String(isOpen));
+    if (isOpen) {
+      const search = document.getElementById('baseBranchSearch');
+      search.value = '';
+      compareTargetTab = 'refs';
+      if (compareTargetTabsEl) {
+        compareTargetTabsEl.querySelectorAll('.compare-target-tab').forEach(function(btn) {
+          btn.classList.toggle('active', btn.dataset.tab === 'refs');
+        });
+      }
+      compareTargetPicker.highlightedIdx = -1;
+      if (commitList.length === 0) fetchCommits();
+      renderCompareTargetList();
+      search.focus();
+    }
+  });
+
+  document.getElementById('baseBranchSearch').addEventListener('input', function(e) {
+    if (isRevishQuery(e.target.value) && compareTargetTab !== 'commits') {
+      compareTargetTab = 'commits';
+      if (compareTargetTabsEl) {
+        compareTargetTabsEl.querySelectorAll('.compare-target-tab').forEach(function(btn) {
+          btn.classList.toggle('active', btn.dataset.tab === 'commits');
+        });
+      }
+    }
+    renderCompareTargetList(e.target.value);
+  });
+
+  document.getElementById('baseBranchSearch').addEventListener('keydown', function(e) {
+    e.stopPropagation();
+    const items = getCompareTargetVisibleItems();
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      compareTargetPicker.highlightedIdx = Math.min(compareTargetPicker.highlightedIdx + 1, items.length - 1);
+      updateCompareTargetHighlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (compareTargetPicker.highlightedIdx > 0) {
+        compareTargetPicker.highlightedIdx--;
+        updateCompareTargetHighlight();
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const customBtn = compareTargetUseCustomEl && compareTargetUseCustomEl.querySelector('button[data-rev]');
+      if (customBtn) {
+        selectCompareTarget(customBtn.getAttribute('data-rev'));
+        return;
+      }
+      if (compareTargetPicker.highlightedIdx >= 0 && compareTargetPicker.highlightedIdx < items.length) {
+        const ref = items[compareTargetPicker.highlightedIdx].dataset.branch;
+        if (ref) selectCompareTarget(ref);
+      }
+    } else if (e.key === 'Escape') {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  document.addEventListener('click', function(e) {
+    if (baseBranchPickerEl && !baseBranchPickerEl.contains(e.target)) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && baseBranchPickerEl && baseBranchPickerEl.classList.contains('open')) {
+      baseBranchPickerEl.classList.remove('open');
+      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
+      e.stopImmediatePropagation();
+    }
+  });
+
+  document.getElementById('baseBranchList').addEventListener('click', function(e) {
+    const item = e.target.closest('.base-branch-item');
+    if (!item) return;
+    const ref = item.dataset.branch;
+    if (ref) selectCompareTarget(ref);
   });
 
   // ===== Scope Toggle (All / Branch / Staged / Unstaged) =====
@@ -7567,15 +8143,12 @@
     navCommentId = null;
     setSetting('diffScope', scope);
     if (scope !== 'all' && scope !== 'branch') {
-      selectedCommits.clear();
-      recomputeDiffCommit();
-      commitDropdownEl.style.display = 'none';
-    } else {
-      fetchCommits();
+      clearCommitPins();
     }
     document.querySelectorAll('#scopeToggle .toggle-btn').forEach(function(b) {
       b.classList.toggle('active', b.dataset.scope === scope);
     });
+    updateCompareAndCommitChrome();
     await reloadForScope();
   });
 
@@ -7587,9 +8160,11 @@
   // the new scope is never requested. Surfaced as a Windows-only e2e flake:
   // slower file I/O made loadAllFileData() outlast the next click handler, so
   // clicks that swapped scope returned the previous scope's in-flight promise.
+  // Story/Diff also changes the effective fetch/file-data scopes without
+  // changing diffScope itself, so include those derived scopes in the key.
   let reloadInFlightKey = null;
   async function reloadForScope() {
-    const key = diffScope + '\0' + diffCommit;
+    const key = currentSessionFetchScope() + '\0' + currentFileDataScope() + '\0' + diffCommit;
     if (reloadInFlight && reloadInFlightKey === key) return reloadInFlight;
     if (reloadInFlight) {
       // Different inputs — chain after the in-flight reload finishes so we
@@ -7606,16 +8181,22 @@
         document.getElementById('filesContainer').innerHTML =
           '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
 
-        let sessionUrl = '/api/session?scope=' + enc(diffScope);
+        let sessionUrl = '/api/session?scope=' + enc(currentSessionFetchScope());
         if (diffCommit) sessionUrl += '&commit=' + enc(diffCommit);
-        const sessionRes = await fetch(sessionUrl).then(function(r) { return r.json(); });
+        let sessionRes = await fetchWhenReady(sessionUrl);
+        if (!storyHasContent(sessionRes.story) && storyHasContent(session && session.story)) {
+          sessionRes.story = session.story;
+        } else {
+          sessionRes = await hydrateStoryIfMissing(sessionRes);
+        }
+        sessionRes = await hydrateFullSessionForStoryIfNeeded(sessionRes);
         session = sessionRes;
         reviewComments = sessionRes.review_comments || [];
 
         // Update base branch label if it changed
         if (session.base_branch_name) {
-          currentBaseBranch = session.base_branch_name;
-          document.getElementById('baseBranchLabel').textContent = currentBaseBranch;
+          currentCompareTarget = session.base_branch_name;
+          document.getElementById('baseBranchLabel').textContent = compareTargetChipLabel(currentCompareTarget);
         }
 
         if (!session.files || session.files.length === 0) {
@@ -7625,10 +8206,12 @@
           renderFileTree();
           updateCommentCount();
           updateViewedCount();
+          if (storyCleared && session) delete session.story;
+          applyStoryPresence();
           return;
         }
 
-        files = await loadAllFileData(session.files, diffScope);
+        files = await loadAllFileData(session.files, currentFileDataScope());
         hiddenUnresolved = session.hidden_unresolved || 0;
         files.sort(fileSortComparator);
         restoreViewedState();
@@ -7637,6 +8220,8 @@
         buildToc();
         updateCommentCount();
         updateViewedCount();
+        if (storyCleared && session) delete session.story;
+        applyStoryPresence();
       } finally {
         reloadInFlight = null;
         reloadInFlightKey = null;
@@ -7644,179 +8229,6 @@
     })();
     return reloadInFlight;
   }
-
-  // ===== Base Branch Picker =====
-  const baseBranchPickerEl = document.getElementById('baseBranchPicker');
-  const baseBranchBtnEl = document.getElementById('baseBranchBtn');
-  let baseBranches = [];
-  let currentBaseBranch = ''; // display name of the current base branch
-  const branchPicker = { highlightedIdx: -1 }; // keyboard-highlighted item index
-
-  async function fetchBranches() {
-    try {
-      const res = await fetch('/api/branches');
-      if (!res.ok) return;
-      // /api/branches returns JSON `null` when the repo has no remote
-      // branches (server marshals a nil Go slice as null). Coerce to [] so
-      // every consumer can rely on baseBranches being array-shaped —
-      // applyFocusToHeader reads baseBranches.length unconditionally on
-      // every focus update, and a null here threw a TypeError that
-      // short-circuited init's promise chain (which silently skipped the
-      // subsequent `.then(connectSSE)` step, leaving the page without any
-      // SSE listeners attached).
-      const parsed = await res.json();
-      baseBranches = Array.isArray(parsed) ? parsed : [];
-      if (baseBranches.length < 2) {
-        baseBranchPickerEl.classList.remove('open');
-        baseBranchPickerEl.style.display = 'none';
-        if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
-        return;
-      }
-      baseBranchPickerEl.style.display = '';
-      renderBaseBranchList();
-    } catch {
-      baseBranchPickerEl.classList.remove('open');
-      baseBranchPickerEl.style.display = 'none';
-      if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
-    }
-  }
-
-  function getVisibleItems() {
-    return Array.from(document.getElementById('baseBranchList').querySelectorAll('.base-branch-item'));
-  }
-
-  function updateHighlight() {
-    const items = getVisibleItems();
-    items.forEach(function(el, i) {
-      el.classList.toggle('highlighted', i === branchPicker.highlightedIdx);
-    });
-    if (branchPicker.highlightedIdx >= 0 && branchPicker.highlightedIdx < items.length) {
-      items[branchPicker.highlightedIdx].scrollIntoView({ block: 'nearest' });
-    }
-  }
-
-  function renderBaseBranchList(filter) {
-    const list = document.getElementById('baseBranchList');
-    let filtered = baseBranches;
-    if (filter) {
-      const lower = filter.toLowerCase();
-      filtered = baseBranches.filter(function(b) { return b.toLowerCase().indexOf(lower) !== -1; });
-    }
-    list.innerHTML = filtered.map(function(b) {
-      const active = b === currentBaseBranch ? ' active' : '';
-      return '<div class="base-branch-item' + active + '" data-branch="' + escapeHtml(b) + '">' + escapeHtml(b) + '</div>';
-    }).join('');
-    if (filtered.length === 0) {
-      list.innerHTML = '<div style="padding: 8px 10px; font-size: 12px; color: var(--crit-editor-fg-muted);">No matching branches</div>';
-    }
-    branchPicker.highlightedIdx = -1;
-  }
-
-  async function selectBaseBranch(branch) {
-    if (branch === currentBaseBranch) {
-      baseBranchPickerEl.classList.remove('open');
-      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
-      return;
-    }
-    baseBranchPickerEl.classList.remove('open');
-    baseBranchBtnEl.setAttribute('aria-expanded', 'false');
-    const previousBranch = currentBaseBranch;
-    const previousLabel = document.getElementById('baseBranchLabel').textContent;
-    document.getElementById('baseBranchLabel').textContent = branch;
-    currentBaseBranch = branch;
-    try {
-      const res = await fetch('/api/base-branch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ branch: branch }),
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        console.error('Failed to change base branch:', errText);
-        currentBaseBranch = previousBranch;
-        document.getElementById('baseBranchLabel').textContent = previousLabel;
-        return;
-      }
-      // Reload immediately for responsiveness; SSE 'base-changed' will also
-      // call reloadForScope() but the dedup guard collapses double-calls.
-      await reloadForScope();
-      fetchCommits();
-    } catch (err) {
-      console.error('Error changing base branch:', err);
-      currentBaseBranch = previousBranch;
-      document.getElementById('baseBranchLabel').textContent = previousLabel;
-    }
-  }
-
-  // Toggle dropdown
-  document.getElementById('baseBranchBtn').addEventListener('click', function() {
-    baseBranchPickerEl.classList.toggle('open');
-    const isOpen = baseBranchPickerEl.classList.contains('open');
-    baseBranchBtnEl.setAttribute('aria-expanded', String(isOpen));
-    if (isOpen) {
-      const search = document.getElementById('baseBranchSearch');
-      search.value = '';
-      branchPicker.highlightedIdx = -1;
-      renderBaseBranchList();
-      search.focus();
-    }
-  });
-
-  // Filter on typing
-  document.getElementById('baseBranchSearch').addEventListener('input', function(e) {
-    renderBaseBranchList(e.target.value);
-  });
-
-  // Keyboard navigation in search input
-  document.getElementById('baseBranchSearch').addEventListener('keydown', function(e) {
-    e.stopPropagation();
-    const items = getVisibleItems();
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      branchPicker.highlightedIdx = Math.min(branchPicker.highlightedIdx + 1, items.length - 1);
-      updateHighlight();
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      if (branchPicker.highlightedIdx > 0) {
-        branchPicker.highlightedIdx--;
-        updateHighlight();
-      }
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (branchPicker.highlightedIdx >= 0 && branchPicker.highlightedIdx < items.length) {
-        const branch = items[branchPicker.highlightedIdx].dataset.branch;
-        if (branch) selectBaseBranch(branch);
-      }
-    } else if (e.key === 'Escape') {
-      baseBranchPickerEl.classList.remove('open');
-      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
-    }
-  });
-
-  // Close on outside click
-  document.addEventListener('click', function(e) {
-    if (!baseBranchPickerEl.contains(e.target)) {
-      baseBranchPickerEl.classList.remove('open');
-      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
-    }
-  });
-
-  // Close on Escape (only when open)
-  document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && baseBranchPickerEl.classList.contains('open')) {
-      baseBranchPickerEl.classList.remove('open');
-      baseBranchBtnEl.setAttribute('aria-expanded', 'false');
-      e.stopImmediatePropagation();
-    }
-  });
-
-  // Item selection via click
-  document.getElementById('baseBranchList').addEventListener('click', function(e) {
-    const item = e.target.closest('.base-branch-item');
-    if (!item) return;
-    const branch = item.dataset.branch;
-    if (branch) selectBaseBranch(branch);
-  });
 
   // ===== TOC Toggle =====
   document.getElementById('tocToggle').addEventListener('click', function() {
@@ -8369,6 +8781,11 @@
 
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
+    // Story navigation keys (chapter nav / overview / jump / help). Scoped to
+    // when the story view is active; uses uppercase J/K so lowercase j/k keep
+    // their in-page block navigation below. Returns early if consumed.
+    if (handleStoryKey(e)) return;
+
     switch (e.key) {
       case 'j': case 'k': {
         e.preventDefault();
@@ -8498,6 +8915,7 @@
       }
       case 'C': {
         e.preventDefault();
+        if (storyActive() && tryOpenFormFromSelection()) return;
         toggleCommentsPanel();
         break;
       }
@@ -8850,6 +9268,34 @@
 
     const ordered = stack.slice();
     const defaultBranchName = defaultBranchNameCache || (ordered[0] && ordered[0].base_ref_name) || 'main';
+    const activeScope = focus.diff_scope || 'layer';
+    const targetIdx = ordered.findIndex(function(entry) { return entry.head_sha === focus.head_sha; });
+    const baseIdx = ordered.findIndex(function(entry) { return entry.head_sha === focus.base_sha; });
+    const hasRootBase = activeScope === 'full_stack' && !!focus.default_sha;
+    // Layer parent is usually focus.base_sha on a stack entry; when base_sha is a
+    // merge-base off-stack, fall back to the next older stack entry below target.
+    let parentIdx = baseIdx;
+    if (!hasRootBase && parentIdx < 0 && targetIdx >= 0 && targetIdx < ordered.length - 1) {
+      parentIdx = targetIdx + 1;
+    }
+
+    function rangeStateForIndex(i) {
+      // Layer scope marks target + any entries down to base when base is present.
+      // Full stack marks target + all entries down to the root default-base marker.
+      if (targetIdx < 0) {
+        return { inRange: false, isRangeStart: false, isRangeEnd: false };
+      }
+      let start = targetIdx;
+      let end = targetIdx;
+      if (hasRootBase) {
+        end = ordered.length - 1;
+      } else if (baseIdx >= 0) {
+        start = Math.min(targetIdx, baseIdx);
+        end = Math.max(targetIdx, baseIdx);
+      }
+      const isInRange = i >= start && i <= end;
+      return { inRange: isInRange };
+    }
 
     const parts = [];
     parts.push('<div class="stack-popover-title">Stack</div>');
@@ -8859,11 +9305,22 @@
       const isLast = i === ordered.length - 1;
       const tree = isLast ? '\u2514\u2500 ' : '\u251C\u2500 ';
       const isCurrent = entry.head_sha === focus.head_sha;
+      const isBase = !hasRootBase && parentIdx >= 0 && i === parentIdx;
+      const rangeState = rangeStateForIndex(i);
+      let rowClass = 'stack-popover-item';
+      if (rangeState.inRange) rowClass += ' stack-popover-in-range';
+      if (isBase) rowClass += ' stack-popover-is-base';
+      if (isCurrent) rowClass += ' stack-popover-current stack-popover-is-target';
       const label = entryLabel(entry, 34);
       const shortSha = entry.head_sha ? entry.head_sha.slice(0, 7) : '';
+      const marker = '<span class="stack-popover-marker-wrap" aria-hidden="true">'
+        + (isCurrent ? '<span class="stack-popover-marker stack-popover-marker-target">target</span>' : '')
+        + (isBase ? '<span class="stack-popover-marker stack-popover-marker-base">parent</span>' : '')
+        + '</span>';
       if (isCurrent) {
-        parts.push('<span class="stack-popover-item stack-popover-current" aria-current="page" role="menuitem"' +
+        parts.push('<span class="' + rowClass + '" aria-current="page" role="menuitem"' +
           ' data-head-sha="' + escapeHtml(entry.head_sha || '') + '">' +
+          marker +
           '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
           '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
           (shortSha ? '<span class="stack-popover-sha">' + escapeHtml(shortSha) + '</span>' : '') +
@@ -8871,11 +9328,12 @@
       } else {
         const payload = focusPayloadFromStackEntry(entry, focus);
         const aria = entry.pr_number ? ('Switch to PR #' + entry.pr_number) : ('Switch to ' + label);
-        parts.push('<button type="button" class="stack-popover-item" role="menuitem"' +
+        parts.push('<button type="button" class="' + rowClass + '" role="menuitem"' +
           ' data-action="switch"' +
           ' data-head-sha="' + escapeHtml(entry.head_sha || '') + '"' +
           ' data-focus-payload="' + escapeHtml(JSON.stringify(payload)) + '"' +
           ' aria-label="' + escapeHtml(aria) + '">' +
+          marker +
           '<span class="stack-popover-tree" aria-hidden="true">' + tree + '</span>' +
           '<span class="stack-popover-label">' + escapeHtml(label) + '</span>' +
           (shortSha ? '<span class="stack-popover-sha">' + escapeHtml(shortSha) + '</span>' : '') +
@@ -8884,9 +9342,11 @@
     });
 
     // Base marker — non-interactive root at the bottom of the tree.
-    parts.push('<span class="stack-popover-item stack-popover-root stack-popover-default" role="presentation">' +
+    parts.push('<span class="stack-popover-item stack-popover-root stack-popover-default' + (hasRootBase ? ' stack-popover-in-range' : '') + '"' +
+      ' role="presentation">' +
+      '<span class="stack-popover-marker-wrap" aria-hidden="true"></span>' +
       '<span class="stack-popover-tree" aria-hidden="true">  </span>' +
-      '<span class="stack-popover-label">base: ' + escapeHtml(defaultBranchName) + '</span>' +
+      '<span class="stack-popover-label">stack root: ' + escapeHtml(defaultBranchName) + '</span>' +
       '</span>');
 
     // "Compare against" radio section. Lives inside the popover so the
@@ -8899,7 +9359,6 @@
     // user understands why they can't reach it rather than wondering
     // where the option went.
     {
-      const activeScope = focus.diff_scope || 'layer';
       const fullStackEnabled = !!focus.default_sha;
       // Subcopy mirrors what full-stack diffs against: the literal
       // default branch tip.
@@ -8971,23 +9430,8 @@
     renderStackChip(focus, stackCache);
     renderStackChipExit(focus, mode);
     renderResumePill(focus, session && session.last_range_focus, mode);
-    // Base-branch picker is meaningful only in working-tree mode — range
-    // mode pins BaseSHA..HeadSHA and ignores Session.BaseRef entirely, so
-    // changing the base branch would be a no-op. Hide it (and its chevron)
-    // when a range focus is active; restore visibility otherwise, but only
-    // if there's actually more than one branch to choose from (the
-    // fetchBranches path already enforces that on initial load).
     const inRange = focus && focus.kind === 'range';
-    if (baseBranchPickerEl) {
-      if (inRange) {
-        baseBranchPickerEl.classList.remove('open');
-        baseBranchPickerEl.style.display = 'none';
-        if (baseBranchArrowEl) baseBranchArrowEl.style.display = 'none';
-      } else if (Array.isArray(baseBranches) && baseBranches.length >= 2) {
-        baseBranchPickerEl.style.display = '';
-        if (baseBranchArrowEl) baseBranchArrowEl.style.display = '';
-      }
-    }
+    updateCompareAndCommitChrome();
     // Toggle compare-rail mode class — drives the segmented-composite
     // visual merge of branch chip + stack chip in stack mode.
     if (compareRailEl) compareRailEl.classList.toggle('is-stack', !!inRange);
@@ -9173,6 +9617,1068 @@
     });
   }
 
+  // ===== Story mode =====
+  // Opt-in editorial layer: session.story groups the diff's hunks into
+  // chapters. When absent, storyState stays null and every branch below is
+  // skipped — flat file/diff rendering is byte-identical to before. The
+  // chapter body reuses the SAME diff renderer (renderDiffHunks) via a
+  // shallow file clone whose diffHunks are filtered to the chapter's hunks;
+  // comments follow their hunk with no duplicated comment logic.
+  //
+  // storyState (rebuilt on session.story change):
+  //   { story, pages: [{kind:'chapter'|'support', idx, id, title, summary,
+  //                      groups: [{filePath, hunks:[hunkObj]}] }],
+  //     hunkOwner: Map("<path>\0<oldStart>" -> pageIndex),
+  //     fileChapters: Map(path -> Set(pageIndex)) }
+  // storyView: 'overview' | page id ('ch1' | 'support' | chapter id).
+  let storyState = null;
+  let storyView = 'overview';
+  // storyHidden: per-page-session escape hatch. "Hide story view" sets this
+  // (non-destructive — the story stays on disk and in session.story); the flat
+  // file layout renders instead, with a "Show story view" re-entry affordance.
+  // NOT persisted: a reload with a story present shows the story view again. A
+  // fresh story via SSE resets it to false; a null story clears it entirely.
+  let storyHidden = false;
+  let storyCleared = false;
+  const storyExpandedFileCache = new Map();
+
+  function hunkKey(filePath, oldStart) { return filePath + '\0' + oldStart; }
+
+  // Stable page id: chapters use their author id (or 'chN'); support is 'support'.
+  function storyPageId(page) {
+    if (page.kind === 'support') return 'support';
+    return page.id || ('ch' + (page.idx + 1));
+  }
+
+  function storyHasContent(story) {
+    if (!story) return false;
+    const chapters = Array.isArray(story.chapters) ? story.chapters : [];
+    const support = Array.isArray(story.support) ? story.support : [];
+    return chapters.length > 0 || support.length > 0;
+  }
+
+  async function hydrateStoryIfMissing(nextSession) {
+    if (storyCleared) {
+      if (nextSession) delete nextSession.story;
+      return nextSession;
+    }
+    if (!nextSession || storyHasContent(nextSession.story)) return nextSession;
+    if (storyHasContent(session && session.story)) {
+      nextSession.story = session.story;
+      return nextSession;
+    }
+    try {
+      const res = await fetch('/api/story');
+      if (!res.ok || res.status === 204) return nextSession;
+      const story = await res.json();
+      if (storyHasContent(story)) nextSession.story = story;
+    } catch {
+      // Story mode is additive; a failed side fetch should not block diff review.
+    }
+    return nextSession;
+  }
+
+  function storyReferencedFilePaths(story) {
+    const paths = new Set();
+    function addRefs(refs) {
+      (refs || []).forEach(function (ref) {
+        const fp = ref.file_path || ref.filePath;
+        if (fp !== undefined && fp !== null) paths.add(fp);
+      });
+    }
+    (Array.isArray(story && story.chapters) ? story.chapters : []).forEach(function (chapter) {
+      addRefs(chapter.hunk_refs || chapter.hunkRefs);
+    });
+    (Array.isArray(story && story.support) ? story.support : []).forEach(function (entry) {
+      addRefs(entry.hunk_refs || entry.hunkRefs);
+    });
+    return paths;
+  }
+
+  function sessionIsMissingStoryFiles(nextSession) {
+    if (!nextSession || !storyHasContent(nextSession.story)) return false;
+    const sessionPaths = new Set((nextSession.files || []).map(function (fileInfo) { return fileInfo.path; }));
+    const storyPaths = storyReferencedFilePaths(nextSession.story);
+    for (const filePath of storyPaths) {
+      if (!sessionPaths.has(filePath)) return true;
+    }
+    return false;
+  }
+
+  async function hydrateFullSessionForStoryIfNeeded(nextSession) {
+    if (storyCleared) {
+      if (nextSession) delete nextSession.story;
+      return nextSession;
+    }
+    if (!nextSession || nextSession.mode !== 'git' || storyHidden || sessionFocusIsRange(nextSession)) return nextSession;
+    if (!sessionIsMissingStoryFiles(nextSession)) return nextSession;
+    try {
+      let fullSession = await fetchWhenReady('/api/session?scope=all');
+      if (!storyHasContent(fullSession.story)) fullSession.story = nextSession.story;
+      fullSession = await hydrateStoryIfMissing(fullSession);
+      return fullSession;
+    } catch {
+      return nextSession;
+    }
+  }
+
+  function updateStoryViewToggle() {
+    const toggle = document.getElementById('storyViewToggle');
+    if (!toggle) return;
+    const present = !!(session && storyHasContent(session.story));
+    toggle.style.display = present ? '' : 'none';
+    toggle.querySelectorAll('.toggle-btn').forEach(function (btn) {
+      const active = storyHidden ? btn.dataset.storyView === 'diff' : btn.dataset.storyView === 'story';
+      btn.classList.toggle('active', active);
+    });
+  }
+
+  function buildStoryState(story) {
+    // Accept a support-only story (chapters: [] or absent) — the --skip-llm
+    // stub places every hunk in one support entry to exercise the renderer.
+    if (!storyHasContent(story)) return null;
+    const pages = [];
+    const hunkOwner = new Map();
+    const fileChapters = new Map();
+
+    function addRefsToPage(refs, pageIndex) {
+      const byFile = new Map();
+      (refs || []).forEach(function (ref) {
+        const fp = ref.file_path || ref.filePath;
+        if (fp === undefined || fp === null) return;
+        let oldStart = 0;
+        if (ref.old_start !== undefined && ref.old_start !== null) oldStart = ref.old_start;
+        else if (ref.oldStart !== undefined && ref.oldStart !== null) oldStart = ref.oldStart;
+        hunkOwner.set(hunkKey(fp, oldStart), pageIndex);
+        if (!byFile.has(fp)) byFile.set(fp, []);
+        byFile.get(fp).push(oldStart);
+        if (!fileChapters.has(fp)) fileChapters.set(fp, new Set());
+        fileChapters.get(fp).add(pageIndex);
+      });
+      return byFile;
+    }
+
+    (Array.isArray(story.chapters) ? story.chapters : []).forEach(function (ch, i) {
+      const page = { kind: 'chapter', idx: i, id: ch.id || ('ch' + (i + 1)), title: ch.title || ('Chapter ' + (i + 1)), summary: ch.summary || '', diagram: ch.diagram || '', refsByFile: null };
+      page.refsByFile = addRefsToPage(ch.hunk_refs || ch.hunkRefs, pages.length);
+      pages.push(page);
+    });
+
+    if (Array.isArray(story.support) && story.support.length) {
+      // Support is a single page; concatenate every support entry's refs, but
+      // keep each entry's reason for display.
+      const supportPage = { kind: 'support', idx: 0, id: 'support', title: 'Support', summary: '', entries: story.support, refsByFile: null };
+      const allRefs = [];
+      story.support.forEach(function (e) { (e.hunk_refs || e.hunkRefs || []).forEach(function (r) { allRefs.push(r); }); });
+      supportPage.refsByFile = addRefsToPage(allRefs, pages.length);
+      pages.push(supportPage);
+    }
+
+    return { story: story, pages: pages, hunkOwner: hunkOwner, fileChapters: fileChapters };
+  }
+
+  // Display label for the support page. Falls back to a friendly label when
+  // the only reason is an internal ingest sentinel (stub / auto-repaired /
+  // ignored) or when no reason was authored.
+  function supportPageLabel(page) {
+    const reason = page && page.entries && page.entries[0] && page.entries[0].reason;
+    if (!reason) return 'Support';
+    if (reason === 'stub') return 'All changes';
+    if (reason === 'auto-repaired') return 'Auto-repaired changes';
+    if (reason === 'ignored') return 'Ignored files';
+    return reason;
+  }
+
+  function storyPageById(id) {
+    if (!storyState) return null;
+    for (let i = 0; i < storyState.pages.length; i++) {
+      if (storyPageId(storyState.pages[i]) === id) return storyState.pages[i];
+    }
+    return null;
+  }
+
+  // ----- Story progress -----
+  // Story mode uses the same file.viewed state and localStorage key as the
+  // regular diff. A file marked viewed in a chapter is viewed everywhere.
+  function isStoryFileViewed(filePath) {
+    const file = getFileByPath(filePath);
+    return !!(file && file.viewed);
+  }
+
+  // Progress for a page: {done, total} over its file groups.
+  function storyPageProgress(page) {
+    const groupFiles = Array.from(page.refsByFile.keys());
+    let done = 0;
+    groupFiles.forEach(function (fp) { if (isStoryFileViewed(fp)) done++; });
+    return { done: done, total: groupFiles.length };
+  }
+
+  function storyStatusClass(page) {
+    const p = storyPageProgress(page);
+    if (p.total === 0) return '';
+    if (p.done >= p.total) return 'done';
+    if (p.done > 0) return 'partial';
+    return '';
+  }
+  function storyStatusPercent(page) {
+    const p = storyPageProgress(page);
+    return p.total ? Math.round((p.done / p.total) * 100) : 0;
+  }
+
+  function storyExpandedFileKey(pageId, filePath, oldStarts) {
+    return pageId + '\0' + filePath + '\0' + (oldStarts || []).join(',');
+  }
+
+  function copyDiffHunk(hunk) {
+    return Object.assign({}, hunk, { Lines: (hunk.Lines || []).slice() });
+  }
+
+  function hunkContainsOldStart(hunk, oldStart) {
+    if (!hunk) return false;
+    if (hunk.OldStart === oldStart) return true;
+    if (hunk.OldCount <= 0) return false;
+    return oldStart >= hunk.OldStart && oldStart < hunk.OldStart + hunk.OldCount;
+  }
+
+  function syncStoryCloneFromFile(clone, file) {
+    clone.oldPath = file.oldPath;
+    clone.status = file.status;
+    clone.fileType = file.fileType;
+    clone.content = file.content;
+    clone.previousContent = file.previousContent;
+    clone.comments = file.comments;
+    clone.lineBlocks = file.lineBlocks;
+    clone.previousLineBlocks = file.previousLineBlocks;
+    clone.tocItems = file.tocItems;
+    clone.collapsed = file.collapsed;
+    clone.viewed = file.viewed;
+    clone.additions = file.additions;
+    clone.deletions = file.deletions;
+    clone.lazy = file.lazy;
+    clone.generated = file.generated;
+    clone.diffTooLarge = file.diffTooLarge;
+    clone.diffLoaded = file.diffLoaded;
+    clone.fileHash = file.fileHash;
+    clone.highlightCache = file.highlightCache;
+    clone.lang = file.lang;
+    clone.viewMode = 'diff';
+  }
+
+  // Build a shallow file clone whose diffHunks are just the referenced ones,
+  // preserving comments/path so the existing diff+comment renderer works
+  // unchanged. Returns null if the file isn't loaded or has no matching hunks.
+  function cloneFileForHunks(filePath, oldStarts, pageId) {
+    const file = getFileByPath(filePath);
+    if (!file) return null;
+    const wanted = new Set(oldStarts);
+    const allHunks = file.diffHunks || [];
+    const key = storyExpandedFileKey(pageId, filePath, oldStarts);
+    const cached = storyExpandedFileCache.get(key);
+    if (cached && cached.fileHash === file.fileHash) {
+      syncStoryCloneFromFile(cached.clone, file);
+      return { clone: cached.clone, total: cached.total, shown: cached.clone.diffHunks.length };
+    }
+
+    // Deep-copy and apply the same small-gap coalescing that normal diff
+    // rendering applies before filtering. Story refs are generated from the
+    // reviewer-facing hunk starts, while the raw git diff can split a logical
+    // GitHub-style hunk into several close zero-context hunks. Filtering first
+    // drops the later pieces of that visual hunk.
+    const expandedFile = Object.assign({}, file, {
+      diffHunks: allHunks.map(copyDiffHunk),
+      _autoExpandDone: false,
+      viewMode: 'diff',
+    });
+    autoExpandSmallGaps(expandedFile);
+    const expandedHunks = expandedFile.diffHunks || [];
+    const filtered = expandedHunks.filter(function (h) {
+      for (const oldStart of wanted) {
+        if (hunkContainsOldStart(h, oldStart)) return true;
+      }
+      return false;
+    });
+    const copiedHunks = filtered.map(copyDiffHunk);
+    const clone = Object.assign({}, file, {
+      diffHunks: copiedHunks,
+      _autoExpandDone: false,
+      // Force diff view for the group body regardless of markdown viewMode.
+      viewMode: 'diff',
+    });
+    storyExpandedFileCache.set(key, { fileHash: file.fileHash, clone: clone, total: expandedHunks.length });
+    return { clone: clone, total: expandedHunks.length, shown: copiedHunks.length };
+  }
+
+  // ----- Rail -----
+  function renderStoryRail() {
+    const rail = document.getElementById('storyRail');
+    if (!rail || !storyState) return;
+    const chapters = storyState.pages.filter(function (p) { return p.kind === 'chapter'; });
+    const support = storyState.pages.filter(function (p) { return p.kind === 'support'; });
+    const totalHunks = storyState.hunkOwner.size;
+
+    rail.innerHTML = '';
+
+    const titleRow = document.createElement('div');
+    titleRow.className = 'crit-story-rail__title';
+    titleRow.innerHTML = '<h2>Story</h2>';
+    rail.appendChild(titleRow);
+
+    const meta = document.createElement('div');
+    meta.className = 'crit-story-rail__meta';
+    const hunkLbl = totalHunks + ' hunk' + (totalHunks === 1 ? '' : 's');
+    if (chapters.length) {
+      meta.textContent = hunkLbl + ' across ' + chapters.length + ' chapter' + (chapters.length === 1 ? '' : 's') + (support.length ? ' · support' : '');
+    } else {
+      // Support-only story (e.g. the --skip-llm stub).
+      meta.textContent = hunkLbl + ' · support only';
+    }
+    rail.appendChild(meta);
+
+    function railRow(page, isOverview) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'crit-story-row' + (page && page.kind === 'support' ? ' support' : '');
+      const targetId = isOverview ? 'overview' : storyPageId(page);
+      row.dataset.storyTarget = targetId;
+      if (storyView === targetId) row.classList.add('active');
+
+      let indexLabel, name, sub, statusHtml = '';
+      if (isOverview) {
+        indexLabel = '◇';
+        name = 'Prologue &amp; index';
+        sub = 'Why this change exists';
+      } else if (page.kind === 'support') {
+        indexLabel = 'S';
+        const prog = storyPageProgress(page);
+        name = escapeHtml(supportPageLabel(page));
+        sub = prog.total + ' file' + (prog.total === 1 ? '' : 's');
+        statusHtml = railStatusHtml(page);
+      } else {
+        indexLabel = String(page.idx + 1);
+        name = escapeHtml(page.title);
+        const prog = storyPageProgress(page);
+        const nh = countHunksForPage(page);
+        sub = prog.total + ' file' + (prog.total === 1 ? '' : 's') + ' · ' + nh + ' hunk' + (nh === 1 ? '' : 's');
+        statusHtml = railStatusHtml(page);
+      }
+      row.innerHTML =
+        '<span class="crit-story-row__index">' + indexLabel + '</span>' +
+        '<span class="crit-story-row__body">' +
+          '<span class="crit-story-row__name">' + name + '</span>' +
+          '<span class="crit-story-row__sub">' + escapeHtml(sub) + '</span>' +
+        '</span>' + statusHtml;
+      row.addEventListener('click', function () { showStory(targetId); });
+      return row;
+    }
+
+    const ovLabel = document.createElement('div');
+    ovLabel.className = 'crit-story-rail__label';
+    ovLabel.textContent = 'Overview';
+    rail.appendChild(ovLabel);
+    rail.appendChild(railRow(null, true));
+
+    if (chapters.length) {
+      const chLabel = document.createElement('div');
+      chLabel.className = 'crit-story-rail__label';
+      chLabel.textContent = 'Chapters';
+      rail.appendChild(chLabel);
+      chapters.forEach(function (p) { rail.appendChild(railRow(p, false)); });
+    }
+
+    if (support.length) {
+      const sLabel = document.createElement('div');
+      sLabel.className = 'crit-story-rail__label';
+      sLabel.textContent = 'Support';
+      rail.appendChild(sLabel);
+      support.forEach(function (p) { rail.appendChild(railRow(p, false)); });
+    }
+
+    const spacer = document.createElement('div');
+    spacer.className = 'crit-story-rail__spacer';
+    rail.appendChild(spacer);
+
+  }
+
+  function railStatusHtml(page) {
+    const cls = storyStatusClass(page);
+    const pct = storyStatusPercent(page);
+    const style = cls === 'partial' ? ' style="--p:' + pct + '%"' : '';
+    const title = cls === 'done' ? 'Reviewed' : (cls === 'partial' ? pct + '% reviewed' : 'Not reviewed');
+    return '<span class="crit-story-status ' + cls + '"' + style + ' title="' + title + '"></span>';
+  }
+
+  function countHunksForPage(page) {
+    let n = 0;
+    page.refsByFile.forEach(function (arr) { n += arr.length; });
+    return n;
+  }
+
+  // ----- Overview -----
+  function renderStoryOverview() {
+    const inner = document.getElementById('storyPaneInner');
+    const view = document.createElement('section');
+    view.className = 'crit-story-view active';
+    view.id = 'crit-story-view-overview';
+
+    const story = storyState.story;
+    const prologue = story.prologue || {};
+    const chapterPages = storyState.pages.filter(function (p) { return p.kind === 'chapter'; });
+    const hasPrologueContent = !!(prologue.title || prologue.overview ||
+      (Array.isArray(prologue.key_changes) && prologue.key_changes.length) ||
+      (Array.isArray(prologue.risks) && prologue.risks.length) ||
+      prologue.diagram);
+
+    const prologueEl = document.createElement('div');
+    prologueEl.className = 'crit-story-prologue';
+    let ph = '<div class="crit-story-prologue__eyebrow"><span class="dot"></span> Prologue</div>';
+    if (prologue.title) {
+      ph += '<h2>' + escapeHtml(prologue.title) + '</h2>';
+    } else if (!hasPrologueContent) {
+      // Support-only / stub story with no authored prologue — give the page a
+      // heading so it doesn't read as a bare eyebrow.
+      ph += '<h2>' + (chapterPages.length ? 'Story overview' : 'Changes grouped for review') + '</h2>';
+    }
+    prologueEl.innerHTML = ph;
+    if (prologue.overview) {
+      const overview = document.createElement('div');
+      overview.className = 'crit-story-prologue__overview';
+      overview.innerHTML = commentMd.render(prologue.overview);
+      prologueEl.appendChild(overview);
+    }
+    const bullets = renderStoryPrologueBullets(prologue);
+    if (bullets) prologueEl.appendChild(bullets);
+    if (prologue.diagram) {
+      const dia = document.createElement('div');
+      dia.className = 'crit-story-chapter__diagram';
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      code.className = 'language-mermaid';
+      code.textContent = prologue.diagram;
+      pre.appendChild(code);
+      dia.appendChild(pre);
+      prologueEl.appendChild(dia);
+    }
+    view.appendChild(prologueEl);
+
+    const divider = document.createElement('div');
+    divider.className = 'crit-story-divider';
+    divider.textContent = chapterPages.length ? 'Read in order' : 'Changes';
+    view.appendChild(divider);
+
+    const toc = document.createElement('div');
+    toc.className = 'crit-story-toc';
+    storyState.pages.forEach(function (page) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'crit-story-toc__item' + (page.kind === 'support' ? ' support' : '');
+      const pid = storyPageId(page);
+      item.dataset.storyTarget = pid;
+      const prog = storyPageProgress(page);
+      const nh = countHunksForPage(page);
+      const indexLabel = page.kind === 'support' ? 'S' : String(page.idx + 1);
+      const title = page.kind === 'support' ? supportPageLabel(page) : page.title;
+      const summaryHtml = page.kind === 'support'
+        ? 'Mechanical or repaired changes — skimmable.'
+        : (page.summary ? commentMd.renderInline(page.summary) : '');
+      item.innerHTML =
+        '<span class="crit-story-toc__index">' + indexLabel + '</span>' +
+        '<span class="crit-story-toc__main">' +
+          '<span class="crit-story-toc__title">' + escapeHtml(title) + '</span>' +
+          (summaryHtml ? '<span class="crit-story-toc__summary">' + summaryHtml + '</span>' : '') +
+        '</span>' +
+        '<span class="crit-story-toc__meta">' +
+          railStatusHtml(page) +
+          '<span>' + prog.total + 'f · ' + nh + 'h</span>' +
+          '<span class="crit-story-toc__go">→</span>' +
+        '</span>';
+      item.addEventListener('click', function () { showStory(pid); });
+      toc.appendChild(item);
+    });
+    view.appendChild(toc);
+
+    inner.appendChild(view);
+  }
+
+  function renderStoryPrologueBullets(prologue) {
+    const groups = [
+      { label: 'Key changes', items: prologue.key_changes || [] },
+      { label: 'Risks', items: prologue.risks || [] },
+    ].filter(function (group) { return Array.isArray(group.items) && group.items.length; });
+    if (!groups.length) return null;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'crit-story-prologue__bullets';
+    groups.forEach(function (group) {
+      const section = document.createElement('section');
+      section.className = 'crit-story-prologue__bullet-group';
+      const heading = document.createElement('h3');
+      heading.textContent = group.label;
+      section.appendChild(heading);
+      const list = document.createElement('ul');
+      group.items.forEach(function (item) {
+        const li = document.createElement('li');
+        li.innerHTML = commentMd.renderInline(String(item || ''));
+        list.appendChild(li);
+      });
+      section.appendChild(list);
+      wrap.appendChild(section);
+    });
+    return wrap;
+  }
+
+  // ----- Chapter / Support page -----
+  function renderStoryPage(page) {
+    const inner = document.getElementById('storyPaneInner');
+    const isSupport = page.kind === 'support';
+    const pid = storyPageId(page);
+    const chapters = storyState.pages.filter(function (p) { return p.kind === 'chapter'; });
+
+    const view = document.createElement('section');
+    view.className = 'crit-story-view active';
+    view.id = 'crit-story-view-' + pid;
+
+    // Heading
+    const top = document.createElement('div');
+    top.className = 'crit-story-chapter__top';
+    const eyebrow = isSupport ? 'Support · mechanical' : ('Chapter ' + (page.idx + 1) + ' of ' + chapters.length);
+    const indexLabel = isSupport ? 'S' : String(page.idx + 1);
+    const title = isSupport ? supportPageLabel(page) : page.title;
+    top.innerHTML =
+      '<span class="crit-story-chapter__index' + (isSupport ? ' support' : '') + '">' + indexLabel + '</span>' +
+      '<div class="crit-story-chapter__heading">' +
+        '<div class="crit-story-chapter__eyebrow">' + escapeHtml(eyebrow) + '</div>' +
+        '<h2>' + escapeHtml(title) + '</h2>' +
+      '</div>';
+    view.appendChild(top);
+
+    // Summary
+    if (isSupport) {
+      const sum = document.createElement('p');
+      sum.className = 'crit-story-chapter__summary';
+      sum.textContent = 'Skimmable — nothing here changes behaviour.';
+      view.appendChild(sum);
+    } else if (page.summary) {
+      const sum = document.createElement('div');
+      sum.className = 'crit-story-chapter__summary';
+      sum.innerHTML = commentMd.render(page.summary);
+      view.appendChild(sum);
+    }
+    if (!isSupport && page.diagram) {
+      const dia = document.createElement('div');
+      dia.className = 'crit-story-chapter__diagram';
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      code.className = 'language-mermaid';
+      code.textContent = page.diagram;
+      pre.appendChild(code);
+      dia.appendChild(pre);
+      view.appendChild(dia);
+    }
+
+    // Per-file hunk groups
+    const supportReasonByFile = new Map();
+    if (isSupport && page.entries) {
+      page.entries.forEach(function (e) {
+        (e.hunk_refs || e.hunkRefs || []).forEach(function (r) {
+          const fp = r.file_path || r.filePath;
+          if (fp && !supportReasonByFile.has(fp)) supportReasonByFile.set(fp, e.reason || '');
+        });
+      });
+    }
+
+    page.refsByFile.forEach(function (oldStarts, filePath) {
+      view.appendChild(renderStoryFileGroup(page, filePath, oldStarts, supportReasonByFile.get(filePath)));
+    });
+
+    const prog = storyPageProgress(page);
+    const allViewed = prog.total > 0 && prog.done >= prog.total;
+    const markRow = document.createElement('div');
+    markRow.className = 'crit-story-chapter__mark-row';
+    const markBtn = document.createElement('button');
+    markBtn.type = 'button';
+    markBtn.className = 'crit-story-chapter__mark';
+    markBtn.textContent = allViewed ? 'Chapter viewed' : 'Mark chapter viewed';
+    markBtn.addEventListener('click', function () { markPageViewed(page, !allViewed); });
+    markRow.appendChild(markBtn);
+    view.appendChild(markRow);
+
+    // Footer: previous/next chapter navigation.
+    const footer = document.createElement('div');
+    footer.className = 'crit-story-footer';
+    const pageIndexInPages = storyState.pages.indexOf(page);
+    const prevPage = storyState.pages[pageIndexInPages - 1];
+    if (prevPage || pageIndexInPages === 0) {
+      const prevCard = document.createElement('button');
+      prevCard.type = 'button';
+      prevCard.className = 'crit-story-next prev';
+      const pidPrev = prevPage ? storyPageId(prevPage) : 'overview';
+      const pLabel = prevPage ? (prevPage.kind === 'support' ? 'S' : String(prevPage.idx + 1)) : 'P';
+      const pTitle = prevPage ? (prevPage.kind === 'support' ? supportPageLabel(prevPage) : prevPage.title) : 'Prologue';
+      prevCard.innerHTML =
+        '<span class="go">←</span>' +
+        '<span class="idx">' + pLabel + '</span>' +
+        '<span class="body"><span class="lbl">Previous</span><span class="nm">' + escapeHtml(pTitle) + '</span></span>';
+      prevCard.addEventListener('click', function () { showStory(pidPrev); });
+      footer.appendChild(prevCard);
+    }
+    const nextCard = document.createElement('button');
+    nextCard.type = 'button';
+    nextCard.className = 'crit-story-next';
+    const nextPage = storyState.pages[pageIndexInPages + 1];
+    if (nextPage) {
+      const nid = storyPageId(nextPage);
+      const nLabel = nextPage.kind === 'support' ? 'S' : String(nextPage.idx + 1);
+      const nTitle = nextPage.kind === 'support' ? supportPageLabel(nextPage) : nextPage.title;
+      nextCard.innerHTML =
+        '<span class="idx">' + nLabel + '</span>' +
+        '<span class="body"><span class="lbl">Next</span><span class="nm">' + escapeHtml(nTitle) + '</span></span>' +
+        '<span class="go">→</span>';
+      nextCard.addEventListener('click', function () { showStory(nid); });
+    } else {
+      nextCard.className += ' done';
+      nextCard.innerHTML =
+        '<span class="idx">✓</span>' +
+        '<span class="body"><span class="lbl">End of story</span><span class="nm">Back to overview</span></span>' +
+        '<span class="go">→</span>';
+      nextCard.addEventListener('click', function () { showStory('overview'); });
+    }
+    footer.appendChild(nextCard);
+    view.appendChild(footer);
+
+    inner.appendChild(view);
+  }
+
+  function renderStoryFileGroup(page, filePath, oldStarts, supportReason) {
+    const pid = storyPageId(page);
+    const built = cloneFileForHunks(filePath, oldStarts, pid);
+    const file = getFileByPath(filePath);
+    const section = document.createElement('details');
+    section.className = 'file-section crit-story-file-group';
+    section.id = 'story-file-section-' + pid + '-' + filePath;
+    section.dataset.storyFile = filePath;
+    if (file && file.viewed) section.classList.add('viewed');
+    if (!file || !file.collapsed) section.open = true;
+
+    const header = document.createElement('summary');
+    header.className = 'file-header crit-story-file-header';
+    header.addEventListener('click', function (e) {
+      if (e.target.closest('.file-header-toggle') || e.target.closest('.file-header-viewed') || e.target.closest('.file-comment-btn') || e.target.closest('.file-header-copy-path') || e.target.closest('.crit-story-elsewhere')) {
+        e.preventDefault();
+        return;
+      }
+      if (file && section.open) {
+        e.preventDefault();
+        if (section.getBoundingClientRect().top < 0) section.scrollIntoView({ behavior: 'instant' });
+        section.open = false;
+        file.collapsed = true;
+      }
+    });
+    section.addEventListener('toggle', function () {
+      if (file) file.collapsed = !section.open;
+    });
+
+    const shown = built ? built.shown : 0;
+    const total = built ? built.total : 0;
+    let statText;
+    if (supportReason) statText = escapeHtml(supportReason);
+    else if (total > 1 && shown < total) statText = 'hunk' + (shown === 1 ? ' ' : 's ') + shown + ' of ' + total;
+    else statText = shown + ' hunk' + (shown === 1 ? '' : 's');
+    const adds = file ? (file.additions || 0) : 0;
+    const dels = file ? (file.deletions || 0) : 0;
+    const dirParts = filePath.split('/');
+    const fileName = dirParts.pop();
+    const dirPath = dirParts.length > 0 ? dirParts.join('/') + '/' : '';
+    header.innerHTML =
+      '<div class="file-header-chevron"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"/></svg></div>' +
+      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
+      '<span class="file-header-name"><span class="dir">' + escapeHtml(dirPath) + '</span><span class="filename">' + escapeHtml(fileName || filePath) + '</span>' +
+        '<button type="button" class="file-header-copy-path" aria-label="Copy file path">' + ICON_COPY_PATH + '</button>' +
+      '</span>' +
+      '<span class="crit-story-file-group__stat">' + statText +
+        (adds ? ' · <span class="add">+' + adds + '</span>' : '') +
+        (dels ? ' <span class="del">-' + dels + '</span>' : '') +
+      '</span>';
+
+    const copyPathBtn = header.querySelector('.file-header-copy-path');
+    if (copyPathBtn) {
+      copyPathBtn.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const originalLabel = copyPathBtn.getAttribute('aria-label');
+        const abs = session.cwd ? session.cwd + '/' + filePath : filePath;
+        navigator.clipboard.writeText(abs).then(function() {
+          copyPathBtn.innerHTML = ICON_COPY_PATH_CHECK;
+          copyPathBtn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function() { copyPathBtn.innerHTML = ICON_COPY_PATH; copyPathBtn.setAttribute('aria-label', originalLabel); }, 1500);
+        }).catch(function() {
+          // Clipboard access is best-effort.
+        });
+      });
+    }
+
+    // Elsewhere hint: this file's other hunks live in other pages.
+    const owners = storyState.fileChapters.get(filePath);
+    if (owners && owners.size > 1) {
+      const others = [];
+      owners.forEach(function (pi) { if (pi !== storyState.pages.indexOf(page)) others.push(pi); });
+      if (others.length) {
+        const first = storyState.pages[others[0]];
+        const hint = document.createElement('button');
+        hint.type = 'button';
+        hint.className = 'crit-story-elsewhere';
+        const lbl = first.kind === 'support' ? 'Support' : ('Ch ' + (first.idx + 1));
+        hint.textContent = 'also in ' + lbl + (others.length > 1 ? ' +' + (others.length - 1) : '');
+        hint.title = 'This file has hunks in other chapters';
+        hint.addEventListener('click', function () { showStory(storyPageId(first)); });
+        header.appendChild(hint);
+      }
+    }
+
+    if (file && !file.orphaned) {
+      const fileCommentBtn = document.createElement('button');
+      fileCommentBtn.className = 'file-comment-btn';
+      fileCommentBtn.title = 'Add file-level comment';
+      fileCommentBtn.setAttribute('aria-label', 'Add file-level comment');
+      fileCommentBtn.innerHTML = ICON_COMMENT;
+      fileCommentBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        openFileCommentForm(file.path);
+      });
+      header.appendChild(fileCommentBtn);
+    }
+
+    const viewedLabel = document.createElement('label');
+    viewedLabel.className = 'file-header-viewed';
+    viewedLabel.title = 'Viewed';
+    viewedLabel.innerHTML = '<input type="checkbox"' + (file && file.viewed ? ' checked' : '') + '><span>Viewed</span>';
+    viewedLabel.addEventListener('click', function(e) { e.stopPropagation(); });
+    viewedLabel.querySelector('input').addEventListener('change', function () {
+      toggleViewed(filePath);
+      if (file && file.viewed && section.open) section.open = false;
+      section.classList.toggle('viewed', !!(file && file.viewed));
+      renderStoryRail();
+    });
+    header.appendChild(viewedLabel);
+    section.appendChild(header);
+
+    if (file) {
+      const fileComments = file.comments.filter(function(c) { return c.scope === 'file'; });
+      const fileForm = getFormsForFile(file.path).find(function(f) { return f.scope === 'file'; });
+      if (fileComments.length > 0 || fileForm) {
+        const fileCommentsContainer = document.createElement('div');
+        fileCommentsContainer.className = 'file-comments';
+        fileComments.forEach(function(comment) {
+          fileCommentsContainer.appendChild(comment.resolved ? createResolvedElement(comment, file.path) : createCommentElement(comment, file.path));
+        });
+        if (fileForm) fileCommentsContainer.appendChild(createFileCommentForm(fileForm));
+        section.appendChild(fileCommentsContainer);
+      }
+    }
+
+    // Body: reuse the existing diff renderer via the filtered file clone.
+    const body = document.createElement('div');
+    body.className = 'file-body';
+    if (built && built.clone.diffHunks.length) {
+      body.appendChild(renderDiffHunks(built.clone));
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'crit-story-file-group__empty';
+      empty.textContent = file ? 'These hunks are no longer in the diff.' : 'File not loaded.';
+      body.appendChild(empty);
+    }
+    section.appendChild(body);
+    if (built && built.clone) highlightQuotesInSection(section, built.clone);
+    return section;
+  }
+
+  function storySupportReasonForFile(page, filePath) {
+    if (!page || page.kind !== 'support' || !page.entries) return undefined;
+    for (let i = 0; i < page.entries.length; i++) {
+      const entry = page.entries[i];
+      const refs = entry.hunk_refs || entry.hunkRefs || [];
+      for (let r = 0; r < refs.length; r++) {
+        const fp = refs[r].file_path || refs[r].filePath;
+        if (fp === filePath) return entry.reason || '';
+      }
+    }
+    return undefined;
+  }
+
+  function renderStoryFileByPath(filePath) {
+    if (!storyState || storyView === 'overview') return false;
+    const page = storyPageById(storyView);
+    if (!page || !page.refsByFile || !page.refsByFile.has(filePath)) return false;
+    const view = document.getElementById('crit-story-view-' + storyPageId(page));
+    if (!view) return false;
+    const oldSection = view.querySelector('.crit-story-file-group[data-story-file="' + CSS.escape(filePath) + '"]');
+    if (!oldSection) return false;
+    const replacement = renderStoryFileGroup(page, filePath, page.refsByFile.get(filePath), storySupportReasonForFile(page, filePath));
+    oldSection.replaceWith(replacement);
+    renderMermaidBlocks();
+    rebuildNavList();
+    applyHideResolved();
+    renderStoryRail();
+    return true;
+  }
+
+  function markPageViewed(page, viewed) {
+    page.refsByFile.forEach(function (_starts, filePath) {
+      const file = getFileByPath(filePath);
+      if (!file || file.viewed === viewed) return;
+      file.viewed = viewed;
+      if (viewed) file.collapsed = true;
+    });
+    saveViewedState();
+    updateViewedCount();
+    updateTreeViewedState();
+    renderStory();
+  }
+
+  // ----- Router -----
+  function renderStory() {
+    if (!storyState) return;
+    const inner = document.getElementById('storyPaneInner');
+    inner.innerHTML = '';
+    if (storyView === 'overview' || !storyPageById(storyView)) {
+      storyView = storyPageById(storyView) ? storyView : 'overview';
+      if (storyView === 'overview') {
+        renderStoryOverview();
+      } else {
+        renderStoryPage(storyPageById(storyView));
+      }
+    } else {
+      renderStoryPage(storyPageById(storyView));
+    }
+    renderStoryRail();
+    renderMermaidBlocks();
+    rebuildNavList();
+    applyHideResolved();
+    // Keep active rail row visible.
+    const activeRow = document.querySelector('.crit-story-row.active');
+    if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+  }
+
+  function resetStoryScroll() {
+    const pane = document.getElementById('storyPane');
+    if (pane) pane.scrollTop = 0;
+    const scrollingEl = document.scrollingElement || document.documentElement;
+    if (scrollingEl) scrollingEl.scrollTop = 0;
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+  }
+
+  function showStory(target) {
+    if (!storyState) return;
+    if (target !== 'overview' && !storyPageById(target)) target = 'overview';
+    storyView = target;
+    const hash = target === 'overview' ? '#story' : '#story/' + target;
+    if (location.hash !== hash) history.replaceState(null, '', hash);
+    document.body.classList.remove('crit-story-rail-open');
+    renderStory();
+    resetStoryScroll();
+  }
+
+  function storyFromHash() {
+    const h = location.hash || '';
+    if (h.indexOf('#story') !== 0) return;
+    if (h.indexOf('/') > -1) {
+      const target = h.split('/')[1];
+      storyView = storyPageById(target) ? target : 'overview';
+    } else {
+      storyView = 'overview';
+    }
+  }
+
+  // Activate/deactivate the whole story layout. Respects storyHidden: when a
+  // story is present but the reviewer chose "Hide story view", the flat layout
+  // renders and a "Show story view" re-entry affordance is surfaced instead.
+  function applyStoryPresence() {
+    const present = !!(session && storyHasContent(session.story));
+    if (present) {
+      storyState = buildStoryState(session.story);
+      if (storyHidden) {
+        // Present but hidden: flat layout + re-entry affordance. Navigating to
+        // a #story hash un-hides (handled in the hashchange listener).
+        document.body.classList.remove('crit-story-active');
+        document.body.classList.remove('crit-story-rail-open');
+        document.body.classList.add('crit-story-hidden');
+      } else {
+        document.body.classList.remove('crit-story-hidden');
+        document.body.classList.add('crit-story-active');
+        storyFromHash();
+        renderStory();
+      }
+    } else {
+      storyState = null;
+      storyHidden = false;
+      document.body.classList.remove('crit-story-active');
+      document.body.classList.remove('crit-story-hidden');
+      document.body.classList.remove('crit-story-rail-open');
+      const inner = document.getElementById('storyPaneInner');
+      if (inner) inner.innerHTML = '';
+      const rail = document.getElementById('storyRail');
+      if (rail) rail.innerHTML = '';
+    }
+    updateStoryViewToggle();
+    updateDiffModeToggle();
+  }
+
+  // "Hide story view" is a non-destructive view toggle (Task 7 user-feedback
+  // fix): it does NOT delete the story. It flips into the flat file layout for
+  // this page session and surfaces a "Show story view" re-entry affordance. The
+  // story stays on disk and in session.story; a reload restores the story view.
+  // Real removal is `crit story --clear` / DELETE /api/story.
+  async function hideStoryView() {
+    storyHidden = true;
+    applyStoryPresence();
+    await reloadForScope();
+  }
+
+  // Restore the story view after "Hide story view". Un-hides and renders at the
+  // overview (or the page named by the current #story hash, if any).
+  async function showStoryView() {
+    storyHidden = false;
+    await reloadForScope();
+  }
+
+  // Chapter that owns the hunk containing a given (filePath, line). Returns
+  // the story page id, or null. Used to make comment/anchor navigation
+  // cross chapter boundaries.
+  function storyPageForLine(filePath, line) {
+    if (!storyState) return null;
+    const file = getFileByPath(filePath);
+    if (!file || !file.diffHunks) return null;
+    // Find which hunk contains the line, then which page owns that hunk.
+    for (let i = 0; i < file.diffHunks.length; i++) {
+      const h = file.diffHunks[i];
+      const lines = h.Lines || [];
+      let hit = false;
+      for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
+        if (ln.NewNum === line || ln.OldNum === line) { hit = true; break; }
+      }
+      if (hit) {
+        let owner;
+        const ownedStarts = storyOwnedStartsInHunk(filePath, h);
+        if (ownedStarts.length) {
+          let chosen = ownedStarts[0];
+          for (let s = 0; s < ownedStarts.length; s++) {
+            if (ownedStarts[s] <= line) chosen = ownedStarts[s];
+          }
+          owner = storyState.hunkOwner.get(hunkKey(filePath, chosen));
+        } else {
+          owner = storyState.hunkOwner.get(hunkKey(filePath, h.OldStart));
+        }
+        if (owner !== undefined) return storyPageId(storyState.pages[owner]);
+      }
+    }
+    // Fallback: any page that references this file.
+    const owners = storyState.fileChapters.get(filePath);
+    if (owners && owners.size) {
+      const first = Array.from(owners)[0];
+      return storyPageId(storyState.pages[first]);
+    }
+    return null;
+  }
+
+  function storyOwnedStartsInHunk(filePath, hunk) {
+    if (!storyState || !hunk) return [];
+    const starts = [];
+    const oldEnd = hunk.OldStart + Math.max(1, hunk.OldCount || 0);
+    storyState.pages.forEach(function (page) {
+      const refs = page.refsByFile && page.refsByFile.get(filePath);
+      (refs || []).forEach(function (oldStart) {
+        const inRange = hunk.OldCount <= 0
+          ? oldStart === hunk.OldStart
+          : oldStart >= hunk.OldStart && oldStart < oldEnd;
+        if (inRange) starts.push(oldStart);
+      });
+    });
+    starts.sort(function (a, b) { return a - b; });
+    return starts;
+  }
+
+  // Ensure the chapter owning (filePath, line) is active; returns true if a
+  // navigation happened (caller should defer scroll to next frame).
+  function storyActivatePageForLine(filePath, line) {
+    if (!storyState) return false;
+    const pid = storyPageForLine(filePath, line);
+    if (pid && pid !== storyView) { showStory(pid); return true; }
+    return false;
+  }
+
+  function storyActive() { return !!storyState && document.body.classList.contains('crit-story-active'); }
+
+  // Handle a keydown when story view is active. Returns true if consumed.
+  // Uppercase J/K (Shift) drive chapter nav so lowercase j/k keep their
+  // existing in-page block navigation. Scoped keys don't fire when typing.
+  function handleStoryKey(e) {
+    if (!storyActive()) return false;
+    const pages = storyState.pages;
+    const curIdx = storyView === 'overview' ? -1 : pages.indexOf(storyPageById(storyView));
+    switch (e.key) {
+      case 'J':
+        e.preventDefault();
+        if (curIdx === -1) { if (pages.length) showStory(storyPageId(pages[0])); }
+        else if (curIdx < pages.length - 1) showStory(storyPageId(pages[curIdx + 1]));
+        return true;
+      case 'K':
+        e.preventDefault();
+        if (curIdx <= 0) showStory('overview');
+        else showStory(storyPageId(pages[curIdx - 1]));
+        return true;
+      case 'O':
+        e.preventDefault(); showStory('overview'); return true;
+      case 'S':
+        e.preventDefault();
+        { const sp = storyPageById('support'); if (sp) showStory('support'); }
+        return true;
+      case '1': case '2': case '3': case '4': case '5':
+      case '6': case '7': case '8': case '9': {
+        const n = parseInt(e.key, 10) - 1;
+        const chs = pages.filter(function (p) { return p.kind === 'chapter'; });
+        if (n < chs.length) { e.preventDefault(); showStory(storyPageId(chs[n])); return true; }
+        return false;
+      }
+      case '\\':
+        e.preventDefault();
+        document.body.classList.toggle('crit-story-rail-open');
+        return true;
+      case 'Escape':
+        if (document.body.classList.contains('crit-story-rail-open')) {
+          e.preventDefault(); document.body.classList.remove('crit-story-rail-open'); return true;
+        }
+        return false;
+    }
+    return false;
+  }
+
+  // Rail toggle + scrim wiring (safe when elements absent).
+  (function wireStoryChrome() {
+    const toggle = document.getElementById('storyRailToggle');
+    if (toggle) toggle.addEventListener('click', function () { document.body.classList.toggle('crit-story-rail-open'); });
+    const scrim = document.getElementById('storyRailScrim');
+    if (scrim) scrim.addEventListener('click', function () { document.body.classList.remove('crit-story-rail-open'); });
+    const storyViewToggle = document.getElementById('storyViewToggle');
+    if (storyViewToggle) {
+      storyViewToggle.addEventListener('click', function (e) {
+        const btn = e.target.closest('.toggle-btn');
+        if (!btn || !storyViewToggle.contains(btn)) return;
+        if (btn.dataset.storyView === 'diff') hideStoryView();
+        else showStoryView();
+      });
+    }
+    window.addEventListener('hashchange', function () {
+      const h = location.hash || '';
+      if (h.indexOf('#story') !== 0) return;
+      // Navigating to a #story hash un-hides a hidden-but-present story.
+      if (storyHidden && storyState) { showStoryView(); return; }
+      if (!storyActive()) return;
+      storyFromHash();
+      renderStory();
+    });
+  })();
+
   // ===== Start =====
   init()
     .then(function() {
@@ -9196,6 +10702,20 @@
         window.crit.renderer.register({
           scrollToAnchor: function (anchor) {
             if (anchor.type !== 'line') return Promise.resolve();
+            // Story view: activate the owning chapter, then scroll to the
+            // matching diff line inside the story pane.
+            if (storyActive()) {
+              const navigated = storyActivatePageForLine(anchor.filePath, anchor.endLine);
+              const locate = function () {
+                const pane = document.getElementById('storyPane');
+                if (!pane) return;
+                const el = pane.querySelector('[data-diff-file-path="' + CSS.escape(anchor.filePath) + '"][data-diff-line-num="' + anchor.endLine + '"]') ||
+                  pane.querySelector('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"][data-end-line="' + anchor.endLine + '"]');
+                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              };
+              if (navigated) requestAnimationFrame(locate); else locate();
+              return Promise.resolve();
+            }
             const section = document.getElementById('file-section-' + anchor.filePath);
             if (!section) return Promise.resolve();
             if (!section.open) section.open = true;
@@ -9206,6 +10726,7 @@
 
           highlightAnchor: function (anchor) {
             if (anchor.type !== 'line') return Promise.resolve();
+            if (storyActive()) return Promise.resolve();
             const section = document.getElementById('file-section-' + anchor.filePath);
             if (!section) return Promise.resolve();
             const blocks = section.querySelectorAll('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"]');

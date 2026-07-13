@@ -29,6 +29,7 @@ var commandDispatch = map[string]func([]string){
 	"preview":   runPreview,
 	"plan":      runPlan,
 	"plan-hook": runPlanHookCommand,
+	"story":     runStory,
 	"auth":      runAuth,
 	"stop":      runStop,
 	"status":    runStatus,
@@ -50,8 +51,10 @@ Review:
   crit live <url>                            Review a running web app in live mode
   crit preview <file.html>                   Review a local HTML file in preview mode
   crit --pr <num|url>                        Review a GitHub pull request
-  crit --range <base>..<head>               Review a commit range
+  crit --range <base>..<head>                Review a commit range
   crit plan --name <slug> <file>             Review a plan file
+  crit story                                 Generate and review a story-mode diff
+  crit --session <id>                        Reconnect to an existing review session
 
 Comments:
   crit comment <path>:<line[-end]> <body>    Add a comment (headless, no server needed)
@@ -63,7 +66,7 @@ Comments:
 Sharing:
   crit share <file> [file...]                Share files to crit-web, print URL
   crit fetch [--output <dir>]                Fetch comments from crit-web
-  crit unpublish [file...]                    Remove a shared review from crit-web
+  crit unpublish [file...]                   Remove a shared review from crit-web
 
 GitHub PR sync:
   crit pull [pr-number]                      Fetch PR comments into the review file
@@ -84,6 +87,7 @@ Setup & management:
 Options:
   -p, --port <port>           Port to listen on (default: random)
       --host <host>           Listen host (default: 127.0.0.1; e.g. 0.0.0.0 for LAN)
+      --public-url <url>      Advertised base URL (e.g. https://machine.ts.net via tailscale serve)
   -o, --output <dir>          Output directory for review file
       --no-open               Don't auto-open browser
       --no-ignore             Disable all file ignore patterns
@@ -91,16 +95,18 @@ Options:
       --share-url <url>       Share service URL (e.g. https://crit.md or self-hosted)
       --base-branch <branch>  Base branch to diff against (overrides auto-detection)
       --scope <mode>          Diff scope for PR review: layer (default) or full-stack
+      --session <id>          Reconnect to an existing review session (from stderr or next_command)
       --remote                Read PR files via GitHub API instead of local git
       --qr                    Print QR code of share URL (with crit share)
   -v, --version               Print version
 
 Environment:
   CRIT_SHARE_URL              Override the share service URL
+  CRIT_PUBLIC_URL             Override the advertised review URL (listen address unchanged)
   CRIT_PORT                   Override the default port
   CRIT_HOST                   Override the listen host (default 127.0.0.1)
   CRIT_NO_UPDATE_CHECK        Disable update check on startup
-  CRIT_AUTH_TOKEN              Override the auth token (skip login)
+  CRIT_AUTH_TOKEN             Override the auth token (skip login)
   CRIT_NO_INTEGRATION_CHECK   Disable staleness check and agent detection on startup
 
 Configuration:

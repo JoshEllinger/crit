@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/JoshEllinger/crit/internal/focus"
 )
 
 func TestAddLivePin_AssignsMonotonicGlobalPinNumbers(t *testing.T) {
@@ -81,6 +83,10 @@ func testRunLive([]string)   { lastDispatch = "live" }
 func testRunReview([]string) { lastDispatch = "review" }
 
 func dispatchForTest(args []string, liveFn, reviewFn func([]string)) {
+	if len(args) == 1 && focus.LooksLikePRURL(args[0]) {
+		reviewFn([]string{"--pr", args[0]})
+		return
+	}
 	if looksLikeLiveArgs(args) {
 		liveFn(args)
 	} else {
@@ -128,6 +134,22 @@ func TestDispatch_PlainArgNotLive(t *testing.T) {
 	}
 }
 
+func TestDispatch_GitHubPRURLUsesReview(t *testing.T) {
+	lastDispatch = ""
+	var reviewArgs []string
+	dispatchForTest([]string{"https://github.com/a/b/pull/295"}, testRunLive, func(args []string) {
+		lastDispatch = "review"
+		reviewArgs = args
+	})
+	if lastDispatch != "review" {
+		t.Errorf("dispatch = %q, want review", lastDispatch)
+	}
+	want := []string{"--pr", "https://github.com/a/b/pull/295"}
+	if len(reviewArgs) != len(want) || reviewArgs[0] != want[0] || reviewArgs[1] != want[1] {
+		t.Errorf("review args = %v, want %v", reviewArgs, want)
+	}
+}
+
 func TestLooksLikeLiveArgs(t *testing.T) {
 	cases := []struct {
 		args []string
@@ -136,6 +158,8 @@ func TestLooksLikeLiveArgs(t *testing.T) {
 		{[]string{"http://localhost:3000"}, true},
 		{[]string{"https://example.com"}, true},
 		{[]string{"https://localhost:8080/path"}, true},
+		{[]string{"https://github.com/a/b/pull/295"}, false},
+		{[]string{"https://github.com/a/b/pull/295/files"}, false},
 		{[]string{"ftp://x.com"}, false},
 		{[]string{"localhost:3000"}, false},
 		{[]string{"README.md"}, false},
@@ -445,22 +469,24 @@ func TestParseLiveCLIFlags(t *testing.T) {
 	f := parseLiveCLIFlags([]string{
 		"-p", "8080",
 		"--host", "0.0.0.0",
+		"--public-url", "https://mymac.ts.net",
 		"--no-open",
 		"-q",
 		"--share-url", "https://share.example",
 		"--cookie", "a=1",
 		"--cookie", "b=2",
 		"--cookie-file", "/tmp/jar.txt",
+		"--cdp-url", "http://127.0.0.1:9222",
 		"https://example.com/app?q=1#frag",
 	})
 	if f.origin != "https://example.com/app" {
 		t.Fatalf("origin = %q", f.origin)
 	}
-	if f.port != 8080 || f.host != "0.0.0.0" || !f.noOpen || !f.quiet {
+	if f.port != 8080 || f.host != "0.0.0.0" || f.publicURL != "https://mymac.ts.net" || !f.noOpen || !f.quiet {
 		t.Fatalf("flags = %+v", f)
 	}
-	if f.shareURL != "https://share.example" || f.cookieFile != "/tmp/jar.txt" {
-		t.Fatalf("share/cookie file = %+v", f)
+	if f.shareURL != "https://share.example" || f.cookieFile != "/tmp/jar.txt" || f.cdpURL != "http://127.0.0.1:9222" {
+		t.Fatalf("share/cookie/cdp = %+v", f)
 	}
 	if len(f.cookieFlags) != 2 || f.cookieFlags[0] != "a=1" || f.cookieFlags[1] != "b=2" {
 		t.Fatalf("cookieFlags = %v", f.cookieFlags)
@@ -468,8 +494,8 @@ func TestParseLiveCLIFlags(t *testing.T) {
 }
 
 func TestBuildLiveDaemonArgs(t *testing.T) {
-	f := liveCLIFlags{port: 9000, host: "127.0.0.1", quiet: true}
-	cfg := Config{Port: 3000, Quiet: false}
+	f := liveCLIFlags{port: 9000, host: "127.0.0.1", publicURL: "https://mymac.ts.net", quiet: true}
+	cfg := Config{Port: 3000, Quiet: false, PublicURL: "https://ignored.example.com"}
 
 	withCookie := buildLiveDaemonArgs("http://localhost:3000/dashboard", "sess=abc", f, cfg, true)
 	if !containsArgPair(withCookie, "--live-origin", "http://localhost:3000/dashboard") {
@@ -477,6 +503,9 @@ func TestBuildLiveDaemonArgs(t *testing.T) {
 	}
 	if !containsArgPair(withCookie, "--live-cookie", "sess=abc") {
 		t.Fatalf("missing live-cookie: %v", withCookie)
+	}
+	if !containsArgPair(withCookie, "--public-url", "https://mymac.ts.net") {
+		t.Fatalf("missing public-url: %v", withCookie)
 	}
 	if !containsArgPair(withCookie, "--port", "9000") {
 		t.Fatalf("missing port: %v", withCookie)
@@ -493,6 +522,11 @@ func TestBuildLiveDaemonArgs(t *testing.T) {
 		if a == "--live-cookie" {
 			t.Fatalf("unexpected --live-cookie at %d in %v", i, withoutCookie)
 		}
+	}
+
+	fromCfg := buildLiveDaemonArgs("http://localhost:3000", "", liveCLIFlags{}, Config{PublicURL: "https://cfg.ts.net"}, false)
+	if !containsArgPair(fromCfg, "--public-url", "https://cfg.ts.net") {
+		t.Fatalf("missing config public-url: %v", fromCfg)
 	}
 }
 
@@ -1203,23 +1237,6 @@ func TestLive_PostFileCommentsDropsScreenshot(t *testing.T) {
 		t.Fatalf("persisted review.json must not contain a screenshot key, got:\n%s", data)
 	}
 }
-
-func TestLiveSession_ReinvokeCommandIncludesOrigin(t *testing.T) {
-	sc := &serverConfig{
-		liveOrigin: "http://localhost:4000",
-		reviewPath: filepath.Join(t.TempDir(), "review-reinvoke"),
-	}
-	sess, err := createLiveSession(sc)
-	if err != nil {
-		t.Fatalf("createLiveSession: %v", err)
-	}
-	got := sess.ReinvokeCommand()
-	want := "crit live http://localhost:4000"
-	if got != want {
-		t.Errorf("ReinvokeCommand() = %q, want %q", got, want)
-	}
-}
-
 func TestLiveSession_AuthorFromConfig(t *testing.T) {
 	setHome(t, t.TempDir())
 	s, _ := newTestServer(t)

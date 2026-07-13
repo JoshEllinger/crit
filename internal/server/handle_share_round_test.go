@@ -109,8 +109,21 @@ func TestHandleShare_NoShareURL(t *testing.T) {
 }
 
 func TestHandleShare_AlreadyShared(t *testing.T) {
-	s, sess := newShareTestServer(t, "https://example.com", true)
-	sess.SetSharedURLAndToken("https://crit.md/r/existing", "tok_existing")
+	var getCount int
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/reviews/existing/comments" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		getCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/existing", "tok_existing")
 	req := httptest.NewRequest(http.MethodPost, "/api/share", nil)
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, req)
@@ -119,8 +132,54 @@ func TestHandleShare_AlreadyShared(t *testing.T) {
 	}
 	var result map[string]any
 	json.NewDecoder(w.Body).Decode(&result)
-	if result["url"] != "https://crit.md/r/existing" {
+	if result["url"] != critWeb.URL+"/r/existing" {
 		t.Errorf("url = %v", result["url"])
+	}
+	if getCount != 1 {
+		t.Errorf("GET comments count = %d, want 1", getCount)
+	}
+}
+
+func TestWriteExistingShareIfPresent_NoExistingShare(t *testing.T) {
+	s, _ := newShareTestServer(t, "https://example.com", true)
+	w := httptest.NewRecorder()
+
+	handled, err := s.writeExistingShareIfPresent(w)
+	if err != nil {
+		t.Fatalf("writeExistingShareIfPresent: %v", err)
+	}
+	if handled {
+		t.Fatal("handled = true, want false")
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("body = %q, want empty", w.Body.String())
+	}
+}
+
+func TestHandleShare_ExistingShareServiceError(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/reviews/existing/comments" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/existing", "tok_existing")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	var result map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result["error"] == "" {
+		t.Fatal("expected error in response body")
 	}
 }
 

@@ -46,6 +46,7 @@ var (
 	daemonFatal       = daemon.DaemonFatal
 	signalReadiness   = daemon.SignalReadiness
 	hostForDisplay    = daemon.HostForDisplay
+	advertisedURL     = daemon.AdvertisedURL
 	shutdownSignals   = daemon.ShutdownSignals
 	openBrowser       = browser.OpenBrowserWithCommand
 
@@ -96,6 +97,7 @@ func init() {
 			VCSOverride:        sc.VCSOverride,
 			BaseBranch:         sc.BaseBranch,
 			IgnorePatterns:     sc.IgnorePatterns,
+			SessionID:          sc.SessionID,
 		}, nil
 	}
 	session.PreflightCheckFn = func(sc *session.CLIReviewConfig) string {

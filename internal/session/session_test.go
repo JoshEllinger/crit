@@ -863,13 +863,32 @@ func TestSession_LoadCritJSON_OutputDir(t *testing.T) {
 }
 
 func TestGetFileDiffSnapshotScoped_AddedFileUnstagedScope(t *testing.T) {
-	// Issue #25: When a file has status "added" (committed on branch, new relative
-	// to merge-base) and the user switches to "unstaged" scope, we should NOT show
-	// the entire file as a diff. Only truly untracked files should get that treatment.
-	s := newTestSession(t)
-	// Simulate a file that is "added" relative to merge-base (committed on branch)
-	s.Files[1].Status = "added"
-	s.Files[1].Content = "package main\n\nfunc main() {}\n"
+	dir := initTestRepo(t)
+	gitT(t, dir, "checkout", "-b", "feature")
+	path := filepath.Join(dir, "main.go")
+	committedContent := "package main\n\nfunc main() {}\n"
+	workingContent := "package main\n\nfunc renamed() {}\n"
+	writeFile(t, path, committedContent)
+	gitT(t, dir, "add", "main.go")
+	gitT(t, dir, "commit", "-m", "add main")
+	writeFile(t, path, workingContent)
+
+	s := &Session{
+		Mode:        "git",
+		RepoRoot:    dir,
+		BaseRef:     "main",
+		VCS:         &vcs.GitVCS{},
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files: []*FileEntry{{
+			Path:     "main.go",
+			AbsPath:  path,
+			Status:   "added",
+			FileType: "code",
+			Content:  workingContent,
+			Comments: []Comment{},
+		}},
+	}
 
 	result, ok := s.GetFileDiffSnapshotScoped("main.go", "unstaged", "", false)
 	if !ok {
@@ -877,15 +896,61 @@ func TestGetFileDiffSnapshotScoped_AddedFileUnstagedScope(t *testing.T) {
 	}
 	hunks := result["hunks"].([]vcs.DiffHunk)
 
-	// With "added" status + "unstaged" scope, the bug would show the entire file
-	// as added lines (3 lines). The fix should return empty hunks because there
-	// are no actual unstaged changes.
-	if len(hunks) != 0 {
-		totalLines := 0
-		for _, h := range hunks {
-			totalLines += len(h.Lines)
-		}
-		t.Errorf("expected 0 hunks for committed 'added' file in unstaged scope, got %d hunks with %d lines", len(hunks), totalLines)
+	additions, deletions := countHunkStats(hunks)
+	if additions != 1 || deletions != 1 {
+		t.Errorf(
+			"unstaged diff for branch-added file = +%d/-%d, want +1/-1",
+			additions,
+			deletions,
+		)
+	}
+}
+
+func TestGetFileDiffSnapshotScoped_AddedFileStagedScope(t *testing.T) {
+	// Twin of the unstaged case: a file committed on the branch (status "added"
+	// vs merge-base) that is modified AND staged must show the real index-vs-HEAD
+	// delta in "staged" scope, not the entire file as newly added.
+	dir := initTestRepo(t)
+	gitT(t, dir, "checkout", "-b", "feature")
+	path := filepath.Join(dir, "main.go")
+	committedContent := "package main\n\nfunc main() {}\n"
+	stagedContent := "package main\n\nfunc renamed() {}\n"
+	writeFile(t, path, committedContent)
+	gitT(t, dir, "add", "main.go")
+	gitT(t, dir, "commit", "-m", "add main")
+	writeFile(t, path, stagedContent)
+	gitT(t, dir, "add", "main.go")
+
+	s := &Session{
+		Mode:        "git",
+		RepoRoot:    dir,
+		BaseRef:     "main",
+		VCS:         &vcs.GitVCS{},
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Files: []*FileEntry{{
+			Path:     "main.go",
+			AbsPath:  path,
+			Status:   "added",
+			FileType: "code",
+			Content:  stagedContent,
+			Comments: []Comment{},
+		}},
+	}
+
+	result, ok := s.GetFileDiffSnapshotScoped("main.go", "staged", "", false)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	hunks := result["hunks"].([]vcs.DiffHunk)
+
+	additions, deletions := countHunkStats(hunks)
+	if additions != 1 || deletions != 1 {
+		t.Errorf(
+			"staged diff for branch-added file = +%d/-%d, want +1/-1",
+			additions,
+			deletions,
+		)
 	}
 }
 
@@ -2593,6 +2658,25 @@ func TestAddReviewComment(t *testing.T) {
 	}
 }
 
+func TestGetReviewComments_DedupesByID(t *testing.T) {
+	s := &Session{
+		reviewComments: []Comment{
+			{ID: "r1", Body: "first"},
+			{ID: "r1", Body: "duplicate"},
+			{ID: "r2", Body: "second"},
+		},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	comments := s.GetReviewComments()
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 deduped comments, got %d", len(comments))
+	}
+	if comments[0].ID != "r1" || comments[1].ID != "r2" {
+		t.Fatalf("expected IDs [r1 r2], got [%s %s]", comments[0].ID, comments[1].ID)
+	}
+}
+
 func TestDeleteReviewComment(t *testing.T) {
 	s := newTestSession(t)
 	c := s.AddReviewComment("temp", "", "")
@@ -3251,9 +3335,9 @@ func TestDeleteReply_NotReAddedFromDisk(t *testing.T) {
 		t.Fatal("DeleteReply failed")
 	}
 
-	// Write again
-	flushWrites(s)
-	s.WriteFiles()
+	if err := s.SyncWriteFiles(); err != nil {
+		t.Fatalf("SyncWriteFiles after delete: %v", err)
+	}
 
 	// Read .crit.json and verify the reply is gone
 	data, err := os.ReadFile(ReviewPathsFor(s.critJSONPath()).Review)
@@ -3285,6 +3369,7 @@ func TestDeleteReviewCommentReply_NotReAddedFromDisk(t *testing.T) {
 		Files:       []*FileEntry{},
 		subscribers: make(map[chan SSEEvent]struct{}),
 	}
+	t.Cleanup(func() { quiesceSession(t, s) })
 
 	// Add review comment with a reply, then write to disk
 	rc := s.AddReviewComment("parent review comment", "", "")
@@ -3292,16 +3377,18 @@ func TestDeleteReviewCommentReply_NotReAddedFromDisk(t *testing.T) {
 	if !ok {
 		t.Fatal("AddReviewCommentReply failed")
 	}
-	s.WriteFiles()
+	if err := s.SyncWriteFiles(); err != nil {
+		t.Fatalf("initial SyncWriteFiles: %v", err)
+	}
 
 	// Delete the reply in-memory
 	if !s.DeleteReviewCommentReply(rc.ID, reply.ID) {
 		t.Fatal("DeleteReviewCommentReply failed")
 	}
 
-	// Write again
-	flushWrites(s)
-	s.WriteFiles()
+	if err := s.SyncWriteFiles(); err != nil {
+		t.Fatalf("SyncWriteFiles after delete: %v", err)
+	}
 
 	// Read back .crit.json
 	data, err := os.ReadFile(ReviewPathsFor(s.critJSONPath()).Review)
@@ -3422,6 +3509,25 @@ func TestSession_SetCommentResolved_NotFound(t *testing.T) {
 	_, ok = s.SetCommentResolved("nonexistent.go", "c1", true)
 	if ok {
 		t.Error("expected false for nonexistent file")
+	}
+}
+
+func TestSession_SetCommentResolved_WrongPathHint(t *testing.T) {
+	s := newTestSession(t)
+	s.Files = append(s.Files, &FileEntry{
+		Path: "index.html",
+		Comments: []Comment{{
+			ID:        "web-1",
+			Body:      "imported preview pin",
+			DOMAnchor: &DOMAnchor{Pathname: "/preview-content", CSSSelector: "h1"},
+		}},
+	})
+	resolved, ok := s.SetCommentResolved("/preview-content", "web-1", true)
+	if !ok {
+		t.Fatal("SetCommentResolved with route hint should find comment stored under index.html")
+	}
+	if !resolved.Resolved {
+		t.Error("comment not resolved")
 	}
 }
 
@@ -4734,6 +4840,74 @@ func TestMergeReviewCommentsFromDisk_NewReplies(t *testing.T) {
 	}
 }
 
+func TestMergeReviewCommentsFromDisk_DedupesDuplicateDiskIDs(t *testing.T) {
+	s := &Session{
+		reviewComments: []Comment{},
+		subscribers:    make(map[chan SSEEvent]struct{}),
+	}
+
+	diskComments := []Comment{
+		{ID: "r1", Body: "from disk"},
+		{ID: "r1", Body: "from disk duplicate"},
+	}
+
+	changed := s.mergeReviewCommentsFromDisk(diskComments)
+	if !changed {
+		t.Error("expected changed=true when adding new comment")
+	}
+	if len(s.reviewComments) != 1 {
+		t.Fatalf("expected 1 comment after dedupe, got %d", len(s.reviewComments))
+	}
+	if s.reviewComments[0].ID != "r1" {
+		t.Errorf("expected r1, got %s", s.reviewComments[0].ID)
+	}
+}
+
+// --- SyncCommentsFromDisk tests ---
+
+func TestSyncCommentsFromDisk_ClearsPendingWrite(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "plan.md")
+	if err := os.WriteFile(filePath, []byte("# Plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	critPath := filepath.Join(dir, ".crit")
+	cj := CritJSON{
+		Files: map[string]CritJSONFile{
+			"plan.md": {Comments: []Comment{{ID: "web-1", Body: "remote", StartLine: 1, EndLine: 1}}},
+		},
+	}
+	data, err := json.MarshalIndent(cj, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mustMkdirAll(ReviewPathsFor(critPath).Review), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Session{
+		Mode:      "files",
+		OutputDir: dir,
+		RepoRoot:  dir,
+		Files:     []*FileEntry{{Path: "plan.md", AbsPath: filePath}},
+	}
+	s.SetSharedURLAndToken("https://crit.md/r/tok", "del")
+	if !s.PendingWriteForTest() {
+		t.Fatal("expected pendingWrite after SetSharedURLAndToken")
+	}
+
+	if !s.SyncCommentsFromDisk() {
+		t.Fatal("SyncCommentsFromDisk returned false")
+	}
+	if len(s.Files[0].Comments) != 1 {
+		t.Fatalf("want 1 comment in memory, got %d", len(s.Files[0].Comments))
+	}
+	if s.PendingWriteForTest() {
+		t.Fatal("expected pendingWrite cleared after sync")
+	}
+}
+
 // --- filterDeletedReviewComments tests ---
 
 func TestFilterDeletedReviewComments_NoneDeleted(t *testing.T) {
@@ -4850,6 +5024,42 @@ func TestGetFileDiffSnapshotScoped_CommitRangeRename(t *testing.T) {
 	hunks, _ := result["hunks"].([]DiffHunk)
 	if len(hunks) != 0 {
 		t.Fatalf("rename-only diff: got %d hunks, want 0", len(hunks))
+	}
+}
+
+// Regression #701: range focus must ignore working-tree scope on /api/file/diff.
+func TestGetFileDiffSnapshotScoped_RangeFocus_IgnoresBranchScope(t *testing.T) {
+	dir := initTestRepo(t)
+	base := gitT(t, dir, "rev-parse", "HEAD")
+	commitAt(t, dir, "changed.go", "line1\nline2\nline3\n", "add file")
+	head := gitT(t, dir, "rev-parse", "HEAD")
+
+	s := &Session{
+		Mode:     "git",
+		RepoRoot: dir,
+		BaseRef:  base,
+		VCS:      &vcs.GitVCS{},
+		Focus: Focus{
+			Kind:    FocusRange,
+			BaseSHA: base,
+			HeadSHA: head,
+		},
+		Files: []*FileEntry{{
+			Path:      "changed.go",
+			Status:    "added",
+			Content:   "line1\nline2\nline3\n",
+			DiffHunks: vcs.FileDiffUnifiedNewFile("line1\nline2\nline3\n"),
+		}},
+		subscribers: make(map[chan SSEEvent]struct{}),
+	}
+
+	result, ok := s.GetFileDiffSnapshotScoped("changed.go", "branch", "", false)
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	hunks, _ := result["hunks"].([]DiffHunk)
+	if len(hunks) == 0 {
+		t.Fatal("range focus with scope=branch must return preloaded range hunks, not empty working-tree diff")
 	}
 }
 
@@ -5019,6 +5229,7 @@ func TestSession_GetCommits_RangeMode(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc B() {}\n")
 	gitT(t, dir, "add", "b.go")
 	gitT(t, dir, "commit", "-m", "B")
+	gitT(t, dir, "clean", "-fd")
 	shaB := gitT(t, dir, "rev-parse", "HEAD")
 
 	writeFile(t, filepath.Join(dir, "c.go"), "package main\n\nfunc C() {}\n")
@@ -5066,6 +5277,7 @@ func TestSession_GetCommits_WorkingTreeMode(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc B() {}\n")
 	gitT(t, dir, "add", "b.go")
 	gitT(t, dir, "commit", "-m", "B")
+	gitT(t, dir, "clean", "-fd")
 
 	s := &Session{
 		Mode:        "git",
@@ -5083,6 +5295,87 @@ func TestSession_GetCommits_WorkingTreeMode(t *testing.T) {
 	}
 	if commits[0].Message != "B" || commits[1].Message != "A" {
 		t.Errorf("messages = [%q, %q], want [B, A]", commits[0].Message, commits[1].Message)
+	}
+}
+
+func TestSession_GetCommits_WorkingTreeMode_WithDirtyTreeAddsVirtualTop(t *testing.T) {
+	dir := initTestRepo(t)
+	baseRef := gitT(t, dir, "rev-parse", "HEAD")
+
+	gitT(t, dir, "checkout", "-b", "feature/get-commits-wt-virtual")
+	writeFile(t, filepath.Join(dir, "a.go"), "package main\n\nfunc A() {}\n")
+	gitT(t, dir, "add", "a.go")
+	gitT(t, dir, "commit", "-m", "A")
+
+	writeFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc B() {}\n")
+	gitT(t, dir, "add", "b.go")
+	gitT(t, dir, "commit", "-m", "B")
+
+	// Leave an unstaged working-tree change so the synthetic top entry appears.
+	writeFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc B() {}\n\nfunc Dirty() {}\n")
+
+	s := &Session{
+		Mode:        "git",
+		RepoRoot:    dir,
+		BaseRef:     baseRef,
+		VCS:         &vcs.GitVCS{},
+		ReviewRound: 1,
+		subscribers: make(map[chan SSEEvent]struct{}),
+		Focus:       Focus{Kind: FocusWorkingTree, BaseRef: baseRef},
+	}
+
+	commits := s.GetCommits()
+	if len(commits) != 3 {
+		t.Fatalf("GetCommits() = %d commits, want 3 (virtual, B, A); got %+v", len(commits), commits)
+	}
+	if !commits[0].Virtual {
+		t.Fatalf("expected first entry to be virtual, got %+v", commits[0])
+	}
+	if commits[0].Message != "Working changes" {
+		t.Errorf("virtual message = %q, want %q", commits[0].Message, "Working changes")
+	}
+	if commits[1].Message != "B" || commits[2].Message != "A" {
+		t.Errorf("messages = [%q, %q], want [B, A] after virtual top", commits[1].Message, commits[2].Message)
+	}
+}
+
+func TestSession_GetSessionInfoScoped_VirtualWorkingCommitOnlyShowsUncommitted(t *testing.T) {
+	dir := initTestRepo(t)
+	baseRef := gitT(t, dir, "rev-parse", "HEAD")
+
+	gitT(t, dir, "checkout", "-b", "feature/virtual-working-scope")
+	writeFile(t, filepath.Join(dir, "committed.go"), "package main\n\nfunc Committed() {}\n")
+	gitT(t, dir, "add", "committed.go")
+	gitT(t, dir, "commit", "-m", "add committed file")
+
+	// One unstaged modification and one untracked file should appear in virtual scope.
+	writeFile(t, filepath.Join(dir, "committed.go"), "package main\n\nfunc Committed() {}\n\nfunc Dirty() {}\n")
+	writeFile(t, filepath.Join(dir, "untracked.go"), "package main\n\nfunc Untracked() {}\n")
+
+	s := &Session{
+		Mode:           "git",
+		RepoRoot:       dir,
+		BaseRef:        baseRef,
+		BaseBranchName: "main",
+		VCS:            &vcs.GitVCS{},
+		ReviewRound:    1,
+		subscribers:    make(map[chan SSEEvent]struct{}),
+		Focus:          Focus{Kind: FocusWorkingTree, BaseRef: baseRef},
+	}
+
+	info := s.GetSessionInfoScoped("", virtualWorkingTreeCommitSHA)
+	paths := map[string]bool{}
+	for _, f := range info.Files {
+		paths[f.Path] = true
+	}
+	if !paths["committed.go"] {
+		t.Fatalf("expected committed.go (dirty working copy) in virtual scope; got %+v", info.Files)
+	}
+	if !paths["untracked.go"] {
+		t.Fatalf("expected untracked.go in virtual scope; got %+v", info.Files)
+	}
+	if len(info.Files) != 2 {
+		t.Fatalf("expected exactly 2 working-tree files in virtual scope, got %d (%+v)", len(info.Files), info.Files)
 	}
 }
 

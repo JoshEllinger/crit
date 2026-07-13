@@ -17,6 +17,7 @@ import (
 	"github.com/JoshEllinger/crit/internal/review"
 	sesspkg "github.com/JoshEllinger/crit/internal/session"
 	"github.com/JoshEllinger/crit/internal/testutil"
+	"github.com/JoshEllinger/crit/internal/vcs"
 )
 
 func init() {
@@ -35,6 +36,7 @@ func newTestServer(t *testing.T) (*Server, *Session) {
 
 	session := &Session{
 		Mode:        "files",
+		SessionKey:  "abcd1234ef01",
 		RepoRoot:    dir,
 		ReviewRound: 1,
 		Files: []*FileEntry{
@@ -55,6 +57,8 @@ func newTestServer(t *testing.T) (*Server, *Session) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.projectDir = dir
+	s.homeDir = t.TempDir()
 	return s, session
 }
 
@@ -100,6 +104,8 @@ func TestHostCheck(t *testing.T) {
 		{"loopback listen, ::1 bare", "127.0.0.1", "[::1]", 200},
 		{"loopback listen, evil.com", "127.0.0.1", "evil.com", 403},
 		{"loopback listen, evil.com no port", "127.0.0.1", "evil.com:80", 403},
+		{"loopback listen, tailscale host allowed with public URL", "127.0.0.1", "mymac.ts.net", 200},
+		{"loopback listen, tailscale host with port", "127.0.0.1", "mymac.ts.net:443", 200},
 
 		// listenHost is non-loopback (user opted into LAN exposure): no check.
 		{"lan listen, evil.com", "0.0.0.0", "evil.com", 200},
@@ -109,6 +115,9 @@ func TestHostCheck(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestServer(t)
 			s.SetListenHost(tt.listenHost)
+			if strings.Contains(tt.name, "tailscale") {
+				s.SetPublicURL("https://mymac.ts.net")
+			}
 			req := httptest.NewRequest("GET", "/api/session", nil)
 			if tt.reqHost != "" {
 				req.Host = tt.reqHost
@@ -171,6 +180,29 @@ func TestHostCheckDefaultWiring(t *testing.T) {
 	s.ServeHTTP(w2, req2)
 	if w2.Code != 200 {
 		t.Errorf("default wiring: Host: localhost:3000 got status %d, want 200", w2.Code)
+	}
+}
+
+func TestSetPublicURL(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.SetPublicURL("https://mymac.ts.net/design")
+	s.SetListenHost("127.0.0.1")
+
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	req.Host = "mymac.ts.net"
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+
+	s.SetPublicURL("")
+	req2 := httptest.NewRequest("GET", "/api/session", nil)
+	req2.Host = "mymac.ts.net"
+	w2 := httptest.NewRecorder()
+	s.ServeHTTP(w2, req2)
+	if w2.Code != 403 {
+		t.Errorf("after clearing public URL, status = %d, want 403", w2.Code)
 	}
 }
 
@@ -525,36 +557,38 @@ func TestFinish_IncludesStructuredComments(t *testing.T) {
 		t.Errorf("comment body = %v, want fix this", c0["body"])
 	}
 	prompt, _ := resp["prompt"].(string)
+	if !strings.Contains(prompt, "fix this") {
+		t.Errorf("expected comment body in finish prompt, got: %s", prompt)
+	}
 	if !strings.Contains(prompt, "Address each comment") {
 		t.Errorf("expected instructions in prompt, got: %s", prompt)
 	}
-	if !strings.Contains(prompt, "run: `crit`") {
-		t.Errorf("expected reinvoke command in prompt, got: %s", prompt)
-	}
-	copyPrompt, _ := resp["copy_prompt"].(string)
-	if !strings.Contains(copyPrompt, "1 unresolved comment") {
-		t.Errorf("copy_prompt should summarize comment count, got: %s", copyPrompt)
+	if !strings.Contains(prompt, "1 unresolved comment") {
+		t.Errorf("prompt should summarize comment count, got: %s", prompt)
 	}
 	wantCommentsCmd := buildCommentsListCommand(session)
-	if !strings.Contains(copyPrompt, wantCommentsCmd) {
-		t.Errorf("copy_prompt should mention %q, got: %s", wantCommentsCmd, copyPrompt)
+	if strings.Contains(prompt, wantCommentsCmd) {
+		t.Errorf("prompt should embed comments inline, not %q, got: %s", wantCommentsCmd, prompt)
 	}
-	if strings.Contains(copyPrompt, "Next review round") {
-		t.Errorf("copy_prompt should not use legacy next review round heading, got: %s", copyPrompt)
+	if strings.Contains(prompt, "Next review round") {
+		t.Errorf("prompt should not use legacy next review round heading, got: %s", prompt)
 	}
-	if !strings.Contains(copyPrompt, "When you're done, run:") {
-		t.Errorf("copy_prompt should include a single next-command instruction, got: %s", copyPrompt)
+	if !strings.Contains(prompt, "When you're done, run:") {
+		t.Errorf("prompt should include a single next-command instruction, got: %s", prompt)
 	}
-	if strings.Contains(copyPrompt, "When done run:") {
-		t.Errorf("copy_prompt should not duplicate next-command wording, got: %s", copyPrompt)
+	if strings.Contains(prompt, "When done run:") {
+		t.Errorf("prompt should not duplicate next-command wording, got: %s", prompt)
+	}
+	if _, ok := resp["copy_prompt"]; ok {
+		t.Error("finish response should not include legacy copy_prompt field")
 	}
 	nextCmd, _ := resp["next_command"].(string)
-	if nextCmd != "crit" {
-		t.Errorf("next_command = %q, want crit", nextCmd)
+	if nextCmd != "crit --session abcd1234ef01" {
+		t.Errorf("next_command = %q, want crit --session abcd1234ef01", nextCmd)
 	}
 }
 
-func TestFinish_CopyPromptApproved(t *testing.T) {
+func TestFinish_PromptApproved(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.cliArgs = []string{"preview", "/tmp/page.html"}
 
@@ -566,15 +600,15 @@ func TestFinish_CopyPromptApproved(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	copyPrompt, _ := resp["copy_prompt"].(string)
-	if !strings.Contains(copyPrompt, "Review approved") {
-		t.Errorf("copy_prompt = %q", copyPrompt)
+	prompt, _ := resp["prompt"].(string)
+	if !strings.Contains(prompt, "Review approved") {
+		t.Errorf("prompt = %q", prompt)
 	}
-	if strings.Contains(copyPrompt, "Next review round") {
-		t.Errorf("approved copy_prompt should not mention next review round, got: %s", copyPrompt)
+	if strings.Contains(prompt, "Next review round") {
+		t.Errorf("approved prompt should not mention next review round, got: %s", prompt)
 	}
-	if strings.Contains(copyPrompt, "crit comments") {
-		t.Errorf("approved copy_prompt should not mention crit comments, got: %s", copyPrompt)
+	if strings.Contains(prompt, "crit comments") {
+		t.Errorf("approved prompt should not mention crit comments, got: %s", prompt)
 	}
 }
 
@@ -592,14 +626,18 @@ func TestFinish_PromptIncludesFileArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompt, _ := resp["prompt"].(string)
-	if !strings.Contains(prompt, "`crit test.md`") {
-		t.Errorf("expected prompt to contain 'crit test.md', got: %s", prompt)
+	if !strings.Contains(prompt, "crit --session abcd1234ef01") {
+		t.Errorf("expected prompt to contain session reconnect command, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "When you're done, run:") {
+		t.Errorf("expected prompt to include reconnect heading, got: %s", prompt)
 	}
 }
 
 func TestFinish_PromptBareGitMode(t *testing.T) {
 	s, session := newTestServer(t)
 	session.Mode = "git"
+	session.SessionKey = ""
 	// CLIArgs stays nil — git mode
 	session.AddComment("test.md", 1, 1, "", "fix this", "", "", "")
 
@@ -612,8 +650,8 @@ func TestFinish_PromptBareGitMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompt, _ := resp["prompt"].(string)
-	if !strings.Contains(prompt, "run: `crit`") {
-		t.Errorf("expected prompt to end with 'run: `crit`', got: %s", prompt)
+	if !strings.Contains(prompt, "When you're done, run:") || !strings.Contains(prompt, "crit") {
+		t.Errorf("expected prompt to include bare git reconnect, got: %s", prompt)
 	}
 }
 
@@ -710,26 +748,17 @@ func TestReviewCycle_UnresolvedReturnsPrompt(t *testing.T) {
 
 func TestReviewCycle_NextCommand(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		want string
+		name       string
+		sessionKey string
+		want       string
 	}{
-		{"no args (git mode)", nil, "crit"},
-		{"empty slice", []string{}, "crit"},
-		{"single file", []string{"plan.md"}, "crit plan.md"},
-		{"multiple files", []string{"a.md", "b.go"}, "crit a.md b.go"},
-		{"arg with space gets quoted", []string{"my plan.md"}, `crit 'my plan.md'`},
-		// Note: cliArgs holds positional file args only at runtime; this case exercises shellQuoteArg formatting, not a real call shape.
-		{"unknown leading-dash arg formats verbatim", []string{"--pr", "42"}, "crit --pr 42"},
-		{"non-ASCII arg passes through", []string{"résumé.md"}, "crit résumé.md"},
-		{"single quote in arg is escaped", []string{"it's.md"}, `crit 'it'\''s.md'`},
-		{"live mode", []string{"live", "http://localhost:4000"}, "crit live http://localhost:4000"},
-		{"preview mode", []string{"preview", "/tmp/mock.html"}, "crit preview /tmp/mock.html"},
+		{"with session key", "839f3b4cd5d6", "crit --session 839f3b4cd5d6"},
+		{"empty session key falls back", "", "crit"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s, session := newTestServer(t)
-			s.cliArgs = tc.args
+			session.SessionKey = tc.sessionKey
 			session.SetAwaitingFirstReview(true)
 
 			done := make(chan *httptest.ResponseRecorder, 1)
@@ -1186,6 +1215,61 @@ func TestPostShareURL(t *testing.T) {
 	}
 	if resp["hosted_url"] != "https://crit.md/r/abc123" {
 		t.Errorf("hosted_url = %v, want https://crit.md/r/abc123", resp["hosted_url"])
+	}
+}
+
+func TestPostShare_RemoteDeletedCreatesFreshShare(t *testing.T) {
+	s, session := newTestServer(t)
+
+	var postCount int
+	var baseURL string
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/reviews/oldtoken/comments":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/reviews":
+			postCount++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"url":          baseURL + "/r/newtoken",
+				"delete_token": "new-delete-token",
+			})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer critWeb.Close()
+	baseURL = critWeb.URL
+
+	s.shareURL = critWeb.URL
+	session.SetSharedURLAndToken(critWeb.URL+"/r/oldtoken", "old-delete-token")
+	session.SetShareScope("old-scope")
+	session.SetShareOrgInfo("old-org", "Old Org", "organization")
+
+	req := httptest.NewRequest("POST", "/api/share", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if postCount != 1 {
+		t.Fatalf("POST /api/reviews count = %d, want 1", postCount)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["url"] != critWeb.URL+"/r/newtoken" {
+		t.Fatalf("url = %q, want fresh share URL", resp["url"])
+	}
+	if got := session.GetSharedURL(); got != critWeb.URL+"/r/newtoken" {
+		t.Fatalf("session shared URL = %q, want fresh share URL", got)
+	}
+	if got := session.GetDeleteToken(); got != "new-delete-token" {
+		t.Fatalf("session delete token = %q, want fresh delete token", got)
 	}
 }
 
@@ -2916,12 +3000,12 @@ func TestHandleBranches_NoVCS(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	var branches []string
-	if err := json.Unmarshal(w.Body.Bytes(), &branches); err != nil {
+	var targets vcs.CompareTargets
+	if err := json.Unmarshal(w.Body.Bytes(), &targets); err != nil {
 		t.Fatalf("JSON decode: %v", err)
 	}
-	if len(branches) != 0 {
-		t.Errorf("expected empty branches for no VCS, got %v", branches)
+	if targets.VCS != "" || targets.Detected != "" || len(targets.Local) != 0 || len(targets.Remote) != 0 {
+		t.Errorf("expected empty compare targets for no VCS, got %+v", targets)
 	}
 }
 
@@ -2959,10 +3043,16 @@ func TestHandleBranches_WithGitVCS(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
-	// No remotes in test repo, so empty list is expected.
-	var branches []string
-	if err := json.Unmarshal(w.Body.Bytes(), &branches); err != nil {
+	// No remotes in test repo; local main is still listed.
+	var targets vcs.CompareTargets
+	if err := json.Unmarshal(w.Body.Bytes(), &targets); err != nil {
 		t.Fatalf("JSON decode: %v", err)
+	}
+	if targets.VCS != "git" {
+		t.Errorf("vcs = %q, want git", targets.VCS)
+	}
+	if len(targets.Local) == 0 {
+		t.Error("expected at least one local branch")
 	}
 }
 
@@ -3112,22 +3202,30 @@ func TestHandleEvents_SSEHeaders(t *testing.T) {
 
 // --- buildPlanFeedback tests ---
 
-func TestBuildPlanInstructions(t *testing.T) {
-	session := &Session{
-		Mode:    "plan",
-		PlanDir: "/tmp/plans/my-feature",
-	}
+func TestFinish_PlanModeNextCommand(t *testing.T) {
+	s, session := newTestServer(t)
+	session.Mode = "plan"
+	session.PlanDir = "/tmp/plans/my-feature"
+	session.AddComment("test.md", 1, 1, "", "expand step 2", "", "", "")
 
-	result := buildPlanInstructions(session)
+	req := httptest.NewRequest("POST", "/api/finish", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
 
-	if !strings.Contains(result, "my-feature") {
-		t.Errorf("expected slug 'my-feature' in feedback, got: %s", result)
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(result, "each comment") {
-		t.Errorf("expected comments reference in feedback, got: %s", result)
+	nextCmd, _ := resp["next_command"].(string)
+	if nextCmd != "crit plan --name my-feature" {
+		t.Errorf("next_command = %q, want crit plan --name my-feature", nextCmd)
 	}
-	if !strings.Contains(result, "crit comment --plan") {
-		t.Errorf("expected crit comment hint in feedback, got: %s", result)
+	prompt, _ := resp["prompt"].(string)
+	if !strings.Contains(prompt, "crit plan --name my-feature") {
+		t.Errorf("prompt should include plan reconnect, got: %s", prompt)
+	}
+	if strings.Contains(prompt, "crit --session") {
+		t.Errorf("prompt should not use --session for plan mode, got: %s", prompt)
 	}
 }
 
@@ -4067,6 +4165,7 @@ func TestLiveRoutes_NotGatedByWithReady(t *testing.T) {
 	for _, path := range []string{
 		"/live", "/crit-agent.js",
 		"/agent-protocol.js", "/agent-anchor-utils.js",
+		"/agent-scroll-utils.js",
 		"/agent-marker-overlay.js", "/agent-mutation-batcher.js",
 		"/agent-resolution.js", "/agent-reanchor-state.js",
 		"/agent-marker.css",
@@ -4498,6 +4597,39 @@ func TestAPIDeleteComment_FansOutSSE(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("no SSE event after DELETE — frontend tabs would stall on stale state")
+	}
+}
+
+// TestAPIResolveComment_WrongPathHint covers preview imports: comments merged
+// from crit-web live under index.html but the client sends the iframe route
+// as ?path= when resolving.
+func TestAPIResolveComment_WrongPathHint(t *testing.T) {
+	srv, sess := newTestServer(t)
+	sess.Files = append(sess.Files, &FileEntry{
+		Path: "index.html",
+		Comments: []Comment{{
+			ID:        "web-1",
+			Body:      "imported pin",
+			DOMAnchor: &DOMAnchor{Pathname: "/preview-content", CSSSelector: "h1"},
+		}},
+	})
+
+	body := strings.NewReader(`{"resolved":true}`)
+	req := httptest.NewRequest("PUT", "/api/comment/web-1/resolve?path=/preview-content", body)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	for _, f := range sess.Files {
+		if f.Path != "index.html" {
+			continue
+		}
+		for _, c := range f.Comments {
+			if c.ID == "web-1" && !c.Resolved {
+				t.Fatal("comment not resolved after PUT with route path hint")
+			}
+		}
 	}
 }
 
@@ -5037,6 +5169,13 @@ func TestHandleMergeComments_NewComment(t *testing.T) {
 			"plan.md": {Comments: []Comment{}},
 		},
 	})
+	// Simulate a recent daemon write so mergeExternalCritJSON would skip a
+	// same-second pull unless handleMergeComments forces a disk sync.
+	if info, err := os.Stat(review.ReviewPathsFor(sess.CritJSONPath()).Review); err != nil {
+		t.Fatal(err)
+	} else {
+		sess.SetLastCritJSONMtimeForTest(info.ModTime())
+	}
 
 	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
@@ -5055,6 +5194,58 @@ func TestHandleMergeComments_NewComment(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["merged"].(float64) != 1 {
 		t.Errorf("merged = %v, want 1", resp["merged"])
+	}
+	comments := sess.GetComments("plan.md")
+	if len(comments) != 1 {
+		t.Fatalf("session has %d comments after merge, want 1", len(comments))
+	}
+	if comments[0].Body != "new web comment" {
+		t.Errorf("comment body = %q, want %q", comments[0].Body, "new web comment")
+	}
+}
+
+func TestHandleMergeComments_DedupStillSyncsSession(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "plan.md")
+	os.WriteFile(filePath, []byte("# Plan\n"), 0o644)
+
+	sess := &Session{
+		Mode:        "files",
+		OutputDir:   dir,
+		RepoRoot:    dir,
+		ReviewRound: 1,
+		Files:       []*FileEntry{{Path: "plan.md", AbsPath: filePath}},
+	}
+	sess.SetSharedURLAndToken("https://crit.md/r/tok123", "del-tok")
+
+	writeCritJSONForTest(t, dir, CritJSON{
+		Files: map[string]CritJSONFile{
+			"plan.md": {Comments: []Comment{{
+				ID: "web-1", Body: "already on disk", StartLine: 1, EndLine: 1,
+			}}},
+		},
+	})
+	if info, err := os.Stat(review.ReviewPathsFor(sess.CritJSONPath()).Review); err != nil {
+		t.Fatal(err)
+	} else {
+		sess.SetLastCritJSONMtimeForTest(info.ModTime())
+	}
+
+	srv, err := NewServer(sess, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := `{"comments": [{"body": "already on disk", "file_path": "plan.md", "start_line": 1, "end_line": 1, "author_display_name": "Web User"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/comments/merge", strings.NewReader(payload))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if len(sess.GetComments("plan.md")) != 1 {
+		t.Fatalf("session has %d comments after dedup pull, want 1", len(sess.GetComments("plan.md")))
 	}
 }
 

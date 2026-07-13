@@ -108,7 +108,7 @@ func TestIntegrationMap_SnapshotGlobalRouting(t *testing.T) {
 		kind       globalDestKind
 	}
 	expected := map[string][]want{
-		"claude-code":    {{"", globalDestNone}, {"", globalDestNone}},
+		"claude-code":    {{"", globalDestNone}, {"", globalDestNone}, {"", globalDestNone}},
 		"cursor":         {{"", globalDestNone}, {"", globalDestNone}},
 		"codex":          {{"", globalDestNone}, {"", globalDestNone}},
 		"qwen":           {{"", globalDestNone}, {"", globalDestNone}},

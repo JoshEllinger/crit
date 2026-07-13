@@ -10,11 +10,23 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/JoshEllinger/crit/internal/prompt"
 )
 
 func runInstall(args []string) {
-	target := ""
-	force := false
+	target, force := parseInstallArgs(args)
+	if target == "" {
+		printInstallUsage()
+		os.Exit(1)
+	}
+	if err := runInstallTarget(target, force); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
+		os.Exit(1)
+	}
+}
+
+func parseInstallArgs(args []string) (target string, force bool) {
 	for _, a := range args {
 		switch {
 		case a == "--force" || a == "-f":
@@ -24,49 +36,96 @@ func runInstall(args []string) {
 			os.Exit(1)
 		default:
 			if target != "" {
-				fmt.Fprintf(os.Stderr, "Error: only one agent name allowed (got %q and %q)\n", target, a)
+				fmt.Fprintf(os.Stderr, "Error: only one target allowed (got %q and %q)\n", target, a)
 				os.Exit(1)
 			}
 			target = a
 		}
 	}
+	return target, force
+}
 
-	if target == "" {
-		fmt.Fprintln(os.Stderr, "Usage: crit install <agent>")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Available agents:")
-		for _, a := range availableIntegrations() {
-			fmt.Fprintf(os.Stderr, "  %s\n", a)
-		}
-		fmt.Fprintln(os.Stderr, "  all")
-		os.Exit(1)
+func printInstallUsage() {
+	fmt.Fprintln(os.Stderr, "Usage: crit install <agent|prompts|story-prompts>")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Available agents:")
+	for _, a := range availableIntegrations() {
+		fmt.Fprintf(os.Stderr, "  %s\n", a)
 	}
+	fmt.Fprintln(os.Stderr, "  all")
+	fmt.Fprintln(os.Stderr, "  prompts")
+	fmt.Fprintln(os.Stderr, "  story-prompts")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Install stock finish templates:")
+	fmt.Fprintln(os.Stderr, "  cd ~ && crit install prompts     # ~/.crit/prompts/")
+	fmt.Fprintln(os.Stderr, "  crit install prompts             # .crit/prompts/ in cwd (from repo root)")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Install the stock on_story_generate template:")
+	fmt.Fprintln(os.Stderr, "  cd ~ && crit install story-prompts   # ~/.crit/prompts/")
+	fmt.Fprintln(os.Stderr, "  crit install story-prompts           # .crit/prompts/ in cwd (from repo root)")
+}
 
+func runInstallTarget(target string, force bool) error {
+	if target == "prompts" {
+		return installPrompts(force)
+	}
+	if target == "story-prompts" {
+		return installStoryPrompts(force)
+	}
 	if target == "all" {
-		cwd := mustGetwd()
-		home, _ := os.UserHomeDir()
-		global := isGlobalInstall(cwd, home)
-		hadErr := false
-		for _, name := range availableIntegrations() {
-			if name == "windsurf" && global {
-				fmt.Fprintln(os.Stderr, "  Skipped: windsurf (no global install supported — run from a project)")
-				continue
-			}
-			if err := installIntegration(name, force); err != nil {
-				fmt.Fprintf(os.Stderr, "  Failed: %s: %v\n", name, err)
-				hadErr = true
-				continue
-			}
-		}
-		if hadErr {
-			os.Exit(1)
-		}
-		return
+		return installAllIntegrations(force)
 	}
-	if err := installIntegration(target, force); err != nil {
-		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
-		os.Exit(1)
+	return installIntegration(target, force)
+}
+
+func installAllIntegrations(force bool) error {
+	cwd := mustGetwd()
+	home, _ := os.UserHomeDir()
+	global := isGlobalInstall(cwd, home)
+	var hadErr bool
+	for _, name := range availableIntegrations() {
+		if name == "windsurf" && global {
+			fmt.Fprintln(os.Stderr, "  Skipped: windsurf (no global install supported — run from a project)")
+			continue
+		}
+		if err := installIntegration(name, force); err != nil {
+			fmt.Fprintf(os.Stderr, "  Failed: %s: %v\n", name, err)
+			hadErr = true
+			continue
+		}
 	}
+	if hadErr {
+		return errors.New("one or more integrations failed to install")
+	}
+	return nil
+}
+
+func installPrompts(force bool) error {
+	cwd := mustGetwd()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dest := filepath.Join(cwd, ".crit", "prompts")
+	if isGlobalInstall(cwd, home) {
+		dest = filepath.Join(home, ".crit", "prompts")
+	}
+	fmt.Printf("Installing stock finish prompts to %s\n", dest)
+	return prompt.InstallPrompts(dest, force)
+}
+
+func installStoryPrompts(force bool) error {
+	cwd := mustGetwd()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dest := filepath.Join(cwd, ".crit", "prompts")
+	if isGlobalInstall(cwd, home) {
+		dest = filepath.Join(home, ".crit", "prompts")
+	}
+	fmt.Printf("Installing stock story prompt to %s\n", dest)
+	return prompt.InstallStoryPrompt(dest, force)
 }
 
 // globalDestKind selects how an integration's globalDest is interpreted.
@@ -100,6 +159,7 @@ var integrationMap = map[string][]integration{
 	"claude-code": {
 		{source: "integrations/claude-code/skills/crit/SKILL.md", dest: ".claude/skills/crit/SKILL.md", hint: "Run /crit in Claude Code to start a review loop"},
 		{source: "integrations/claude-code/skills/crit-cli/SKILL.md", dest: ".claude/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Claude Code agents when needed"},
+		{source: "integrations/claude-code/skills/crit-story/SKILL.md", dest: ".claude/skills/crit-story/SKILL.md", hint: "Run /crit-story in Claude Code to author a story for a diff review"},
 	},
 	"cursor": {
 		{source: "integrations/cursor/skills/crit/SKILL.md", dest: ".cursor/skills/crit/SKILL.md", hint: "Run /crit in Cursor to start a review loop"},
@@ -114,9 +174,9 @@ var integrationMap = map[string][]integration{
 		// opencode does NOT read ~/.opencode/skills/ globally — redirect to ~/.agents/skills/
 		{source: "integrations/opencode/SKILL.md", dest: ".opencode/skills/crit/SKILL.md", globalDest: ".agents/skills/crit/SKILL.md", globalDestKind: globalDestRelHome, hint: "The crit skill is available to OpenCode agents when needed"},
 		// Plugin file auto-loaded from project `.opencode/plugins/` or global
-		// `~/.config/opencode/plugins/`. Conditionally injects sharing instructions
-		// only when share_url is set in crit config.
-		{source: "integrations/opencode/plugin/crit.ts", dest: ".opencode/plugins/crit.ts", globalDest: ".config/opencode/plugins/crit.ts", globalDestKind: globalDestRelHome, hint: "Crit's opencode plugin gates sharing instructions on share_url being set"},
+		// `~/.config/opencode/plugins/`. Injects sharing instructions by default
+		// (share_url defaults to https://crit.md); docs cover how to disable.
+		{source: "integrations/opencode/plugin/crit.ts", dest: ".opencode/plugins/crit.ts", globalDest: ".config/opencode/plugins/crit.ts", globalDestKind: globalDestRelHome},
 	},
 	"windsurf": {
 		// windsurf has no per-tool global rules dir — global install rejected in installIntegration.

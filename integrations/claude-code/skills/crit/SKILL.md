@@ -1,6 +1,6 @@
 ---
 name: crit
-description: "Review code changes, a plan, a live page (running dev server), or a local HTML file with crit inline comments"
+description: "Review code changes, a plan, a live page (running dev server), or a local HTML file with crit inline comments. Use when asked to review code, a plan, a diff, a running web app, or when you want structured human feedback on your work."
 allowed-tools: Bash(crit:*), Bash(command ls:*), Read, Edit, Glob
 argument-hint: "[file|url]"
 ---
@@ -45,11 +45,7 @@ If a crit server is already running from earlier in this conversation, `crit` au
 
 ## Step 3: Read the review output
 
-When `crit` completes, inspect its stdout JSON. Use `approved` for status and read `prompt` for instructions.
-
-If `"approved": true`, tell the user no changes were requested and stop.
-
-If `"approved": false`, unresolved comments are in the `comments` array (same schema as `crit comments --json`). Address each comment.
+When `crit` completes, read **stdout** and follow its instructions. Check **stderr** for `approved: true` or `approved: false`.
 
 <important if="a comment has a quote, anchor, or drifted field">
 - `quote`: the specific text the reviewer selected — focus your changes on the quoted text rather than the entire line range
@@ -86,7 +82,7 @@ echo '[
 
 **CRITICAL — you MUST run this step. Do NOT skip it. Do NOT proceed without it.**
 
-Run the **exact same `crit` command from Step 2** in the background. The daemon is keyed by arguments — mismatched args spawn a new daemon instead of reconnecting. If Step 2 was `crit plan.md`, this must also be `crit plan.md` (not bare `crit`).
+The finish prompt on stdout includes the command to run again — use it to start a new round.
 
 On subsequent calls, `crit` automatically signals round-complete first, then blocks until the next "Finish Review" click.
 

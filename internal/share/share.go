@@ -58,6 +58,7 @@ func checkGitHubSyncAllowed(cj session.CritJSON, op string) error {
 }
 
 var ErrShareUnauthorized = errors.New("auth token rejected by share service")
+var ErrShareNotFound = errors.New("shared review not found")
 
 // shareScope computes a hash of sorted file paths, used to detect when
 // share state belongs to a different file set.
@@ -124,19 +125,20 @@ type ShareReply struct {
 // If we add other sync sources (GitLab, Gerrit) later, we can introduce a
 // `source` enum at that point.
 type ShareComment struct {
-	File        string       `json:"file,omitempty"`
-	StartLine   int          `json:"start_line,omitempty"`
-	EndLine     int          `json:"end_line,omitempty"`
-	Body        string       `json:"body"`
-	Quote       string       `json:"quote,omitempty"`
-	Author      string       `json:"author_display_name,omitempty"`
-	UserID      string       `json:"user_id,omitempty"`
-	Scope       string       `json:"scope,omitempty"`
-	ReviewRound int          `json:"review_round,omitempty"`
-	Replies     []ShareReply `json:"replies,omitempty"`
-	ExternalID  string       `json:"external_id,omitempty"`
-	Resolved    bool         `json:"resolved,omitempty"`
-	GitHubID    int64        `json:"github_id,omitempty"`
+	File        string             `json:"file,omitempty"`
+	StartLine   int                `json:"start_line,omitempty"`
+	EndLine     int                `json:"end_line,omitempty"`
+	Body        string             `json:"body"`
+	Quote       string             `json:"quote,omitempty"`
+	Author      string             `json:"author_display_name,omitempty"`
+	UserID      string             `json:"user_id,omitempty"`
+	Scope       string             `json:"scope,omitempty"`
+	ReviewRound int                `json:"review_round,omitempty"`
+	Replies     []ShareReply       `json:"replies,omitempty"`
+	ExternalID  string             `json:"external_id,omitempty"`
+	Resolved    bool               `json:"resolved,omitempty"`
+	GitHubID    int64              `json:"github_id,omitempty"`
+	DOMAnchor   *session.DOMAnchor `json:"dom_anchor,omitempty"`
 }
 
 // shareFileEntries serializes ShareFile values into the JSON-friendly maps
@@ -440,6 +442,7 @@ func commentToShareComment(c session.Comment, filePath, scope, fallbackAuthor, c
 		UserID:    c.UserID,
 		Scope:     scope,
 		GitHubID:  c.GitHubID,
+		DOMAnchor: c.DOMAnchor,
 	}
 	if includeResolved {
 		sc.Resolved = c.Resolved
@@ -529,20 +532,21 @@ type WebReply struct {
 // is the verified user id, set when the comment was authored by a logged-in
 // user (either CLI with bearer token or LiveView while signed in).
 type WebComment struct {
-	Body              string     `json:"body"`
-	FilePath          string     `json:"file_path"`
-	StartLine         int        `json:"start_line"`
-	EndLine           int        `json:"end_line"`
-	ReviewRound       int        `json:"review_round"`
-	Resolved          bool       `json:"resolved"`
-	ResolvedRound     int        `json:"resolved_round"`
-	ExternalID        string     `json:"external_id"`
-	AuthorDisplayName string     `json:"author_display_name"`
-	AuthorIdentity    string     `json:"author_identity"`
-	UserID            string     `json:"user_id"`
-	Quote             string     `json:"quote"`
-	Scope             string     `json:"scope"`
-	Replies           []WebReply `json:"replies"`
+	Body              string             `json:"body"`
+	FilePath          string             `json:"file_path"`
+	StartLine         int                `json:"start_line"`
+	EndLine           int                `json:"end_line"`
+	ReviewRound       int                `json:"review_round"`
+	Resolved          bool               `json:"resolved"`
+	ResolvedRound     int                `json:"resolved_round"`
+	ExternalID        string             `json:"external_id"`
+	AuthorDisplayName string             `json:"author_display_name"`
+	AuthorIdentity    string             `json:"author_identity"`
+	UserID            string             `json:"user_id"`
+	Quote             string             `json:"quote"`
+	Scope             string             `json:"scope"`
+	Replies           []WebReply         `json:"replies"`
+	DOMAnchor         *session.DOMAnchor `json:"dom_anchor,omitempty"`
 }
 
 // buildLocalFingerprintIndex returns both the fingerprint set and a map from
@@ -610,7 +614,7 @@ func fetchWebComments(shareURL string, localIDs map[string]bool, localFingerprin
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return result, nil // review gone
+		return result, ErrShareNotFound
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		return result, ErrShareUnauthorized
@@ -712,6 +716,9 @@ func upsertShareToWeb(cfg session.CritJSON, files []ShareFile, comments []ShareC
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		return result, ErrShareUnauthorized
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return result, ErrShareNotFound
 	}
 	if resp.StatusCode >= 400 {
 		return result, fmt.Errorf("upsert failed with status %d", resp.StatusCode)
@@ -857,18 +864,21 @@ func MergeWebComments(critPath string, newComments []WebComment, replyUpdates ma
 			})
 		}
 		c := session.StampWithFocus(session.Comment{
-			ID:          fmt.Sprintf("web-%d", webCount),
-			StartLine:   wc.StartLine,
-			EndLine:     wc.EndLine,
-			Body:        wc.Body,
-			Quote:       wc.Quote,
-			Author:      wc.AuthorDisplayName,
-			UserID:      wc.UserID,
-			Scope:       wc.Scope,
-			ReviewRound: wc.ReviewRound,
-			Replies:     replies,
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			ID:            fmt.Sprintf("web-%d", webCount),
+			StartLine:     wc.StartLine,
+			EndLine:       wc.EndLine,
+			Body:          wc.Body,
+			Quote:         wc.Quote,
+			Author:        wc.AuthorDisplayName,
+			UserID:        wc.UserID,
+			Scope:         wc.Scope,
+			ReviewRound:   wc.ReviewRound,
+			Resolved:      wc.Resolved,
+			ResolvedRound: wc.ResolvedRound,
+			DOMAnchor:     wc.DOMAnchor,
+			Replies:       replies,
+			CreatedAt:     now,
+			UpdatedAt:     now,
 		}, scope.AsFocus())
 		if wc.Scope == "review" {
 			cj.ReviewComments = append(cj.ReviewComments, c)
@@ -975,6 +985,20 @@ func clearShareState(critPath string) error {
 	cj.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
 	return session.SaveCritJSON(critPath, cj)
+}
+
+// checkProxyAuthCLIAllowed returns an error when proxy_auth is enabled in global
+// config. Terminal share/fetch/unpublish cannot authenticate to crit-web behind
+// an SSO reverse proxy — those operations must use the browser UI relay instead.
+func checkProxyAuthCLIAllowed(command string) error {
+	if !loadShareConfig().ProxyAuth {
+		return nil
+	}
+	return fmt.Errorf(`%s is unavailable with proxy_auth enabled
+
+Your crit-web instance is behind an SSO reverse proxy. Terminal commands cannot authenticate there — use Crit's browser interface instead
+
+proxy_auth is set in ~/.crit.config.json (global config only)`, command)
 }
 
 // loadShareConfig loads the merged config.Config from the current directory context.

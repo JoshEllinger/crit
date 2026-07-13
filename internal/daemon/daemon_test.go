@@ -79,6 +79,24 @@ func TestSessionKey_Length(t *testing.T) {
 	}
 }
 
+func TestValidSessionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		{"839f3b4cd5d6", true},
+		{"ABCDEF123456", false},
+		{"839f3b4cd5d", false},
+		{"839f3b4cd5d6x", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := ValidSessionKey(tc.key); got != tc.want {
+			t.Errorf("ValidSessionKey(%q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
 func TestSessionEntry_DisplayHost(t *testing.T) {
 	tests := []struct {
 		host string
@@ -100,19 +118,44 @@ func TestSessionEntry_DisplayHost(t *testing.T) {
 
 func TestSessionEntry_BaseURL(t *testing.T) {
 	tests := []struct {
-		host string
-		port int
-		want string
+		host      string
+		port      int
+		publicURL string
+		want      string
 	}{
-		{"", 3000, "http://localhost:3000"},
-		{"127.0.0.1", 4567, "http://localhost:4567"},
-		{"0.0.0.0", 8080, "http://0.0.0.0:8080"},
-		{"192.168.1.10", 3000, "http://192.168.1.10:3000"},
+		{"", 3000, "", "http://localhost:3000"},
+		{"127.0.0.1", 4567, "", "http://localhost:4567"},
+		{"0.0.0.0", 8080, "", "http://0.0.0.0:8080"},
+		{"192.168.1.10", 3000, "", "http://192.168.1.10:3000"},
+		{"127.0.0.1", 4567, "https://mymac.ts.net", "https://mymac.ts.net"},
+		{"127.0.0.1", 4567, "https://mymac.ts.net/design", "https://mymac.ts.net/design"},
 	}
 	for _, tt := range tests {
-		e := SessionEntry{Host: tt.host, Port: tt.port}
+		e := SessionEntry{Host: tt.host, Port: tt.port, PublicURL: tt.publicURL}
 		if got := e.BaseURL(); got != tt.want {
-			t.Errorf("baseURL(host=%q, port=%d) = %q, want %q", tt.host, tt.port, got, tt.want)
+			t.Errorf("baseURL(host=%q, port=%d, publicURL=%q) = %q, want %q", tt.host, tt.port, tt.publicURL, got, tt.want)
+		}
+	}
+}
+
+func TestAdvertisedURL(t *testing.T) {
+	tests := []struct {
+		publicURL  string
+		listenHost string
+		port       int
+		path       string
+		want       string
+	}{
+		{"", "127.0.0.1", 3000, "", "http://localhost:3000"},
+		{"", "127.0.0.1", 3000, "/live", "http://localhost:3000/live"},
+		{"https://mymac.ts.net", "127.0.0.1", 3000, "", "https://mymac.ts.net"},
+		{"https://mymac.ts.net/design", "127.0.0.1", 3000, "/live", "https://mymac.ts.net/design/live"},
+		{"https://mymac.ts.net", "127.0.0.1", 3000, "live", "https://mymac.ts.net/live"},
+		{"", "127.0.0.1", 3000, "live", "http://localhost:3000/live"},
+	}
+	for _, tt := range tests {
+		if got := AdvertisedURL(tt.publicURL, tt.listenHost, tt.port, tt.path); got != tt.want {
+			t.Errorf("AdvertisedURL(%q, %q, %d, %q) = %q, want %q", tt.publicURL, tt.listenHost, tt.port, tt.path, got, tt.want)
 		}
 	}
 }
@@ -410,6 +453,13 @@ func TestDaemonHasBrowser(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			name: "returns true when health status is not ok",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]any{"status": "starting", "browser_clients": false})
+			},
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -629,6 +679,72 @@ func TestListSessionsForRepoRoot_NoPartialMatch(t *testing.T) {
 	entries, _ := ListSessionsForRepoRoot("/tmp/myrepo")
 	if len(entries) != 0 {
 		t.Errorf("expected 0 sessions (no partial match), got %d", len(entries))
+	}
+}
+
+func TestListAllSessions_FiltersAndCleans(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+
+	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts1.Close()
+	port1, _ := strconv.Atoi(ts1.URL[strings.LastIndex(ts1.URL, ":")+1:])
+
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts2.Close()
+	port2, _ := strconv.Atoi(ts2.URL[strings.LastIndex(ts2.URL, ":")+1:])
+
+	pid := os.Getpid()
+	WriteSessionFile("repo1", SessionEntry{PID: pid, Port: port1, CWD: "/tmp/repo1", Branch: "main"})
+	WriteSessionFile("repo2", SessionEntry{PID: pid, Port: port2, CWD: "/tmp/repo2/sub", Branch: "feat"})
+	WriteSessionFile("dead", SessionEntry{PID: 999999999, Port: 3333, CWD: "/tmp/dead", Branch: "main"})
+
+	sessDir := filepath.Join(home, ".crit", "sessions")
+	if err := os.WriteFile(filepath.Join(sessDir, "notes.txt"), []byte("not a session"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "bad.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, keys := ListAllSessions()
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 alive sessions, got %d", len(entries))
+	}
+
+	foundKeys := map[string]bool{}
+	for _, key := range keys {
+		foundKeys[key] = true
+	}
+	if !foundKeys["repo1"] || !foundKeys["repo2"] {
+		t.Fatalf("expected repo1 and repo2 keys, got %v", keys)
+	}
+	if foundKeys["dead"] || foundKeys["bad"] {
+		t.Fatalf("dead or malformed session should not be returned, got %v", keys)
+	}
+	if _, err := os.Stat(filepath.Join(sessDir, "dead.json")); !os.IsNotExist(err) {
+		t.Fatalf("dead session file should be cleaned up, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessDir, "notes.txt")); err != nil {
+		t.Fatalf("non-json file should be left alone: %v", err)
+	}
+}
+
+func TestListAllSessions_NoHomeReturnsEmpty(t *testing.T) {
+	t.Setenv("HOME", "")
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", "")
+		t.Setenv("HOMEDRIVE", "")
+		t.Setenv("HOMEPATH", "")
+	}
+
+	entries, keys := ListAllSessions()
+	if len(entries) != 0 || len(keys) != 0 {
+		t.Fatalf("ListAllSessions without home = %d entries, %d keys; want empty", len(entries), len(keys))
 	}
 }
 
@@ -1054,15 +1170,17 @@ func TestAppendCommonDaemonFlags(t *testing.T) {
 		{
 			name: "all flags set",
 			f: commonDaemonFlags{
-				Port:     3456,
-				Host:     "0.0.0.0",
-				NoOpen:   true,
-				Quiet:    true,
-				ShareURL: "https://crit.md",
+				Port:      3456,
+				Host:      "0.0.0.0",
+				PublicURL: "https://mymac.ts.net",
+				NoOpen:    true,
+				Quiet:     true,
+				ShareURL:  "https://crit.md",
 			},
 			want: []string{"--preview-file", "/tmp/x.html",
 				"--port", "3456",
 				"--host", "0.0.0.0",
+				"--public-url", "https://mymac.ts.net",
 				"--no-open",
 				"--quiet",
 				"--share-url", "https://crit.md"},

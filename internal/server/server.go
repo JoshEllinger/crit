@@ -27,6 +27,7 @@ import (
 	"github.com/JoshEllinger/crit/internal/comment"
 	"github.com/JoshEllinger/crit/internal/config"
 	"github.com/JoshEllinger/crit/internal/diff"
+	"github.com/JoshEllinger/crit/internal/prompt"
 	"github.com/JoshEllinger/crit/internal/review"
 	"github.com/JoshEllinger/crit/internal/session"
 	"github.com/JoshEllinger/crit/internal/share"
@@ -45,6 +46,7 @@ var sseHeartbeatInterval = 30 * time.Second
 var AgentScriptFiles = []string{
 	"agent-protocol.js",
 	"agent-anchor-utils.js",
+	"agent-scroll-utils.js",
 	"agent-marker-overlay.js",
 	"agent-mutation-batcher.js",
 	"agent-resolution.js",
@@ -84,8 +86,12 @@ type Server struct {
 	// listenHost is the host the server is bound to (e.g. "127.0.0.1" or
 	// "0.0.0.0"). Set via SetListenHost after construction. When set to a
 	// loopback address, ServeHTTP enforces that the request Host header is
-	// also a loopback hostname, blocking DNS-rebinding attacks.
+	// also a loopback hostname, blocking DNS-rebinding attacks — unless
+	// SetPublicURL was called with a reverse-proxy hostname (e.g. tailscale serve).
 	listenHost string
+	// publicURLHost is the hostname from --public-url / CRIT_PUBLIC_URL, allowed
+	// through the DNS-rebinding guard when requests arrive via a reverse proxy.
+	publicURLHost string
 
 	// shutdownCtx is the daemon's signal-handled context; child operations
 	// (e.g. runAgentCmd subprocesses) derive their context from this so a
@@ -151,9 +157,11 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/api/session", s.withReady(s.handleSession))
 	mux.HandleFunc("/api/share", s.withReady(s.handleShare))
 	mux.HandleFunc("/api/share-consent", s.withReady(s.handleShareConsent))
+	mux.HandleFunc("/api/project-prompts/trust", s.withReady(s.handleProjectPromptTrust))
 	mux.HandleFunc("/api/share/payload", s.withReady(s.handleSharePayload))
 	mux.HandleFunc("/api/share/preview-payload", s.withReady(s.handlePreviewPayload))
 	mux.HandleFunc("/api/share/upsert-payload", s.withReady(s.handleUpsertPayload))
+	mux.HandleFunc("/api/share-policy", s.withReady(s.handleSharePolicy))
 	mux.HandleFunc("/api/share-url", s.withReady(s.handleShareURL))
 	mux.HandleFunc("/api/comments/merge", s.withReady(s.handleMergeComments))
 	mux.HandleFunc("/api/finish", s.withReady(s.handleFinish))
@@ -172,6 +180,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/api/comments", s.withReady(s.handleReviewComments))
 	mux.HandleFunc("/api/review-comment/", s.withReady(s.handleReviewCommentByID))
 	mux.HandleFunc("/api/files/list", s.withReady(s.handleFilesList))
+	mux.HandleFunc("/api/story", s.withReady(s.handleStory))
 
 	// File-scoped endpoints (use ?path= query param)
 	mux.HandleFunc("/api/file", s.withReady(s.handleFile))
@@ -207,6 +216,13 @@ func (s *Server) SetListenHost(host string) {
 	s.listenHost = host
 }
 
+// SetPublicURL records the user-facing base URL (e.g. https://machine.ts.net).
+// When set, requests whose Host header matches the URL hostname are allowed even
+// if the server is bound to loopback — needed for tailscale serve and similar proxies.
+func (s *Server) SetPublicURL(publicURL string) {
+	s.publicURLHost = config.PublicURLHost(publicURL)
+}
+
 // isLoopbackHost reports whether host (no port) is a loopback address.
 func isLoopbackHost(host string) bool {
 	if host == "localhost" {
@@ -220,10 +236,18 @@ func isLoopbackHost(host string) bool {
 // is bound to a loopback address, the request's Host header must also resolve
 // to a loopback hostname — this is the canonical DNS-rebinding defense.
 func (s *Server) checkHost(r *http.Request) bool {
+	host := requestHost(r.Host)
+	if s.publicURLHost != "" && strings.EqualFold(host, s.publicURLHost) {
+		return true
+	}
 	if s.listenHost == "" || !isLoopbackHost(s.listenHost) {
 		return true
 	}
-	host := r.Host
+	return isLoopbackHost(host)
+}
+
+func requestHost(hostport string) string {
+	host := hostport
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	} else {
@@ -231,7 +255,7 @@ func (s *Server) checkHost(r *http.Request) bool {
 		// Strip IPv6 brackets so ParseIP can recognise the address.
 		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	}
-	return isLoopbackHost(host)
+	return host
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -430,6 +454,13 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 	// Integration detection
 	s.addIntegrationStatus(resp)
+
+	for k, v := range s.projectPromptTrustPayload() {
+		resp[k] = v
+	}
+	if sess != nil && s.projectPromptsUntrusted() {
+		resp["project_prompt_preview"] = s.renderProjectPromptPreview(sess)
+	}
 
 	if sess != nil && sess.ReviewType != "" {
 		resp["review_type"] = sess.ReviewType
@@ -656,6 +687,38 @@ func (s *Server) handleShareConsent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+// handleProjectPromptTrust records the user's trust choice for project prompt hooks.
+// POST /api/project-prompts/trust
+// Body: {"mode":"until_change"|"always"|"defaults"}
+func (s *Server) handleProjectPromptTrust(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	switch req.Mode {
+	case prompt.TrustUntilChange, prompt.TrustAlways, prompt.TrustDefaults:
+	default:
+		http.Error(w, "invalid mode", http.StatusBadRequest)
+		return
+	}
+	_, projectPrompts := config.LoadPromptMaps(s.projectDir)
+	_, projectHooks := config.LoadHookMaps(s.projectDir)
+	hash := prompt.ContentHash(projectPrompts, projectHooks, s.projectDir)
+	if err := prompt.SaveTrustChoice(s.projectDir, req.Mode, hash); err != nil {
+		http.Error(w, "failed to persist trust choice", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 // consentNeeded reports whether the user must still confirm before sharing.
 // It guards reads of s.cfg.ShareConsented under s.authMu and, if the in-memory
 // flag is false, re-checks the on-disk global config so consent granted by the
@@ -743,6 +806,32 @@ func (s *Server) shareFilesForSession() (files []ShareFile, reviewType string, e
 	return sess.LoadShareFilesFromDisk(), "", nil
 }
 
+func (s *Server) writeExistingShareIfPresent(w http.ResponseWriter) (bool, error) {
+	// Uses GetShareState() to read both fields under a single lock (avoids TOCTOU race
+	// where a concurrent DELETE /api/share-url could clear the token between two calls).
+	existingURL, existingToken := s.session.Load().GetShareState()
+	if existingURL == "" {
+		return false, nil
+	}
+
+	_, err := share.FetchWebComments(existingURL, map[string]bool{}, map[string]bool{}, map[string]string{}, s.authTokenSnapshot())
+	if errors.Is(err, share.ErrShareNotFound) {
+		s.session.Load().SetSharedURLAndToken("", "")
+		s.session.Load().SetShareScope("")
+		s.session.Load().SetShareOrgInfo("", "", "")
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	writeJSON(w, map[string]any{
+		"url":          existingURL,
+		"delete_token": existingToken,
+	})
+	return true, nil
+}
+
 // handleShare uploads the current session to crit-web and returns the share URL.
 // POST /api/share
 func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
@@ -759,14 +848,15 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Idempotent: if already shared, return the existing URL without calling crit-web.
-	// Uses GetShareState() to read both fields under a single lock (avoids TOCTOU race
-	// where a concurrent DELETE /api/share-url could clear the token between two calls).
-	if existingURL, existingToken := s.session.Load().GetShareState(); existingURL != "" {
-		writeJSON(w, map[string]any{
-			"url":          existingURL,
-			"delete_token": existingToken,
-		})
+	// Idempotent: if already shared and still present on crit-web, return the
+	// existing URL without uploading. If the remote review was deleted, clear the
+	// stale local state and create a fresh share below.
+	if handled, err := s.writeExistingShareIfPresent(w); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	} else if handled {
 		return
 	}
 
@@ -1096,6 +1186,16 @@ func (s *Server) handleMergeComments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	critPath := sess.CritJSONPath()
+	if _, err := os.Stat(review.ReviewPathsFor(critPath).Review); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		if os.IsNotExist(err) {
+			json.NewEncoder(w).Encode(map[string]string{"error": "review file not found"})
+		} else {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		}
+		return
+	}
 	data, err := session.ReadFileShared(review.ReviewPathsFor(critPath).Review)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1113,6 +1213,9 @@ func (s *Server) handleMergeComments(w http.ResponseWriter, r *http.Request) {
 
 	newComments, replyUpdates := dedupWebComments(cj, req.Comments)
 	if len(newComments) == 0 && len(replyUpdates) == 0 {
+		// Comments may already be on disk from a prior pull while memory is
+		// still stale (e.g. pendingWrite blocked the file watcher).
+		sess.SyncCommentsFromDisk()
 		writeJSON(w, map[string]any{"merged": 0, "replies_updated": 0})
 		return
 	}
@@ -1122,6 +1225,11 @@ func (s *Server) handleMergeComments(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	// mergeWebComments writes review.json outside WriteFiles; sync in-memory
+	// state immediately so /api/file/comments and the UI refresh path see
+	// pulled comments without waiting for the 1s file watcher tick (which can
+	// also miss same-second mtime updates).
+	sess.SyncCommentsFromDisk()
 	writeJSON(w, map[string]any{"merged": len(newComments), "replies_updated": len(replyUpdates)})
 }
 
@@ -1574,7 +1682,7 @@ func (s *Server) handleCommits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, commits)
 }
 
-// handleBranches returns remote branch names for the base-branch picker.
+// handleBranches returns grouped compare targets for the compare-against picker.
 func (s *Server) handleBranches(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1583,18 +1691,18 @@ func (s *Server) handleBranches(w http.ResponseWriter, r *http.Request) {
 	sess := s.session.Load()
 	sess.RLock()
 	repoRoot := sess.RepoRoot
-	vcs := sess.VCS
+	vc := sess.VCS
 	sess.RUnlock()
-	if vcs == nil {
-		writeJSON(w, []string{})
+	if vc == nil {
+		writeJSON(w, vcs.CompareTargets{})
 		return
 	}
-	branches, err := vcs.RemoteBranches(repoRoot)
+	targets, err := vcs.CompareTargetsFor(vc, repoRoot)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, branches)
+	writeJSON(w, targets)
 }
 
 // handleBaseBranch changes the diff base branch for the current session.
@@ -1605,12 +1713,21 @@ func (s *Server) handleBaseBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Branch string `json:"branch"`
+		Ref    string `json:"ref"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Branch == "" {
-		http.Error(w, "Bad request: branch is required", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Bad request: invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if err := s.session.Load().ChangeBaseBranch(body.Branch); err != nil {
+	ref := strings.TrimSpace(body.Ref)
+	if ref == "" {
+		ref = strings.TrimSpace(body.Branch)
+	}
+	if ref == "" {
+		http.Error(w, "Bad request: ref is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.session.Load().ChangeBaseBranch(ref); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1897,6 +2014,11 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.projectPromptsUntrusted() {
+		http.Error(w, "project prompt trust required", http.StatusForbidden)
+		return
+	}
+
 	sess := s.session.Load()
 	// Synchronous, serialized flush before building the agent-facing payload.
 	// Bare WriteFiles races with the debounce timer (both call session.AtomicWriteFile
@@ -1911,32 +2033,41 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	unresolvedComments := sess.UnresolvedCommentCount()
 	stats := s.buildSessionStats(sess)
 
-	prompt, approved, comments := buildFinishFeedback(sess)
-	nextCommand := buildNextCommand(s.cliArgs)
-	copyPrompt := buildCopyPrompt(sess, approved, comments, nextCommand)
+	approved := unresolvedComments == 0
+	comments := []comment.ListedComment{}
+	if unresolvedComments > 0 {
+		comments = listUnresolvedComments(sess)
+	}
+	prompt, promptMeta := s.renderFinishPrompts(sess, approved, stats)
+	nextCommand := session.NextRoundCommand(sess)
 	if !approved {
 		sess.SetWaitingForAgent(true)
 	}
 
+	// Run the configured command hook (if any) for this finish state. Hooks run
+	// synchronously after the review file is persisted so scripts can read
+	// $CRIT_REVIEW_PATH; failures/timeouts are logged and never block finish.
+	s.runFinishHooks(sess, approved, stats)
+
 	writeJSON(w, map[string]any{
 		"status":       "finished",
 		"prompt":       prompt,
-		"copy_prompt":  copyPrompt,
 		"approved":     approved,
 		"comments":     comments,
 		"next_command": nextCommand,
 		"stats":        stats,
+		"prompt_meta":  promptMeta,
 	})
 
 	// Encode approved status into SSE event content as JSON so review-cycle
 	// clients can extract it without string matching on the prompt.
 	eventData, _ := json.Marshal(map[string]any{
 		"prompt":       prompt,
-		"copy_prompt":  copyPrompt,
 		"approved":     approved,
 		"stats":        stats,
 		"comments":     comments,
 		"next_command": nextCommand,
+		"prompt_meta":  promptMeta,
 	})
 	sess.Notify(SSEEvent{
 		Type:    "finish",
@@ -1975,93 +2106,20 @@ func (s *Server) buildSessionStats(sess *Session) map[string]any {
 
 const approvedNoCommentsPrompt = "Review approved with no comments — no changes requested."
 
-// buildFinishFeedback returns the agent-facing finish payload fields.
-func buildFinishFeedback(sess *Session) (prompt string, approved bool, comments []comment.ListedComment) {
-	totalComments := sess.TotalCommentCount()
-	unresolvedComments := sess.UnresolvedCommentCount()
-	approved = unresolvedComments == 0
-	comments = []comment.ListedComment{}
-	if unresolvedComments > 0 {
-		comments = listUnresolvedComments(sess)
-	}
-	prompt = buildFinishPrompt(sess, approved, totalComments)
-	return prompt, approved, comments
+func listUnresolvedComments(sess *Session) []comment.ListedComment {
+	return listComments(sess, true)
 }
 
-func listUnresolvedComments(sess *Session) []comment.ListedComment {
+func listAllComments(sess *Session) []comment.ListedComment {
+	return listComments(sess, false)
+}
+
+func listComments(sess *Session, unresolvedOnly bool) []comment.ListedComment {
 	cj, err := review.LoadCritJSON(sess.CritJSONPath())
 	if err != nil {
 		return nil
 	}
-	return comment.ListCommentsFromCritJSON(cj, true)
-}
-
-func buildFinishPrompt(sess *Session, approved bool, totalComments int) string {
-	if !approved {
-		if sess.Mode == "plan" {
-			return buildPlanInstructions(sess)
-		}
-		return buildUnresolvedInstructions(sess)
-	}
-	if totalComments > 0 {
-		return "All comments are resolved — no changes needed, please proceed."
-	}
-	return approvedNoCommentsPrompt
-}
-
-func buildUnresolvedInstructions(sess *Session) string {
-	return buildUnresolvedActions(sess) + fmt.Sprintf(" When done run: `%s`", sess.ReinvokeCommand())
-}
-
-func buildUnresolvedActions(sess *Session) string {
-	return "Address each comment. For each one, reply explaining what you did using `crit comment --reply-to <comment-id> --author <your-name> \"<explanation>\"`."
-}
-
-func buildPlanActions(sess *Session) string {
-	slug := filepath.Base(sess.PlanDir)
-	return fmt.Sprintf(
-		"Revise the plan to address each comment. "+
-			"If you are running under Codex, re-emit the revised plan inside <proposed_plan>...</proposed_plan> so Crit can review the new version. "+
-			"To reply to comments, use `crit comment --plan %s --reply-to <id> --author <your-name> \"<explanation>\"`.",
-		slug)
-}
-
-func buildPlanInstructions(sess *Session) string {
-	return buildPlanActions(sess)
-}
-
-// buildCopyPrompt is pasted directly to the agent from the finish modal.
-func buildCopyPrompt(sess *Session, approved bool, comments []comment.ListedComment, nextCommand string) string {
-	var b strings.Builder
-	if approved {
-		totalComments := sess.TotalCommentCount()
-		switch {
-		case totalComments == 0:
-			b.WriteString("Review approved — no changes requested.")
-		default:
-			b.WriteString("Review approved. All comments are resolved — proceed with implementation.")
-		}
-		return b.String()
-	}
-
-	n := len(comments)
-	if n == 1 {
-		b.WriteString("The review finished with 1 unresolved comment.\n\n")
-	} else {
-		fmt.Fprintf(&b, "The review finished with %d unresolved comments.\n\n", n)
-	}
-	b.WriteString("Load them with:\n\n")
-	fmt.Fprintf(&b, "  %s\n\n", buildCommentsListCommand(sess))
-	if sess.Mode == "plan" {
-		b.WriteString(buildPlanActions(sess))
-	} else {
-		b.WriteString(buildUnresolvedActions(sess))
-	}
-	if nextCommand != "" {
-		b.WriteString("\n\nWhen you're done, run:\n\n  ")
-		b.WriteString(nextCommand)
-	}
-	return b.String()
+	return comment.ListCommentsFromCritJSON(cj, unresolvedOnly)
 }
 
 func buildCommentsListCommand(sess *Session) string {
@@ -2081,20 +2139,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":          "ok",
 		"browser_clients": browserClients,
 	})
-}
-
-// buildNextCommand renders the command the agent should run to start the
-// next review round, given the args the daemon was launched with.
-func buildNextCommand(args []string) string {
-	if len(args) == 0 {
-		return "crit"
-	}
-	parts := make([]string, 0, len(args)+1)
-	parts = append(parts, "crit")
-	for _, a := range args {
-		parts = append(parts, shellQuoteArg(a))
-	}
-	return strings.Join(parts, " ")
 }
 
 // shellQuoteArg quotes a single CLI arg using POSIX single-quote syntax when
@@ -2140,22 +2184,26 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 				sess.SetAwaitingFirstReview(false)
 				// Parse the structured finish event data
 				var finishData struct {
-					Prompt   string                  `json:"prompt"`
-					Approved bool                    `json:"approved"`
-					Stats    map[string]any          `json:"stats"`
-					Comments []comment.ListedComment `json:"comments"`
+					Prompt      string                  `json:"prompt"`
+					Approved    bool                    `json:"approved"`
+					Stats       map[string]any          `json:"stats"`
+					Comments    []comment.ListedComment `json:"comments"`
+					PromptMeta  *prompt.Meta            `json:"prompt_meta"`
+					NextCommand string                  `json:"next_command"`
 				}
 				json.Unmarshal([]byte(event.Content), &finishData)
-				nextCommand := buildNextCommand(s.cliArgs)
-				copyPrompt := buildCopyPrompt(sess, finishData.Approved, finishData.Comments, nextCommand)
+				nextCommand := finishData.NextCommand
+				if nextCommand == "" {
+					nextCommand = session.NextRoundCommand(sess)
+				}
 				writeJSON(w, map[string]any{
 					"status":       "finished",
 					"prompt":       finishData.Prompt,
-					"copy_prompt":  copyPrompt,
 					"approved":     finishData.Approved,
 					"comments":     finishData.Comments,
 					"stats":        finishData.Stats,
 					"next_command": nextCommand,
+					"prompt_meta":  finishData.PromptMeta,
 				})
 				return
 			}
@@ -2400,7 +2448,8 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.Contains(reqPath, "..") {
+	reqPath = filepath.ToSlash(filepath.Clean(reqPath))
+	if reqPath == "" || reqPath == "." || strings.HasPrefix(reqPath, "../") || strings.Contains(reqPath, "/../") {
 		http.Error(w, "Invalid file path", http.StatusBadRequest)
 		return
 	}
@@ -2791,6 +2840,53 @@ func (s *Server) handleAuthOrgs(w http.ResponseWriter, r *http.Request) {
 
 	if resp.StatusCode != http.StatusOK {
 		emptyArray()
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	io.Copy(w, resp.Body)
+}
+
+// handleSharePolicy proxies GET /api/share-policy to the configured crit-web
+// service. Older self-hosted instances do not expose it, so every failure falls
+// back to the historical client behaviour: all current share options allowed.
+func (s *Server) handleSharePolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	defaultPolicy := func() {
+		writeJSON(w, map[string]any{
+			"allowed_comment_policies":    []string{"open", "logged_in_only", "disallowed"},
+			"allowed_review_visibilities": []string{"organization", "unlisted", "public"},
+		})
+	}
+
+	if s.shareURL == "" {
+		defaultPolicy()
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.shareURL+"/api/share-policy", nil)
+	if err != nil {
+		defaultPolicy()
+		return
+	}
+	share.SetBearer(req, s.authTokenSnapshot())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		defaultPolicy()
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		defaultPolicy()
 		return
 	}
 

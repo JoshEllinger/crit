@@ -2,6 +2,7 @@ package live
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/JoshEllinger/crit/internal/browser"
 	"github.com/JoshEllinger/crit/internal/config"
 	"github.com/JoshEllinger/crit/internal/daemon"
+	"github.com/JoshEllinger/crit/internal/focus"
 )
 
 type smokeKind int
@@ -123,8 +125,12 @@ func runSmokeTest(origin, cookies string) smokeResult {
 }
 
 // LooksLikeLiveArgs returns true when args is a single http/https URL.
+// GitHub PR URLs are excluded — those route to range mode via --pr.
 func LooksLikeLiveArgs(args []string) bool {
 	if len(args) != 1 {
+		return false
+	}
+	if focus.LooksLikePRURL(args[0]) {
 		return false
 	}
 	u, err := url.Parse(args[0])
@@ -152,11 +158,13 @@ func connectToLiveDaemon(key, openCmd string) bool {
 type liveCLIFlags struct {
 	port        int
 	host        string
+	publicURL   string
 	noOpen      bool
 	quiet       bool
 	shareURL    string
 	cookieFlags stringSliceFlag
 	cookieFile  string
+	cdpURL      string
 	origin      string
 }
 
@@ -165,6 +173,7 @@ func parseLiveCLIFlags(args []string) liveCLIFlags {
 	port := fs.Int("port", 0, "Port to listen on")
 	fs.IntVar(port, "p", 0, "Port (shorthand)")
 	host := fs.String("host", "", "Host to listen on")
+	publicURL := fs.String("public-url", "", "Advertised base URL (overrides CRIT_PUBLIC_URL)")
 	noOpen := fs.Bool("no-open", false, "Don't auto-open browser")
 	quiet := fs.Bool("quiet", false, "Suppress status output")
 	fs.BoolVar(quiet, "q", false, "Suppress status (shorthand)")
@@ -172,6 +181,7 @@ func parseLiveCLIFlags(args []string) liveCLIFlags {
 	var cookieFlags stringSliceFlag
 	fs.Var(&cookieFlags, "cookie", "Cookie header value for upstream requests (repeatable)")
 	cookieFile := fs.String("cookie-file", "", "File with upstream cookies (raw header or Netscape jar)")
+	cdpURL := fs.String("cdp-url", "", "Chrome DevTools URL (e.g. http://127.0.0.1:9222) to reuse browser cookies")
 	fs.Parse(args)
 
 	rawURL := ""
@@ -195,11 +205,13 @@ func parseLiveCLIFlags(args []string) liveCLIFlags {
 	return liveCLIFlags{
 		port:        *port,
 		host:        *host,
+		publicURL:   *publicURL,
 		noOpen:      *noOpen,
 		quiet:       *quiet,
 		shareURL:    *shareURL,
 		cookieFlags: cookieFlags,
 		cookieFile:  *cookieFile,
+		cdpURL:      *cdpURL,
 		origin:      strings.TrimSuffix(u.String(), "/"),
 	}
 }
@@ -210,11 +222,12 @@ func buildLiveDaemonArgs(origin, liveCookies string, f liveCLIFlags, cfg config.
 		daemonArgs = append(daemonArgs, "--live-cookie", liveCookies)
 	}
 	return daemon.AppendCommonDaemonFlags(daemonArgs, daemon.CommonDaemonFlags{
-		Port:     config.ResolvePort(f.port, cfg.Port),
-		Host:     config.ResolveHost(f.host, cfg.Host),
-		NoOpen:   noOpenResolved,
-		Quiet:    f.quiet || cfg.Quiet,
-		ShareURL: config.ResolveShareURL(f.shareURL, cfg, ""),
+		Port:      config.ResolvePort(f.port, cfg.Port),
+		Host:      config.ResolveHost(f.host, cfg.Host),
+		PublicURL: config.ResolvePublicURL(f.publicURL, cfg),
+		NoOpen:    noOpenResolved,
+		Quiet:     f.quiet || cfg.Quiet,
+		ShareURL:  config.ResolveShareURL(f.shareURL, cfg, ""),
 	})
 }
 
@@ -228,7 +241,12 @@ func RunLive(args []string) {
 		os.Exit(1)
 	}
 	cfg := config.LoadConfig(cwd)
-	liveCookies, err := resolveLiveCookies(f.cookieFlags, f.cookieFile, cfg, cwd)
+	key := daemon.LiveSessionKey(cwd, f.origin)
+	if connectToLiveDaemon(key, cfg.OpenCmd) {
+		return
+	}
+
+	liveCookies, err := resolveLiveCookiesWithCDP(context.Background(), f.cookieFlags, f.cookieFile, f.cdpURL, cfg, cwd, f.origin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -236,7 +254,6 @@ func RunLive(args []string) {
 
 	checkLiveSmoke(f.origin, liveCookies)
 
-	key := daemon.LiveSessionKey(cwd, f.origin)
 	if connectToLiveDaemon(key, cfg.OpenCmd) {
 		return
 	}

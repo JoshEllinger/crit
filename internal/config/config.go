@@ -20,31 +20,41 @@ const defaultShareURL = DefaultShareURL
 
 // Config holds all configuration values from config files.
 type Config struct {
-	Port               int      `json:"port,omitempty"`
-	Host               string   `json:"host,omitempty"` // listen host (default 127.0.0.1)
-	NoOpen             bool     `json:"no_open,omitempty"`
-	OpenCmd            string   `json:"open_cmd,omitempty"`
-	ShareURL           string   `json:"share_url,omitempty"`
-	ProxyAuth          bool     `json:"proxy_auth,omitempty"`
-	Quiet              bool     `json:"quiet,omitempty"`
-	Output             string   `json:"output,omitempty"`
-	Author             string   `json:"author,omitempty"`
-	BaseBranch         string   `json:"base_branch,omitempty"`
-	IgnorePatterns     []string `json:"ignore_patterns,omitempty"`
-	AutoViewedPatterns []string `json:"auto_viewed_patterns,omitempty"`
-	NoIntegrationCheck bool     `json:"no_integration_check,omitempty"`
-	NoUpdateCheck      bool     `json:"no_update_check,omitempty"`
-	AgentCmd           string   `json:"agent_cmd,omitempty"`
-	AuthToken          string   `json:"auth_token,omitempty"`
-	AuthUserName       string   `json:"auth_user_name,omitempty"`
-	AuthUserEmail      string   `json:"auth_user_email,omitempty"`
-	AuthUserID         string   `json:"auth_user_id,omitempty"`
-	CleanupOnApprove   *bool    `json:"cleanup_on_approve,omitempty"`
-	DisableStats       bool     `json:"disable_stats,omitempty"`
-	VCS                string   `json:"vcs,omitempty"` // preferred VCS backend: "git", "sl", "jj"
-	ShareConsented     bool     `json:"share_consented,omitempty"`
-	LiveCookie         string   `json:"live_cookie,omitempty"`
-	LiveCookieFile     string   `json:"live_cookie_file,omitempty"`
+	Port               int               `json:"port,omitempty"`
+	Host               string            `json:"host,omitempty"`       // listen host (default 127.0.0.1)
+	PublicURL          string            `json:"public_url,omitempty"` // advertised base URL (global-only; e.g. tailscale serve)
+	NoOpen             bool              `json:"no_open,omitempty"`
+	OpenCmd            string            `json:"open_cmd,omitempty"`
+	ShareURL           string            `json:"share_url,omitempty"`
+	ProxyAuth          bool              `json:"proxy_auth,omitempty"`
+	Quiet              bool              `json:"quiet,omitempty"`
+	Output             string            `json:"output,omitempty"`
+	Author             string            `json:"author,omitempty"`
+	BaseBranch         string            `json:"base_branch,omitempty"`
+	IgnorePatterns     []string          `json:"ignore_patterns,omitempty"`
+	AutoViewedPatterns []string          `json:"auto_viewed_patterns,omitempty"`
+	NoIntegrationCheck bool              `json:"no_integration_check,omitempty"`
+	NoUpdateCheck      bool              `json:"no_update_check,omitempty"`
+	AgentCmd           string            `json:"agent_cmd,omitempty"`
+	AuthToken          string            `json:"auth_token,omitempty"`
+	AuthUserName       string            `json:"auth_user_name,omitempty"`
+	AuthUserEmail      string            `json:"auth_user_email,omitempty"`
+	AuthUserID         string            `json:"auth_user_id,omitempty"`
+	CleanupOnApprove   *bool             `json:"cleanup_on_approve,omitempty"`
+	DisableStats       bool              `json:"disable_stats,omitempty"`
+	VCS                string            `json:"vcs,omitempty"` // preferred VCS backend: "git", "sl", "jj"
+	ShareConsented     bool              `json:"share_consented,omitempty"`
+	LiveCookie         string            `json:"live_cookie,omitempty"`
+	LiveCookieFile     string            `json:"live_cookie_file,omitempty"`
+	LiveCDPURL         string            `json:"live_cdp_url,omitempty"`
+	Prompts            map[string]string `json:"prompts,omitempty"`
+	// Hooks are shell commands/scripts executed at the same finish lifecycle
+	// points as prompt templates (on_finish_unresolved / on_finish_approved,
+	// optionally mode-suffixed :files/:diff/:live/:preview). Values use the
+	// inline:/file: forms like prompts, but resolve to an executable instead of
+	// template text. Project-level hooks are gated by the same trust flow as
+	// project prompts (they run arbitrary code).
+	Hooks map[string]string `json:"hooks,omitempty"`
 }
 
 // needsShareConsent reports whether the user must confirm before sharing.
@@ -105,6 +115,8 @@ func defaultConfig() generatedConfig {
 		AgentCmd:           "",
 		CleanupOnApprove:   true,
 		VCS:                "",
+		Prompts:            map[string]string{},
+		Hooks:              map[string]string{},
 	}
 }
 
@@ -112,24 +124,27 @@ func defaultConfig() generatedConfig {
 // auth_token is intentionally excluded — it is global-only and should not appear
 // in project config files where it could be accidentally committed.
 type generatedConfig struct {
-	Port               int      `json:"port"`
-	Host               string   `json:"host"`
-	NoOpen             bool     `json:"no_open"`
-	OpenCmd            string   `json:"open_cmd"`
-	ShareURL           string   `json:"share_url"`
-	ProxyAuth          bool     `json:"proxy_auth"`
-	Quiet              bool     `json:"quiet"`
-	Output             string   `json:"output"`
-	Author             string   `json:"author"`
-	BaseBranch         string   `json:"base_branch"`
-	IgnorePatterns     []string `json:"ignore_patterns"`
-	AutoViewedPatterns []string `json:"auto_viewed_patterns"`
-	NoIntegrationCheck bool     `json:"no_integration_check"`
-	NoUpdateCheck      bool     `json:"no_update_check"`
-	DisableStats       bool     `json:"disable_stats"`
-	AgentCmd           string   `json:"agent_cmd"`
-	CleanupOnApprove   bool     `json:"cleanup_on_approve"`
-	VCS                string   `json:"vcs"`
+	Port               int               `json:"port"`
+	Host               string            `json:"host"`
+	PublicURL          string            `json:"public_url"`
+	NoOpen             bool              `json:"no_open"`
+	OpenCmd            string            `json:"open_cmd"`
+	ShareURL           string            `json:"share_url"`
+	ProxyAuth          bool              `json:"proxy_auth"`
+	Quiet              bool              `json:"quiet"`
+	Output             string            `json:"output"`
+	Author             string            `json:"author"`
+	BaseBranch         string            `json:"base_branch"`
+	IgnorePatterns     []string          `json:"ignore_patterns"`
+	AutoViewedPatterns []string          `json:"auto_viewed_patterns"`
+	NoIntegrationCheck bool              `json:"no_integration_check"`
+	NoUpdateCheck      bool              `json:"no_update_check"`
+	DisableStats       bool              `json:"disable_stats"`
+	AgentCmd           string            `json:"agent_cmd"`
+	CleanupOnApprove   bool              `json:"cleanup_on_approve"`
+	VCS                string            `json:"vcs"`
+	Prompts            map[string]string `json:"prompts"`
+	Hooks              map[string]string `json:"hooks"`
 }
 
 func (c generatedConfig) String() string {
@@ -243,21 +258,54 @@ func mergeConfigs(global, project Config, projectPresence ConfigPresence) Config
 	if project.LiveCookieFile != "" {
 		merged.LiveCookieFile = project.LiveCookieFile
 	}
-	// Security: agent_cmd, auth_token, share_url, proxy_auth, and open_cmd are intentionally
+	if project.LiveCDPURL != "" {
+		merged.LiveCDPURL = project.LiveCDPURL
+	}
+	// Security: agent_cmd, auth_token, share_url, public_url, proxy_auth, and open_cmd are intentionally
 	// NOT merged from project config. They must remain global-only: agent_cmd to
 	// prevent untrusted repos from hijacking the agent command; open_cmd to prevent
 	// untrusted repos from hijacking browser launches; auth_token and
-	// share_url to prevent a malicious repo's .crit.config.json from redirecting
-	// share requests (and the bearer token) to an attacker-controlled host;
+	// share_url and public_url to prevent a malicious repo's .crit.config.json from
+	// redirecting share requests (and the bearer token) or advertised URLs to an
+	// attacker-controlled host;
 	// proxy_auth to prevent a repo from silently changing the transport mode.
-	// live_cookie/live_cookie_file DO merge from project config — common for local
+	// live_cookie/live_cookie_file/live_cdp_url DO merge from project config — common for local
 	// dev auth. Prefer live_cookie_file pointing at a gitignored path (e.g.
-	// .crit/live-cookies.txt) over committing live_cookie inline.
+	// .crit/live-cookies.txt) over committing live_cookie inline. live_cdp_url
+	// reuses cookies from a local Chrome with remote debugging enabled.
 	// Union ignore patterns
 	merged.IgnorePatterns = append(merged.IgnorePatterns, project.IgnorePatterns...)
 	// Union auto-viewed patterns (global + project both apply)
 	merged.AutoViewedPatterns = append(merged.AutoViewedPatterns, project.AutoViewedPatterns...)
+	mergeProjectPrompts(&merged, project)
+	mergeProjectHooks(&merged, project)
 	return merged
+}
+
+func mergeProjectPrompts(merged *Config, project Config) {
+	if len(project.Prompts) == 0 {
+		return
+	}
+	if merged.Prompts == nil {
+		merged.Prompts = make(map[string]string, len(project.Prompts))
+	}
+	for k, v := range project.Prompts {
+		merged.Prompts[k] = v
+	}
+}
+
+// mergeProjectHooks unions project hook config onto merged (project overrides
+// per key), mirroring mergeProjectPrompts.
+func mergeProjectHooks(merged *Config, project Config) {
+	if len(project.Hooks) == 0 {
+		return
+	}
+	if merged.Hooks == nil {
+		merged.Hooks = make(map[string]string, len(project.Hooks))
+	}
+	for k, v := range project.Hooks {
+		merged.Hooks[k] = v
+	}
 }
 
 // LoadConfig loads and merges configuration from all sources.
@@ -321,6 +369,51 @@ func LoadConfig(projectDir string) Config {
 	}
 
 	return merged
+}
+
+// LoadPromptMaps reads prompts from global and project config without merging.
+func LoadPromptMaps(projectDir string) (global, project map[string]string) {
+	globalCfg, _, err := LoadConfigFile(GlobalConfigPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: reading global config: %v\n", err)
+	}
+	global = globalCfg.Prompts
+
+	projectConfigPath := filepath.Join(projectDir, ".crit.config.json")
+	globalAbs, _ := filepath.Abs(GlobalConfigPath())
+	projectAbs, _ := filepath.Abs(projectConfigPath)
+	if globalAbs != projectAbs {
+		projectCfg, _, err := LoadConfigFile(projectConfigPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: reading project config: %v\n", err)
+		} else {
+			project = projectCfg.Prompts
+		}
+	}
+	return global, project
+}
+
+// LoadHookMaps reads hooks from global and project config without merging,
+// mirroring LoadPromptMaps for command hooks.
+func LoadHookMaps(projectDir string) (global, project map[string]string) {
+	globalCfg, _, err := LoadConfigFile(GlobalConfigPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: reading global config: %v\n", err)
+	}
+	global = globalCfg.Hooks
+
+	projectConfigPath := filepath.Join(projectDir, ".crit.config.json")
+	globalAbs, _ := filepath.Abs(GlobalConfigPath())
+	projectAbs, _ := filepath.Abs(projectConfigPath)
+	if globalAbs != projectAbs {
+		projectCfg, _, err := LoadConfigFile(projectConfigPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: reading project config: %v\n", err)
+		} else {
+			project = projectCfg.Hooks
+		}
+	}
+	return global, project
 }
 
 // GlobalConfigPath returns the path to the global config file.

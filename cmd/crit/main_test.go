@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,35 @@ import (
 	"github.com/JoshEllinger/crit/internal/share"
 	"github.com/JoshEllinger/crit/internal/testutil"
 )
+
+func TestPrintHelpMentionsSession(t *testing.T) {
+	var stderr strings.Builder
+	old := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&stderr, r)
+		close(done)
+	}()
+	printHelp()
+	w.Close()
+	<-done
+	os.Stderr = old
+	out := stderr.String()
+	if !strings.Contains(out, "--session") {
+		t.Fatalf("help missing --session:\n%s", out)
+	}
+	if !strings.Contains(out, "--public-url") {
+		t.Fatalf("help missing --public-url:\n%s", out)
+	}
+	if !strings.Contains(out, "CRIT_PUBLIC_URL") {
+		t.Fatalf("help missing CRIT_PUBLIC_URL:\n%s", out)
+	}
+	if !strings.Contains(out, "crit story") {
+		t.Fatalf("help missing crit story:\n%s", out)
+	}
+}
 
 // TestSubcommandDispatch_Help verifies that help flags are recognized.
 func TestSubcommandDispatch_Help(t *testing.T) {
@@ -40,9 +70,22 @@ func TestHelperProcess_Help(t *testing.T) {
 	}
 	arg := os.Getenv("GO_TEST_HELP_ARG")
 	os.Args = []string{"crit", arg}
-	// printHelp writes to stderr and main() just returns (no os.Exit in the new code)
-	// We just verify it doesn't panic
+	var stderr strings.Builder
+	old := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&stderr, r)
+		close(done)
+	}()
 	printHelp()
+	w.Close()
+	<-done
+	os.Stderr = old
+	if !strings.Contains(stderr.String(), "--session") {
+		t.Fatalf("help missing --session:\n%s", stderr.String())
+	}
 }
 
 // TestSubcommandDispatch_Version verifies the version flag.

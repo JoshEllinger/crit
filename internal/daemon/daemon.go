@@ -19,11 +19,12 @@ import (
 )
 
 type CommonDaemonFlags struct {
-	Port     int
-	Host     string
-	NoOpen   bool
-	Quiet    bool
-	ShareURL string
+	Port      int
+	Host      string
+	PublicURL string
+	NoOpen    bool
+	Quiet     bool
+	ShareURL  string
 }
 
 func AppendCommonDaemonFlags(args []string, f CommonDaemonFlags) []string {
@@ -32,6 +33,9 @@ func AppendCommonDaemonFlags(args []string, f CommonDaemonFlags) []string {
 	}
 	if f.Host != "" && f.Host != "127.0.0.1" {
 		args = append(args, "--host", f.Host)
+	}
+	if f.PublicURL != "" {
+		args = append(args, "--public-url", f.PublicURL)
 	}
 	if f.NoOpen {
 		args = append(args, "--no-open")
@@ -58,6 +62,7 @@ type SessionEntry struct {
 	PID        int      `json:"pid"`
 	Port       int      `json:"port"`
 	Host       string   `json:"host,omitempty"`
+	PublicURL  string   `json:"public_url,omitempty"`
 	CWD        string   `json:"cwd"`
 	Args       []string `json:"args,omitempty"`
 	Branch     string   `json:"branch"`
@@ -72,9 +77,33 @@ func (e SessionEntry) DisplayHost() string {
 	return HostForDisplay(e.Host)
 }
 
-// baseURL returns the user-facing HTTP base URL (browser, stderr).
+// BaseURL returns the user-facing HTTP base URL (browser, stderr).
 func (e SessionEntry) BaseURL() string {
-	return fmt.Sprintf("http://%s:%d", e.DisplayHost(), e.Port)
+	return AdvertisedURL(e.PublicURL, e.Host, e.Port, "")
+}
+
+// AdvertisedURL builds the URL shown to users and opened in the browser.
+// When publicURL is set it is used as-is (optional path prefix included);
+// otherwise the listen host and port are used.
+func AdvertisedURL(publicURL, listenHost string, port int, path string) string {
+	if publicURL != "" {
+		base := strings.TrimSuffix(publicURL, "/")
+		if path == "" {
+			return base
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		return base + path
+	}
+	dh := HostForDisplay(listenHost)
+	if path == "" {
+		return fmt.Sprintf("http://%s:%d", dh, port)
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return fmt.Sprintf("http://%s:%d%s", dh, port, path)
 }
 
 // connURL returns the HTTP base URL for internal connectivity (health checks, API calls).
@@ -141,6 +170,20 @@ func LiveSessionKey(cwd, origin string) string {
 	h.Write([]byte("\x00live\x00"))
 	h.Write([]byte(origin))
 	return fmt.Sprintf("%x", h.Sum(nil))[:12]
+}
+
+// ValidSessionKey reports whether key looks like a crit session ID (12 lowercase hex chars).
+func ValidSessionKey(key string) bool {
+	if len(key) != 12 {
+		return false
+	}
+	for _, c := range key {
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // sessionsDir returns the path to ~/.crit/sessions/.
@@ -255,6 +298,43 @@ func ListSessionsForCWD(cwd string) ([]SessionEntry, error) {
 func listSessionsForCWD(cwd string) ([]SessionEntry, []string) {
 	sessions, keys, _ := scanSessionsForCWD(cwd)
 	return sessions, keys
+}
+
+// ListAllSessions returns all alive registered sessions and their registry
+// keys, regardless of working directory. It cleans up stale session files as a
+// side effect.
+func ListAllSessions() ([]SessionEntry, []string) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return nil, nil
+	}
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil
+	}
+	var alive []SessionEntry
+	var keys []string
+	for _, de := range dirEntries {
+		if !strings.HasSuffix(de.Name(), ".json") {
+			continue
+		}
+		key := strings.TrimSuffix(de.Name(), ".json")
+		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		if err != nil {
+			continue
+		}
+		var entry SessionEntry
+		if err := json.Unmarshal(data, &entry); err != nil {
+			continue
+		}
+		if isDaemonAlive(entry) {
+			alive = append(alive, entry)
+			keys = append(keys, key)
+		} else {
+			RemoveSessionFile(key)
+		}
+	}
+	return alive, keys
 }
 
 // scanSessionsForCWD walks the session registry and returns the alive sessions
@@ -412,9 +492,16 @@ func DaemonHasBrowser(s SessionEntry) bool {
 	}
 	defer resp.Body.Close()
 	var result struct {
-		BrowserClients *bool `json:"browser_clients"`
+		Status         string `json:"status"`
+		BrowserClients *bool  `json:"browser_clients"`
+	}
+	if resp.StatusCode != http.StatusOK {
+		return true
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return true
+	}
+	if result.Status != "ok" {
 		return true
 	}
 	if result.BrowserClients == nil {

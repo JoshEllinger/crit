@@ -23,6 +23,7 @@ var PrintVersionFn func()
 type DaemonCLIConfig struct {
 	Port               int
 	Host               string
+	PublicURL          string
 	NoOpen             bool
 	OpenCmd            string
 	Quiet              bool
@@ -47,30 +48,35 @@ type DaemonCLIConfig struct {
 	LiveOrigin         string
 	LiveCookie         string
 	PreviewFile        string
+	SessionID          string // user-facing reconnect ID from --session
+	SessionKeyOverride string // internal: force session registry key in _serve
 }
 
 type daemonFlagSet struct {
-	port        int
-	host        string
-	noOpen      bool
-	showVersion bool
-	shareURL    string
-	proxyAuth   bool
-	outputDir   string
-	quiet       bool
-	noIgnore    bool
-	baseBranch  string
-	vcsOverride string
-	planDir     string
-	planName    string
-	fileArgs    []string
-	prSpec      string
-	rangeSpec   string
-	scopeSpec   string
-	remoteFiles bool
-	liveOrigin  string
-	liveCookie  string
-	previewFile string
+	port               int
+	host               string
+	publicURL          string
+	noOpen             bool
+	showVersion        bool
+	shareURL           string
+	proxyAuth          bool
+	outputDir          string
+	quiet              bool
+	noIgnore           bool
+	baseBranch         string
+	vcsOverride        string
+	planDir            string
+	planName           string
+	fileArgs           []string
+	prSpec             string
+	rangeSpec          string
+	scopeSpec          string
+	remoteFiles        bool
+	liveOrigin         string
+	liveCookie         string
+	previewFile        string
+	sessionID          string
+	sessionKeyOverride string
 }
 
 func parseDaemonFlags(args []string) daemonFlagSet {
@@ -78,6 +84,7 @@ func parseDaemonFlags(args []string) daemonFlagSet {
 	port := fs.Int("port", 0, "Port to listen on (default: random available port)")
 	fs.IntVar(port, "p", 0, "Port to listen on (shorthand)")
 	host := fs.String("host", "", "Host to listen on (default: 127.0.0.1; e.g. 0.0.0.0 to expose on LAN — no auth, opt in deliberately)")
+	publicURL := fs.String("public-url", "", "Advertised base URL for browser/stderr (overrides CRIT_PUBLIC_URL; e.g. https://machine.ts.net for tailscale serve)")
 	noOpen := fs.Bool("no-open", false, "Don't auto-open browser")
 	showVersion := fs.Bool("version", false, "Print version and exit")
 	fs.BoolVar(showVersion, "v", false, "Print version and exit (shorthand)")
@@ -98,6 +105,8 @@ func parseDaemonFlags(args []string) daemonFlagSet {
 	liveOrigin := fs.String("live-origin", "", "")
 	liveCookie := fs.String("live-cookie", "", "")
 	previewFile := fs.String("preview-file", "", "")
+	sessionID := fs.String("session", "", "Reconnect to an existing review session by ID")
+	sessionKeyOverride := fs.String("session-key", "", "")
 	fs.Usage = func() {
 		if PrintHelpFn != nil {
 			PrintHelpFn()
@@ -106,32 +115,36 @@ func parseDaemonFlags(args []string) daemonFlagSet {
 	fs.Parse(args)
 
 	return daemonFlagSet{
-		port:        *port,
-		host:        *host,
-		noOpen:      *noOpen,
-		showVersion: *showVersion,
-		shareURL:    *shareURL,
-		outputDir:   *outputDir,
-		quiet:       *quiet,
-		noIgnore:    *noIgnore,
-		baseBranch:  *baseBranch,
-		vcsOverride: *vcsFlag,
-		planDir:     *planDir,
-		planName:    *planName,
-		fileArgs:    fs.Args(),
-		prSpec:      *prSpec,
-		rangeSpec:   *rangeSpec,
-		scopeSpec:   *scopeSpec,
-		remoteFiles: *remoteFiles,
-		liveOrigin:  *liveOrigin,
-		liveCookie:  *liveCookie,
-		previewFile: *previewFile,
+		port:               *port,
+		host:               *host,
+		publicURL:          *publicURL,
+		noOpen:             *noOpen,
+		showVersion:        *showVersion,
+		shareURL:           *shareURL,
+		outputDir:          *outputDir,
+		quiet:              *quiet,
+		noIgnore:           *noIgnore,
+		baseBranch:         *baseBranch,
+		vcsOverride:        *vcsFlag,
+		planDir:            *planDir,
+		planName:           *planName,
+		fileArgs:           fs.Args(),
+		prSpec:             *prSpec,
+		rangeSpec:          *rangeSpec,
+		scopeSpec:          *scopeSpec,
+		remoteFiles:        *remoteFiles,
+		liveOrigin:         *liveOrigin,
+		liveCookie:         *liveCookie,
+		previewFile:        *previewFile,
+		sessionID:          *sessionID,
+		sessionKeyOverride: *sessionKeyOverride,
 	}
 }
 
 func applyDaemonConfigDefaults(sf *daemonFlagSet, cfg config.Config) {
 	sf.port = config.ResolvePort(sf.port, cfg.Port)
 	sf.host = config.ResolveHost(sf.host, cfg.Host)
+	sf.publicURL = config.ResolvePublicURL(sf.publicURL, cfg)
 	if !sf.noOpen && cfg.NoOpen {
 		sf.noOpen = true
 	}
@@ -194,6 +207,14 @@ func ResolveDaemonCLIConfig(args []string) (*DaemonCLIConfig, error) {
 
 	applyDaemonConfigDefaults(&sf, cfg)
 
+	if sf.publicURL != "" {
+		normalized, err := config.NormalizePublicURL(sf.publicURL)
+		if err != nil {
+			return nil, err
+		}
+		sf.publicURL = normalized
+	}
+
 	var ignorePatterns []string
 	if !sf.noIgnore {
 		ignorePatterns = cfg.IgnorePatterns
@@ -213,6 +234,7 @@ func ResolveDaemonCLIConfig(args []string) (*DaemonCLIConfig, error) {
 	return &DaemonCLIConfig{
 		Port:               sf.port,
 		Host:               sf.host,
+		PublicURL:          sf.publicURL,
 		NoOpen:             sf.noOpen,
 		OpenCmd:            cfg.OpenCmd,
 		Quiet:              sf.quiet,
@@ -236,6 +258,8 @@ func ResolveDaemonCLIConfig(args []string) (*DaemonCLIConfig, error) {
 		LiveOrigin:         sf.liveOrigin,
 		LiveCookie:         sf.liveCookie,
 		PreviewFile:        sf.previewFile,
+		SessionID:          sf.sessionID,
+		SessionKeyOverride: sf.sessionKeyOverride,
 	}, nil
 }
 

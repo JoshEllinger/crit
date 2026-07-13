@@ -25,12 +25,18 @@
     </button>
     <div class="compare-rail" id="compareRail" role="group" aria-label="Diff target">
       <span class="base-branch-picker" id="baseBranchPicker" style="display:none">
-        <button class="header-chip base-branch-btn" id="baseBranchBtn" title="Change base branch" aria-haspopup="listbox" aria-expanded="false">
+        <button class="header-chip base-branch-btn" id="baseBranchBtn" title="Compare against" aria-haspopup="listbox" aria-expanded="false">
+          <span class="compare-target-prefix">against</span>
           <span class="base-branch-label" id="baseBranchLabel"></span>
           <svg class="base-branch-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.75 5 6.25 7.5 3.75"/></svg>
         </button>
         <div class="base-branch-menu" id="baseBranchMenu">
-          <input class="base-branch-search" id="baseBranchSearch" type="text" placeholder="Filter branches…" autocomplete="off" aria-label="Filter branches" />
+          <input class="base-branch-search" id="baseBranchSearch" type="text" placeholder="Search refs or rev…" autocomplete="off" aria-label="Search compare targets or enter a revision" />
+          <div class="compare-target-use-custom" id="compareTargetUseCustom" style="display:none"></div>
+          <div class="compare-target-tabs" id="compareTargetTabs">
+            <button type="button" class="compare-target-tab active" data-tab="refs">Refs</button>
+            <button type="button" class="compare-target-tab" data-tab="commits">Commits</button>
+          </div>
           <div class="base-branch-list" id="baseBranchList"></div>
         </div>
       </span>
@@ -90,6 +96,10 @@
       <button class="toggle-btn" data-scope="staged" title="Staged changes">Staged</button>
       <button class="toggle-btn" data-scope="unstaged" title="Unstaged changes">Unstaged</button>
     </div>
+    <div class="scope-toggle crit-story-view-toggle" id="storyViewToggle" style="display:none">
+      <button class="toggle-btn active" data-story-view="story" title="Show story view">Story</button>
+      <button class="toggle-btn" data-story-view="diff" title="Show diff view">Diff</button>
+    </div>
     <button class="btn btn-sm" id="diffToggle" style="display:none">Toggle Diff</button>
     <div class="diff-mode-toggle" id="diffModeToggle" style="display:none">
       <button class="toggle-btn active" data-mode="split" title="Split diff">Split</button>
@@ -99,6 +109,9 @@
       <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M7.429 1.525a3.5 3.5 0 0 1 1.142 0c.036.003.108.036.137.146l.289 1.105c.147.56.55.967.997 1.189.174.086.341.183.501.29.417.278.97.423 1.53.27l1.102-.303c.11-.03.175.016.195.046.219.31.41.641.573.989.014.031.022.11-.059.19l-.815.806c-.411.406-.562.957-.53 1.456a4.6 4.6 0 0 1 0 .582c-.032.499.119 1.05.53 1.456l.815.806c.08.08.073.159.059.19a6 6 0 0 1-.573.99c-.02.029-.086.074-.195.045l-1.103-.303c-.559-.153-1.112-.008-1.529.27-.16.107-.327.204-.5.29-.449.222-.851.628-.998 1.189l-.289 1.105c-.029.11-.101.143-.137.146a3.5 3.5 0 0 1-1.142 0c-.036-.003-.108-.037-.137-.146l-.289-1.105c-.147-.56-.55-.967-.997-1.189a4 4 0 0 1-.501-.29c-.417-.278-.97-.423-1.53-.27l-1.102.303c-.11.03-.175-.016-.195-.046a6 6 0 0 1-.573-.989c-.014-.031-.022-.11.059-.19l.815-.806c.411-.406.562-.957.53-1.456a4.6 4.6 0 0 1 0-.582c.032-.499-.119-1.05-.53-1.456l-.815-.806c-.08-.08-.073-.159-.059-.19a6 6 0 0 1 .573-.99c.02-.029.086-.074.195-.045l1.103.303c.559.153 1.112.008 1.529-.27.16-.107.327-.204.5-.29.449-.222.851-.628.998-1.189l.289-1.105c.029-.11.101-.143.137-.146M8 0a4.5 4.5 0 0 0-1.46.243 1.5 1.5 0 0 0-1.088 1.158l-.289 1.105a1 1 0 0 1-.249.432 3 3 0 0 0-.37.215 1 1 0 0 1-.473.083l-1.103-.303a1.5 1.5 0 0 0-1.53.463 7 7 0 0 0-.688 1.186 1.5 1.5 0 0 0 .442 1.621l.815.806a1 1 0 0 1 .168.474 3.6 3.6 0 0 0 0 .428 1 1 0 0 1-.168.474l-.815.806a1.5 1.5 0 0 0-.442 1.621c.17.434.378.846.618 1.236a1.5 1.5 0 0 0 1.6.413l1.103-.303a1 1 0 0 1 .473.083c.121.065.24.137.37.215a1 1 0 0 1 .249.432l.289 1.105a1.5 1.5 0 0 0 1.088 1.158A4.5 4.5 0 0 0 8 16a4.5 4.5 0 0 0 1.46-.243 1.5 1.5 0 0 0 1.088-1.158l.289-1.105a1 1 0 0 1 .249-.432 3 3 0 0 0 .37-.215 1 1 0 0 1 .473-.083l1.103.303a1.5 1.5 0 0 0 1.53-.463c.24-.39.447-.802.617-1.236a1.5 1.5 0 0 0-.442-1.621l-.815-.806a1 1 0 0 1-.168-.474 3.6 3.6 0 0 0 0-.428 1 1 0 0 1 .168-.474l.815-.806a1.5 1.5 0 0 0 .442-1.621 7 7 0 0 0-.688-1.186 1.5 1.5 0 0 0-1.53-.463l-1.103.303a1 1 0 0 1-.473-.083 3 3 0 0 0-.37-.215 1 1 0 0 1-.249-.432l-.289-1.105A1.5 1.5 0 0 0 9.46.243 4.5 4.5 0 0 0 8 0M5.5 8a2.5 2.5 0 1 1 5 0 2.5 2.5 0 0 1-5 0M8 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3" clip-rule="evenodd"/></svg>
     </button>
     <button class="theme-toggle" id="tocToggle" title="Table of contents" aria-label="Table of contents">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" stroke-linecap="round"/></svg>
+    </button>
+    <button class="theme-toggle crit-story-rail-toggle" id="storyRailToggle" title="Toggle chapters" aria-label="Toggle chapters">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" stroke-linecap="round"/></svg>
     </button>
     <button class="btn" id="shareBtn" style="display:none">Share</button>
@@ -132,11 +145,14 @@
     </div>
     <div class="commit-picker" id="commitDropdown" style="display:none">
       <button class="commit-picker-btn" id="commitDropdownBtn">
+        <span class="commit-picker-prefix">commits</span>
         <span class="commit-picker-label" id="commitDropdownLabel">All commits</span>
         <svg class="commit-picker-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.75 5 6.25 7.5 3.75"/></svg>
       </button>
       <div class="commit-picker-menu" id="commitDropdownMenu">
+        <div class="commit-picker-hint">Click: from · Alt+click: through</div>
         <div class="commit-picker-item active" data-commit="" role="button" tabindex="0"><span class="commit-picker-item-check-spacer" aria-hidden="true"></span>All commits</div>
+        <button type="button" class="commit-picker-clear-through" id="commitClearThrough" style="display:none">Clear through</button>
         <div class="commit-picker-separator"></div>
         <div class="commit-picker-list" id="commitDropdownList"></div>
       </div>
@@ -148,6 +164,16 @@
     <div id="reviewConversation" class="review-conversation" hidden></div>
     <div id="filesContainer">
       <div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>
+    </div>
+    <!-- Story mode root: rail + paginated pane. Hidden (display:none) unless
+         session.story is present; populated by app.js renderStory* functions. -->
+    <div id="storyRoot" class="crit-story-root">
+      <nav class="crit-story-rail" id="storyRail" aria-label="Story chapters"></nav>
+      <div class="sidebar-resize-handle crit-story-rail-resizer" id="storyRailResizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize story chapter list" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div>
+      <div class="crit-story-rail-scrim" id="storyRailScrim"></div>
+      <main class="crit-story-pane" id="storyPane">
+        <div class="crit-story-pane__inner" id="storyPaneInner"></div>
+      </main>
     </div>
   </div>
   <div class="sidebar-resize-handle" id="commentsPanelResizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize comments panel" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div>

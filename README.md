@@ -41,7 +41,7 @@ INSTALL_DIR=~/.local/bin curl -fsSL https://github.com/JoshEllinger/crit/release
 
 Go:
 ```bash
-go install github.com/tomasz-tomczyk/crit@latest
+go install github.com/tomasz-tomczyk/crit/cmd/crit@latest
 ```
 
 Nix:
@@ -70,7 +70,7 @@ Crit also works with Cursor, GitHub Copilot, OpenCode, Codex, Gemini, Qwen, Herm
 
 ### 3. Tell your agent to use `crit`
 
-Most integrations include a `/crit` slash command that automates the full review loop. 
+Most integrations include a `/crit` slash command that automates the full review loop.
 Agent launches Crit, waits for your review and acts on the feedback.
 Repeat the process until you approve the changes.
 
@@ -89,6 +89,13 @@ crit http://localhost:3000        # review a running dev server
 crit landing.html                 # review a static HTML file
 ```
 
+If talking to an agent, you can invoke the `/crit` command and optionally provide arguments like the above examples or the agent will try to launch the right thing based on the context of the conversation.
+
+For larger branch, PR, or range reviews, `crit story` can generate an optional
+chaptered overview of the diff before you review it. See the
+**[story mode guide](docs/story-mode.md)** for the workflow and custom prompt
+setup.
+
 ### Live mode
 
 `crit live <url>` (or `crit <url>`) proxies a running dev server through Crit's review UI. Crit's iframe loads the app on a different origin/port than your browser tab, so **host-scoped session cookies are not shared automatically**. If the direct URL works but Crit shows a login page or hydration mismatch, forward the upstream cookies:
@@ -99,15 +106,19 @@ crit live http://localhost:4000/dashboard --cookie "_crit_key=..."
 
 # repeatable (Netscape jar or raw Cookie header lines)
 crit live http://localhost:4000/dashboard --cookie-file .crit/live-cookies.txt
+
+# reuse cookies from a Chrome session with remote debugging enabled
+crit live http://localhost:4000/dashboard --cdp-url http://127.0.0.1:9222
 ```
 
-**Getting cookies:** log in to the app in your browser, then copy the session cookie from DevTools (Application → Cookies) or export a cookie jar.
+**Getting cookies:** log in to the app in your browser, then copy the session cookie from DevTools (Application → Cookies), export a cookie jar, or start Chrome with `--remote-debugging-port=9222` and pass `--cdp-url` so Crit reads cookies for the target origin automatically.
 
 **Config** (global or project `.crit.config.json`; project overrides global):
 
 ```json
 {
-  "live_cookie_file": ".crit/live-cookies.txt"
+  "live_cookie_file": ".crit/live-cookies.txt",
+  "live_cdp_url": "http://127.0.0.1:9222"
 }
 ```
 
@@ -311,6 +322,31 @@ All keys are optional — omit any you don't need.
 | `vcs`                  | string   | auto-detected              | Preferred VCS backend: `"git"`, `"sl"`, or `"jj"`. When set, crit uses this VCS instead of auto-detecting. Falls back to git if the configured VCS isn't available. Can also be set via `--vcs` CLI flag (flag takes precedence over config). |
 | `live_cookie`          | string   | `""`                       | Cookie header value forwarded to the upstream app in live mode (e.g. `"_crit_key=..."`). Global or project. Prefer `live_cookie_file` for secrets. |
 | `live_cookie_file`     | string   | `""`                       | Path to a file with upstream cookies for live mode (raw header lines or Netscape jar). Global or project; relative paths resolve from repo root. |
+| `live_cdp_url`         | string   | `""`                       | Chrome DevTools URL (e.g. `http://127.0.0.1:9222`) to reuse browser cookies for the live upstream. Global or project. |
+| `prompts`              | object   | `{}`                       | Custom finish-hook templates (project overrides global per key). See [Agent prompts](docs/agent-prompts.md). |
+| `hooks`                | object   | `{}`                       | Custom finish-hook **commands** executed at Finish/Approve (project overrides global per key). Deterministic side effects — `crit` pipes a JSON payload to stdin and sets `CRIT_*` env vars. See [Command hooks](docs/agent-hooks.md). |
+
+### Agent prompts
+
+Customize what Crit tells your agent when you **Finish Review** or **Approve**. Hooks are templates in global or project config (`prompts` map) and `.crit/prompts/*.md` files.
+
+See the **[agent prompts guide](docs/agent-prompts.md)** for hook reference, template variables, trust flow, and examples.
+
+### Command hooks
+
+Run your own scripts when you **Finish Review** or **Approve** — deterministic side effects, no LLM in the loop. Crit pipes a JSON payload to the hook's stdin and sets `CRIT_*` env vars (review path, session key, mode, unresolved count, files-with-comments, …). Keys and resolution mirror the prompt system (`on_finish_unresolved` / `on_finish_approved`, optionally `:files` / `:diff` / `:live` / `:preview`), and project hooks go through the same trust gate as project prompts.
+
+```bash
+# ~/.crit.config.json
+{
+  "hooks": {
+    "on_finish_unresolved": "inline:rsync -a \"$CRIT_REVIEW_PATH\" ~/reviews/$CRIT_SESSION_KEY.json",
+    "on_finish_approved":   "file:~/.crit/hooks/approved.sh"
+  }
+}
+```
+
+See the **[command hooks guide](docs/agent-hooks.md)** for the full env-var/stdin reference, trust flow, and examples (including the “snapshot commented-on files” recipe). Reference example hook scripts live under [`docs/example-hooks/`](https://github.com/tomasz-tomczyk/crit/tree/main/docs/example-hooks) in the repo — they're documentation, not installed by `crit install` and not tracked among the integrations (hooks are opt-in and not used by default).
 
 ### Global-only config keys
 
@@ -322,6 +358,7 @@ These keys can only be set in `~/.crit.config.json` (global). Project-level `.cr
 | `open_cmd`             | string   | `""`                       | Custom command to open review URLs — receives the URL as its only argument (must be a single executable, no flags). Use when the browser isn't on the machine running crit, e.g. crit runs on a remote host over SSH and a small wrapper script opens the URL on your local machine. When unset, crit uses the platform default opener. |
 | `auth_token`           | string   | `""`                       | Authentication token for crit.md. Set automatically by `crit auth login`. |
 | `share_url`            | string   | `"https://crit.md"`        | Base URL of the share service. Set to `""` to disable sharing entirely. Self-host with [`crit-web`](https://github.com/tomasz-tomczyk/crit-web). |
+| `public_url`           | string   | `""`                       | Advertised base URL for stderr and browser-open (e.g. `https://machine.ts.net` via tailscale serve). Listen address unchanged. |
 | `share_consented`      | bool     | `false`                    | Written automatically to `true` after you confirm the first-time share prompt. Reset to `false` to see the prompt again. Not used when `share_url` is a custom (self-hosted) URL. |
 | `proxy_auth`           | bool     | `false`                    | When `true`, share / pull / unpublish / re-share use the browser popup relay instead of the local Go server contacting crit-web directly. Use when crit-web is behind an SSO reverse proxy that the terminal cannot authenticate against. No flag or env var — this is a property of the deployment, not a per-invocation choice. |
 
@@ -331,6 +368,7 @@ These keys can only be set in `~/.crit.config.json` (global). Project-level `.cr
 | --------------- | ----- | --------------------- | -------------------------------------- |
 | `--port`        | `-p`  | `port`                | Port to listen on                      |
 | `--host`        |       | `host`                | Listen host (default `127.0.0.1`)      |
+| `--public-url`  |       | `public_url`          | Advertised review URL (listen unchanged) |
 | `--no-open`     |       | `no_open`             | Don't auto-open browser                |
 | `--share-url`   |       | `share_url`           | Share service URL                      |
 | `--output`      | `-o`  | `output`              | Output directory for review files      |
@@ -346,6 +384,7 @@ These keys can only be set in `~/.crit.config.json` (global). Project-level `.cr
 | --------------- | --------------------- | ----------- |
 | `--cookie`      | `live_cookie`         | Upstream cookie value (repeatable) |
 | `--cookie-file` | `live_cookie_file`    | File with upstream cookies |
+| `--cdp-url`     | `live_cdp_url`        | Chrome DevTools URL to reuse browser cookies |
 
 ### Ignore patterns
 
@@ -370,6 +409,7 @@ crit --no-ignore
 | --------------------------- | ------------------------------------------------- |
 | `CRIT_PORT`                 | Default port for the local server                 |
 | `CRIT_HOST`                 | Listen host (default `127.0.0.1`)                 |
+| `CRIT_PUBLIC_URL`           | Advertised review URL (e.g. tailscale serve)      |
 | `CRIT_SHARE_URL`            | Override the share service URL                    |
 | `CRIT_AUTH_TOKEN`           | Override the auth token (skips `crit auth login`) |
 | `CRIT_NO_UPDATE_CHECK`      | Disable the update check on startup               |

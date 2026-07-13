@@ -306,6 +306,7 @@ type Session struct {
 	Files          []*FileEntry
 	Mode           string   // "files" (explicit markdown files) or "git" (auto-detected from git)
 	CLIArgs        []string // original file arguments passed on the command line (empty for git mode)
+	SessionKey     string   // stable ID for reconnect via crit --session (set by daemon)
 	Branch         string
 	BaseRef        string
 	BaseBranchName string // display name of the base branch (e.g. "production", "master")
@@ -334,6 +335,10 @@ type Session struct {
 	liveRoundStart func(prevRound, newRound int)
 
 	reviewComments []Comment
+
+	// story is the loaded narrative from review.json (nil unless `crit story`
+	// ingested one). Read/write under s.mu; surfaced via GetSessionInfo.
+	story *Story
 
 	// RoundSnapshots is in-memory state populated from <folder>/snapshots.json
 	// at boot. Persisted via SaveSnapshotsFile; never written into review.json.
@@ -466,6 +471,75 @@ type CritJSON struct {
 	// Origin is the upstream URL for live reviews (e.g. "http://localhost:3000").
 	// Empty for code reviews.
 	Origin string `json:"origin,omitempty"`
+
+	// Story is the optional LLM-authored narrative grouping of diff hunks into
+	// chapters. Nil unless `crit story` has ingested one. Preserved across the
+	// daemon's read-merge-modify write cycle by being a field on CritJSON (see
+	// buildCritJSON): as long as the field exists here, an externally-set story
+	// survives the debounced writes.
+	Story *Story `json:"story,omitempty"`
+}
+
+// Story is the LLM-authored narrative for a review: a prologue, an ordered set
+// of chapters grouping diff hunks by theme, and a second-class Support bucket
+// for mechanical/ignored/back-filled hunks. It is an explainer, not a reviewer.
+type Story struct {
+	Version          int                 `json:"version"`                     // 1
+	GeneratedAt      string              `json:"generated_at,omitempty"`      // RFC3339 timestamp
+	Agent            string              `json:"agent,omitempty"`             // e.g. "claude-sonnet-4-6"
+	BaseSHA          string              `json:"base_sha,omitempty"`          // diff scope snapshot, set at prep time
+	HeadSHA          string              `json:"head_sha,omitempty"`          // empty for working-tree scopes
+	ScopeFingerprint string              `json:"scope_fingerprint,omitempty"` // sha256 over sorted prep hunk ids+headers; detects working-tree drift
+	Prologue         *StoryPrologue      `json:"prologue,omitempty"`
+	Chapters         []StoryChapter      `json:"chapters"`           // array order IS display order
+	Support          []StorySupportEntry `json:"support,omitempty"`  // second-class bucket for mechanical hunks
+	Coverage         *StoryCoverage      `json:"coverage,omitempty"` // post-validation report
+}
+
+// StoryPrologue is the story's opening overview. Guard rails: it is an
+// explainer, so there is deliberately no verdict field.
+type StoryPrologue struct {
+	Title      string   `json:"title,omitempty"`       // <= 48 chars
+	Overview   string   `json:"overview,omitempty"`    // 1-3 sentences
+	KeyChanges []string `json:"key_changes,omitempty"` // concise bullets
+	Risks      []string `json:"risks,omitempty"`       // concise bullets
+	Diagram    string   `json:"diagram,omitempty"`     // Mermaid or empty
+}
+
+// StoryChapter is one thematic grouping of hunks. Chapters array position is
+// the canonical display order — there is intentionally no Order field.
+type StoryChapter struct {
+	ID       string         `json:"id"`                // "ch1"
+	Title    string         `json:"title"`             // <= 48 chars
+	Summary  string         `json:"summary,omitempty"` // one-liner; must stand alone
+	HunkRefs []StoryHunkRef `json:"hunk_refs"`
+	Diagram  string         `json:"diagram,omitempty"` // Mermaid, mostly empty
+}
+
+// StoryHunkRef points at a diff hunk by (file_path, old_start). old_start is 0
+// for new files (stage-cli convention).
+type StoryHunkRef struct {
+	FilePath string `json:"file_path"`
+	OldStart int    `json:"old_start"` // 0 for new files
+}
+
+// StorySupportEntry is a group of hunks the story treats as second-class:
+// mechanical churn, ignored files, or auto-repaired omissions. Reason explains
+// why (free text, or the sentinels "auto-repaired" / "ignored" / "stub").
+type StorySupportEntry struct {
+	HunkRefs []StoryHunkRef `json:"hunk_refs"`
+	Reason   string         `json:"reason"`
+}
+
+// StoryCoverage is the post-validation report. OK is true only when the story
+// saved with zero repairs; saved-with-repairs is ok:false, auto_repaired:true.
+type StoryCoverage struct {
+	OK           bool     `json:"ok"`
+	Indexed      int      `json:"indexed"` // total hunks in diff
+	Placed       int      `json:"placed"`
+	Missing      []string `json:"missing,omitempty"` // human "(file, oldStart)" ids
+	Duplicated   []string `json:"duplicated,omitempty"`
+	AutoRepaired bool     `json:"auto_repaired,omitempty"` // back-fill into Support triggered
 }
 
 // CritJSONFile is the per-file section in review files.
@@ -1206,9 +1280,16 @@ func (s *Session) GetReviewComments() []Comment {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]Comment, 0, len(s.reviewComments))
+	seen := make(map[string]struct{}, len(s.reviewComments))
 	for _, c := range s.reviewComments {
 		if !visibleInFocus(c, s.Focus) {
 			continue
+		}
+		if c.ID != "" {
+			if _, ok := seen[c.ID]; ok {
+				continue
+			}
+			seen[c.ID] = struct{}{}
 		}
 		out = append(out, c)
 	}
@@ -1349,29 +1430,23 @@ func (s *Session) UpdateComment(filePath, id, body string) (Comment, bool) {
 func (s *Session) UpdateCommentWithAnchor(filePath, id, body string, newAnchor *DOMAnchor) (Comment, bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fe := s.fileByPathLocked(filePath)
+	fe, i := s.locateFileCommentLocked(filePath, id)
 	if fe == nil {
 		return Comment{}, false, "not_found"
 	}
-	for i := range fe.Comments {
-		c := &fe.Comments[i]
-		if c.ID != id {
-			continue
-		}
-		if newAnchor != nil && c.DOMAnchor == nil {
-			return Comment{}, false, "anchor_on_code_comment"
-		}
-		if body != "" {
-			c.Body = body
-		}
-		if newAnchor != nil {
-			c.DOMAnchor = newAnchor
-		}
-		c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-		s.scheduleWrite()
-		return *c, true, ""
+	c := &fe.Comments[i]
+	if newAnchor != nil && c.DOMAnchor == nil {
+		return Comment{}, false, "anchor_on_code_comment"
 	}
-	return Comment{}, false, "not_found"
+	if body != "" {
+		c.Body = body
+	}
+	if newAnchor != nil {
+		c.DOMAnchor = newAnchor
+	}
+	c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	s.scheduleWrite()
+	return *c, true, ""
 }
 
 // PatchCommentDrift partially updates the live-pin drift fields on a
@@ -1381,26 +1456,20 @@ func (s *Session) UpdateCommentWithAnchor(filePath, id, body string, newAnchor *
 func (s *Session) PatchCommentDrift(filePath, id string, drifted *bool, driftedOnRound *int) (Comment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fe := s.fileByPathLocked(filePath)
+	fe, i := s.locateFileCommentLocked(filePath, id)
 	if fe == nil {
 		return Comment{}, false
 	}
-	for i := range fe.Comments {
-		c := &fe.Comments[i]
-		if c.ID != id {
-			continue
-		}
-		if drifted != nil {
-			c.Drifted = *drifted
-		}
-		if driftedOnRound != nil {
-			c.DriftedOnRound = *driftedOnRound
-		}
-		c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-		s.scheduleWrite()
-		return *c, true
+	c := &fe.Comments[i]
+	if drifted != nil {
+		c.Drifted = *drifted
 	}
-	return Comment{}, false
+	if driftedOnRound != nil {
+		c.DriftedOnRound = *driftedOnRound
+	}
+	c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	s.scheduleWrite()
+	return *c, true
 }
 
 // SetCommentResolved sets or clears the resolved flag on a comment.
@@ -1409,42 +1478,32 @@ func (s *Session) PatchCommentDrift(filePath, id string, drifted *bool, driftedO
 func (s *Session) SetCommentResolved(filePath, id string, resolved bool) (Comment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
+	f, i := s.locateFileCommentLocked(filePath, id)
 	if f == nil {
 		return Comment{}, false
 	}
-	for i, c := range f.Comments {
-		if c.ID == id {
-			f.Comments[i].Resolved = resolved
-			if resolved {
-				f.Comments[i].ResolvedRound = s.ReviewRound
-			} else {
-				f.Comments[i].ResolvedRound = 0
-			}
-			f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-			s.scheduleWrite()
-			return f.Comments[i], true
-		}
+	f.Comments[i].Resolved = resolved
+	if resolved {
+		f.Comments[i].ResolvedRound = s.ReviewRound
+	} else {
+		f.Comments[i].ResolvedRound = 0
 	}
-	return Comment{}, false
+	f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	s.scheduleWrite()
+	return f.Comments[i], true
 }
 
 // SetCommentLive marks a comment as live (sent to an agent).
 func (s *Session) SetCommentLive(filePath, id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
+	f, i := s.locateFileCommentLocked(filePath, id)
 	if f == nil {
 		return false
 	}
-	for i, c := range f.Comments {
-		if c.ID == id {
-			f.Comments[i].Live = true
-			s.scheduleWrite()
-			return true
-		}
-	}
-	return false
+	f.Comments[i].Live = true
+	s.scheduleWrite()
+	return true
 }
 
 // DeleteComment deletes a comment from a specific file. The record is always
@@ -1471,47 +1530,38 @@ const (
 func (s *Session) DeleteFileCommentAs(filePath, id, requesterID string) deleteResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
+	f, i := s.locateFileCommentLocked(filePath, id)
 	if f == nil {
 		return deleteResultNotFound
 	}
-	for i, c := range f.Comments {
-		if c.ID != id {
-			continue
-		}
-		if c.UserID != "" && c.UserID != requesterID {
-			return deleteResultForbidden
-		}
-		if c.GitHubID != 0 {
-			s.appendPendingGHDelete(c.GitHubID)
-		}
-		f.Comments = append(f.Comments[:i], f.Comments[i+1:]...)
-		s.trackDeletedComment(filePath, id)
-		s.scheduleWrite()
-		return deleteResultDeleted
+	c := f.Comments[i]
+	if c.UserID != "" && c.UserID != requesterID {
+		return deleteResultForbidden
 	}
-	return deleteResultNotFound
+	if c.GitHubID != 0 {
+		s.appendPendingGHDelete(c.GitHubID)
+	}
+	f.Comments = append(f.Comments[:i], f.Comments[i+1:]...)
+	s.trackDeletedComment(f.Path, id)
+	s.scheduleWrite()
+	return deleteResultDeleted
 }
 
 func (s *Session) DeleteComment(filePath, id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
+	f, i := s.locateFileCommentLocked(filePath, id)
 	if f == nil {
 		return false
 	}
-	for i, c := range f.Comments {
-		if c.ID == id {
-			if c.GitHubID != 0 {
-				s.appendPendingGHDelete(c.GitHubID)
-			}
-			f.Comments = append(f.Comments[:i], f.Comments[i+1:]...)
-			s.trackDeletedComment(filePath, id)
-			s.scheduleWrite()
-			return true
-		}
+	c := f.Comments[i]
+	if c.GitHubID != 0 {
+		s.appendPendingGHDelete(c.GitHubID)
 	}
-	return false
+	f.Comments = append(f.Comments[:i], f.Comments[i+1:]...)
+	s.trackDeletedComment(f.Path, id)
+	s.scheduleWrite()
+	return true
 }
 
 // appendPendingGHDelete adds a GitHub comment ID to the pending-deletes list
@@ -1564,51 +1614,41 @@ func (s *Session) RefreshFileContent() {
 func (s *Session) AddReply(filePath, commentID, body, author, userID string) (Reply, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
+	f, i := s.locateFileCommentLocked(filePath, commentID)
 	if f == nil {
 		return Reply{}, false
 	}
-	for i, c := range f.Comments {
-		if c.ID == commentID {
-			now := time.Now().UTC().Format(time.RFC3339)
-			r := Reply{
-				ID:          RandomReplyID(),
-				Body:        body,
-				Author:      author,
-				UserID:      userID,
-				CreatedAt:   now,
-				ReviewRound: s.ReviewRound,
-			}
-			f.Comments[i].Replies = append(f.Comments[i].Replies, r)
-			f.Comments[i].Resolved = false
-			f.Comments[i].ResolvedRound = 0
-			f.Comments[i].UpdatedAt = now
-			s.scheduleWrite()
-			return r, true
-		}
+	now := time.Now().UTC().Format(time.RFC3339)
+	r := Reply{
+		ID:          RandomReplyID(),
+		Body:        body,
+		Author:      author,
+		UserID:      userID,
+		CreatedAt:   now,
+		ReviewRound: s.ReviewRound,
 	}
-	return Reply{}, false
+	f.Comments[i].Replies = append(f.Comments[i].Replies, r)
+	f.Comments[i].Resolved = false
+	f.Comments[i].ResolvedRound = 0
+	f.Comments[i].UpdatedAt = now
+	s.scheduleWrite()
+	return r, true
 }
 
 // UpdateReply updates a reply's body on a specific comment.
 func (s *Session) UpdateReply(filePath, commentID, replyID, body string) (Reply, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
+	f, i := s.locateFileCommentLocked(filePath, commentID)
 	if f == nil {
 		return Reply{}, false
 	}
-	for i, c := range f.Comments {
-		if c.ID == commentID {
-			for j, r := range c.Replies {
-				if r.ID == replyID {
-					f.Comments[i].Replies[j].Body = body
-					f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-					s.scheduleWrite()
-					return f.Comments[i].Replies[j], true
-				}
-			}
-			return Reply{}, false
+	for j, r := range f.Comments[i].Replies {
+		if r.ID == replyID {
+			f.Comments[i].Replies[j].Body = body
+			f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			s.scheduleWrite()
+			return f.Comments[i].Replies[j], true
 		}
 	}
 	return Reply{}, false
@@ -1621,24 +1661,19 @@ func (s *Session) UpdateReply(filePath, commentID, replyID, body string) (Reply,
 func (s *Session) DeleteReply(filePath, commentID, replyID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fileByPathLocked(filePath)
+	f, i := s.locateFileCommentLocked(filePath, commentID)
 	if f == nil {
 		return false
 	}
-	for i, c := range f.Comments {
-		if c.ID == commentID {
-			for j, r := range c.Replies {
-				if r.ID == replyID {
-					if r.GitHubID != 0 {
-						s.appendPendingGHDelete(r.GitHubID)
-					}
-					f.Comments[i].Replies = append(f.Comments[i].Replies[:j], f.Comments[i].Replies[j+1:]...)
-					f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-					s.scheduleWrite()
-					return true
-				}
+	for j, r := range f.Comments[i].Replies {
+		if r.ID == replyID {
+			if r.GitHubID != 0 {
+				s.appendPendingGHDelete(r.GitHubID)
 			}
-			return false
+			f.Comments[i].Replies = append(f.Comments[i].Replies[:j], f.Comments[i].Replies[j+1:]...)
+			f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			s.scheduleWrite()
+			return true
 		}
 	}
 	return false
@@ -1760,6 +1795,30 @@ func (s *Session) UnresolvedCommentCount() int {
 		}
 	}
 	return total
+}
+
+// locateFileCommentLocked finds a file comment by ID. hintPath is the route
+// pathname the client sent (?path=); when it differs from the on-disk file
+// key (e.g. preview pins re-keyed to index.html on crit-web share), the
+// global search still finds the comment.
+func (s *Session) locateFileCommentLocked(hintPath, id string) (*FileEntry, int) {
+	if hintPath != "" {
+		if f := s.fileByPathLocked(hintPath); f != nil {
+			for i, c := range f.Comments {
+				if c.ID == id {
+					return f, i
+				}
+			}
+		}
+	}
+	for _, f := range s.Files {
+		for i, c := range f.Comments {
+			if c.ID == id {
+				return f, i
+			}
+		}
+	}
+	return nil, -1
 }
 
 func (s *Session) fileByPathLocked(path string) *FileEntry {
@@ -2351,6 +2410,9 @@ func (s *Session) loadCritJSONLocked() {
 	// Restore review-level comments.
 	s.reviewComments = cj.ReviewComments
 
+	// Restore the story (nil if none), so GetSessionInfo can surface it.
+	s.story = cj.Story
+
 	// Restore pending DELETE intents so they survive across daemon restarts.
 	s.pendingGitHubDeletes = cj.PendingGitHubDeletes
 	s.lastLoadedPendingGHDeletes = make(map[int64]struct{}, len(cj.PendingGitHubDeletes))
@@ -2496,15 +2558,6 @@ func (s *Session) BrowserDisconnect() {
 // HasBrowserClients returns true if any browser SSE clients are connected.
 func (s *Session) HasBrowserClients() bool {
 	return atomic.LoadInt32(&s.browserClients) > 0
-}
-
-// ReinvokeCommand returns the crit command the agent should run to trigger the next round.
-// For file-mode sessions it includes the original file arguments; for git-mode it's bare "crit".
-func (s *Session) ReinvokeCommand() string {
-	if len(s.CLIArgs) == 0 {
-		return "crit"
-	}
-	return "crit " + strings.Join(s.CLIArgs, " ")
 }
 
 // Shutdown sends a server-shutdown event to all SSE subscribers.
@@ -2658,9 +2711,11 @@ type SessionInfo struct {
 	Files            []SessionFileInfo `json:"files"`
 	ReviewComments   []Comment         `json:"review_comments"`
 	Cwd              string            `json:"cwd,omitempty"`
+	SessionKey       string            `json:"session_key,omitempty"`
 	Focus            Focus             `json:"focus"`
 	LastRangeFocus   *Focus            `json:"last_range_focus,omitempty"`
 	HiddenUnresolved int               `json:"hidden_unresolved"`
+	Story            *Story            `json:"story,omitempty"`
 }
 
 // SessionFileInfo is a summary of a file for the session API response.
@@ -2706,8 +2761,10 @@ func (s *Session) GetSessionInfo() SessionInfo {
 		ReviewRound:    s.ReviewRound,
 		ReviewComments: reviewComments,
 		Cwd:            s.RepoRoot,
+		SessionKey:     s.SessionKey,
 		Focus:          s.Focus,
 		LastRangeFocus: s.LastRangeFocus,
+		Story:          s.story,
 	}
 
 	info.AvailableScopes = cachedAvailableScopes(info.BaseRef, vc)
