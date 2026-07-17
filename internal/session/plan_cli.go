@@ -152,10 +152,8 @@ func RunPlan(args []string) error {
 }
 
 type planHookEvent struct {
-	SessionID string `json:"session_id"`
-	ToolInput struct {
-		Plan string `json:"plan"`
-	} `json:"tool_input"`
+	SessionID string          `json:"session_id"`
+	ToolInput json.RawMessage `json:"tool_input"`
 }
 
 func resolveHookSlug(sessionID string, content []byte) string {
@@ -172,12 +170,15 @@ func resolveHookSlug(sessionID string, content []byte) string {
 	return ResolveSlug(content)
 }
 
-func emitHookDecision(approved bool, prompt string) {
+func emitHookDecision(approved bool, prompt string, toolInput json.RawMessage) {
 	if approved {
 		out, _ := json.Marshal(map[string]any{
 			"hookSpecificOutput": map[string]any{
 				"hookEventName": "PermissionRequest",
-				"decision":      map[string]any{"behavior": "allow"},
+				"decision": map[string]any{
+					"behavior":     "allow",
+					"updatedInput": toolInput,
+				},
 			},
 		})
 		fmt.Println(string(out))
@@ -215,6 +216,10 @@ func emitCodexStopDecision(approved bool, prompt string) {
 
 var runCodexPlanReviewHook = func(sessionID string, content []byte) {
 	runPlanReviewHook("crit plan-hook --mode codex", sessionID, content, emitCodexStopDecision)
+}
+
+var runClaudePlanReviewHook = func(sessionID string, content []byte, emitDecision func(bool, string)) {
+	runPlanReviewHook("crit plan-hook", sessionID, content, emitDecision)
 }
 
 func runPlanReviewHook(logPrefix, sessionID string, content []byte, emitDecision func(bool, string)) {
@@ -279,14 +284,29 @@ func RunPlanHook() error {
 	var event planHookEvent
 	if err := json.NewDecoder(os.Stdin).Decode(&event); err != nil {
 		fmt.Fprintf(os.Stderr, "crit plan-hook: could not parse stdin: %v\n", err)
-		emitHookDecision(false, "Crit could not parse the plan hook input; plan was not reviewed.")
+		emitHookDecision(false, "Crit could not parse the plan hook input; plan was not reviewed.", nil)
 		return nil
 	}
-	if strings.TrimSpace(event.ToolInput.Plan) == "" {
+	if len(event.ToolInput) == 0 {
 		return nil
 	}
 
-	runPlanReviewHook("crit plan-hook", event.SessionID, []byte(event.ToolInput.Plan), emitHookDecision)
+	var toolInput struct {
+		Plan string `json:"plan"`
+	}
+	if err := json.Unmarshal(event.ToolInput, &toolInput); err != nil {
+		fmt.Fprintf(os.Stderr, "crit plan-hook: could not parse tool input: %v\n", err)
+		emitHookDecision(false, "Crit could not parse the plan hook input; plan was not reviewed.", nil)
+		return nil
+	}
+	if strings.TrimSpace(toolInput.Plan) == "" {
+		return nil
+	}
+
+	emitDecision := func(approved bool, prompt string) {
+		emitHookDecision(approved, prompt, event.ToolInput)
+	}
+	runClaudePlanReviewHook(event.SessionID, []byte(toolInput.Plan), emitDecision)
 	return nil
 }
 
