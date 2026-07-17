@@ -150,6 +150,7 @@ func runServe(args []string) {
 		sessionArgs = []string{"preview", sc.PreviewFile}
 	}
 	sessionStartedAt := time.Now().UTC()
+	sessionGeneration := sessionStartedAt.Format(time.RFC3339Nano)
 	srv.ConfigureDaemon(sc.Cfg, cwd, homeDir, sc.ReviewPath, cliArgs, sessionStartedAt)
 	if err := writeSessionFile(key, sessionEntry{
 		PID:        os.Getpid(),
@@ -160,7 +161,7 @@ func runServe(args []string) {
 		Args:       sessionArgs,
 		Branch:     branch,
 		ReviewPath: sc.ReviewPath,
-		StartedAt:  sessionStartedAt.Format(time.RFC3339),
+		StartedAt:  sessionGeneration,
 	}); err != nil {
 		daemonFatal(pipe, "Error writing session file: %v", err)
 	}
@@ -236,9 +237,14 @@ func runServe(args []string) {
 	if initErr != nil {
 		log.Printf("Error: %v", initErr)
 		srv.SetInitErr(initErr)
+		if err := writeDaemonFailure(key, sessionGeneration, initErr); err != nil {
+			log.Printf("Warning: could not preserve daemon initialization error: %v", err)
+		}
 		stop()
 		<-ctx.Done()
-		removeSessionFile(key)
+		// Keep the session entry and log until stale-session cleanup. The client
+		// may already have received the entry and needs the log to report this
+		// fatal initialization error after the server stops.
 		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutCtx)

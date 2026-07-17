@@ -223,7 +223,7 @@ func TestWaitForDaemonReady_SurfacesDaemonLog(t *testing.T) {
 		os.WriteFile(filepath.Join(sessDir, "testkey123.log"), []byte("Error: not in a git repository"), 0600)
 
 		client := &http.Client{Timeout: 1 * time.Second}
-		_, _, err = waitForDaemonReady(client, "", port, "testkey123")
+		_, _, err = waitForDaemonReady(client, "", port, "testkey123", "")
 		if err == nil {
 			t.Fatal("expected error for unreachable daemon")
 		}
@@ -241,7 +241,7 @@ func TestWaitForDaemonReady_SurfacesDaemonLog(t *testing.T) {
 		ln.Close()
 
 		client := &http.Client{Timeout: 1 * time.Second}
-		_, _, err = waitForDaemonReady(client, "", port, "")
+		_, _, err = waitForDaemonReady(client, "", port, "", "")
 		if err == nil {
 			t.Fatal("expected error for unreachable daemon")
 		}
@@ -249,4 +249,61 @@ func TestWaitForDaemonReady_SurfacesDaemonLog(t *testing.T) {
 			t.Errorf("expected 'could not reach daemon' fallback, got: %v", err)
 		}
 	})
+}
+
+func TestWaitForDaemonReady_SurfacesFailureAfterSameKeyCleanup(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	key := "fatalinit123"
+	generation := "2026-07-17T12:00:00.123456789Z"
+	if err := WriteSessionFile(key, SessionEntry{PID: 999999999, Port: port, StartedAt: generation}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteDaemonFailure(key, generation, fmt.Errorf("not in a version-controlled repository and no files specified")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A concurrent same-key invocation removes the stale session and its log.
+	if _, alive := FindAliveSession(key); alive {
+		t.Fatal("dead daemon should not be considered alive")
+	}
+
+	client := &http.Client{Timeout: time.Second}
+	_, _, err = waitForDaemonReady(client, "", port, key, generation)
+	if err == nil || !strings.Contains(err.Error(), "not in a version-controlled repository") {
+		t.Fatalf("expected preserved initialization error, got %v", err)
+	}
+}
+
+func TestRunReviewClientRaw_ReturnsInitializationError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/session" {
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "error",
+			"message": "not in a version-controlled repository and no files specified",
+		})
+	}))
+	defer ts.Close()
+
+	port := 0
+	fmt.Sscanf(ts.URL, "http://127.0.0.1:%d", &port)
+	approved, prompt := RunReviewClientRaw(SessionEntry{Port: port}, "")
+	if approved {
+		t.Fatal("expected approved=false")
+	}
+	if !strings.Contains(prompt, "not in a version-controlled repository") {
+		t.Fatalf("expected initialization error in prompt, got %q", prompt)
+	}
 }

@@ -57,6 +57,8 @@ var aliveClient = &http.Client{Timeout: time.Second}
 // daemon lifecycle and can tolerate a longer timeout.
 var browserClient = &http.Client{Timeout: 2 * time.Second}
 
+const daemonFailureRetention = 10 * time.Minute
+
 // SessionEntry tracks a running daemon process in ~/.crit/sessions/.
 type SessionEntry struct {
 	PID        int      `json:"pid"`
@@ -603,6 +605,14 @@ func setupDaemonCmd(key string, args []string) (*exec.Cmd, *os.File, *os.File, *
 	return cmd, readEnd, writeEnd, logFile, nil
 }
 
+// prepareDaemonCmd removes stale session state before creating the log that
+// the new daemon inherits. This keeps fatal initialization errors readable by
+// the client after the daemon exits.
+func prepareDaemonCmd(key string, args []string) (*exec.Cmd, *os.File, *os.File, *os.File, error) {
+	RemoveSessionFile(key)
+	return setupDaemonCmd(key, args)
+}
+
 func readPortFromPipe(readEnd *os.File) (portCh chan int, errCh chan error) {
 	portCh = make(chan int, 1)
 	errCh = make(chan error, 1)
@@ -680,12 +690,10 @@ func StartDaemon(key string, args []string) (SessionEntry, error) {
 		return entry, nil
 	}
 
-	cmd, readEnd, writeEnd, logFile, err := setupDaemonCmd(key, args)
+	cmd, readEnd, writeEnd, logFile, err := prepareDaemonCmd(key, args)
 	if err != nil {
 		return SessionEntry{}, err
 	}
-
-	RemoveSessionFile(key)
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
@@ -734,6 +742,39 @@ func sessionLogPath(key string) (string, error) {
 	return filepath.Join(dir, key+".log"), nil
 }
 
+func daemonFailurePath(key, generation string) (string, error) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(generation))
+	return filepath.Join(dir, fmt.Sprintf("%s-%x.error", key, digest)), nil
+}
+
+// WriteDaemonFailure preserves a fatal post-readiness initialization error for
+// the client that started this daemon. Failure records are generation-scoped
+// so a reused PID cannot be mistaken for an earlier daemon with the same key.
+func WriteDaemonFailure(key, generation string, err error) error {
+	path, pathErr := daemonFailurePath(key, generation)
+	if pathErr != nil {
+		return pathErr
+	}
+	return config.AtomicWriteFile(path, []byte(err.Error()), 0600)
+}
+
+// ReadDaemonFailure returns the fatal initialization error for one daemon generation.
+func ReadDaemonFailure(key, generation string) string {
+	path, err := daemonFailurePath(key, generation)
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // ReadDaemonLog reads and returns the trimmed contents of a daemon log file.
 func ReadDaemonLog(key string) string {
 	logPath, err := sessionLogPath(key)
@@ -745,6 +786,23 @@ func ReadDaemonLog(key string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func cleanExpiredDaemonFailures(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-daemonFailureRetention)
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".error") {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil && info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
 }
 
 // OpenReadyPipe returns the readiness pipe (the inherited stdout) if this
@@ -846,6 +904,7 @@ func cleanOrphanedSessions() {
 	if err != nil {
 		return
 	}
+	cleanExpiredDaemonFailures(sessDir)
 	for _, de := range entries {
 		if !strings.HasSuffix(de.Name(), ".json") {
 			continue
