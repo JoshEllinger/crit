@@ -62,6 +62,16 @@ func detectFrameworks(body []byte) []string {
 
 var smokeClient = &http.Client{Timeout: 10 * time.Second}
 
+var (
+	startLiveDaemon                = daemon.StartDaemon
+	runLiveClient                  = daemon.RunReviewClient
+	installLiveDaemonSignalHandler = installDaemonSignalHandler
+	openLiveBrowser                = browser.OpenBrowserWithCommand
+	launchLiveBrowser              = func(url, openCmd string) {
+		go openLiveBrowser(url, openCmd)
+	}
+)
+
 func runSmokeTest(origin, cookies string) smokeResult {
 	req, err := http.NewRequest(http.MethodGet, origin, nil)
 	if err != nil {
@@ -149,9 +159,9 @@ func connectToLiveDaemon(key, openCmd string) bool {
 		entry.BaseURL(), entry.Port+1)
 	fmt.Fprintf(os.Stderr, "[crit] open %s/live\n", entry.BaseURL())
 	if !daemon.DaemonHasBrowser(entry) {
-		go browser.OpenBrowserWithCommand(entry.BaseURL()+"/live", openCmd)
+		launchLiveBrowser(entry.BaseURL()+"/live", openCmd)
 	}
-	daemon.RunReviewClient(entry, key)
+	runLiveClient(entry, key)
 	return true
 }
 
@@ -259,7 +269,7 @@ func RunLive(args []string) {
 	}
 
 	noOpenResolved := f.noOpen || cfg.NoOpen
-	entry, err := daemon.StartDaemon(key, buildLiveDaemonArgs(f.origin, liveCookies, f, cfg, noOpenResolved))
+	entry, err := startLiveDaemon(key, buildLiveDaemonArgs(f.origin, liveCookies, f, cfg, noOpenResolved))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: could not start live daemon: %v\n", err)
 		os.Exit(1)
@@ -269,13 +279,9 @@ func RunLive(args []string) {
 		entry.Port, entry.Port+1)
 	fmt.Fprintf(os.Stderr, "[crit] open %s/live\n", entry.BaseURL())
 
-	installDaemonSignalHandler(entry.PID)
+	installLiveDaemonSignalHandler(entry.PID)
 
-	if !noOpenResolved {
-		go browser.OpenBrowserWithCommand(entry.BaseURL()+"/live", cfg.OpenCmd)
-	}
-
-	daemon.RunReviewClient(entry, key)
+	runLiveClient(entry, key)
 }
 
 func checkLiveSmoke(origin, cookies string) {
