@@ -16,8 +16,9 @@ import (
 )
 
 type pullFlags struct {
-	prFlag    int
-	outputDir string
+	prFlag           int
+	outputDir        string
+	configuredOutput string
 }
 
 func parsePullFlags(args []string) (pullFlags, error) {
@@ -43,12 +44,36 @@ func parsePullFlags(args []string) (pullFlags, error) {
 	return f, nil
 }
 
+func resolvePullFlags(f *pullFlags) error {
+	cfg, err := config.LoadCurrentConfig()
+	if err != nil {
+		return err
+	}
+	f.configuredOutput = cfg.Output
+	return nil
+}
+
+func parseResolvedPullFlags(args []string) (pullFlags, error) {
+	f, err := parsePullFlags(args)
+	if err != nil {
+		return pullFlags{}, err
+	}
+	if err := resolvePullFlags(&f); err != nil {
+		return pullFlags{}, err
+	}
+	return f, nil
+}
+
+func shouldRedirectReviewForPR(prFlag int, pinnedOutput bool) bool {
+	return prFlag != 0 && !pinnedOutput
+}
+
 func RunPull(args []string) error { //nolint:gocyclo
 	if err := RequireGH(); err != nil {
 		return err
 	}
 
-	f, err := parsePullFlags(args)
+	f, err := parseResolvedPullFlags(args)
 	if err != nil {
 		return err
 	}
@@ -71,7 +96,7 @@ func RunPull(args []string) error { //nolint:gocyclo
 		threadResolved = nil
 	}
 
-	critPath, err := review.ResolveReviewPath(f.outputDir)
+	critPath, err := review.ResolveCommandReviewPath(f.outputDir, f.configuredOutput)
 	if err != nil {
 		return err
 	}
@@ -82,7 +107,7 @@ func RunPull(args []string) error { //nolint:gocyclo
 		}
 	}
 
-	if f.prFlag != 0 && f.outputDir == "" {
+	if shouldRedirectReviewForPR(f.prFlag, f.outputDir != "" || f.configuredOutput != "") {
 		if altPath, altCJ, ok := review.RedirectReviewPathForPR(prNumber, cj.Branch, critPath); ok {
 			critPath = altPath
 			cj = altCJ

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/tomasz-tomczyk/crit/internal/config"
 	"github.com/tomasz-tomczyk/crit/internal/daemon"
+	"github.com/tomasz-tomczyk/crit/internal/reviewpath"
 	"github.com/tomasz-tomczyk/crit/internal/vcs"
 )
 
@@ -24,29 +26,27 @@ func RunStatus(args []string) error {
 
 	vcsName := ""
 	branch := ""
-	if vcs := vcs.DetectVCS(""); vcs != nil {
-		vcsName = vcs.Name()
-		branch = vcs.CurrentBranch()
+	var backend vcs.VCS
+	if backend = vcs.DetectVCS(""); backend != nil {
+		vcsName = backend.Name()
+		branch = backend.CurrentBranch()
 	}
 
 	sessions, err := daemon.ListSessionsForCWD(cwd)
 	if err != nil {
 		return err
 	}
-	var matchedSession *daemon.SessionEntry
-	for i, s := range sessions {
-		if s.Branch == branch || (branch == "" && len(sessions) == 1) {
-			matchedSession = &sessions[i]
-			break
+	matchedSession := selectStatusSession(sessions, branch)
+	if matchedSession == nil && backend != nil {
+		if repoRoot, rootErr := backend.RepoRoot(); rootErr == nil {
+			repoSessions, _ := daemon.ListSessionsForRepoRoot(repoRoot)
+			matchedSession = selectStatusSession(repoSessions, branch)
 		}
 	}
 
-	var revPath string
-	if matchedSession != nil && matchedSession.ReviewPath != "" {
-		revPath = matchedSession.ReviewPath
-	} else {
-		key := daemon.SessionKey(cwd, branch, nil)
-		revPath, _ = daemon.ReviewFilePath(key)
+	revPath, err := resolveStatusReviewPath(cwd, branch, matchedSession)
+	if err != nil {
+		return err
 	}
 
 	revExists := false
@@ -61,6 +61,30 @@ func RunStatus(args []string) error {
 
 	printStatusHuman(vcsName, branch, revPath, revExists, matchedSession)
 	return nil
+}
+
+func selectStatusSession(sessions []daemon.SessionEntry, branch string) *daemon.SessionEntry {
+	for i, s := range sessions {
+		if s.Branch == branch || (branch == "" && len(sessions) == 1) {
+			return &sessions[i]
+		}
+	}
+	return nil
+}
+
+func resolveStatusReviewPath(cwd, branch string, matchedSession *daemon.SessionEntry) (string, error) {
+	if matchedSession != nil && matchedSession.ReviewPath != "" {
+		return matchedSession.ReviewPath, nil
+	}
+	cfg, err := config.LoadCurrentConfig()
+	if err != nil {
+		return "", err
+	}
+	if cfg.Output != "" {
+		return reviewpath.FromOutputDir(cfg.Output)
+	}
+	key := daemon.SessionKey(cwd, branch, nil)
+	return daemon.ReviewFilePath(key)
 }
 
 func printStatusJSON(vcsName, branch, revPath string, revExists bool, session *daemon.SessionEntry) {

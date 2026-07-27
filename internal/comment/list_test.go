@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tomasz-tomczyk/crit/internal/testutil"
 )
 
 func writeTestReview(t *testing.T, dir string, cj CritJSON) string {
@@ -269,6 +271,84 @@ func TestRunComments_PlanAndOutputConflict(t *testing.T) {
 	err := RunComments([]string{"--plan", "x", "--output", "/tmp", "--json"})
 	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestResolveCommentsListFlagsOutputPrecedence(t *testing.T) {
+	projectDir := t.TempDir()
+	testutil.SetHome(t, t.TempDir())
+	t.Chdir(projectDir)
+
+	configuredOutput := filepath.Join(projectDir, "reviews")
+	configData := outputConfigJSON(t, configuredOutput)
+	if err := os.WriteFile(filepath.Join(projectDir, ".crit.config.json"), configData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name           string
+		args           []string
+		wantOutput     string
+		wantConfigured string
+		wantPlan       bool
+	}{
+		{name: "configured output", args: []string{"--json"}, wantConfigured: configuredOutput},
+		{name: "explicit output wins", args: []string{"--output", "explicit", "--json"}, wantOutput: "explicit", wantConfigured: configuredOutput},
+		{name: "plan storage wins without conflict", args: []string{"--plan", "my-plan", "--json"}, wantPlan: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, err := parseCommentsListFlags(tt.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := resolveCommentsListFlags(&f); err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantPlan {
+				if f.outputDir == "" || f.outputDir == configuredOutput {
+					t.Fatalf("outputDir = %q, want plan storage", f.outputDir)
+				}
+				return
+			}
+			if f.configuredOutput != tt.wantConfigured {
+				t.Fatalf("configuredOutput = %q, want %q", f.configuredOutput, tt.wantConfigured)
+			}
+			if f.outputDir != tt.wantOutput {
+				t.Fatalf("outputDir = %q, want %q", f.outputDir, tt.wantOutput)
+			}
+		})
+	}
+}
+
+func TestResolveCommentsCritPathExplicitPathWinsConfiguredOutput(t *testing.T) {
+	projectDir := t.TempDir()
+	testutil.SetHome(t, t.TempDir())
+	t.Chdir(projectDir)
+	if err := os.WriteFile(
+		filepath.Join(projectDir, ".crit.config.json"),
+		[]byte(`{"output":"configured"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	explicitPath := writeTestReview(t, t.TempDir(), CritJSON{})
+	f, err := parseCommentsListFlags([]string{filepath.Join(explicitPath, "review.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resolveCommentsListFlags(&f); err != nil {
+		t.Fatal(err)
+	}
+	if f.configuredOutput != "" {
+		t.Fatalf("configured output was loaded despite explicit review path: %q", f.configuredOutput)
+	}
+	got, err := resolveCommentsCritPath(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != explicitPath {
+		t.Fatalf("crit path = %q, want explicit review path %q", got, explicitPath)
 	}
 }
 

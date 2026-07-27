@@ -2,8 +2,46 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
+
+	"github.com/tomasz-tomczyk/crit/internal/vcs"
 )
+
+// LoadConfigForCommands loads merged config and anchors a relative configured
+// output to the project/config directory. Explicit CLI outputs are normalized
+// later by review-path resolution and remain relative to the invoking CWD.
+func LoadConfigForCommands(configDir string) Config {
+	cfg := LoadConfig(configDir)
+	if cfg.Output != "" && !filepath.IsAbs(cfg.Output) {
+		cfg.Output = filepath.Join(configDir, cfg.Output)
+	}
+	return cfg
+}
+
+// LoadCurrentConfig loads merged global and project config for the current
+// repository, falling back to the current directory outside a repository.
+func LoadCurrentConfig() (Config, error) {
+	configDir, err := os.Getwd()
+	if err != nil {
+		return Config{}, err
+	}
+	if v := vcs.DetectVCS(""); v != nil {
+		if root, rootErr := v.RepoRoot(); rootErr == nil {
+			configDir = root
+		}
+	}
+	return LoadConfigForCommands(configDir), nil
+}
+
+// ResolveOutputDir returns the explicit CLI/plan output when set, otherwise
+// the output from merged config.
+func ResolveOutputDir(explicit string, cfg Config) string {
+	if explicit != "" {
+		return explicit
+	}
+	return cfg.Output
+}
 
 // ResolvePort returns the effective listen port (flag > env > config).
 func ResolvePort(flagPort, cfgPort int) int {

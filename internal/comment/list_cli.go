@@ -6,16 +6,18 @@ import (
 	"path/filepath"
 
 	"github.com/tomasz-tomczyk/crit/internal/clicmd"
+	"github.com/tomasz-tomczyk/crit/internal/config"
 	"github.com/tomasz-tomczyk/crit/internal/review"
 	"github.com/tomasz-tomczyk/crit/internal/session"
 )
 
 type commentsListFlags struct {
-	outputDir    string
-	plan         string
-	jsonOutput   bool
-	all          bool
-	explicitPath string
+	outputDir        string
+	configuredOutput string
+	plan             string
+	jsonOutput       bool
+	all              bool
+	explicitPath     string
 }
 
 func parseCommentsListFlags(args []string) (commentsListFlags, error) {
@@ -68,6 +70,14 @@ func resolveCommentsListFlags(f *commentsListFlags) error {
 			return err
 		}
 	}
+	if f.explicitPath != "" {
+		return nil
+	}
+	cfg, err := config.LoadCurrentConfig()
+	if err != nil {
+		return err
+	}
+	f.configuredOutput = cfg.Output
 	return nil
 }
 
@@ -75,7 +85,7 @@ func resolveCommentsCritPath(f commentsListFlags) (string, error) {
 	if f.explicitPath != "" {
 		return resolveExplicitReviewPath(f.explicitPath)
 	}
-	return review.ResolveReviewPath(f.outputDir)
+	return review.ResolveCommandReviewPath(f.outputDir, f.configuredOutput)
 }
 
 func resolveExplicitReviewPath(path string) (string, error) {

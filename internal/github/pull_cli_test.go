@@ -1,11 +1,31 @@
 package github
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/tomasz-tomczyk/crit/internal/clicmd"
+	"github.com/tomasz-tomczyk/crit/internal/testutil"
 )
+
+func configureOutputForTest(t *testing.T) string {
+	t.Helper()
+	projectDir := t.TempDir()
+	testutil.SetHome(t, t.TempDir())
+	t.Chdir(projectDir)
+	configuredOutput := filepath.Join(projectDir, "configured")
+	data, err := json.Marshal(map[string]string{"output": configuredOutput})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, ".crit.config.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return configuredOutput
+}
 
 func TestParsePullFlags(t *testing.T) {
 	tests := []struct {
@@ -36,6 +56,74 @@ func TestParsePullFlags(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("parsePullFlags(%v) = %+v, want %+v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolvePullFlagsOutputPrecedence(t *testing.T) {
+	configuredOutput := configureOutputForTest(t)
+	explicitOutput := t.TempDir()
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "configured output", want: configuredOutput},
+		{name: "explicit output wins", in: explicitOutput, want: explicitOutput},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := pullFlags{outputDir: tt.in}
+			if err := resolvePullFlags(&f); err != nil {
+				t.Fatal(err)
+			}
+			got := f.configuredOutput
+			if f.outputDir != "" {
+				got = f.outputDir
+			}
+			if got != tt.want {
+				t.Fatalf("resolved output = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseResolvedPullFlags(t *testing.T) {
+	configuredOutput := configureOutputForTest(t)
+
+	t.Run("success loads configured output", func(t *testing.T) {
+		f, err := parseResolvedPullFlags([]string{"42"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.prFlag != 42 || f.configuredOutput != configuredOutput {
+			t.Fatalf("flags = %+v, want PR 42 and configured output %q", f, configuredOutput)
+		}
+	})
+
+	t.Run("parse error", func(t *testing.T) {
+		if _, err := parseResolvedPullFlags([]string{"--output"}); err == nil {
+			t.Fatal("expected missing output value error")
+		}
+	})
+}
+
+func TestShouldRedirectReviewForPR(t *testing.T) {
+	tests := []struct {
+		name         string
+		prFlag       int
+		pinnedOutput bool
+		want         bool
+	}{
+		{name: "explicit PR without pinned output redirects", prFlag: 42, want: true},
+		{name: "auto-detected PR does not redirect", want: false},
+		{name: "explicit PR with CLI or configured output stays pinned", prFlag: 42, pinnedOutput: true, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRedirectReviewForPR(tt.prFlag, tt.pinnedOutput); got != tt.want {
+				t.Fatalf("shouldRedirectReviewForPR(%d, %v) = %v, want %v", tt.prFlag, tt.pinnedOutput, got, tt.want)
 			}
 		})
 	}

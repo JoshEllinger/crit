@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,17 @@ import (
 	"github.com/tomasz-tomczyk/crit/internal/testutil"
 	"github.com/tomasz-tomczyk/crit/internal/vcs"
 )
+
+func writeDaemonOutputConfig(t *testing.T, dir, output string) {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{"output": output})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".crit.config.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func resetBranchOverride(t *testing.T) {
 	t.Helper()
@@ -654,7 +666,8 @@ func TestResolveServerConfig_OutputDir(t *testing.T) {
 		vcs.SetDefaultBranchOverride("")
 
 		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, ".crit.config.json"), []byte(`{"output": "/tmp/cfg-out"}`), 0644)
+		configuredOutput := t.TempDir()
+		writeDaemonOutputConfig(t, dir, configuredOutput)
 		homeDir := t.TempDir()
 		testutil.SetHome(t, homeDir)
 
@@ -666,10 +679,90 @@ func TestResolveServerConfig_OutputDir(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if sc.OutputDir != "/tmp/cfg-out" {
-			t.Errorf("outputDir = %q, want /tmp/cfg-out (from config)", sc.OutputDir)
+		if sc.OutputDir != configuredOutput {
+			t.Errorf("outputDir = %q, want %q (from config)", sc.OutputDir, configuredOutput)
 		}
 	})
+
+	t.Run("plan dir wins over config output", func(t *testing.T) {
+		vcs.SetDefaultBranchOverride("")
+
+		dir := t.TempDir()
+		writeDaemonOutputConfig(t, dir, t.TempDir())
+		homeDir := t.TempDir()
+		testutil.SetHome(t, homeDir)
+
+		origDir, _ := os.Getwd()
+		os.Chdir(dir)
+		defer os.Chdir(origDir)
+
+		planDir := filepath.Join(dir, "plan")
+		sc, err := ResolveDaemonCLIConfig([]string{"--plan-dir", planDir})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sc.OutputDir != "" {
+			t.Errorf("outputDir = %q, want empty so plan dir remains authoritative", sc.OutputDir)
+		}
+		if sc.PlanDir != planDir {
+			t.Errorf("planDir = %q, want %q", sc.PlanDir, planDir)
+		}
+	})
+
+	t.Run("explicit output wins over plan dir and config", func(t *testing.T) {
+		vcs.SetDefaultBranchOverride("")
+
+		dir := t.TempDir()
+		writeDaemonOutputConfig(t, dir, t.TempDir())
+		homeDir := t.TempDir()
+		testutil.SetHome(t, homeDir)
+
+		origDir, _ := os.Getwd()
+		os.Chdir(dir)
+		defer os.Chdir(origDir)
+
+		explicitOutput := t.TempDir()
+		planDir := t.TempDir()
+		sc, err := ResolveDaemonCLIConfig([]string{"--output", explicitOutput, "--plan-dir", planDir})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sc.OutputDir != explicitOutput {
+			t.Errorf("outputDir = %q, want %q", sc.OutputDir, explicitOutput)
+		}
+	})
+}
+
+func TestResolveDaemonCLIConfigRelativeOutputAnchoredToRepoRoot(t *testing.T) {
+	defer resetBranchOverride(t)
+	vcs.SetDefaultBranchOverride("")
+	repoDir := testutil.InitTestRepo(t)
+	testutil.SetHome(t, t.TempDir())
+	if err := os.WriteFile(
+		filepath.Join(repoDir, ".crit.config.json"),
+		[]byte(`{"output":"reviews"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	nestedDir := filepath.Join(repoDir, "pkg")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(nestedDir)
+
+	sc, err := ResolveDaemonCLIConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalRepo, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(canonicalRepo, "reviews")
+	if sc.OutputDir != want {
+		t.Fatalf("outputDir = %q, want repo-relative %q", sc.OutputDir, want)
+	}
 }
 
 func TestResolveDaemonCLIConfig_NotifyOnRoundReady(t *testing.T) {

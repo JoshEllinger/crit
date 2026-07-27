@@ -23,13 +23,21 @@ import (
 )
 
 type shareFlags struct {
-	outputDir  string
-	svcURL     string
-	showQR     bool
-	org        string
-	visibility string
-	preview    string
-	files      []string
+	outputDir        string
+	configuredOutput string
+	svcURL           string
+	showQR           bool
+	org              string
+	visibility       string
+	preview          string
+	files            []string
+}
+
+type unpublishFlags struct {
+	outputDir        string
+	configuredOutput string
+	svcURL           string
+	files            []string
 }
 
 func postPreviewShare(htmlPath, svcURL, authToken string) (string, error) {
@@ -117,6 +125,11 @@ func parseShareFlags(args []string) (shareFlags, error) {
 		}
 	}
 	return sf, nil
+}
+
+func applyShareConfigDefaults(sf *shareFlags, cfg config.Config) {
+	sf.configuredOutput = cfg.Output
+	sf.svcURL = ResolveShareURL(sf.svcURL, cfg, config.DefaultShareURL)
 }
 
 func runSharePreview(sf shareFlags) error {
@@ -312,7 +325,7 @@ func RunShare(args []string) error { //nolint:gocyclo // CLI dispatcher
 	flagURL := sf.svcURL != ""
 
 	cfg := LoadShareConfig()
-	sf.svcURL = ResolveShareURL(sf.svcURL, cfg, config.DefaultShareURL)
+	applyShareConfigDefaults(&sf, cfg)
 	cfg.AuthToken = ResolveAuthToken(cfg)
 	auth.LazyBackfillAuthUserID(&cfg, sf.svcURL)
 	authToken := cfg.AuthToken
@@ -322,7 +335,7 @@ func RunShare(args []string) error { //nolint:gocyclo // CLI dispatcher
 		return err
 	}
 
-	critPath, err := review.ResolveReviewPath(sf.outputDir)
+	critPath, err := review.ResolveCommandReviewPath(sf.outputDir, sf.configuredOutput)
 	if err != nil {
 		return err
 	}
@@ -396,6 +409,15 @@ func parseFetchOutputDir(args []string) (string, error) {
 	return outputDir, nil
 }
 
+func resolveFetchReviewPath(args []string) (string, error) {
+	outputDir, err := parseFetchOutputDir(args)
+	if err != nil {
+		return "", err
+	}
+	cfg := LoadShareConfig()
+	return review.ResolveCommandReviewPath(outputDir, cfg.Output)
+}
+
 func printFetchedComments(webComments []WebComment) {
 	fmt.Printf("Fetched %d new comment(s) into review file\n", len(webComments))
 	for _, wc := range webComments {
@@ -417,12 +439,7 @@ func RunFetch(args []string) error {
 	if err := checkProxyAuthCLIAllowed("crit fetch"); err != nil {
 		return err
 	}
-	outputDir, err := parseFetchOutputDir(args)
-	if err != nil {
-		return err
-	}
-
-	critPath, err := review.ResolveReviewPath(outputDir)
+	critPath, err := resolveFetchReviewPath(args)
 	if err != nil {
 		return err
 	}
@@ -480,39 +497,50 @@ func runFetchUnderLock(critPath string) error {
 	return nil
 }
 
-// RunUnpublish removes a shared review from crit-web.
-func RunUnpublish(args []string) error {
-	if err := checkProxyAuthCLIAllowed("crit unpublish"); err != nil {
-		return err
-	}
-	unpubOutputDir := ""
-	unpubSvcURL := ""
-	var unpubFiles []string
+func parseUnpublishFlags(args []string) (unpublishFlags, error) {
+	var f unpublishFlags
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
 		case arg == "--output" || arg == "-o":
 			if i+1 >= len(args) {
-				return clicmd.Usage(fmt.Sprintf("Error: %s requires a value", arg))
+				return f, clicmd.Usage(fmt.Sprintf("Error: %s requires a value", arg))
 			}
 			i++
-			unpubOutputDir = args[i]
+			f.outputDir = args[i]
 		case arg == "--share-url":
 			if i+1 >= len(args) {
-				return clicmd.Usage("Error: --share-url requires a value")
+				return f, clicmd.Usage("Error: --share-url requires a value")
 			}
 			i++
-			unpubSvcURL = args[i]
+			f.svcURL = args[i]
 		default:
-			unpubFiles = append(unpubFiles, arg)
+			f.files = append(f.files, arg)
 		}
+	}
+	return f, nil
+}
+
+func applyUnpublishConfigDefaults(f *unpublishFlags, cfg config.Config) {
+	f.configuredOutput = cfg.Output
+	f.svcURL = ResolveShareURL(f.svcURL, cfg, config.DefaultShareURL)
+}
+
+// RunUnpublish removes a shared review from crit-web.
+func RunUnpublish(args []string) error {
+	if err := checkProxyAuthCLIAllowed("crit unpublish"); err != nil {
+		return err
+	}
+	f, err := parseUnpublishFlags(args)
+	if err != nil {
+		return err
 	}
 
 	unpubCfg := LoadShareConfig()
-	unpubSvcURL = ResolveShareURL(unpubSvcURL, unpubCfg, config.DefaultShareURL)
+	applyUnpublishConfigDefaults(&f, unpubCfg)
 	unpubAuthToken := ResolveAuthToken(unpubCfg)
 
-	critPath, err := review.ResolveReviewPathWithArgs(unpubOutputDir, unpubFiles)
+	critPath, err := review.ResolveCommandReviewPathWithArgs(f.outputDir, f.configuredOutput, f.files)
 	if err != nil {
 		return err
 	}
@@ -529,7 +557,7 @@ func RunUnpublish(args []string) error {
 		return nil
 	}
 
-	if err := UnpublishFromWeb(unpubSvcURL, cj.DeleteToken, unpubAuthToken); err != nil {
+	if err := UnpublishFromWeb(f.svcURL, cj.DeleteToken, unpubAuthToken); err != nil {
 		return err
 	}
 

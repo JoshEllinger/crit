@@ -154,7 +154,7 @@ func applyDaemonConfigDefaults(sf *daemonFlagSet, cfg config.Config) {
 	if !sf.quiet && cfg.Quiet {
 		sf.quiet = true
 	}
-	if sf.outputDir == "" && cfg.Output != "" {
+	if sf.outputDir == "" && sf.planDir == "" {
 		sf.outputDir = cfg.Output
 	}
 	if sf.baseBranch == "" && cfg.BaseBranch != "" {
@@ -204,7 +204,7 @@ func ResolveDaemonCLIConfig(args []string) (*DaemonCLIConfig, error) {
 	if configDir == "" {
 		configDir = daemonMustGetwd()
 	}
-	cfg := config.LoadConfig(configDir)
+	cfg := config.LoadConfigForCommands(configDir)
 
 	applyDaemonConfigDefaults(&sf, cfg)
 
