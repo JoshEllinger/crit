@@ -13,6 +13,13 @@ import (
 // startDaemonForReconnect is daemon.StartDaemon in production; tests may replace it.
 var startDaemonForReconnect = daemon.StartDaemon
 
+// Test hooks for migrateLegacyOutputReconnect error paths.
+var (
+	migrateMkdirAll = os.MkdirAll
+	migrateRename   = os.Rename
+	userHomeDir     = os.UserHomeDir
+)
+
 // ReconnectCommand returns the crit CLI command to reconnect to an existing review
 // session. Works from any cwd; use for file, git, live, and preview modes.
 func ReconnectCommand(sessionKey string) string {
@@ -97,29 +104,71 @@ func daemonArgsForReconnect(sessionKey string, cliArgs []string, stale daemon.Se
 // appendReconnectPathFlags adds --output or --plan-dir/--name when the review
 // folder is outside the default ~/.crit/reviews/<key> layout.
 func appendReconnectPathFlags(sessionKey string, args []string, reviewDir string) []string {
-	if !strings.HasSuffix(filepath.ToSlash(reviewDir), "/.crit") {
-		return args
-	}
 	defaultDir, err := daemon.ReviewFilePath(sessionKey)
 	if err == nil && filepath.Clean(reviewDir) == filepath.Clean(defaultDir) {
 		return args
 	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		plansRoot := filepath.Join(home, ".crit", "plans")
-		parent := filepath.Dir(reviewDir)
-		if strings.HasPrefix(filepath.Clean(parent), filepath.Clean(plansRoot)+string(filepath.Separator)) {
-			slug := filepath.Base(parent)
-			if slug != "" && slug != "." {
-				return append(args, "--plan-dir", parent, "--name", slug)
-			}
+	if planArgs := planReconnectFlags(reviewDir); planArgs != nil {
+		return append(args, planArgs...)
+	}
+	// Custom data root: {root}/reviews/<key> → --output {root}
+	if filepath.Base(reviewDir) == sessionKey && filepath.Base(filepath.Dir(reviewDir)) == "reviews" {
+		root := filepath.Dir(filepath.Dir(reviewDir))
+		if root != "" && root != "." {
+			return append(args, "--output", root)
 		}
 	}
-	outputDir := filepath.Dir(reviewDir)
-	if outputDir != "" && outputDir != "." {
-		return append(args, "--output", outputDir)
+	if outArgs := migrateLegacyOutputReconnect(sessionKey, reviewDir); outArgs != nil {
+		return append(args, outArgs...)
 	}
 	return args
+}
+
+func planReconnectFlags(reviewDir string) []string {
+	home, err := userHomeDir()
+	if err != nil {
+		return nil
+	}
+	plansRoot := filepath.Join(home, ".crit", "plans")
+	parent := filepath.Dir(reviewDir)
+	if !strings.HasSuffix(filepath.ToSlash(reviewDir), "/.crit") {
+		return nil
+	}
+	if !strings.HasPrefix(filepath.Clean(parent), filepath.Clean(plansRoot)+string(filepath.Separator)) {
+		return nil
+	}
+	slug := filepath.Base(parent)
+	if slug == "" || slug == "." {
+		return nil
+	}
+	return []string{"--plan-dir", parent, "--name", slug}
+}
+
+// migrateLegacyOutputReconnect moves {root}/.crit → {root}/reviews/<key> and
+// returns --output flags, or nil if this is not a legacy output identity.
+func migrateLegacyOutputReconnect(sessionKey, reviewDir string) []string {
+	if !strings.HasSuffix(filepath.ToSlash(reviewDir), "/.crit") {
+		return nil
+	}
+	root := filepath.Dir(reviewDir)
+	if root == "" || root == "." {
+		return nil
+	}
+	dest := filepath.Join(root, "reviews", sessionKey)
+	if _, err := os.Stat(dest); err == nil {
+		fmt.Fprintf(os.Stderr, "crit: warning: legacy review at %s ignored; %s already exists\n", reviewDir, dest)
+		return []string{"--output", root}
+	}
+	if err := migrateMkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "crit: warning: could not migrate legacy review %s: %v\n", reviewDir, err)
+		return nil
+	}
+	if err := migrateRename(reviewDir, dest); err != nil {
+		fmt.Fprintf(os.Stderr, "crit: warning: could not migrate legacy review %s → %s: %v\n", reviewDir, dest, err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "crit: migrated legacy review %s → %s\n", reviewDir, dest)
+	return []string{"--output", root}
 }
 
 // reconnectDeadSession restarts a daemon for an existing review folder.

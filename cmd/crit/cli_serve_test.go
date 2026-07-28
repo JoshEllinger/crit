@@ -105,15 +105,35 @@ func TestPreflightCheck_NotARepo(t *testing.T) {
 // session.critJSONPath() returned <planDir>/.crit — the split caused pasted
 // images to render as [image: <alt>] placeholders on crit-web.
 func TestResolveServeReviewPath(t *testing.T) {
-	t.Run("outputDir wins", func(t *testing.T) {
+	t.Run("outputDir wins as data root", func(t *testing.T) {
 		dir := t.TempDir()
 		got, err := resolveServeReviewPath(dir, "/some/plan/dir", "deadbeef")
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := filepath.Join(dir, ".crit")
+		want := filepath.Join(dir, "reviews", "deadbeef")
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("outputDir warns on legacy identity", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, ".crit"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stderr := captureStderr(t, func() {
+			got, err := resolveServeReviewPath(dir, "", "deadbeef1234")
+			if err != nil {
+				t.Fatalf("resolveServeReviewPath: %v", err)
+			}
+			want := filepath.Join(dir, "reviews", "deadbeef1234")
+			if got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		})
+		if !strings.Contains(stderr, "legacy .crit review") {
+			t.Fatalf("stderr = %q, want legacy warning", stderr)
 		}
 	})
 
@@ -149,19 +169,6 @@ func TestResolveServeReviewPath(t *testing.T) {
 		if _, err := resolveServeReviewPath("", "", "deadbeef123"); err == nil ||
 			!strings.Contains(err.Error(), "home unavailable") {
 			t.Fatalf("expected centralized path error, got %v", err)
-		}
-	})
-
-	t.Run("absolute output path errors are preserved", func(t *testing.T) {
-		orig := serveAbsPath
-		t.Cleanup(func() { serveAbsPath = orig })
-		serveAbsPath = func(string) (string, error) {
-			return "", errors.New("working directory unavailable")
-		}
-
-		if _, err := resolveServeReviewPath("output", "", "deadbeef123"); err == nil ||
-			!strings.Contains(err.Error(), "working directory unavailable") {
-			t.Fatalf("expected output path error, got %v", err)
 		}
 	})
 

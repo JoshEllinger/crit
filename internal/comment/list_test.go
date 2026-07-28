@@ -9,13 +9,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tomasz-tomczyk/crit/internal/review"
 	"github.com/tomasz-tomczyk/crit/internal/testutil"
 )
 
 func writeTestReview(t *testing.T, dir string, cj CritJSON) string {
 	t.Helper()
-	critPath := filepath.Join(dir, ".crit")
-	if err := os.MkdirAll(critPath, 0o755); err != nil {
+	critPath, err := review.ResolveReviewPath(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := saveCritJSON(critPath, cj); err != nil {
@@ -349,6 +350,25 @@ func TestResolveCommentsCritPathExplicitPathWinsConfiguredOutput(t *testing.T) {
 	}
 	if got != explicitPath {
 		t.Fatalf("crit path = %q, want explicit review path %q", got, explicitPath)
+	}
+}
+
+func TestResolveCommentsCritPath_PlanUsesColocatedCrit(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+	f, err := parseCommentsListFlags([]string{"--plan", "my-plan", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resolveCommentsListFlags(&f); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveCommentsCritPath(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(f.outputDir, ".crit")
+	if got != want {
+		t.Fatalf("got %q, want plan colocated path %q", got, want)
 	}
 }
 
