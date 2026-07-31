@@ -106,7 +106,9 @@ Diff scope options:
       --pr <num|url>         Generate for a GitHub pull request
       --range <base>..<head> Generate for a commit range
       --base-branch <branch> Override auto-detected base branch
-      --output, -o <dir>     Output directory for the review file
+      --output, -o <dir>     Crit data root for reviews (default: ~/.crit)
+      --scope <mode>         PR diff scope: layer or full-stack
+      --vcs <name>           VCS backend: git, sl, or jj
 
 Default generation uses global agent_cmd from ~/.crit.config.json. The agent
 must be able to read the generated prep file and print raw story JSON.`)
@@ -241,12 +243,7 @@ func clearStory(f storyFlags, critPath string, cj review.CritJSON) error {
 }
 
 func wantsStoryHelp(args []string) bool {
-	for _, arg := range args {
-		if arg == "help" || arg == "--help" || arg == "-h" {
-			return true
-		}
-	}
-	return false
+	return len(args) > 0 && (args[0] == "help" || isHelpFlag(args[0]))
 }
 
 func runStoryNoSpend(f storyFlags, cj review.CritJSON) error {
@@ -281,9 +278,9 @@ func resolveStoryReviewPath(scopeArgs []string) (string, error) {
 	if entry, alive := storyDaemonAlive(key); alive && entry.ReviewPath != "" {
 		return entry.ReviewPath, nil
 	}
-	path, err := daemon.ReviewFilePath(key)
+	path, err := resolveServeReviewPath(reviewCfg.OutputDir, reviewCfg.PlanDir, key)
 	if err != nil {
-		return "", clicmd.ExitError{Code: 1, Err: err}
+		return "", clicmd.ExitError{Code: 1, Err: fmt.Errorf("resolve story review path: %w", err)}
 	}
 	return path, nil
 }

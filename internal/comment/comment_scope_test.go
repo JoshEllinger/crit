@@ -5,7 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JoshEllinger/crit/internal/daemon"
+	"github.com/JoshEllinger/crit/internal/review"
 	"github.com/JoshEllinger/crit/internal/session"
+	"github.com/JoshEllinger/crit/internal/vcs"
 )
 
 func withDaemonFocus(t *testing.T, f *Focus) {
@@ -22,9 +25,28 @@ func withDaemonFocus(t *testing.T, f *Focus) {
 
 func writeReviewFileWithScope(t *testing.T, dir, scope string) {
 	t.Helper()
-	cj := CritJSON{ActiveDiffScope: scope, Files: map[string]CritJSONFile{}}
-	if err := saveCritJSON(filepath.Join(dir, ".crit"), cj); err != nil {
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
 		t.Fatal(err)
+	}
+	branch := ""
+	if vc := vcs.DetectVCS(""); vc != nil {
+		branch = vc.CurrentBranch()
+	}
+	key := daemon.SessionKey(cwd, branch, nil)
+	cj := CritJSON{ActiveDiffScope: scope, Files: map[string]CritJSONFile{}}
+	if err := saveCritJSON(filepath.Join(dir, "reviews", key), cj); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadCritJSONForOutputDir(t *testing.T) {
+	outputDir := t.TempDir()
+	writeReviewFileWithScope(t, outputDir, "layer")
+
+	cj, ok := loadCritJSONForOutputDir(outputDir)
+	if !ok || cj.ActiveDiffScope != "layer" {
+		t.Fatalf("review = %+v, ok = %v; want layer scope", cj, ok)
 	}
 }
 
@@ -135,7 +157,11 @@ func TestRunComment_StampsScopeFromDaemon_LineLevel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cj, err := loadCritJSON(filepath.Join(dir, ".crit"))
+	critPath, err := review.ResolveReviewPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cj, err := loadCritJSON(critPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +187,11 @@ func TestRunComment_NoStampWithoutDaemonAndDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cj, _ := loadCritJSON(filepath.Join(dir, ".crit"))
+	critPath, err := review.ResolveReviewPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cj, _ := loadCritJSON(critPath)
 	cf := cj.Files["foo.go"]
 	if cf.Comments[0].HeadSHA != "" || cf.Comments[0].DiffScope != "" {
 		t.Errorf("expected no stamping in working-tree mode, got %+v", cf.Comments[0])

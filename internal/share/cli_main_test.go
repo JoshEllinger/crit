@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/JoshEllinger/crit/internal/config"
+	"github.com/JoshEllinger/crit/internal/testutil"
 )
 
 func TestPromptShareConsent(t *testing.T) {
@@ -70,6 +73,14 @@ func TestRunUnpublish_NoReviewFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no review file found") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRunUnpublish_ParseError(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+	t.Chdir(t.TempDir())
+	if err := RunUnpublish([]string{"--output"}); err == nil {
+		t.Fatal("expected missing output value error")
 	}
 }
 
@@ -154,6 +165,128 @@ func TestParseShareFlags(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestApplyShareConfigDefaultsOutputPrecedence(t *testing.T) {
+	cfg := config.Config{Output: "/configured", ShareURL: "https://configured.example"}
+	explicitOutput := t.TempDir()
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "configured output", want: "/configured"},
+		{name: "explicit output wins", in: explicitOutput, want: explicitOutput},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sf := shareFlags{outputDir: tt.in}
+			applyShareConfigDefaults(&sf, cfg)
+			got := sf.configuredOutput
+			if sf.outputDir != "" {
+				got = sf.outputDir
+			}
+			if got != tt.want {
+				t.Fatalf("resolved output = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyUnpublishConfigDefaultsOutputPrecedence(t *testing.T) {
+	cfg := config.Config{Output: "/configured", ShareURL: "https://configured.example"}
+	explicitOutput := t.TempDir()
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "configured output", want: "/configured"},
+		{name: "explicit output wins", in: explicitOutput, want: explicitOutput},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := unpublishFlags{outputDir: tt.in}
+			applyUnpublishConfigDefaults(&f, cfg)
+			got := f.configuredOutput
+			if f.outputDir != "" {
+				got = f.outputDir
+			}
+			if got != tt.want {
+				t.Fatalf("resolved output = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseUnpublishFlags(t *testing.T) {
+	outputDir := t.TempDir()
+	tests := []struct {
+		name    string
+		args    []string
+		want    unpublishFlags
+		wantErr bool
+	}{
+		{name: "empty"},
+		{
+			name: "all values",
+			args: []string{"--output", outputDir, "--share-url", "https://example.test", "one.md", "two.md"},
+			want: unpublishFlags{
+				outputDir: outputDir,
+				svcURL:    "https://example.test",
+				files:     []string{"one.md", "two.md"},
+			},
+		},
+		{name: "missing output", args: []string{"--output"}, wantErr: true},
+		{name: "missing share URL", args: []string{"--share-url"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseUnpublishFlags(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.outputDir != tt.want.outputDir || got.svcURL != tt.want.svcURL {
+				t.Fatalf("flags = %+v, want %+v", got, tt.want)
+			}
+			if strings.Join(got.files, ",") != strings.Join(tt.want.files, ",") {
+				t.Fatalf("files = %v, want %v", got.files, tt.want.files)
+			}
+		})
+	}
+}
+
+func TestLoadShareConfigRelativeOutputAnchoredToRepoRoot(t *testing.T) {
+	repoDir := testutil.InitTestRepo(t)
+	testutil.SetHome(t, t.TempDir())
+	if err := os.WriteFile(
+		filepath.Join(repoDir, ".crit.config.json"),
+		[]byte(`{"output":"reviews"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	nestedDir := filepath.Join(repoDir, "pkg")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(nestedDir)
+
+	cfg := LoadShareConfig()
+	canonicalRepo, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(canonicalRepo, "reviews")
+	if cfg.Output != want {
+		t.Fatalf("share output = %q, want repo-relative %q", cfg.Output, want)
 	}
 }
 

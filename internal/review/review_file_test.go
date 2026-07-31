@@ -4,9 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -234,7 +239,7 @@ func TestResolveReviewPathWithArgs(t *testing.T) {
 		}
 	})
 
-	t.Run("outputDir takes precedence over file args", func(t *testing.T) {
+	t.Run("outputDir is data root with keyed review", func(t *testing.T) {
 		dir := filepath.Join(tmp, "out")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -243,11 +248,290 @@ func TestResolveReviewPathWithArgs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := filepath.Join(dir, ".crit")
+		cwd, err := daemon.ResolvedCWD()
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := daemon.SessionKey(cwd, "", []string{"file.md"})
+		want := filepath.Join(dir, "reviews", key)
 		if path != want {
 			t.Errorf("got %q, want %q", path, want)
 		}
 	})
+}
+
+func TestResolveReviewPathOutputHomeCritMatchesDefault(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	resolvedCWD, err := daemon.ResolvedCWD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := daemon.SessionKey(resolvedCWD, "", nil)
+	defaultPath, err := daemon.ReviewFilePath(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolveReviewPath(filepath.Join(home, ".crit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != defaultPath {
+		t.Fatalf("got %q, want default path %q", got, defaultPath)
+	}
+}
+
+func TestResolveCommandReviewPathExplicitRelativeOutputUsesCurrentDirectory(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "pkg")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(nested)
+
+	got, err := ResolveCommandReviewPath("out", filepath.Join(root, "configured"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := daemon.SessionKey(cwd, "", nil)
+	want := filepath.Join(nested, "out", "reviews", key)
+	if got != want {
+		t.Fatalf("review path = %q, want explicit CWD-relative path %q", got, want)
+	}
+}
+
+func TestResolveCommandReviewPathPrecedence(t *testing.T) {
+	cwd := t.TempDir()
+	testutil.SetHome(t, t.TempDir())
+	t.Chdir(cwd)
+	resolvedCWD, err := daemon.ResolvedCWD()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("configured output before centralized", func(t *testing.T) {
+		configuredOutput := t.TempDir()
+		got, err := ResolveCommandReviewPath("", configuredOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := daemon.SessionKey(resolvedCWD, "", nil)
+		want := filepath.Join(configuredOutput, "reviews", key)
+		if got != want {
+			t.Fatalf("review path = %q, want configured path %q", got, want)
+		}
+	})
+
+	t.Run("file args retained for centralized fallback", func(t *testing.T) {
+		args := []string{"plan.md"}
+		got, err := ResolveCommandReviewPathWithArgs("", "", args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := ResolveReviewPathWithArgs("", args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("review path = %q, want centralized path %q", got, want)
+		}
+	})
+
+	t.Run("active daemon before configured output", func(t *testing.T) {
+		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"status":"ok"}`)
+		}))
+		t.Cleanup(health.Close)
+		parsed, err := url.Parse(health.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, err := strconv.Atoi(parsed.Port())
+		if err != nil {
+			t.Fatal(err)
+		}
+		daemonPath := filepath.Join(t.TempDir(), ".crit")
+		const key = "review-command-path"
+		if err := daemon.WriteSessionFile(key, daemon.SessionEntry{
+			PID:        os.Getpid(),
+			Port:       port,
+			CWD:        resolvedCWD,
+			ReviewPath: daemonPath,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { daemon.RemoveSessionFile(key) })
+
+		got, err := ResolveCommandReviewPath("", t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != daemonPath {
+			t.Fatalf("review path = %q, want daemon path %q", got, daemonPath)
+		}
+	})
+
+	t.Run("explicit output uses live daemon session key", func(t *testing.T) {
+		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"status":"ok"}`)
+		}))
+		t.Cleanup(health.Close)
+		parsed, err := url.Parse(health.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, err := strconv.Atoi(parsed.Port())
+		if err != nil {
+			t.Fatal(err)
+		}
+		const key = "bb2ba5445243"
+		dataRoot := t.TempDir()
+		daemonPath := filepath.Join(dataRoot, "reviews", key)
+		if err := daemon.WriteSessionFile(key, daemon.SessionEntry{
+			PID:        os.Getpid(),
+			Port:       port,
+			CWD:        resolvedCWD,
+			Args:       []string{"a.md"},
+			ReviewPath: daemonPath,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { daemon.RemoveSessionFile(key) })
+
+		// Without the daemon-key preference this would use the branch key and
+		// fork a sibling review under the same data root.
+		got, err := ResolveCommandReviewPath(dataRoot, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(dataRoot, "reviews", key)
+		if got != want {
+			t.Fatalf("review path = %q, want daemon-keyed path %q", got, want)
+		}
+	})
+
+	t.Run("plan-mode daemon path is not treated as session key", func(t *testing.T) {
+		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"status":"ok"}`)
+		}))
+		t.Cleanup(health.Close)
+		parsed, err := url.Parse(health.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, err := strconv.Atoi(parsed.Port())
+		if err != nil {
+			t.Fatal(err)
+		}
+		const key = "cc3cb6556354"
+		dataRoot := t.TempDir()
+		planPath := filepath.Join(t.TempDir(), "plans", "auth-flow", ".crit")
+		if err := daemon.WriteSessionFile(key, daemon.SessionEntry{
+			PID:        os.Getpid(),
+			Port:       port,
+			CWD:        resolvedCWD,
+			ReviewPath: planPath,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { daemon.RemoveSessionFile(key) })
+
+		got, err := ResolveCommandReviewPath(dataRoot, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// .crit basename must not become the key under the data root.
+		branchKey := daemon.SessionKey(resolvedCWD, "", nil)
+		want := filepath.Join(dataRoot, "reviews", branchKey)
+		if got != want {
+			t.Fatalf("review path = %q, want branch-keyed path %q", got, want)
+		}
+	})
+
+	t.Run("non-key daemon review basename is ignored", func(t *testing.T) {
+		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"status":"ok"}`)
+		}))
+		t.Cleanup(health.Close)
+		parsed, err := url.Parse(health.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, err := strconv.Atoi(parsed.Port())
+		if err != nil {
+			t.Fatal(err)
+		}
+		const key = "dd4dc7667465"
+		dataRoot := t.TempDir()
+		weirdPath := filepath.Join(t.TempDir(), "custom-review-folder")
+		if err := daemon.WriteSessionFile(key, daemon.SessionEntry{
+			PID:        os.Getpid(),
+			Port:       port,
+			CWD:        resolvedCWD,
+			ReviewPath: weirdPath,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { daemon.RemoveSessionFile(key) })
+
+		got, err := ResolveCommandReviewPath(dataRoot, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		branchKey := daemon.SessionKey(resolvedCWD, "", nil)
+		want := filepath.Join(dataRoot, "reviews", branchKey)
+		if got != want {
+			t.Fatalf("review path = %q, want branch-keyed path %q", got, want)
+		}
+	})
+
+	t.Run("keeps using a legacy output layout and warns", func(t *testing.T) {
+		dataRoot := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataRoot, ".crit"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		var got string
+		stderr := captureStderr(t, func() {
+			var err error
+			got, err = ResolveReviewPathWithArgs(dataRoot, nil)
+			if err != nil {
+				t.Fatalf("ResolveReviewPathWithArgs: %v", err)
+			}
+		})
+		want := filepath.Join(dataRoot, ".crit")
+		if got != want {
+			t.Fatalf("review path = %q, want pre-existing legacy path %q", got, want)
+		}
+		if !strings.Contains(stderr, "legacy .crit review") {
+			t.Fatalf("stderr = %q, want legacy warning", stderr)
+		}
+	})
+}
+
+func TestClearReviewPath(t *testing.T) {
+	reviewPath := filepath.Join(t.TempDir(), ".crit")
+	if err := os.MkdirAll(reviewPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(reviewPath, "review.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearReviewPath(reviewPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Fatalf("review path still exists or stat failed unexpectedly: %v", err)
+	}
 }
 
 func withFetchPRHeadInfo(t *testing.T, fn func(int) (*PRHeadInfo, error)) {

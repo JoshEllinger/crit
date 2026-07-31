@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,18 +105,46 @@ func TestPreflightCheck_NotARepo(t *testing.T) {
 // session.critJSONPath() returned <planDir>/.crit — the split caused pasted
 // images to render as [image: <alt>] placeholders on crit-web.
 func TestResolveServeReviewPath(t *testing.T) {
-	t.Run("outputDir wins", func(t *testing.T) {
+	t.Run("outputDir wins as data root", func(t *testing.T) {
 		dir := t.TempDir()
-		got := resolveServeReviewPath(dir, "/some/plan/dir", "deadbeef")
-		want := filepath.Join(dir, ".crit")
+		got, err := resolveServeReviewPath(dir, "/some/plan/dir", "deadbeef")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(dir, "reviews", "deadbeef")
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
 	})
 
+	t.Run("outputDir keeps a legacy identity and warns", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, ".crit"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stderr := captureStderr(t, func() {
+			got, err := resolveServeReviewPath(dir, "", "deadbeef1234")
+			if err != nil {
+				t.Fatalf("resolveServeReviewPath: %v", err)
+			}
+			// The daemon must land on the same folder the headless commands
+			// resolve to, or `crit comment` would write to a sibling review.
+			want := filepath.Join(dir, ".crit")
+			if got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		})
+		if !strings.Contains(stderr, "legacy .crit review") {
+			t.Fatalf("stderr = %q, want legacy warning", stderr)
+		}
+	})
+
 	t.Run("planDir used when outputDir empty", func(t *testing.T) {
 		planDir := t.TempDir()
-		got := resolveServeReviewPath("", planDir, "deadbeef")
+		got, err := resolveServeReviewPath("", planDir, "deadbeef")
+		if err != nil {
+			t.Fatal(err)
+		}
 		want := filepath.Join(planDir, ".crit")
 		if got != want {
 			t.Errorf("plan-mode review path: got %q, want %q (must co-locate with review.json so attachments/ inlining can find them)", got, want)
@@ -123,11 +152,67 @@ func TestResolveServeReviewPath(t *testing.T) {
 	})
 
 	t.Run("centralized path when neither outputDir nor planDir set", func(t *testing.T) {
-		got := resolveServeReviewPath("", "", "deadbeef123")
+		got, err := resolveServeReviewPath("", "", "deadbeef123")
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !strings.Contains(got, "deadbeef123") {
 			t.Errorf("centralized path should embed session key; got %q", got)
 		}
 	})
+
+	t.Run("centralized path errors are preserved", func(t *testing.T) {
+		orig := reviewFilePath
+		t.Cleanup(func() { reviewFilePath = orig })
+		reviewFilePath = func(string) (string, error) {
+			return "", errors.New("home unavailable")
+		}
+
+		if _, err := resolveServeReviewPath("", "", "deadbeef123"); err == nil ||
+			!strings.Contains(err.Error(), "home unavailable") {
+			t.Fatalf("expected centralized path error, got %v", err)
+		}
+	})
+
+	t.Run("absolute plan path errors are preserved", func(t *testing.T) {
+		orig := serveAbsPath
+		t.Cleanup(func() { serveAbsPath = orig })
+		serveAbsPath = func(string) (string, error) {
+			return "", errors.New("working directory unavailable")
+		}
+
+		if _, err := resolveServeReviewPath("", "plan", "deadbeef123"); err == nil ||
+			!strings.Contains(err.Error(), "working directory unavailable") {
+			t.Fatalf("expected plan path error, got %v", err)
+		}
+	})
+}
+
+func TestResolveServeReviewPathPlanBeatsConfiguredOutput(t *testing.T) {
+	dir := t.TempDir()
+	testutil.SetHome(t, t.TempDir())
+	t.Chdir(dir)
+	if err := os.WriteFile(
+		filepath.Join(dir, ".crit.config.json"),
+		[]byte(`{"output":"/tmp/configured"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	planDir := filepath.Join(dir, "plan")
+	sc, err := server.ResolveDaemonCLIConfig([]string{"--plan-dir", planDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveServeReviewPath(sc.OutputDir, sc.PlanDir, "deadbeef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(planDir, ".crit")
+	if got != want {
+		t.Fatalf("review path = %q, want plan review path %q", got, want)
+	}
 }
 
 func TestServeSessionKey_Override(t *testing.T) {

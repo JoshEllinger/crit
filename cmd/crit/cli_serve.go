@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JoshEllinger/crit/internal/reviewpath"
 	"github.com/JoshEllinger/crit/internal/server"
 )
 
@@ -83,17 +84,21 @@ func bindListener(host string, port int) (net.Listener, error) {
 // resolveServeReviewPath computes the daemon's review folder so that
 // srv.reviewPath, the session-registry entry, session.ReviewFilePath, and
 // session.critJSONPath() all agree on one folder.
-func resolveServeReviewPath(outputDir, planDir, sessionKey string) string {
+var serveAbsPath = filepath.Abs
+
+func resolveServeReviewPath(outputDir, planDir, sessionKey string) (string, error) {
 	switch {
 	case outputDir != "":
-		abs, _ := filepath.Abs(outputDir)
-		return filepath.Join(abs, ".crit")
+		// --output / config output is a crit data root (like ~/.crit).
+		return reviewpath.IdentityUnderDataRoot(outputDir, sessionKey)
 	case planDir != "":
-		abs, _ := filepath.Abs(planDir)
-		return filepath.Join(abs, ".crit")
+		abs, err := serveAbsPath(planDir)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(abs, ".crit"), nil
 	default:
-		path, _ := reviewFilePath(sessionKey)
-		return path
+		return reviewFilePath(sessionKey)
 	}
 }
 
@@ -121,6 +126,9 @@ func runServe(args []string) {
 	}
 	srv.SetListenHost(sc.Host)
 	srv.SetPublicURL(sc.PublicURL)
+	if sc.AllowUnauthenticatedNetwork {
+		fmt.Fprintln(os.Stderr, "crit: WARNING: unauthenticated network exposure enabled. Anyone who can reach this port can read review files and write comments.")
+	}
 
 	cwd, _ := resolvedCWD()
 	homeDir := ""
@@ -132,7 +140,10 @@ func runServe(args []string) {
 	if vcs := DetectVCS(sc.VCSOverride); vcs != nil {
 		branch = vcs.CurrentBranch()
 	}
-	sc.ReviewPath = resolveServeReviewPath(sc.OutputDir, sc.PlanDir, key)
+	sc.ReviewPath, err = resolveServeReviewPath(sc.OutputDir, sc.PlanDir, key)
+	if err != nil {
+		daemonFatal(pipe, "Error: resolve review path: %v", err)
+	}
 	var cliArgs []string
 	switch {
 	case sc.LiveOrigin != "":
@@ -150,6 +161,7 @@ func runServe(args []string) {
 		sessionArgs = []string{"preview", sc.PreviewFile}
 	}
 	sessionStartedAt := time.Now().UTC()
+	sessionGeneration := sessionStartedAt.Format(time.RFC3339Nano)
 	srv.ConfigureDaemon(sc.Cfg, cwd, homeDir, sc.ReviewPath, cliArgs, sessionStartedAt)
 	if err := writeSessionFile(key, sessionEntry{
 		PID:        os.Getpid(),
@@ -160,7 +172,7 @@ func runServe(args []string) {
 		Args:       sessionArgs,
 		Branch:     branch,
 		ReviewPath: sc.ReviewPath,
-		StartedAt:  sessionStartedAt.Format(time.RFC3339),
+		StartedAt:  sessionGeneration,
 	}); err != nil {
 		daemonFatal(pipe, "Error writing session file: %v", err)
 	}
@@ -236,9 +248,14 @@ func runServe(args []string) {
 	if initErr != nil {
 		log.Printf("Error: %v", initErr)
 		srv.SetInitErr(initErr)
+		if err := writeDaemonFailure(key, sessionGeneration, initErr); err != nil {
+			log.Printf("Warning: could not preserve daemon initialization error: %v", err)
+		}
 		stop()
 		<-ctx.Done()
-		removeSessionFile(key)
+		// Keep the session entry and log until stale-session cleanup. The client
+		// may already have received the entry and needs the log to report this
+		// fatal initialization error after the server stops.
 		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutCtx)
@@ -268,6 +285,14 @@ func runServe(args []string) {
 	if sess.ReviewType == "live" || sess.ReviewType == "preview" {
 		sess.SetLiveRoundStart(func(_, next int) {
 			sess.Notify(SSEEvent{Type: "live-round-start", Round: next})
+		})
+	}
+	// Desktop notify is independent of Quiet: the daemon always sets Quiet so
+	// status goes through the client pipe, but AFK notifications should still fire.
+	if sc.NotifyOnRoundReady {
+		reviewURL := advertisedURL(sc.PublicURL, sc.Host, addr.Port, "")
+		sess.SetOnRoundReady(func(round int) {
+			go notifyRoundReady(round, reviewURL)
 		})
 	}
 	srv.SetSession(sess)

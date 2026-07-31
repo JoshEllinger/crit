@@ -8,7 +8,22 @@ import (
 	"testing"
 
 	"github.com/JoshEllinger/crit/internal/clicmd"
+	"github.com/JoshEllinger/crit/internal/daemon"
+	"github.com/JoshEllinger/crit/internal/review"
 )
+
+func loadOutputReview(t *testing.T, dataRoot string) CritJSON {
+	t.Helper()
+	critPath, err := review.ResolveReviewPath(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cj, err := loadCritJSON(critPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cj
+}
 
 func TestRunComment_MissingArgs(t *testing.T) {
 	err := RunComment([]string{})
@@ -43,10 +58,7 @@ func TestRunComment_ReviewLevel(t *testing.T) {
 	if err := RunComment([]string{"--output", tmp, "--author", "TestBot", "overall looks good"}); err != nil {
 		t.Fatalf("RunComment: %v", err)
 	}
-	cj, err := loadCritJSON(filepath.Join(tmp, ".crit"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	cj := loadOutputReview(t, tmp)
 	if len(cj.ReviewComments) != 1 || cj.ReviewComments[0].Body != "overall looks good" {
 		t.Errorf("review comment not saved: %+v", cj.ReviewComments)
 	}
@@ -62,10 +74,7 @@ func TestRunComment_FileLevel(t *testing.T) {
 	if err := RunComment([]string{"--output", tmp, "--author", "Bot", "test.go", "file comment"}); err != nil {
 		t.Fatalf("RunComment: %v", err)
 	}
-	cj, err := loadCritJSON(filepath.Join(tmp, ".crit"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	cj := loadOutputReview(t, tmp)
 	if len(cj.Files["test.go"].Comments) != 1 {
 		t.Fatalf("expected file comment, got %+v", cj.Files)
 	}
@@ -76,10 +85,7 @@ func TestRunComment_LineLevel(t *testing.T) {
 	if err := RunComment([]string{"--output", tmp, "--author", "Bot", "main.go:42", "line comment"}); err != nil {
 		t.Fatalf("RunComment: %v", err)
 	}
-	cj, err := loadCritJSON(filepath.Join(tmp, ".crit"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	cj := loadOutputReview(t, tmp)
 	c := cj.Files["main.go"].Comments[0]
 	if c.StartLine != 42 || c.EndLine != 42 {
 		t.Errorf("lines = %d-%d, want 42-42", c.StartLine, c.EndLine)
@@ -91,10 +97,7 @@ func TestRunComment_RangeLine(t *testing.T) {
 	if err := RunComment([]string{"--output", tmp, "--author", "Bot", "test.go:10-25", "range body"}); err != nil {
 		t.Fatalf("RunComment: %v", err)
 	}
-	cj, err := loadCritJSON(filepath.Join(tmp, ".crit"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	cj := loadOutputReview(t, tmp)
 	c := cj.Files["test.go"].Comments[0]
 	if c.StartLine != 10 || c.EndLine != 25 {
 		t.Errorf("lines = %d-%d, want 10-25", c.StartLine, c.EndLine)
@@ -110,11 +113,118 @@ func TestRunComment_InvalidRange(t *testing.T) {
 
 func TestRunComment_Clear(t *testing.T) {
 	tmp := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmp, ".crit.json"), []byte(`{"files":{}}`), 0o644); err != nil {
+	t.Chdir(tmp)
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := daemon.SessionKey(cwd, "", nil)
+	reviewPath := filepath.Join(tmp, "reviews", key)
+	if err := saveCritJSON(reviewPath, CritJSON{Files: map[string]CritJSONFile{}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := RunComment([]string{"--output", tmp, "--clear"}); err != nil {
 		t.Fatalf("RunComment --clear: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(reviewPath, "review.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected review cleared, stat err = %v", err)
+	}
+}
+
+func TestRunComment_ReplyUsesResolvedReviewPath(t *testing.T) {
+	outputDir := t.TempDir()
+	t.Chdir(outputDir)
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := daemon.SessionKey(cwd, "", nil)
+	reviewPath := filepath.Join(outputDir, "reviews", key)
+	if err := saveCritJSON(reviewPath, CritJSON{
+		ReviewComments: []Comment{{ID: "r_reply", Body: "parent", Scope: "review"}},
+		Files:          map[string]CritJSONFile{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RunComment([]string{
+		"--output", outputDir,
+		"--reply-to", "r_reply",
+		"--author", "bot",
+		"done",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cj, err := loadCritJSON(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cj.ReviewComments) != 1 || len(cj.ReviewComments[0].Replies) != 1 {
+		t.Fatalf("review comments = %+v, want one reply", cj.ReviewComments)
+	}
+	if cj.ReviewComments[0].Replies[0].Body != "done" {
+		t.Fatalf("reply body = %q, want done", cj.ReviewComments[0].Replies[0].Body)
+	}
+}
+
+func TestRunComment_InvalidReviewReturnsErrors(t *testing.T) {
+	projectDir := t.TempDir()
+	t.Chdir(projectDir)
+	if err := os.WriteFile(filepath.Join(projectDir, "file.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outputDir := filepath.Join(projectDir, "output")
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := daemon.SessionKey(cwd, "", nil)
+	reviewPath := filepath.Join(outputDir, "reviews", key)
+	if err := os.MkdirAll(reviewPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(reviewPath, "review.json"), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "review comment", args: []string{"body"}},
+		{name: "file comment", args: []string{"file.go", "body"}},
+		{name: "line comment", args: []string{"file.go:1", "body"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--output", outputDir}, tt.args...)
+			if err := RunComment(args); err == nil {
+				t.Fatal("expected invalid review error")
+			}
+		})
+	}
+}
+
+func TestRunCommentLineLevelRejectsLiveReview(t *testing.T) {
+	reviewPath := filepath.Join(t.TempDir(), ".crit")
+	if err := saveCritJSON(reviewPath, CritJSON{
+		ReviewType: "live",
+		Files:      map[string]CritJSONFile{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runCommentLineLevelAtPath(
+		"file.go:1",
+		[]string{"file.go:1", "body"},
+		"bot",
+		"",
+		reviewPath,
+		inheritedScope{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "not supported for live reviews") {
+		t.Fatalf("error = %v, want live review rejection", err)
 	}
 }
 
@@ -160,7 +270,11 @@ func TestRunCommentJSONScoped_CountsCommentsAndReplies(t *testing.T) {
 			"a.go": {Comments: []Comment{{ID: "c1", Body: "orig"}}},
 		},
 	}
-	if err := saveCritJSON(filepath.Join(tmp, ".crit"), cj); err != nil {
+	critPath, err := review.ResolveReviewPath(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCritJSON(critPath, cj); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,10 +287,7 @@ func TestRunCommentJSONScoped_CountsCommentsAndReplies(t *testing.T) {
 	if err := RunComment([]string{"--json", "--file", jsonPath, "--output", tmp, "--author", "bot"}); err != nil {
 		t.Fatalf("RunComment --json: %v", err)
 	}
-	loaded, err := loadCritJSON(filepath.Join(tmp, ".crit"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	loaded := loadOutputReview(t, tmp)
 	if len(loaded.Files["b.go"].Comments) != 1 {
 		t.Errorf("expected line comment in b.go, got %+v", loaded.Files)
 	}

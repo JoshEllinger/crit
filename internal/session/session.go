@@ -334,6 +334,12 @@ type Session struct {
 	// starts — read-only after.
 	liveRoundStart func(prevRound, newRound int)
 
+	// onRoundReady, when non-nil, is invoked from finishRoundComplete after a
+	// review round becomes ready for the human. Production wires desktop
+	// notifications here. Must be installed before the watcher starts —
+	// read-only after.
+	onRoundReady func(round int)
+
 	reviewComments []Comment
 
 	// story is the loaded narrative from review.json (nil unless `crit story`
@@ -2605,16 +2611,28 @@ func (s *Session) GetFileSnapshotFromDisk(path string) (map[string]any, bool) {
 	if repoRoot == "" {
 		return nil, false
 	}
-	// Resolve symlinks in repoRoot before path traversal check
-	if resolved, err := filepath.EvalSymlinks(repoRoot); err == nil {
-		repoRoot = resolved
+	clean := filepath.Clean(filepath.FromSlash(path))
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, false
 	}
-	// Prevent path traversal
-	absPath := filepath.Join(repoRoot, path)
+	absPath := filepath.Join(repoRoot, clean)
+	// Reject before symlink resolution if the joined path escapes repoRoot
+	// via ".." segments that Clean left relative to an absolute root join.
 	if !strings.HasPrefix(absPath, repoRoot+string(filepath.Separator)) && absPath != repoRoot {
 		return nil, false
 	}
-	data, err := os.ReadFile(absPath)
+	resolved, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return nil, false
+	}
+	if !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) && resolved != resolvedRoot {
+		return nil, false
+	}
+	data, err := os.ReadFile(resolved)
 	if err != nil {
 		return nil, false
 	}

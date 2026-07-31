@@ -35,8 +35,8 @@ crit/
 7. **Comments reference source line numbers** — stored in `~/.crit/reviews/<key>.json` with per-file sections
 8. **Real-time output** — review file written on every comment change (200ms debounce)
 9. **File watching** — git mode polls `git status --porcelain`; files mode polls mtimes; reloads via SSE
-10. **Localhost by default** — server binds to `127.0.0.1` (no CORS headers needed). Configurable via `--host` / `CRIT_HOST` / `host` config key (e.g. `0.0.0.0` for LAN). No auth, so non-loopback binds are explicit opt-in.
-11. **Two-level config** — `~/.crit.config.json` (global) merged with `.crit.config.json` (project), CLI flags override both. `agent_cmd`, `auth_token`, and `share_url` are global-only (prevents malicious repos from hijacking the agent command or redirecting share requests to steal auth tokens)
+10. **Localhost by default** — server binds to `127.0.0.1` (no CORS headers needed). Non-loopback `--host` / `CRIT_HOST` / global `host`, or any `public_url`, require `--allow-unauthenticated-network` / `CRIT_ALLOW_UNAUTHENTICATED_NETWORK=1` (Crit has no network auth).
+11. **Two-level config** — `~/.crit.config.json` (global) merged with `.crit.config.json` (project), CLI flags override both. `agent_cmd`, `auth_token`, `share_url`, and `plan_approve_mode` are global-only (prevents malicious repos from hijacking agent commands, redirecting share requests, or weakening Claude Code permissions)
 12. **Headless CLI comment** — `crit comment` writes directly to the review file without starting the server; SSE notifies any running server
 13. **Comment threading** — comments support nested replies and a `resolved` boolean. Review file schema nests replies inside each comment's `replies` array.
 14. **Centralized review storage** — `~/.crit/reviews/<key>.json` keyed by cwd + branch (git mode) or cwd + args (file mode)
@@ -98,13 +98,15 @@ Two-level JSON config files, merged (project overrides global):
 - **Global**: `~/.crit.config.json` — user-wide defaults
 - **Project**: `.crit.config.json` in repo root — per-project overrides
 
-Config keys: `port`, `host`, `no_open`, `share_url`, `quiet`, `output`, `author`, `base_branch`, `ignore_patterns`, `auto_viewed_patterns`, `agent_cmd`, `auth_token`, `auth_user_name`, `auth_user_email`, `auth_user_id`, `cleanup_on_approve`, `disable_stats`, `no_update_check`, `no_integration_check`, `vcs`, `proxy_auth`, `live_cookie`, `live_cookie_file`, `live_cdp_url`.
+Config keys: `port`, `host`, `no_open`, `share_url`, `quiet`, `output`, `author`, `base_branch`, `ignore_patterns`, `auto_viewed_patterns`, `agent_cmd`, `auth_token`, `auth_user_name`, `auth_user_email`, `auth_user_id`, `plan_approve_mode`, `cleanup_on_approve`, `notify_on_round_ready`, `disable_stats`, `no_update_check`, `no_integration_check`, `vcs`, `proxy_auth`, `live_cookie`, `live_cookie_file`, `live_cdp_url`, `close_on_approve_after_ms`.
 
 - `base_branch` overrides auto-detected default branch (used as diff base in git mode, and by `crit pull`/`crit push`/`crit comment`)
 - `author` falls back to the configured VCS user name if not set
-- `agent_cmd`, `auth_token`, `share_url`, and `proxy_auth` are **global config only**; project-level config cannot override (security — prevents malicious repos from hijacking the agent command or redirecting share requests to an attacker-controlled host)
+- `agent_cmd`, `auth_token`, `share_url`, `proxy_auth`, `plan_approve_mode`, and `close_on_approve_after_ms` are **global config only**; project-level config cannot override (security — prevents malicious repos from hijacking the agent command, redirecting share requests to an attacker-controlled host, weakening Claude Code permissions, or forcing a reviewer's tab to auto-close)
+- `close_on_approve_after_ms` (default: unset/disabled) — auto-close the review tab N ms after Approve with no unresolved comments; negative values are treated as unset. Not included in `crit config --generate` scaffolding.
 - `proxy_auth` (default: `false`) — when `true`, terminal `crit share` / `crit fetch` / `crit unpublish` are blocked (SSO proxy); the browser UI uses a popup relay instead. Global-only for security. See proxy-auth transport rules.
 - `cleanup_on_approve` (default: `true`) — auto-delete review file when reviewer approves with no unresolved comments
+- `notify_on_round_ready` (default: `false`) — opt in to a desktop notification when a review round becomes ready for the human
 - `disable_stats` (default: `false`) — disable session stats recording to `~/.crit/stats.json`
 - `ignore_patterns` are unioned (global + project both apply); types: `*.ext`, `dir/`, `exact.file`, `path/*.ext`
 - `auto_viewed_patterns` are unioned (global + project both apply); matched client-side against file paths and applied once per launch to auto-mark matching files viewed (collapsed). No runtime default (empty). Plumbed through `/api/config` only — Go does no glob matching.
@@ -248,7 +250,8 @@ Static: `GET /files/<path>` — serve files from repo root (path traversal prote
 
 <important if="you are modifying server security, request handling, or path-validation logic">
 
-- Server binds to `127.0.0.1` by default; user can opt into a different host via `--host` / `CRIT_HOST` / `host` config key. There is no auth, so any non-loopback bind exposes file content + comment-write API to anyone who can reach the port — that's why it's an explicit opt-in (CLI flag / env var / config key).
+- Server binds to `127.0.0.1` by default. Non-loopback listen or any `public_url` refuses to start unless `--allow-unauthenticated-network` / `CRIT_ALLOW_UNAUTHENTICATED_NETWORK=1` is set (CLI/env only — never project config). Prefer SSH `-L`, Tailscale Serve to loopback, or Docker `-p 127.0.0.1:port:port`.
+- State-changing requests (POST/PUT/PATCH/DELETE) with a `Sec-Fetch-Site` header must be `same-origin`. Missing header is allowed (CLI/curl/agent). `cross-site` is rejected — CSRF defense against malicious pages posting to loopback. Complements `checkHost` (DNS-rebinding); does not authenticate network clients.
 - `/files/` validates paths, blocks `..` traversal, verifies resolved path stays within repo root
 - Body size: 10MB for comments, 1MB for share-url via `http.MaxBytesReader`
 - HTTP server: `ReadTimeout: 15s`, `IdleTimeout: 60s` (no `WriteTimeout` — SSE needs open connections)

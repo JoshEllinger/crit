@@ -1,9 +1,9 @@
 package comment
 
 import (
-	"path/filepath"
 	"testing"
 
+	"github.com/JoshEllinger/crit/internal/review"
 	"github.com/JoshEllinger/crit/internal/session"
 )
 
@@ -60,7 +60,10 @@ func TestExportWrappers_PersistComments(t *testing.T) {
 	if err := BulkAddCommentsToCritJSONScoped([]BulkCommentEntry{{Body: "bulk", Scope: "review"}}, "bot", "", dir, scope); err != nil {
 		t.Fatal(err)
 	}
-	critPath := filepath.Join(dir, ".crit")
+	critPath, err := review.ResolveReviewPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	loaded, err := loadCritJSON(critPath)
 	if err != nil {
 		t.Fatal(err)
