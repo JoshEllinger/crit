@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,25 +10,26 @@ import (
 	"time"
 )
 
+type daemonInitializationError struct {
+	message string
+}
+
+func (e *daemonInitializationError) Error() string {
+	return e.message
+}
+
 // RunReviewClient connects to a running daemon, blocks until the user finishes
 // reviewing, prints feedback to stdout, and returns whether the review was approved.
 func RunReviewClient(entry SessionEntry, sessionKey string) (approved bool) {
 	client := &http.Client{Timeout: 24 * time.Hour}
 
-	statusCode, body, err := waitForDaemonReady(client, entry.Host, entry.Port, sessionKey)
+	statusCode, body, err := waitForDaemonReady(client, entry.Host, entry.Port, sessionKey, entry.StartedAt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	if statusCode == http.StatusInternalServerError {
-		var status struct {
-			Message string `json:"message"`
-		}
-		if json.Unmarshal(body, &status) == nil && status.Message != "" {
-			fmt.Fprintf(os.Stderr, "Error: %s\n", status.Message)
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: %s\n", body)
-		}
+		fmt.Fprintf(os.Stderr, "Error: %s\n", daemonInitError(body))
 		os.Exit(1)
 	}
 
@@ -73,9 +75,19 @@ func RunReviewClient(entry SessionEntry, sessionKey string) (approved bool) {
 func RunReviewClientRaw(entry SessionEntry, sessionKey string) (approved bool, prompt string) {
 	client := &http.Client{Timeout: 24 * time.Hour}
 
-	if _, _, err := waitForDaemonReady(client, entry.Host, entry.Port, sessionKey); err != nil {
+	statusCode, body, err := waitForDaemonReady(client, entry.Host, entry.Port, sessionKey, entry.StartedAt)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "crit plan-hook: %v\n", err)
+		var initErr *daemonInitializationError
+		if errors.As(err, &initErr) {
+			return false, "crit daemon failed to initialize: " + initErr.Error()
+		}
 		return false, "crit daemon was unreachable; plan was not reviewed."
+	}
+	if statusCode == http.StatusInternalServerError {
+		message := daemonInitError(body)
+		fmt.Fprintf(os.Stderr, "crit plan-hook: %s\n", message)
+		return false, "crit daemon failed to initialize: " + message
 	}
 
 	resp, err := client.Post(entry.ConnURL()+"/api/review-cycle", "application/json", nil)
@@ -85,7 +97,7 @@ func RunReviewClientRaw(entry SessionEntry, sessionKey string) (approved bool, p
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "crit plan-hook: could not read daemon response: %v\n", err)
 		return false, "crit daemon response could not be read."
@@ -107,7 +119,7 @@ func RunReviewClientRaw(entry SessionEntry, sessionKey string) (approved bool, p
 	return result.Approved, result.Prompt
 }
 
-func waitForDaemonReady(client *http.Client, host string, port int, sessionKey string) (statusCode int, body []byte, err error) {
+func waitForDaemonReady(client *http.Client, host string, port int, sessionKey, daemonGeneration string) (statusCode int, body []byte, err error) {
 	connHost := host
 	if connHost == "" {
 		connHost = "127.0.0.1"
@@ -118,6 +130,9 @@ func waitForDaemonReady(client *http.Client, host string, port int, sessionKey s
 		resp, reqErr := client.Get(base + "/api/session")
 		if reqErr != nil {
 			if sessionKey != "" {
+				if msg := ReadDaemonFailure(sessionKey, daemonGeneration); msg != "" {
+					return 0, nil, &daemonInitializationError{message: msg}
+				}
 				if msg := ReadDaemonLog(sessionKey); msg != "" {
 					return 0, nil, fmt.Errorf("%s", msg)
 				}
@@ -134,6 +149,16 @@ func waitForDaemonReady(client *http.Client, host string, port int, sessionKey s
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+func daemonInitError(body []byte) string {
+	var status struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &status) == nil && status.Message != "" {
+		return status.Message
+	}
+	return string(body)
 }
 
 func readReviewCycleResponse(resp *http.Response) ([]byte, error) {

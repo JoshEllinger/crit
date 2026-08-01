@@ -62,6 +62,16 @@ func detectFrameworks(body []byte) []string {
 
 var smokeClient = &http.Client{Timeout: 10 * time.Second}
 
+var (
+	startLiveDaemon                = daemon.StartDaemon
+	runLiveClient                  = daemon.RunReviewClient
+	installLiveDaemonSignalHandler = installDaemonSignalHandler
+	openLiveBrowser                = browser.OpenBrowserWithCommand
+	launchLiveBrowser              = func(url, openCmd string) {
+		go openLiveBrowser(url, openCmd)
+	}
+)
+
 func runSmokeTest(origin, cookies string) smokeResult {
 	req, err := http.NewRequest(http.MethodGet, origin, nil)
 	if err != nil {
@@ -140,7 +150,7 @@ func LooksLikeLiveArgs(args []string) bool {
 	return u.Scheme == "http" || u.Scheme == "https"
 }
 
-func connectToLiveDaemon(key, openCmd string) bool {
+func connectToLiveDaemon(key string, noOpen bool, openCmd string) bool {
 	entry, alive := daemon.FindAliveSession(key)
 	if !alive {
 		return false
@@ -148,24 +158,25 @@ func connectToLiveDaemon(key, openCmd string) bool {
 	fmt.Fprintf(os.Stderr, "[crit] connected to live daemon at %s (proxy :%d)\n",
 		entry.BaseURL(), entry.Port+1)
 	fmt.Fprintf(os.Stderr, "[crit] open %s/live\n", entry.BaseURL())
-	if !daemon.DaemonHasBrowser(entry) {
-		go browser.OpenBrowserWithCommand(entry.BaseURL()+"/live", openCmd)
+	if !noOpen && !daemon.DaemonHasBrowser(entry) {
+		launchLiveBrowser(entry.BaseURL()+"/live", openCmd)
 	}
-	daemon.RunReviewClient(entry, key)
+	runLiveClient(entry, key)
 	return true
 }
 
 type liveCLIFlags struct {
-	port        int
-	host        string
-	publicURL   string
-	noOpen      bool
-	quiet       bool
-	shareURL    string
-	cookieFlags stringSliceFlag
-	cookieFile  string
-	cdpURL      string
-	origin      string
+	port                        int
+	host                        string
+	publicURL                   string
+	allowUnauthenticatedNetwork bool
+	noOpen                      bool
+	quiet                       bool
+	shareURL                    string
+	cookieFlags                 stringSliceFlag
+	cookieFile                  string
+	cdpURL                      string
+	origin                      string
 }
 
 func parseLiveCLIFlags(args []string) liveCLIFlags {
@@ -174,6 +185,7 @@ func parseLiveCLIFlags(args []string) liveCLIFlags {
 	fs.IntVar(port, "p", 0, "Port (shorthand)")
 	host := fs.String("host", "", "Host to listen on")
 	publicURL := fs.String("public-url", "", "Advertised base URL (overrides CRIT_PUBLIC_URL)")
+	allowUnauthNet := fs.Bool(config.AllowUnauthenticatedNetworkFlag, false, "Allow non-loopback listen or public_url without authentication")
 	noOpen := fs.Bool("no-open", false, "Don't auto-open browser")
 	quiet := fs.Bool("quiet", false, "Suppress status output")
 	fs.BoolVar(quiet, "q", false, "Suppress status (shorthand)")
@@ -203,16 +215,17 @@ func parseLiveCLIFlags(args []string) liveCLIFlags {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return liveCLIFlags{
-		port:        *port,
-		host:        *host,
-		publicURL:   *publicURL,
-		noOpen:      *noOpen,
-		quiet:       *quiet,
-		shareURL:    *shareURL,
-		cookieFlags: cookieFlags,
-		cookieFile:  *cookieFile,
-		cdpURL:      *cdpURL,
-		origin:      strings.TrimSuffix(u.String(), "/"),
+		port:                        *port,
+		host:                        *host,
+		publicURL:                   *publicURL,
+		allowUnauthenticatedNetwork: *allowUnauthNet,
+		noOpen:                      *noOpen,
+		quiet:                       *quiet,
+		shareURL:                    *shareURL,
+		cookieFlags:                 cookieFlags,
+		cookieFile:                  *cookieFile,
+		cdpURL:                      *cdpURL,
+		origin:                      strings.TrimSuffix(u.String(), "/"),
 	}
 }
 
@@ -222,12 +235,13 @@ func buildLiveDaemonArgs(origin, liveCookies string, f liveCLIFlags, cfg config.
 		daemonArgs = append(daemonArgs, "--live-cookie", liveCookies)
 	}
 	return daemon.AppendCommonDaemonFlags(daemonArgs, daemon.CommonDaemonFlags{
-		Port:      config.ResolvePort(f.port, cfg.Port),
-		Host:      config.ResolveHost(f.host, cfg.Host),
-		PublicURL: config.ResolvePublicURL(f.publicURL, cfg),
-		NoOpen:    noOpenResolved,
-		Quiet:     f.quiet || cfg.Quiet,
-		ShareURL:  config.ResolveShareURL(f.shareURL, cfg, ""),
+		Port:                        config.ResolvePort(f.port, cfg.Port),
+		Host:                        config.ResolveHost(f.host, cfg.Host),
+		PublicURL:                   config.ResolvePublicURL(f.publicURL, cfg),
+		AllowUnauthenticatedNetwork: f.allowUnauthenticatedNetwork || config.EnvAllowsUnauthenticatedNetwork(),
+		NoOpen:                      noOpenResolved,
+		Quiet:                       f.quiet || cfg.Quiet,
+		ShareURL:                    config.ResolveShareURL(f.shareURL, cfg, ""),
 	})
 }
 
@@ -242,7 +256,8 @@ func RunLive(args []string) {
 	}
 	cfg := config.LoadConfig(cwd)
 	key := daemon.LiveSessionKey(cwd, f.origin)
-	if connectToLiveDaemon(key, cfg.OpenCmd) {
+	noOpenResolved := f.noOpen || cfg.NoOpen
+	if connectToLiveDaemon(key, noOpenResolved, cfg.OpenCmd) {
 		return
 	}
 
@@ -254,12 +269,11 @@ func RunLive(args []string) {
 
 	checkLiveSmoke(f.origin, liveCookies)
 
-	if connectToLiveDaemon(key, cfg.OpenCmd) {
+	if connectToLiveDaemon(key, noOpenResolved, cfg.OpenCmd) {
 		return
 	}
 
-	noOpenResolved := f.noOpen || cfg.NoOpen
-	entry, err := daemon.StartDaemon(key, buildLiveDaemonArgs(f.origin, liveCookies, f, cfg, noOpenResolved))
+	entry, err := startLiveDaemon(key, buildLiveDaemonArgs(f.origin, liveCookies, f, cfg, noOpenResolved))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: could not start live daemon: %v\n", err)
 		os.Exit(1)
@@ -269,13 +283,9 @@ func RunLive(args []string) {
 		entry.Port, entry.Port+1)
 	fmt.Fprintf(os.Stderr, "[crit] open %s/live\n", entry.BaseURL())
 
-	installDaemonSignalHandler(entry.PID)
+	installLiveDaemonSignalHandler(entry.PID)
 
-	if !noOpenResolved {
-		go browser.OpenBrowserWithCommand(entry.BaseURL()+"/live", cfg.OpenCmd)
-	}
-
-	daemon.RunReviewClient(entry, key)
+	runLiveClient(entry, key)
 }
 
 func checkLiveSmoke(origin, cookies string) {

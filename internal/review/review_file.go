@@ -11,6 +11,7 @@ import (
 
 	"github.com/JoshEllinger/crit/internal/config"
 	"github.com/JoshEllinger/crit/internal/daemon"
+	"github.com/JoshEllinger/crit/internal/reviewpath"
 	"github.com/JoshEllinger/crit/internal/session"
 	"github.com/JoshEllinger/crit/internal/vcs"
 )
@@ -28,18 +29,51 @@ var errReviewFileAmbiguousForBranch = errors.New("multiple review files match br
 // ResolveReviewPath returns the review identity path for the current context.
 // In v4 the identity is a folder; review.json and snapshots.json live inside.
 // Resolution order:
-//  1. If outputDir is set, return outputDir/.crit (explicit override)
+//  1. If outputDir is set, return {outputDir}/reviews/<key> (crit data root)
 //  2. Check daemon registry for running sessions matching this cwd
 //  3. If one daemon matches, use its ReviewPath
 //  4. If multiple daemons match, use the one matching current branch
 //  5. If no daemon found, compute the centralized path: ~/.crit/reviews/<key>
 func ResolveReviewPath(outputDir string) (string, error) {
+	return ResolveReviewPathWithArgs(outputDir, nil)
+}
+
+// ResolveCommandReviewPath resolves a headless command's review identity.
+// Explicit output belongs to the current invocation and wins first. A live
+// daemon then preserves the identity selected when the review was launched,
+// followed by configured output and finally centralized storage.
+func ResolveCommandReviewPath(explicitOutput, configuredOutput string) (string, error) {
+	return resolveCommandReviewPathWithArgs(explicitOutput, configuredOutput, nil)
+}
+
+// ResolveCommandReviewPathWithArgs applies command-path precedence while
+// retaining file arguments for the centralized fallback session key.
+func ResolveCommandReviewPathWithArgs(explicitOutput, configuredOutput string, fileArgs []string) (string, error) {
+	return resolveCommandReviewPathWithArgs(explicitOutput, configuredOutput, fileArgs)
+}
+
+func resolveCommandReviewPathWithArgs(explicitOutput, configuredOutput string, fileArgs []string) (string, error) {
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
+		return "", err
+	}
+	if explicitOutput != "" {
+		return identityUnderDataRoot(explicitOutput, fileArgs)
+	}
+	if path := ResolveReviewPathFromDaemon(cwd); path != "" {
+		return path, nil
+	}
+	if configuredOutput != "" {
+		return identityUnderDataRoot(configuredOutput, fileArgs)
+	}
+	return ResolveReviewPathWithArgs("", fileArgs)
+}
+
+// ResolveReviewPathWithArgs is like ResolveReviewPath but includes file args
+// in the session key, matching the key that file-mode sessions use.
+func ResolveReviewPathWithArgs(outputDir string, fileArgs []string) (string, error) {
 	if outputDir != "" {
-		abs, err := filepath.Abs(outputDir)
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(abs, ".crit"), nil
+		return identityUnderDataRoot(outputDir, fileArgs)
 	}
 
 	cwd, err := daemon.ResolvedCWD()
@@ -51,50 +85,56 @@ func ResolveReviewPath(outputDir string) (string, error) {
 		return path, nil
 	}
 
-	// No daemon — compute centralized path.
+	key := sessionKeyForArgs(cwd, fileArgs)
+	return daemon.ReviewFilePath(key)
+}
+
+// identityUnderDataRoot maps --output / config output (a crit data root) to
+// {dataRoot}/reviews/<key>, matching default ~/.crit/reviews/<key> layout. A
+// pre-data-root {dataRoot}/.crit review still wins — see
+// reviewpath.IdentityUnderDataRoot.
+//
+// When a daemon is alive for this cwd, its session key wins — file/live/PR/range
+// reviews key differently from plain git mode, and re-deriving from local
+// context would fork a sibling review under the same data root.
+func identityUnderDataRoot(dataRoot string, fileArgs []string) (string, error) {
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
+		return "", err
+	}
+	if key := sessionKeyFromDaemon(cwd); key != "" {
+		return reviewpath.IdentityUnderDataRoot(dataRoot, key)
+	}
+	return reviewpath.IdentityUnderDataRoot(dataRoot, sessionKeyForArgs(cwd, fileArgs))
+}
+
+// sessionKeyFromDaemon returns the registry key of the best matching live
+// daemon for cwd, or "" if none. Prefer this over recomputing SessionKey when
+// placing a review under a custom data root.
+func sessionKeyFromDaemon(cwd string) string {
+	path := ResolveReviewPathFromDaemon(cwd)
+	if path == "" {
+		return ""
+	}
+	base := filepath.Base(path)
+	if base == ".crit" {
+		return "" // plan-mode identity is not a session key
+	}
+	if daemon.ValidSessionKey(base) {
+		return base
+	}
+	return ""
+}
+
+func sessionKeyForArgs(cwd string, fileArgs []string) string {
+	if len(fileArgs) > 0 {
+		return daemon.SessionKey(cwd, "", fileArgs)
+	}
 	branch := ""
 	if vc := vcs.DetectVCS(""); vc != nil {
 		branch = vc.CurrentBranch()
 	}
-	key := daemon.SessionKey(cwd, branch, nil)
-	path, err := daemon.ReviewFilePath(key)
-	if err != nil {
-		return "", err
-	}
-
-	return path, nil
-}
-
-// resolveReviewPathWithArgs is like ResolveReviewPath but includes file args
-// in the session key, matching the key that file-mode sessions use.
-func ResolveReviewPathWithArgs(outputDir string, fileArgs []string) (string, error) {
-	if len(fileArgs) == 0 {
-		return ResolveReviewPath(outputDir)
-	}
-	if outputDir != "" {
-		abs, err := filepath.Abs(outputDir)
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(abs, ".crit"), nil
-	}
-
-	cwd, err := daemon.ResolvedCWD()
-	if err != nil {
-		return "", err
-	}
-
-	if path := ResolveReviewPathFromDaemon(cwd); path != "" {
-		return path, nil
-	}
-
-	key := daemon.SessionKey(cwd, "", fileArgs)
-	path, err := daemon.ReviewFilePath(key)
-	if err != nil {
-		return "", err
-	}
-
-	return path, nil
+	return daemon.SessionKey(cwd, branch, nil)
 }
 
 // ResolveReviewPathFromDaemon checks the daemon registry for a running session

@@ -17,15 +17,16 @@ import (
 )
 
 type planConfig struct {
-	name          string
-	filePath      string
-	stdinExpected bool
-	port          int
-	host          string
-	publicURL     string
-	noOpen        bool
-	quiet         bool
-	shareURL      string
+	name                        string
+	filePath                    string
+	stdinExpected               bool
+	port                        int
+	host                        string
+	publicURL                   string
+	allowUnauthenticatedNetwork bool
+	noOpen                      bool
+	quiet                       bool
+	shareURL                    string
 }
 
 func resolvePlanConfig(args []string) planConfig {
@@ -35,6 +36,7 @@ func resolvePlanConfig(args []string) planConfig {
 	fs.IntVar(port, "p", 0, "Port (shorthand)")
 	host := fs.String("host", "", "Host to listen on")
 	publicURL := fs.String("public-url", "", "Advertised base URL (overrides CRIT_PUBLIC_URL)")
+	allowUnauthNet := fs.Bool(config.AllowUnauthenticatedNetworkFlag, false, "Allow non-loopback listen or public_url without authentication")
 	noOpen := fs.Bool("no-open", false, "Don't auto-open browser")
 	quiet := fs.Bool("quiet", false, "Suppress status output")
 	fs.BoolVar(quiet, "q", false, "Suppress status (shorthand)")
@@ -42,13 +44,14 @@ func resolvePlanConfig(args []string) planConfig {
 	fs.Parse(args)
 
 	pc := planConfig{
-		name:      *name,
-		port:      *port,
-		host:      *host,
-		publicURL: *publicURL,
-		noOpen:    *noOpen,
-		quiet:     *quiet,
-		shareURL:  *shareURL,
+		name:                        *name,
+		port:                        *port,
+		host:                        *host,
+		publicURL:                   *publicURL,
+		allowUnauthenticatedNetwork: *allowUnauthNet,
+		noOpen:                      *noOpen,
+		quiet:                       *quiet,
+		shareURL:                    *shareURL,
 	}
 
 	remaining := fs.Args()
@@ -128,12 +131,13 @@ func RunPlan(args []string) error {
 	cfg := config.LoadConfig(cwd)
 	noOpenResolved := pc.noOpen || cfg.NoOpen
 	daemonArgs := BuildPlanDaemonArgs(currentPath, storageDir, slug, PlanDaemonFlags{
-		Port:      config.ResolvePort(pc.port, cfg.Port),
-		Host:      config.ResolveHost(pc.host, cfg.Host),
-		PublicURL: config.ResolvePublicURL(pc.publicURL, cfg),
-		NoOpen:    noOpenResolved,
-		Quiet:     pc.quiet || cfg.Quiet,
-		ShareURL:  config.ResolveShareURL(pc.shareURL, cfg, ""),
+		Port:                        config.ResolvePort(pc.port, cfg.Port),
+		Host:                        config.ResolveHost(pc.host, cfg.Host),
+		PublicURL:                   config.ResolvePublicURL(pc.publicURL, cfg),
+		AllowUnauthenticatedNetwork: pc.allowUnauthenticatedNetwork || config.EnvAllowsUnauthenticatedNetwork(),
+		NoOpen:                      noOpenResolved,
+		Quiet:                       pc.quiet || cfg.Quiet,
+		ShareURL:                    config.ResolveShareURL(pc.shareURL, cfg, ""),
 	})
 
 	entry, weStartedDaemon, err := connectOrStartDaemon(key, daemonArgs, noOpenResolved, cfg.OpenCmd)
@@ -152,10 +156,8 @@ func RunPlan(args []string) error {
 }
 
 type planHookEvent struct {
-	SessionID string `json:"session_id"`
-	ToolInput struct {
-		Plan string `json:"plan"`
-	} `json:"tool_input"`
+	SessionID string          `json:"session_id"`
+	ToolInput json.RawMessage `json:"tool_input"`
 }
 
 func resolveHookSlug(sessionID string, content []byte) string {
@@ -172,12 +174,40 @@ func resolveHookSlug(sessionID string, content []byte) string {
 	return ResolveSlug(content)
 }
 
-func emitHookDecision(approved bool, prompt string) {
+func planApproveModePermissionUpdate(mode string) (map[string]string, bool) {
+	switch mode {
+	case "default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions":
+		return map[string]string{
+			"type":        "setMode",
+			"mode":        mode,
+			"destination": "session",
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func emitHookDecision(approved bool, prompt string, toolInput json.RawMessage, planApproveMode string) {
 	if approved {
+		decision := map[string]any{
+			"behavior":     "allow",
+			"updatedInput": toolInput,
+		}
+		if planApproveMode != "" {
+			if update, valid := planApproveModePermissionUpdate(planApproveMode); valid {
+				decision["updatedPermissions"] = []map[string]string{update}
+			} else {
+				fmt.Fprintf(
+					os.Stderr,
+					"crit plan-hook: warning: ignoring invalid plan_approve_mode %q; expected default, manual, acceptEdits, plan, auto, dontAsk, or bypassPermissions\n",
+					planApproveMode,
+				)
+			}
+		}
 		out, _ := json.Marshal(map[string]any{
 			"hookSpecificOutput": map[string]any{
 				"hookEventName": "PermissionRequest",
-				"decision":      map[string]any{"behavior": "allow"},
+				"decision":      decision,
 			},
 		})
 		fmt.Println(string(out))
@@ -217,6 +247,10 @@ var runCodexPlanReviewHook = func(sessionID string, content []byte) {
 	runPlanReviewHook("crit plan-hook --mode codex", sessionID, content, emitCodexStopDecision)
 }
 
+var runClaudePlanReviewHook = func(sessionID string, content []byte, emitDecision func(bool, string)) {
+	runPlanReviewHook("crit plan-hook", sessionID, content, emitDecision)
+}
+
 func runPlanReviewHook(logPrefix, sessionID string, content []byte, emitDecision func(bool, string)) {
 	slug := resolveHookSlug(sessionID, content)
 
@@ -240,7 +274,8 @@ func runPlanReviewHook(logPrefix, sessionID string, content []byte, emitDecision
 	key := PlanSessionKey(cwd, slug)
 	currentPath := filepath.Join(storageDir, "current.md")
 	daemonArgs := BuildPlanDaemonArgs(currentPath, storageDir, slug, PlanDaemonFlags{
-		PublicURL: config.ResolvePublicURL("", cfg),
+		PublicURL:                   config.ResolvePublicURL("", cfg),
+		AllowUnauthenticatedNetwork: config.EnvAllowsUnauthenticatedNetwork(),
 	})
 
 	entry, alive := daemon.FindAliveSession(key)
@@ -279,14 +314,36 @@ func RunPlanHook() error {
 	var event planHookEvent
 	if err := json.NewDecoder(os.Stdin).Decode(&event); err != nil {
 		fmt.Fprintf(os.Stderr, "crit plan-hook: could not parse stdin: %v\n", err)
-		emitHookDecision(false, "Crit could not parse the plan hook input; plan was not reviewed.")
+		emitHookDecision(false, "Crit could not parse the plan hook input; plan was not reviewed.", nil, "")
 		return nil
 	}
-	if strings.TrimSpace(event.ToolInput.Plan) == "" {
+	if len(event.ToolInput) == 0 {
 		return nil
 	}
 
-	runPlanReviewHook("crit plan-hook", event.SessionID, []byte(event.ToolInput.Plan), emitHookDecision)
+	var toolInput struct {
+		Plan string `json:"plan"`
+	}
+	if err := json.Unmarshal(event.ToolInput, &toolInput); err != nil {
+		fmt.Fprintf(os.Stderr, "crit plan-hook: could not parse tool input: %v\n", err)
+		emitHookDecision(false, "Crit could not parse the plan hook input; plan was not reviewed.", nil, "")
+		return nil
+	}
+	if strings.TrimSpace(toolInput.Plan) == "" {
+		return nil
+	}
+
+	emitDecision := func(approved bool, prompt string) {
+		planApproveMode := ""
+		if approved {
+			cwd, _ := daemon.ResolvedCWD()
+			// Resolve at approval time because a plan review can stay open for
+			// hours and the user may update their global preference meanwhile.
+			planApproveMode = config.LoadConfig(cwd).PlanApproveMode
+		}
+		emitHookDecision(approved, prompt, event.ToolInput, planApproveMode)
+	}
+	runClaudePlanReviewHook(event.SessionID, []byte(toolInput.Plan), emitDecision)
 	return nil
 }
 

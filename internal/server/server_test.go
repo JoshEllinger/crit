@@ -183,6 +183,94 @@ func TestHostCheckDefaultWiring(t *testing.T) {
 	}
 }
 
+func TestCheckSecFetchSite(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		site   string // empty = omit header
+		want   bool
+	}{
+		{"GET ignores cross-site", http.MethodGet, "cross-site", true},
+		{"HEAD ignores cross-site", http.MethodHead, "cross-site", true},
+		{"OPTIONS ignores cross-site", http.MethodOptions, "cross-site", true},
+		{"POST missing header (CLI)", http.MethodPost, "", true},
+		{"PUT missing header (CLI)", http.MethodPut, "", true},
+		{"DELETE missing header (CLI)", http.MethodDelete, "", true},
+		{"POST same-origin (UI)", http.MethodPost, "same-origin", true},
+		{"PUT same-origin (UI)", http.MethodPut, "same-origin", true},
+		{"DELETE same-origin (UI)", http.MethodDelete, "same-origin", true},
+		{"POST cross-site (CSRF)", http.MethodPost, "cross-site", false},
+		{"PUT cross-site (CSRF)", http.MethodPut, "cross-site", false},
+		{"PATCH cross-site (CSRF)", http.MethodPatch, "cross-site", false},
+		{"DELETE cross-site (CSRF)", http.MethodDelete, "cross-site", false},
+		{"POST same-site rejected", http.MethodPost, "same-site", false},
+		{"POST none rejected", http.MethodPost, "none", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "/api/finish", nil)
+			if tt.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tt.site)
+			}
+			if got := checkSecFetchSite(req); got != tt.want {
+				t.Errorf("checkSecFetchSite = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSecFetchSiteCSRF_RejectsCrossSiteCommentPOST pins Vector A: a browser on
+// evil.com POSTing to 127.0.0.1 with Host: loopback (so checkHost passes) must
+// still be rejected when Sec-Fetch-Site is cross-site. The comment must not
+// be written.
+func TestSecFetchSiteCSRF_RejectsCrossSiteCommentPOST(t *testing.T) {
+	s, session := newTestServer(t)
+	s.SetListenHost("127.0.0.1")
+	before := len(session.GetComments("test.md"))
+
+	body := `{"start_line":1,"end_line":1,"body":"run attacker command","author":"evil"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/file/comments?path=test.md", strings.NewReader(body))
+	req.Host = "127.0.0.1:9"
+	req.Header.Set("Content-Type", "text/plain") // simple-request CSRF shape
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body.String())
+	}
+	if got := len(session.GetComments("test.md")); got != before {
+		t.Fatalf("comment count = %d, want %d (cross-site POST must not write)", got, before)
+	}
+}
+
+func TestSecFetchSiteCSRF_AllowsSameOriginAndCLI(t *testing.T) {
+	s, session := newTestServer(t)
+	s.SetListenHost("127.0.0.1")
+
+	post := func(t *testing.T, site string) {
+		t.Helper()
+		body := `{"start_line":1,"end_line":1,"body":"ok","author":"me"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/file/comments?path=test.md", strings.NewReader(body))
+		req.Host = "127.0.0.1:9"
+		req.Header.Set("Content-Type", "application/json")
+		if site != "" {
+			req.Header.Set("Sec-Fetch-Site", site)
+		}
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("site=%q status = %d, want 201; body=%s", site, w.Code, w.Body.String())
+		}
+	}
+
+	before := len(session.GetComments("test.md"))
+	post(t, "")            // CLI / curl
+	post(t, "same-origin") // Crit UI
+	if got := len(session.GetComments("test.md")); got != before+2 {
+		t.Fatalf("comment count = %d, want %d", got, before+2)
+	}
+}
+
 func TestSetPublicURL(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.SetPublicURL("https://mymac.ts.net/design")
@@ -1685,6 +1773,31 @@ func TestGetFile_NotInSession_PathTraversal(t *testing.T) {
 	}
 }
 
+// TestGetFile_NotInSession_SymlinkTraversal verifies the disk fallback
+// resolves symlinks and refuses paths that escape the repo root.
+func TestGetFile_NotInSession_SymlinkTraversal(t *testing.T) {
+	s, session := newTestServer(t)
+
+	outsideDir := t.TempDir()
+	secretPath := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("secret data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkPath := filepath.Join(session.RepoRoot, "escape")
+	if err := os.Symlink(outsideDir, linkPath); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/file?path=escape/secret.txt", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code == 200 {
+		t.Errorf("symlink traversal should be blocked, got 200 with body: %s", w.Body.String())
+	}
+}
+
 func TestHandleFinish_PromptIncludesAuthor(t *testing.T) {
 	srv, session := newTestServer(t)
 	session.AddComment(session.Files[0].Path, 1, 1, "", "fix this", "", "", "")
@@ -2410,6 +2523,60 @@ func TestHandleConfig_AuthNotLoggedIn(t *testing.T) {
 	}
 	if resp["auth_user_name"] != "" {
 		t.Errorf("auth_user_name = %v, want empty", resp["auth_user_name"])
+	}
+}
+
+func TestHandleConfig_CloseOnApproveAfterMs_OmittedWhenUnset(t *testing.T) {
+	s, _ := newTestServer(t)
+	// s.cfg.CloseOnApproveAfterMs is nil by default (zero value Config).
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := resp["close_on_approve_after_ms"]; ok {
+		t.Errorf("close_on_approve_after_ms = %v, want omitted when unset", resp["close_on_approve_after_ms"])
+	}
+}
+
+func TestHandleConfig_CloseOnApproveAfterMs_IncludedWhenSet(t *testing.T) {
+	s, _ := newTestServer(t)
+	ms := 2500
+	s.cfg = Config{CloseOnApproveAfterMs: &ms}
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := resp["close_on_approve_after_ms"].(float64)
+	if !ok || int(got) != 2500 {
+		t.Errorf("close_on_approve_after_ms = %v, want 2500", resp["close_on_approve_after_ms"])
+	}
+}
+
+func TestHandleConfig_CloseOnApproveAfterMs_OmittedWhenNegative(t *testing.T) {
+	s, _ := newTestServer(t)
+	ms := -1
+	s.cfg = Config{CloseOnApproveAfterMs: &ms}
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := resp["close_on_approve_after_ms"]; ok {
+		t.Errorf("close_on_approve_after_ms = %v, want omitted for negative value", resp["close_on_approve_after_ms"])
 	}
 }
 

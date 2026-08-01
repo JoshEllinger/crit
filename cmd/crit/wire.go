@@ -7,6 +7,7 @@ import (
 	"github.com/JoshEllinger/crit/internal/focus"
 	"github.com/JoshEllinger/crit/internal/github"
 	"github.com/JoshEllinger/crit/internal/live"
+	"github.com/JoshEllinger/crit/internal/notify"
 	"github.com/JoshEllinger/crit/internal/preview"
 	"github.com/JoshEllinger/crit/internal/server"
 	"github.com/JoshEllinger/crit/internal/session"
@@ -34,21 +35,23 @@ var (
 	NewServer    = server.NewServer
 	mustGetwd    = session.MustGetwd
 
-	resolvedCWD       = daemon.ResolvedCWD
-	sessionKey        = daemon.SessionKey
-	liveSessionKey    = daemon.LiveSessionKey
-	previewSessionKey = preview.PreviewSessionKey
-	planSessionKey    = session.PlanSessionKey
-	writeSessionFile  = daemon.WriteSessionFile
-	removeSessionFile = daemon.RemoveSessionFile
-	reviewFilePath    = daemon.ReviewFilePath
-	openReadyPipe     = daemon.OpenReadyPipe
-	daemonFatal       = daemon.DaemonFatal
-	signalReadiness   = daemon.SignalReadiness
-	hostForDisplay    = daemon.HostForDisplay
-	advertisedURL     = daemon.AdvertisedURL
-	shutdownSignals   = daemon.ShutdownSignals
-	openBrowser       = browser.OpenBrowserWithCommand
+	resolvedCWD        = daemon.ResolvedCWD
+	sessionKey         = daemon.SessionKey
+	liveSessionKey     = daemon.LiveSessionKey
+	previewSessionKey  = preview.PreviewSessionKey
+	planSessionKey     = session.PlanSessionKey
+	writeSessionFile   = daemon.WriteSessionFile
+	writeDaemonFailure = daemon.WriteDaemonFailure
+	removeSessionFile  = daemon.RemoveSessionFile
+	reviewFilePath     = daemon.ReviewFilePath
+	openReadyPipe      = daemon.OpenReadyPipe
+	daemonFatal        = daemon.DaemonFatal
+	signalReadiness    = daemon.SignalReadiness
+	hostForDisplay     = daemon.HostForDisplay
+	advertisedURL      = daemon.AdvertisedURL
+	shutdownSignals    = daemon.ShutdownSignals
+	openBrowser        = browser.OpenBrowserWithCommand
+	notifyRoundReady   = notify.RoundReady
 
 	reviewPathsFor = session.ReviewPathsFor
 	detectPRInfo   = github.DetectPRInfo
@@ -90,6 +93,7 @@ func init() {
 		return &session.CLIReviewConfig{
 			Files:              sc.Files,
 			Focus:              sc.Focus,
+			OutputDir:          sc.OutputDir,
 			PlanDir:            sc.PlanDir,
 			NoOpen:             sc.NoOpen,
 			OpenCmd:            sc.OpenCmd,

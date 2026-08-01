@@ -21,76 +21,80 @@ var PrintVersionFn func()
 
 // DaemonCLIConfig holds resolved daemon configuration from CLI flags, env, and config files.
 type DaemonCLIConfig struct {
-	Port               int
-	Host               string
-	PublicURL          string
-	NoOpen             bool
-	OpenCmd            string
-	Quiet              bool
-	ShareURL           string
-	ProxyAuth          bool
-	AuthToken          string
-	OutputDir          string
-	Author             string
-	BaseBranch         string
-	IgnorePatterns     []string
-	Files              []string
-	NoIntegrationCheck bool
-	NoUpdateCheck      bool
-	AgentCmd           string
-	PlanDir            string
-	PlanName           string
-	ReviewPath         string
-	VCSOverride        string
-	Cfg                config.Config
-	Focus              *session.Focus
-	RemoteFiles        bool
-	LiveOrigin         string
-	LiveCookie         string
-	PreviewFile        string
-	SessionID          string // user-facing reconnect ID from --session
-	SessionKeyOverride string // internal: force session registry key in _serve
+	Port                        int
+	Host                        string
+	PublicURL                   string
+	AllowUnauthenticatedNetwork bool
+	NoOpen                      bool
+	OpenCmd                     string
+	Quiet                       bool
+	NotifyOnRoundReady          bool
+	ShareURL                    string
+	ProxyAuth                   bool
+	AuthToken                   string
+	OutputDir                   string
+	Author                      string
+	BaseBranch                  string
+	IgnorePatterns              []string
+	Files                       []string
+	NoIntegrationCheck          bool
+	NoUpdateCheck               bool
+	AgentCmd                    string
+	PlanDir                     string
+	PlanName                    string
+	ReviewPath                  string
+	VCSOverride                 string
+	Cfg                         config.Config
+	Focus                       *session.Focus
+	RemoteFiles                 bool
+	LiveOrigin                  string
+	LiveCookie                  string
+	PreviewFile                 string
+	SessionID                   string // user-facing reconnect ID from --session
+	SessionKeyOverride          string // internal: force session registry key in _serve
 }
 
 type daemonFlagSet struct {
-	port               int
-	host               string
-	publicURL          string
-	noOpen             bool
-	showVersion        bool
-	shareURL           string
-	proxyAuth          bool
-	outputDir          string
-	quiet              bool
-	noIgnore           bool
-	baseBranch         string
-	vcsOverride        string
-	planDir            string
-	planName           string
-	fileArgs           []string
-	prSpec             string
-	rangeSpec          string
-	scopeSpec          string
-	remoteFiles        bool
-	liveOrigin         string
-	liveCookie         string
-	previewFile        string
-	sessionID          string
-	sessionKeyOverride string
+	port                        int
+	host                        string
+	publicURL                   string
+	allowUnauthenticatedNetwork bool
+	noOpen                      bool
+	showVersion                 bool
+	shareURL                    string
+	proxyAuth                   bool
+	outputDir                   string
+	quiet                       bool
+	noIgnore                    bool
+	baseBranch                  string
+	vcsOverride                 string
+	planDir                     string
+	planName                    string
+	fileArgs                    []string
+	prSpec                      string
+	rangeSpec                   string
+	scopeSpec                   string
+	remoteFiles                 bool
+	liveOrigin                  string
+	liveCookie                  string
+	previewFile                 string
+	sessionID                   string
+	sessionKeyOverride          string
 }
 
 func parseDaemonFlags(args []string) daemonFlagSet {
 	fs := flag.NewFlagSet("crit", flag.ExitOnError)
 	port := fs.Int("port", 0, "Port to listen on (default: random available port)")
 	fs.IntVar(port, "p", 0, "Port to listen on (shorthand)")
-	host := fs.String("host", "", "Host to listen on (default: 127.0.0.1; e.g. 0.0.0.0 to expose on LAN — no auth, opt in deliberately)")
+	host := fs.String("host", "", "Host to listen on (default: 127.0.0.1)")
 	publicURL := fs.String("public-url", "", "Advertised base URL for browser/stderr (overrides CRIT_PUBLIC_URL; e.g. https://machine.ts.net for tailscale serve)")
+	allowUnauthNet := fs.Bool(config.AllowUnauthenticatedNetworkFlag, false, "Allow non-loopback listen or public_url without authentication (trusted network only)")
 	noOpen := fs.Bool("no-open", false, "Don't auto-open browser")
 	showVersion := fs.Bool("version", false, "Print version and exit")
 	fs.BoolVar(showVersion, "v", false, "Print version and exit (shorthand)")
 	shareURL := fs.String("share-url", "", "Base URL of hosted Crit service for sharing reviews (overrides CRIT_SHARE_URL env var)")
-	outputDir := fs.String("output", "", "Output directory for review file (default: repo root or file directory)")
-	fs.StringVar(outputDir, "o", "", "Output directory for review file (shorthand)")
+	outputDir := fs.String("output", "", "Crit data root for reviews (default: ~/.crit); reviews live in <root>/reviews/<key>/")
+	fs.StringVar(outputDir, "o", "", "Crit data root for reviews (shorthand)")
 	quiet := fs.Bool("quiet", false, "Suppress status output")
 	fs.BoolVar(quiet, "q", false, "Suppress status output (shorthand)")
 	noIgnore := fs.Bool("no-ignore", false, "Disable all ignore patterns from config files")
@@ -115,29 +119,30 @@ func parseDaemonFlags(args []string) daemonFlagSet {
 	fs.Parse(args)
 
 	return daemonFlagSet{
-		port:               *port,
-		host:               *host,
-		publicURL:          *publicURL,
-		noOpen:             *noOpen,
-		showVersion:        *showVersion,
-		shareURL:           *shareURL,
-		outputDir:          *outputDir,
-		quiet:              *quiet,
-		noIgnore:           *noIgnore,
-		baseBranch:         *baseBranch,
-		vcsOverride:        *vcsFlag,
-		planDir:            *planDir,
-		planName:           *planName,
-		fileArgs:           fs.Args(),
-		prSpec:             *prSpec,
-		rangeSpec:          *rangeSpec,
-		scopeSpec:          *scopeSpec,
-		remoteFiles:        *remoteFiles,
-		liveOrigin:         *liveOrigin,
-		liveCookie:         *liveCookie,
-		previewFile:        *previewFile,
-		sessionID:          *sessionID,
-		sessionKeyOverride: *sessionKeyOverride,
+		port:                        *port,
+		host:                        *host,
+		publicURL:                   *publicURL,
+		allowUnauthenticatedNetwork: *allowUnauthNet,
+		noOpen:                      *noOpen,
+		showVersion:                 *showVersion,
+		shareURL:                    *shareURL,
+		outputDir:                   *outputDir,
+		quiet:                       *quiet,
+		noIgnore:                    *noIgnore,
+		baseBranch:                  *baseBranch,
+		vcsOverride:                 *vcsFlag,
+		planDir:                     *planDir,
+		planName:                    *planName,
+		fileArgs:                    fs.Args(),
+		prSpec:                      *prSpec,
+		rangeSpec:                   *rangeSpec,
+		scopeSpec:                   *scopeSpec,
+		remoteFiles:                 *remoteFiles,
+		liveOrigin:                  *liveOrigin,
+		liveCookie:                  *liveCookie,
+		previewFile:                 *previewFile,
+		sessionID:                   *sessionID,
+		sessionKeyOverride:          *sessionKeyOverride,
 	}
 }
 
@@ -153,7 +158,7 @@ func applyDaemonConfigDefaults(sf *daemonFlagSet, cfg config.Config) {
 	if !sf.quiet && cfg.Quiet {
 		sf.quiet = true
 	}
-	if sf.outputDir == "" && cfg.Output != "" {
+	if sf.outputDir == "" && sf.planDir == "" {
 		sf.outputDir = cfg.Output
 	}
 	if sf.baseBranch == "" && cfg.BaseBranch != "" {
@@ -203,7 +208,7 @@ func ResolveDaemonCLIConfig(args []string) (*DaemonCLIConfig, error) {
 	if configDir == "" {
 		configDir = daemonMustGetwd()
 	}
-	cfg := config.LoadConfig(configDir)
+	cfg := config.LoadConfigForCommands(configDir)
 
 	applyDaemonConfigDefaults(&sf, cfg)
 
@@ -213,6 +218,11 @@ func ResolveDaemonCLIConfig(args []string) (*DaemonCLIConfig, error) {
 			return nil, err
 		}
 		sf.publicURL = normalized
+	}
+
+	allowUnauthNet := sf.allowUnauthenticatedNetwork || config.EnvAllowsUnauthenticatedNetwork()
+	if config.NeedsUnauthenticatedNetworkAck(sf.host, sf.publicURL) && !allowUnauthNet {
+		return nil, config.ErrUnauthenticatedNetwork(sf.host, sf.publicURL)
 	}
 
 	var ignorePatterns []string
@@ -232,34 +242,36 @@ func ResolveDaemonCLIConfig(args []string) (*DaemonCLIConfig, error) {
 	}
 
 	return &DaemonCLIConfig{
-		Port:               sf.port,
-		Host:               sf.host,
-		PublicURL:          sf.publicURL,
-		NoOpen:             sf.noOpen,
-		OpenCmd:            cfg.OpenCmd,
-		Quiet:              sf.quiet,
-		ShareURL:           sf.shareURL,
-		ProxyAuth:          sf.proxyAuth,
-		AuthToken:          cfg.AuthToken,
-		OutputDir:          sf.outputDir,
-		Author:             cfg.Author,
-		BaseBranch:         sf.baseBranch,
-		IgnorePatterns:     ignorePatterns,
-		NoIntegrationCheck: cfg.NoIntegrationCheck,
-		NoUpdateCheck:      cfg.NoUpdateCheck,
-		AgentCmd:           cfg.AgentCmd,
-		Files:              sf.fileArgs,
-		PlanDir:            sf.planDir,
-		PlanName:           sf.planName,
-		VCSOverride:        resolveVCSOverride(sf.vcsOverride, cfg.VCS),
-		Cfg:                cfg,
-		Focus:              f,
-		RemoteFiles:        remoteFiles,
-		LiveOrigin:         sf.liveOrigin,
-		LiveCookie:         sf.liveCookie,
-		PreviewFile:        sf.previewFile,
-		SessionID:          sf.sessionID,
-		SessionKeyOverride: sf.sessionKeyOverride,
+		Port:                        sf.port,
+		Host:                        sf.host,
+		PublicURL:                   sf.publicURL,
+		AllowUnauthenticatedNetwork: allowUnauthNet && config.NeedsUnauthenticatedNetworkAck(sf.host, sf.publicURL),
+		NoOpen:                      sf.noOpen,
+		OpenCmd:                     cfg.OpenCmd,
+		Quiet:                       sf.quiet,
+		NotifyOnRoundReady:          cfg.NotifyOnRoundReadyEnabled(),
+		ShareURL:                    sf.shareURL,
+		ProxyAuth:                   sf.proxyAuth,
+		AuthToken:                   cfg.AuthToken,
+		OutputDir:                   sf.outputDir,
+		Author:                      cfg.Author,
+		BaseBranch:                  sf.baseBranch,
+		IgnorePatterns:              ignorePatterns,
+		NoIntegrationCheck:          cfg.NoIntegrationCheck,
+		NoUpdateCheck:               cfg.NoUpdateCheck,
+		AgentCmd:                    cfg.AgentCmd,
+		Files:                       sf.fileArgs,
+		PlanDir:                     sf.planDir,
+		PlanName:                    sf.planName,
+		VCSOverride:                 resolveVCSOverride(sf.vcsOverride, cfg.VCS),
+		Cfg:                         cfg,
+		Focus:                       f,
+		RemoteFiles:                 remoteFiles,
+		LiveOrigin:                  sf.liveOrigin,
+		LiveCookie:                  sf.liveCookie,
+		PreviewFile:                 sf.previewFile,
+		SessionID:                   sf.sessionID,
+		SessionKeyOverride:          sf.sessionKeyOverride,
 	}, nil
 }
 

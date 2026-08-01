@@ -9,10 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/JoshEllinger/crit/internal/daemon"
 	"github.com/JoshEllinger/crit/internal/focus"
 )
 
@@ -527,6 +529,191 @@ func TestBuildLiveDaemonArgs(t *testing.T) {
 	fromCfg := buildLiveDaemonArgs("http://localhost:3000", "", liveCLIFlags{}, Config{PublicURL: "https://cfg.ts.net"}, false)
 	if !containsArgPair(fromCfg, "--public-url", "https://cfg.ts.net") {
 		t.Fatalf("missing config public-url: %v", fromCfg)
+	}
+}
+
+func TestRunLive_ColdStartBrowserOwnership(t *testing.T) {
+	originalStart := startLiveDaemon
+	originalRunClient := runLiveClient
+	originalInstallSignalHandler := installLiveDaemonSignalHandler
+	originalOpenBrowser := openLiveBrowser
+	originalLaunchBrowser := launchLiveBrowser
+	t.Cleanup(func() {
+		startLiveDaemon = originalStart
+		runLiveClient = originalRunClient
+		installLiveDaemonSignalHandler = originalInstallSignalHandler
+		openLiveBrowser = originalOpenBrowser
+		launchLiveBrowser = originalLaunchBrowser
+	})
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintln(w, "<html><body>ok</body></html>")
+	}))
+	defer upstream.Close()
+
+	tests := []struct {
+		name             string
+		args             []string
+		wantDaemonNoOpen bool
+	}{
+		{
+			name: "default leaves opening to daemon",
+			args: []string{upstream.URL},
+		},
+		{
+			name:             "no-open disables daemon opening",
+			args:             []string{"--no-open", upstream.URL},
+			wantDaemonNoOpen: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var daemonArgs []string
+			startLiveDaemon = func(_ string, args []string) (daemon.SessionEntry, error) {
+				daemonArgs = append([]string(nil), args...)
+				return daemon.SessionEntry{PID: os.Getpid(), Port: 43123}, nil
+			}
+			clientRan := false
+			runLiveClient = func(daemon.SessionEntry, string) bool {
+				clientRan = true
+				return false
+			}
+			signalHandlerInstalled := false
+			installLiveDaemonSignalHandler = func(int) {
+				signalHandlerInstalled = true
+			}
+			browserOpenCalls := 0
+			launchLiveBrowser = func(string, string) {
+				browserOpenCalls++
+			}
+
+			RunLive(tt.args)
+
+			if !signalHandlerInstalled {
+				t.Fatal("daemon signal handler was not installed")
+			}
+			if !clientRan {
+				t.Fatal("review client did not run")
+			}
+			if got := containsArgPair(daemonArgs, "--no-open", ""); got != tt.wantDaemonNoOpen {
+				t.Fatalf("daemon --no-open = %v, want %v; args: %v", got, tt.wantDaemonNoOpen, daemonArgs)
+			}
+			if browserOpenCalls != 0 {
+				t.Fatalf("cold-start client launched the browser %d times; the daemon owns the initial browser open", browserOpenCalls)
+			}
+		})
+	}
+}
+
+func TestConnectToLiveDaemon_LaunchesBrowserWhenNoneAttached(t *testing.T) {
+	originalRunClient := runLiveClient
+	originalOpenBrowser := openLiveBrowser
+	t.Cleanup(func() {
+		runLiveClient = originalRunClient
+		openLiveBrowser = originalOpenBrowser
+	})
+
+	t.Setenv("HOME", t.TempDir())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "browser_clients": false})
+	}))
+	defer srv.Close()
+
+	serverURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	port, err := strconv.Atoi(serverURL.Port())
+	if err != nil {
+		t.Fatalf("parse server port: %v", err)
+	}
+
+	const key = "live-connect-test"
+	entry := daemon.SessionEntry{PID: os.Getpid(), Port: port}
+	if err := daemon.WriteSessionFile(key, entry); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	type browserCall struct {
+		url     string
+		openCmd string
+	}
+	browserCalls := make(chan browserCall, 1)
+	openLiveBrowser = func(url, openCmd string) {
+		browserCalls <- browserCall{url: url, openCmd: openCmd}
+	}
+	clientRan := false
+	runLiveClient = func(gotEntry daemon.SessionEntry, gotKey string) bool {
+		clientRan = true
+		if gotEntry.Port != entry.Port || gotKey != key {
+			t.Fatalf("run client with entry/key = %+v/%q, want %+v/%q", gotEntry, gotKey, entry, key)
+		}
+		return false
+	}
+
+	if !connectToLiveDaemon(key, false, "custom-open") {
+		t.Fatal("connectToLiveDaemon returned false")
+	}
+	if !clientRan {
+		t.Fatal("review client did not run")
+	}
+	select {
+	case got := <-browserCalls:
+		wantURL := entry.BaseURL() + "/live"
+		if got.url != wantURL || got.openCmd != "custom-open" {
+			t.Fatalf("browser call = %+v, want URL %q with custom-open", got, wantURL)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("browser launch was not dispatched")
+	}
+}
+
+func TestConnectToLiveDaemon_RespectsNoOpen(t *testing.T) {
+	originalRunClient := runLiveClient
+	originalLaunchBrowser := launchLiveBrowser
+	t.Cleanup(func() {
+		runLiveClient = originalRunClient
+		launchLiveBrowser = originalLaunchBrowser
+	})
+
+	t.Setenv("HOME", t.TempDir())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "browser_clients": false})
+	}))
+	defer srv.Close()
+
+	serverURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	port, err := strconv.Atoi(serverURL.Port())
+	if err != nil {
+		t.Fatalf("parse server port: %v", err)
+	}
+
+	const key = "live-connect-no-open"
+	entry := daemon.SessionEntry{PID: os.Getpid(), Port: port}
+	if err := daemon.WriteSessionFile(key, entry); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	browserOpenCalls := 0
+	launchLiveBrowser = func(string, string) {
+		browserOpenCalls++
+	}
+	runLiveClient = func(daemon.SessionEntry, string) bool { return false }
+
+	if !connectToLiveDaemon(key, true, "custom-open") {
+		t.Fatal("connectToLiveDaemon returned false")
+	}
+	if browserOpenCalls != 0 {
+		t.Fatalf("noOpen reconnect launched the browser %d times", browserOpenCalls)
 	}
 }
 

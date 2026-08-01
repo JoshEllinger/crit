@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JoshEllinger/crit/internal/testutil"
 )
@@ -990,6 +991,78 @@ func TestReadDaemonLog(t *testing.T) {
 	})
 }
 
+func TestCleanOrphanedSessions_ExpiresOldDaemonFailures(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+
+	key := "expirederror"
+	generation := "2026-07-17T12:00:00.123456789Z"
+	if err := WriteDaemonFailure(key, generation, fmt.Errorf("initialization failed")); err != nil {
+		t.Fatal(err)
+	}
+	path, err := daemonFailurePath(key, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired := time.Now().Add(-daemonFailureRetention - time.Second)
+	if err := os.Chtimes(path, expired, expired); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanOrphanedSessions()
+	if got := ReadDaemonFailure(key, generation); got != "" {
+		t.Errorf("ReadDaemonFailure = %q, want expired failure removed", got)
+	}
+}
+
+func TestDaemonFailure_GenerationScoped(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+
+	key := "generation12"
+	firstGeneration := "2026-07-17T12:00:00.123456789Z"
+	secondGeneration := "2026-07-17T12:00:00.987654321Z"
+	if err := WriteDaemonFailure(key, firstGeneration, fmt.Errorf("first failure")); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadDaemonFailure(key, secondGeneration); got != "" {
+		t.Errorf("ReadDaemonFailure for another generation = %q, want empty", got)
+	}
+}
+
+func TestPrepareDaemonCmd_KeepsNewLogAvailable(t *testing.T) {
+	home := t.TempDir()
+	testutil.SetHome(t, home)
+
+	key := "newdaemonlog"
+	sessDir := filepath.Join(home, ".crit", "sessions")
+	if err := os.MkdirAll(sessDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, key+".json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, key+".log"), []byte("old error"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, readEnd, writeEnd, logFile, err := prepareDaemonCmd(key, nil)
+	if err != nil {
+		t.Fatalf("prepareDaemonCmd: %v", err)
+	}
+	readEnd.Close()
+	writeEnd.Close()
+	logFile.Close()
+
+	logPath := filepath.Join(sessDir, key+".log")
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("new daemon log should remain accessible: %v", err)
+	}
+	if got := ReadDaemonLog(key); got != "" {
+		t.Errorf("ReadDaemonLog = %q, want cleared new log", got)
+	}
+}
+
 func TestOpenReadyPipe_NoEnvVar(t *testing.T) {
 	t.Setenv("_CRIT_READY_STDOUT", "")
 	os.Unsetenv("_CRIT_READY_STDOUT")
@@ -1170,17 +1243,19 @@ func TestAppendCommonDaemonFlags(t *testing.T) {
 		{
 			name: "all flags set",
 			f: commonDaemonFlags{
-				Port:      3456,
-				Host:      "0.0.0.0",
-				PublicURL: "https://mymac.ts.net",
-				NoOpen:    true,
-				Quiet:     true,
-				ShareURL:  "https://crit.md",
+				Port:                        3456,
+				Host:                        "0.0.0.0",
+				PublicURL:                   "https://mymac.ts.net",
+				AllowUnauthenticatedNetwork: true,
+				NoOpen:                      true,
+				Quiet:                       true,
+				ShareURL:                    "https://crit.md",
 			},
 			want: []string{"--preview-file", "/tmp/x.html",
 				"--port", "3456",
 				"--host", "0.0.0.0",
 				"--public-url", "https://mymac.ts.net",
+				"--allow-unauthenticated-network",
 				"--no-open",
 				"--quiet",
 				"--share-url", "https://crit.md"},

@@ -20,7 +20,6 @@ import (
 	"github.com/JoshEllinger/crit/internal/config"
 	"github.com/JoshEllinger/crit/internal/focus"
 	"github.com/JoshEllinger/crit/internal/session"
-	"github.com/JoshEllinger/crit/internal/vcs"
 )
 
 // DefaultShareURL is the production crit-web service URL, used as the fallback
@@ -1004,18 +1003,11 @@ proxy_auth is set in ~/.crit.config.json (global config only)`, command)
 // loadShareConfig loads the merged config.Config from the current directory context.
 // Used by share/fetch/unpublish commands to avoid redundant config parsing.
 func loadShareConfig() config.Config {
-	cfgDir := ""
-	if vcs := vcs.DetectVCS(""); vcs != nil {
-		cfgDir, _ = vcs.RepoRoot()
+	cfg, err := config.LoadCurrentConfig()
+	if err != nil {
+		return config.Config{}
 	}
-	if cfgDir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return config.Config{}
-		}
-		cfgDir = cwd
-	}
-	return config.LoadConfig(cfgDir)
+	return cfg
 }
 
 // resolveShareURL resolves the share service URL from flag > env > config > fallback.

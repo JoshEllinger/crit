@@ -1,8 +1,23 @@
 package comment
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/JoshEllinger/crit/internal/daemon"
+	"github.com/JoshEllinger/crit/internal/testutil"
 )
+
+func outputConfigJSON(t *testing.T, output string) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{"output": output})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
 
 func TestParseCommentFlags(t *testing.T) {
 	tests := []struct {
@@ -104,4 +119,75 @@ func TestParseCommentFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveCommentFlagsOutputPrecedence(t *testing.T) {
+	projectDir := t.TempDir()
+	testutil.SetHome(t, t.TempDir())
+	t.Chdir(projectDir)
+
+	configuredOutput := filepath.Join(projectDir, "reviews")
+	configData := outputConfigJSON(t, configuredOutput)
+	if err := os.WriteFile(filepath.Join(projectDir, ".crit.config.json"), configData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("configured output", func(t *testing.T) {
+		f, err := parseCommentFlags([]string{"body"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resolveCommentFlags(&f); err != nil {
+			t.Fatal(err)
+		}
+		if f.configuredOutput != configuredOutput {
+			t.Fatalf("configuredOutput = %q, want %q", f.configuredOutput, configuredOutput)
+		}
+		cwd, err := daemon.ResolvedCWD()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(configuredOutput, "reviews", daemon.SessionKey(cwd, "", nil))
+		if f.reviewPath != want {
+			t.Fatalf("reviewPath = %q, want configured review path %q", f.reviewPath, want)
+		}
+	})
+
+	t.Run("explicit output wins", func(t *testing.T) {
+		explicitOutput := filepath.Join(projectDir, "explicit")
+		f, err := parseCommentFlags([]string{"--output", explicitOutput, "body"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resolveCommentFlags(&f); err != nil {
+			t.Fatal(err)
+		}
+		if f.outputDir != explicitOutput {
+			t.Fatalf("outputDir = %q, want explicit output %q", f.outputDir, explicitOutput)
+		}
+		cwd, err := daemon.ResolvedCWD()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(explicitOutput, "reviews", daemon.SessionKey(cwd, "", nil))
+		if f.reviewPath != want {
+			t.Fatalf("reviewPath = %q, want explicit review path %q", f.reviewPath, want)
+		}
+	})
+
+	t.Run("plan storage wins without conflict", func(t *testing.T) {
+		f, err := parseCommentFlags([]string{"--plan", "my-plan", "body"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resolveCommentFlags(&f); err != nil {
+			t.Fatal(err)
+		}
+		if f.outputDir == "" || f.outputDir == configuredOutput {
+			t.Fatalf("outputDir = %q, want plan storage", f.outputDir)
+		}
+		if f.reviewPath != filepath.Join(f.outputDir, ".crit") {
+			t.Fatalf("reviewPath = %q, want plan review path", f.reviewPath)
+		}
+	})
 }
