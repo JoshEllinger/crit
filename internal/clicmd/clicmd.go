@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // ExitError signals a CLI handler failure with a specific exit code.
@@ -72,4 +73,53 @@ func RequireFlagValue(args []string, i int, flag string) (string, error) {
 		return "", ExitError{Code: 1, Err: fmt.Errorf("%s requires a value", flag)}
 	}
 	return args[i+1], nil
+}
+
+// ReorderFlagsFirst rewrites args so all flags (and their values) precede
+// positional arguments, without changing the relative order within either
+// group. flag.Parse stops parsing at the first non-flag argument, so
+// `crit <file> --no-open` silently treats "--no-open" as a second file
+// argument instead of a flag. Passing the reordered slice through
+// flag.Parse lets users place flags anywhere on the command line.
+//
+// boolFlags must name every flag (without leading dashes) that takes no
+// value, so the argument that follows it isn't mistaken for its value.
+// "-h"/"--help"/"-help" are always treated as valueless, matching the
+// stdlib flag package's built-in handling. A "--" argument ends
+// reordering: everything after it is treated as positional, and "--" is
+// re-emitted before the positional group so flag.Parse still treats
+// dash-looking positionals as non-flags (same terminator semantics).
+// Combined short flags like -pq are not expanded (same as stdlib flag).
+func ReorderFlagsFirst(args []string, boolFlags map[string]bool) []string {
+	flags := make([]string, 0, len(args))
+	positional := make([]string, 0, len(args))
+	sawTerminator := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			sawTerminator = true
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if a == "-" || len(a) == 0 || a[0] != '-' {
+			positional = append(positional, a)
+			continue
+		}
+		flags = append(flags, a)
+		if strings.Contains(a, "=") {
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if name == "h" || name == "help" || boolFlags[name] {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	if sawTerminator {
+		return append(append(flags, "--"), positional...)
+	}
+	return append(flags, positional...)
 }
