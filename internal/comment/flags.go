@@ -2,6 +2,7 @@ package comment
 
 import (
 	"github.com/tomasz-tomczyk/crit/internal/clicmd"
+	"github.com/tomasz-tomczyk/crit/internal/daemon"
 )
 
 type commentFlags struct {
@@ -16,6 +17,8 @@ type commentFlags struct {
 	json             bool
 	file             string
 	plan             string
+	sessionID        string
+	sessionEntry     *daemon.SessionEntry
 	scope            CommentFocusOverride
 	args             []string
 }
@@ -31,6 +34,13 @@ func parseCommentFlags(args []string) (commentFlags, error) { //nolint:gocyclo /
 				return f, err
 			}
 			f.plan = val
+			i++
+		case "--session":
+			val, err := clicmd.RequireFlagValue(args, i, "--session")
+			if err != nil {
+				return f, err
+			}
+			f.sessionID = val
 			i++
 		case "--output", "-o":
 			val, err := clicmd.RequireFlagValue(args, i, arg)
