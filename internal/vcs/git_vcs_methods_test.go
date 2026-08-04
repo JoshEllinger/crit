@@ -123,6 +123,17 @@ func TestGitVCS_Methods(t *testing.T) {
 	}
 	_ = ns
 
+	betweenNS, err := g.DiffNumstatBetweenSHAs(base, head, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry, ok := betweenNS["a.txt"]; !ok || entry.Additions == 0 {
+		t.Errorf("DiffNumstatBetweenSHAs a.txt = %+v, want additions > 0", betweenNS["a.txt"])
+	}
+	if _, err := g.DiffNumstatBetweenSHAs("", head, dir); err == nil {
+		t.Error("DiffNumstatBetweenSHAs empty base: want error")
+	}
+
 	content, err := g.FileContentAtRef("README.md", "HEAD", dir)
 	if err != nil || content == "" {
 		t.Errorf("FileContentAtRef: %q, %v", content, err)
