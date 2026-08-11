@@ -54,6 +54,8 @@ function loadShared() {
   const sandbox = { window: {}, document: { cookie: '', getElementById: () => null } };
   const sharedSrc = fs.readFileSync(path.join(__dirname, '..', 'crit-shared.js'), 'utf8');
   new Function('window', 'document', sharedSrc)(sandbox.window, sandbox.document);
+  const shortcutsSrc = fs.readFileSync(path.join(__dirname, '..', 'crit-shortcuts.js'), 'utf8');
+  new Function('window', 'globalThis', 'module', shortcutsSrc)(sandbox.window, sandbox.window, undefined);
   const panesSrc = fs.readFileSync(path.join(__dirname, '..', 'crit-settings-panes.js'), 'utf8');
   // navigator.clipboard is referenced inside copy-button click handlers but
   // those handlers don't run during render.
@@ -333,7 +335,7 @@ test('renderShortcutsPane: code-review mode shows code-review-only shortcuts', (
   assert.match(html, /<kbd>h<\/kbd>/);
   assert.match(html, /Shift<\/kbd>\+<kbd>F/);
   assert.match(html, /Shift<\/kbd>\+<kbd>C/);
-  assert.match(html, /Switch scope/);
+  assert.match(html, /Switch to all changes/);
   assert.match(html, /Next story chapter/);
   assert.match(html, /Previous story chapter/);
   assert.match(html, /Story prologue/);
@@ -344,8 +346,19 @@ test('renderShortcutsPane: code-review mode shows code-review-only shortcuts', (
   assert.match(html, /<kbd>Esc<\/kbd>/);
   assert.match(html, /<kbd>\?<\/kbd>/);
   assert.match(html, /Ctrl<\/kbd>\+<kbd>Enter/);
+  // Capture a11y: idle binding buttons expose change label + aria-pressed
+  assert.match(html, /aria-pressed="false"/);
+  assert.match(html, /aria-label="Change shortcut for Next block"/);
+  assert.match(html, /data-shortcut-action="Next block"/);
   // Live-only binding absent
   assert.doesNotMatch(html, /Toggle pin mode/);
+});
+
+test('shortcut capture updates aria-label to Press new keys for …', () => {
+  const panesSrc = fs.readFileSync(path.join(__dirname, '..', 'crit-settings-panes.js'), 'utf8');
+  assert.match(panesSrc, /Press new keys for /);
+  assert.match(panesSrc, /aria-pressed',\s*'true'/);
+  assert.match(panesSrc, /function restoreBindingLabel\s*\(/);
 });
 
 test('renderShortcutsPane: live mode omits code-review-only shortcuts', () => {

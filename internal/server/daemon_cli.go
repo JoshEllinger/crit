@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/JoshEllinger/crit/internal/clicmd"
 	"github.com/JoshEllinger/crit/internal/config"
 	"github.com/JoshEllinger/crit/internal/focus"
 	"github.com/JoshEllinger/crit/internal/session"
@@ -95,8 +96,8 @@ func parseDaemonFlags(args []string) daemonFlagSet {
 	shareURL := fs.String("share-url", "", "Base URL of hosted Crit service for sharing reviews (overrides CRIT_SHARE_URL env var)")
 	outputDir := fs.String("output", "", "Crit data root for reviews (default: ~/.crit); reviews live in <root>/reviews/<key>/")
 	fs.StringVar(outputDir, "o", "", "Crit data root for reviews (shorthand)")
-	quiet := fs.Bool("quiet", false, "Suppress status output")
-	fs.BoolVar(quiet, "q", false, "Suppress status output (shorthand)")
+	quiet := fs.Bool("quiet", false, "On success, suppress connect/start status, tips, and session summary")
+	fs.BoolVar(quiet, "q", false, "On success, suppress connect/start status, tips, and session summary (shorthand)")
 	noIgnore := fs.Bool("no-ignore", false, "Disable all ignore patterns from config files")
 	baseBranch := fs.String("base-branch", "", "Base branch to diff against (overrides auto-detection)")
 	vcsFlag := fs.String("vcs", "", "VCS backend to use: git, sl/sapling, jj/jujutsu (default: auto-detect)")
@@ -116,6 +117,17 @@ func parseDaemonFlags(args []string) daemonFlagSet {
 			PrintHelpFn()
 		}
 	}
+	// Keep in sync with the fs.Bool/fs.BoolVar registrations above.
+	args = clicmd.ReorderFlagsFirst(args, map[string]bool{
+		config.AllowUnauthenticatedNetworkFlag: true,
+		"no-open":                              true,
+		"version":                              true,
+		"v":                                    true,
+		"quiet":                                true,
+		"q":                                    true,
+		"no-ignore":                            true,
+		"remote":                               true,
+	})
 	fs.Parse(args)
 
 	return daemonFlagSet{

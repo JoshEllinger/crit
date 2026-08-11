@@ -82,7 +82,29 @@
   // Scroll/expand/flash a comment card located anywhere in the document, given just its id.
   // Distinct from scrollToComment(commentId, filePath) below — that one needs filePath context.
   function scrollToCommentRef(id) {
-    const card = document.querySelector('.comment-card[data-comment-id="' + CSS.escape(id) + '"]');
+    let card = document.querySelector('.comment-card[data-comment-id="' + CSS.escape(id) + '"]');
+    if (!card) {
+      // Line cards live in deferred .file-body — mount the owning file and retry.
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const comments = f.comments || [];
+        let found = false;
+        for (let j = 0; j < comments.length; j++) {
+          if (comments[j].id === id) { found = true; break; }
+        }
+        if (!found) continue;
+        const section = document.getElementById('file-section-' + f.path);
+        if (!section) continue;
+        section.open = true;
+        if (f.lazy) {
+          loadLazyFile(section, f, function() { scrollToCommentRef(id); });
+          return;
+        }
+        ensureFileBodyMounted(section, f);
+        card = document.querySelector('.comment-card[data-comment-id="' + CSS.escape(id) + '"]');
+        break;
+      }
+    }
     if (!card) return;
     // Make sure any containing <details> file section is open
     const section = card.closest('details');
@@ -275,14 +297,11 @@
   // Exception: `crit-templates` stays in its own cookie because it's user-defined
   // and can be longer than the rest combined.
   const SETTINGS_COOKIE = 'crit-settings';
-  let settingsCache = null;
 
   function loadSettings() {
-    if (settingsCache) return settingsCache;
     const raw = getCookie(SETTINGS_COOKIE);
-    try { settingsCache = raw ? JSON.parse(raw) : {}; }
-    catch { settingsCache = {}; }
-    return settingsCache;
+    try { return raw ? JSON.parse(raw) : {}; }
+    catch { return {}; }
   }
 
   function getSetting(key, fallback) {
@@ -381,7 +400,7 @@
       } else {
         diffMode = getSetting('diffMode', 'split');
       }
-      renderAllFiles();
+      renderAllFilesKeepingPlace();
     });
   }
   let diffScope = getSetting('diffScope', null); // null = no preference saved yet
@@ -556,7 +575,7 @@
         lineBlocks: null,
         previousLineBlocks: null,
         tocItems: [],
-        collapsed: true,
+        collapsed: false,
         viewMode: (session.mode === 'git') ? 'diff' : 'document',
         additions: fi.additions || 0,
         deletions: fi.deletions || 0,
@@ -1255,8 +1274,25 @@
   // ===== File Tree Sidebar =====
   let activeTreePath = null;
   let treeObserver = null;
+  let bodyMountObserver = null;
   let ignoreTreeObserverUntil = 0;
+  let ignoreBodyMountObserverUntil = 0;
+  let bodyMountSuppressTimer = null;
   const treeFolderState = {}; // { 'src': true, 'src/components': false } — true = collapsed
+
+  // Suppress observer-driven mounts briefly (e.g. during scrollToFile) so
+  // adjacent bodies don't push the target out of view. When the window
+  // expires, remount anything still visible — IntersectionObserver will not
+  // re-fire for elements that stayed intersecting while we ignored callbacks.
+  function suppressBodyMountObserver(ms) {
+    ignoreBodyMountObserverUntil = Date.now() + ms;
+    if (bodyMountSuppressTimer) clearTimeout(bodyMountSuppressTimer);
+    bodyMountSuppressTimer = setTimeout(function() {
+      bodyMountSuppressTimer = null;
+      if (Date.now() < ignoreBodyMountObserverUntil) return;
+      mountVisibleDeferredBodies();
+    }, ms + 10);
+  }
 
   function buildFileTree(fileList) {
     // Build a nested tree from flat paths
@@ -1323,7 +1359,9 @@
     if (files.length > 1) {
       const collapseBtn = document.createElement('button');
       collapseBtn.className = 'file-tree-collapse-btn';
-      collapseBtn.title = 'Collapse all files';
+      const initiallyExpanded = files.some(function(f) { return !f.collapsed; });
+      collapseBtn.title = initiallyExpanded ? 'Collapse all files' : 'Expand all files';
+      collapseBtn.classList.toggle('all-collapsed', !initiallyExpanded);
       // Stacked chevron SVG
       collapseBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M4.22 3.22a.75.75 0 0 1 1.06 0L8 5.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 4.28a.75.75 0 0 1 0-1.06zm0 5a.75.75 0 0 1 1.06 0L8 10.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 9.28a.75.75 0 0 1 0-1.06z"/></svg>';
       collapseBtn.addEventListener('click', function() {
@@ -1334,6 +1372,10 @@
         const sections = document.querySelectorAll('.file-section');
         for (let i = 0; i < sections.length; i++) {
           sections[i].open = !anyExpanded;
+        }
+        if (!anyExpanded) {
+          // Re-attach observer so it fires for newly visible sections and mounts their bodies.
+          setupBodyMountObserver();
         }
         collapseBtn.title = anyExpanded ? 'Expand all files' : 'Collapse all files';
         collapseBtn.classList.toggle('all-collapsed', anyExpanded);
@@ -1644,6 +1686,69 @@
     }
   }
 
+  function setupBodyMountObserver() {
+    if (bodyMountObserver) bodyMountObserver.disconnect();
+    const sections = document.querySelectorAll('.file-section[id]');
+    if (sections.length === 0) return;
+
+    bodyMountObserver = new IntersectionObserver(function(entries) {
+      // Skip observer-driven mounts briefly after a manual scrollToFile so the
+      // requested file doesn't get pushed out of view by adjacent bodies mounting.
+      if (Date.now() < ignoreBodyMountObserverUntil) return;
+      let mountedAny = false;
+      for (let i = 0; i < entries.length; i++) {
+        if (!entries[i].isIntersecting) continue;
+        const section = entries[i].target;
+        if (!section.open) continue;
+        const path = section.id.replace('file-section-', '');
+        const file = getFileByPath(path);
+        if (!file) continue;
+        if (file.lazy) {
+          loadLazyFile(section, file);
+        } else {
+          mountDeferredBody(section, file);
+          mountedAny = true;
+        }
+      }
+      if (mountedAny) {
+        renderMermaidBlocks();
+        rebuildNavList();
+        applyHideResolved();
+      }
+    }, { rootMargin: '100% 0px 100% 0px' });
+
+    for (let i = 0; i < sections.length; i++) {
+      bodyMountObserver.observe(sections[i]);
+    }
+  }
+
+  function mountVisibleDeferredBodies() {
+    const sections = document.querySelectorAll('.file-section[id]');
+    if (sections.length === 0) return;
+    const windowHeight = window.innerHeight || document.documentElement.clientHeight;
+    let mountedAny = false;
+    for (let i = 0; i < sections.length; i++) {
+      const section = sections[i];
+      if (!section.open) continue;
+      const rect = section.getBoundingClientRect();
+      if (rect.bottom < -windowHeight || rect.top > windowHeight * 2) continue;
+      const path = section.id.replace('file-section-', '');
+      const file = getFileByPath(path);
+      if (!file) continue;
+      if (file.lazy) {
+        loadLazyFile(section, file);
+      } else {
+        mountDeferredBody(section, file);
+        mountedAny = true;
+      }
+    }
+    if (mountedAny) {
+      renderMermaidBlocks();
+      rebuildNavList();
+      applyHideResolved();
+    }
+  }
+
   function scrollToFile(filePath) {
     const sectionEl = document.getElementById('file-section-' + filePath);
     if (!sectionEl) return;
@@ -1651,9 +1756,27 @@
     const file = getFileByPath(filePath);
     if (file) file.collapsed = false;
     sectionEl.open = true;
-    // Suppress IntersectionObserver for 200ms so it doesn't override our manual active state
+    // toggle handler mounts deferred bodies; call explicitly so layout exists before scroll
+    if (file) {
+      if (file.lazy) {
+        // Scroll to header immediately while loading; re-scroll to the loaded section once
+        // the body mounts so the user lands reliably on the requested file.
+        sectionEl.scrollIntoView({ block: 'start', behavior: 'instant' });
+        loadLazyFile(sectionEl, file, function onLoaded(newSection) {
+          const el = newSection || document.getElementById('file-section-' + filePath);
+          if (el) el.scrollIntoView({ block: 'start', behavior: 'instant' });
+        });
+      } else {
+        ensureFileBodyMounted(sectionEl, file);
+      }
+    }
+    // Suppress observers briefly so adjacent bodies mounting don't push the
+    // requested file out of view after we scroll to it.
     ignoreTreeObserverUntil = Date.now() + 200;
-    sectionEl.scrollIntoView({ block: 'start', behavior: 'instant' });
+    suppressBodyMountObserver(500);
+    if (!file || !file.lazy) {
+      sectionEl.scrollIntoView({ block: 'start', behavior: 'instant' });
+    }
     updateTreeActive(filePath);
   }
 
@@ -1672,16 +1795,359 @@
     // Render the inline Review Conversation section above filesContainer
     renderReviewConversation();
 
-    // Re-attach intersection observer for file tree active tracking
+    // Re-attach intersection observers for file tree active tracking and
+    // deferred body mounting (keeps large reviews fast while leaving files open).
     setupTreeObserver();
+    setupBodyMountObserver();
+    // Mount bodies that are already visible so first paint doesn't show empty
+    // open sections while the observer fires.
+    mountVisibleDeferredBodies();
     rebuildNavList();
     applyHideResolved();
+  }
+
+  // A full rebuild hands back sections whose bodies are deferred, so every file
+  // the reader had already scrolled past collapses to nothing, the document
+  // ends up shorter than the current offset, and the browser clamps to the top.
+  // Use this for view toggles that must rebuild diffs (split/unified, rendered
+  // diff) but should leave the reader where they were. Remounts only bodies at
+  // or above the reading position — below-fold stays deferred — and pins the
+  // mid-viewport line (falling back to the topmost intersecting file section).
+  // Not for hide-resolved (CSS + highlight sync) or initial load / scope change.
+  function renderAllFilesKeepingPlace() {
+    const mounted = mountedFilePaths();
+    const sectionAnchor = topVisibleSectionAnchor();
+    const lineAnchor = readingLineAnchor();
+
+    renderAllFiles();
+
+    const remountThrough = remountThroughIndex(sectionAnchor, lineAnchor);
+    let remounted = false;
+    for (let i = 0; i < mounted.length; i++) {
+      const path = mounted[i];
+      const idx = files.findIndex(function(f) { return f.path === path; });
+      if (remountThrough >= 0 && idx > remountThrough) continue;
+      const file = getFileByPath(path);
+      const section = document.getElementById('file-section-' + path);
+      if (!file || !section || !section.open || file.lazy) continue;
+      mountDeferredBody(section, file);
+      remounted = true;
+    }
+    if (remounted) {
+      renderMermaidBlocks();
+      rebuildNavList();
+      applyHideResolved();
+    }
+
+    if (restoreReadingLineAnchor(lineAnchor)) return;
+    if (!sectionAnchor) return;
+    const section = document.getElementById(sectionAnchor.id);
+    if (!section) return;
+    const delta = section.getBoundingClientRect().top - sectionAnchor.top;
+    if (Math.abs(delta) < 1) return;
+    window.scrollBy({ top: delta, left: 0, behavior: 'instant' });
+  }
+
+  function remountThroughIndex(sectionAnchor, lineAnchor) {
+    let through = -1;
+    if (sectionAnchor) {
+      const path = sectionAnchor.id.replace('file-section-', '');
+      through = Math.max(through, files.findIndex(function(f) { return f.path === path; }));
+    }
+    if (lineAnchor && lineAnchor.filePath) {
+      through = Math.max(through, files.findIndex(function(f) { return f.path === lineAnchor.filePath; }));
+    }
+    return through;
+  }
+
+  function mountedFilePaths() {
+    const paths = [];
+    const sections = document.querySelectorAll('#filesContainer .file-section[id]');
+    for (let i = 0; i < sections.length; i++) {
+      const body = sections[i].querySelector(':scope > .file-body');
+      if (body && body.getAttribute('data-body-deferred') !== '1') {
+        paths.push(sections[i].id.replace('file-section-', ''));
+      }
+    }
+    return paths;
+  }
+
+  // The first file section still touching the viewport, plus where its top sits
+  // relative to it — fallback when no mid-viewport line is available.
+  function topVisibleSectionAnchor() {
+    const sections = document.querySelectorAll('#filesContainer .file-section[id]');
+    for (let i = 0; i < sections.length; i++) {
+      const rect = sections[i].getBoundingClientRect();
+      if (rect.bottom > 0) return { id: sections[i].id, top: rect.top };
+    }
+    return null;
+  }
+
+  // The line/block closest to the vertical center of the viewport — preferred
+  // restore target so split↔unified doesn't slide the hunk the reader was on.
+  // Prefer the new/right side when both halves of a split row sit at the same
+  // Y: unified tags context/add lines by NewNum with an empty side, so an
+  // old-side capture often has nothing to restore to after the switch.
+  function readingLineAnchor() {
+    const midY = (window.innerHeight || 0) / 2;
+    const nodes = document.querySelectorAll(
+      '#filesContainer .diff-line[data-diff-line-num], ' +
+      '#filesContainer .diff-split-side[data-diff-line-num], ' +
+      '#filesContainer .line-block[data-start-line]'
+    );
+    let best = null;
+    let bestDist = Infinity;
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom <= 0 || rect.top >= (window.innerHeight || 0)) continue;
+      const dist = Math.abs((rect.top + rect.bottom) / 2 - midY);
+      const isBlock = el.classList.contains('line-block');
+      const side = el.dataset.diffSide || '';
+      const preferNew = !isBlock && side === '';
+      const bestPreferNew = best && best.kind === 'diff' && best.side === '';
+      if (dist > bestDist + 0.5) continue;
+      if (Math.abs(dist - bestDist) <= 0.5 && best && !(preferNew && !bestPreferNew)) continue;
+      bestDist = dist;
+      best = {
+        kind: isBlock ? 'block' : 'diff',
+        filePath: el.dataset.diffFilePath || el.dataset.filePath || '',
+        lineNum: parseInt(isBlock ? el.dataset.startLine : el.dataset.diffLineNum, 10),
+        side: side,
+        top: rect.top,
+      };
+    }
+    return best && best.filePath && best.lineNum > 0 ? best : null;
+  }
+
+  function restoreReadingLineAnchor(anchor) {
+    if (!anchor) return false;
+    let el = null;
+    if (anchor.kind === 'block') {
+      const blocks = document.querySelectorAll(
+        '#filesContainer .line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"]'
+      );
+      for (let i = 0; i < blocks.length; i++) {
+        const start = parseInt(blocks[i].dataset.startLine, 10);
+        const end = parseInt(blocks[i].dataset.endLine, 10);
+        if (anchor.lineNum >= start && anchor.lineNum <= end) { el = blocks[i]; break; }
+      }
+    } else {
+      const base =
+        '#filesContainer [data-diff-file-path="' + CSS.escape(anchor.filePath) + '"]' +
+        '[data-diff-line-num="' + anchor.lineNum + '"]';
+      el = document.querySelector(base + '[data-diff-side="' + CSS.escape(anchor.side) + '"]') ||
+        document.querySelector(base);
+    }
+    if (!el) return false;
+    const delta = el.getBoundingClientRect().top - anchor.top;
+    if (Math.abs(delta) >= 1) window.scrollBy({ top: delta, left: 0, behavior: 'instant' });
+    return true;
+  }
+
+  // Hide-resolved: cards are CSS (`body.hide-resolved`). Line highlights are
+  // baked in at render time via isHideResolved(), so toggle them in place on
+  // currently-mounted bodies instead of wiping #filesContainer.
+  function refreshHideResolvedView() {
+    applyHideResolved();
+    const root = storyActive()
+      ? document.getElementById('storyPane')
+      : document.getElementById('filesContainer');
+    if (!root) return;
+    const sections = root.querySelectorAll('.file-section[id]');
+    for (let i = 0; i < sections.length; i++) {
+      const section = sections[i];
+      const path = section.dataset.storyFile ||
+        (section.id.indexOf('file-section-') === 0
+          ? section.id.slice('file-section-'.length)
+          : null);
+      if (!path) continue;
+      syncCommentHighlightsInSection(section, getFileByPath(path));
+    }
+  }
+
+  function syncCommentHighlightsInSection(section, file) {
+    if (!section || !file) return;
+    const body = section.querySelector(':scope > .file-body');
+    if (!body || body.getAttribute('data-body-deferred') === '1') return;
+
+    const lineBlocks = body.querySelectorAll('.line-block[data-start-line]');
+    if (lineBlocks.length > 0) {
+      const rangeSet = buildCommentIndices(file.comments || []).rangeSet;
+      for (let i = 0; i < lineBlocks.length; i++) {
+        const el = lineBlocks[i];
+        const start = parseInt(el.dataset.startLine, 10);
+        const end = parseInt(el.dataset.endLine, 10);
+        let inRange = false;
+        for (let ln = start; ln <= end; ln++) {
+          if (rangeSet.has(ln + ':')) { inRange = true; break; }
+        }
+        el.classList.toggle('has-comment', inRange);
+      }
+    }
+
+    const unified = body.querySelector('.diff-container.unified');
+    if (unified) {
+      const visualSet = buildUnifiedCommentVisualSet(file.diffHunks || [], file.comments || []);
+      const lines = unified.querySelectorAll('.diff-line[data-diff-visual-idx]');
+      for (let i = 0; i < lines.length; i++) {
+        const el = lines[i];
+        el.classList.toggle('has-comment', visualSet.has(parseInt(el.dataset.diffVisualIdx, 10)));
+      }
+    }
+
+    const split = body.querySelector('.diff-container.split');
+    if (split) {
+      const rangeSet = buildCommentIndices(file.comments || []).rangeSet;
+      const sides = split.querySelectorAll('.diff-split-side[data-diff-line-num]');
+      for (let i = 0; i < sides.length; i++) {
+        const el = sides[i];
+        const key = parseInt(el.dataset.diffLineNum, 10) + ':' + (el.dataset.diffSide || '');
+        el.classList.toggle('has-comment', rangeSet.has(key));
+      }
+    }
   }
 
   function rebuildNavList() {
     navElements = Array.from(document.querySelectorAll('.kb-nav'));
     buildChangeGroups();
     restoreKeyboardFocus();
+  }
+
+  // Deferred / lazy file bodies are absent from .kb-nav and change-group
+  // queries. Keyboard nav (j/k, n/N) must mount the next file when it hits a
+  // section boundary so off-screen deferred content stays reachable.
+  function fileSectionNeedsMount(file) {
+    if (!file) return false;
+    const section = document.getElementById('file-section-' + file.path);
+    if (!section) return false;
+    if (file.lazy) return true;
+    const body = section.querySelector(':scope > .file-body');
+    return !!(body && body.getAttribute('data-body-deferred') === '1');
+  }
+
+  function fileLikelyHasChanges(file) {
+    if (!file) return false;
+    if (file.diffHunks && file.diffHunks.length > 0) return true;
+    // Lazy placeholders ship empty diffHunks until loadLazyFile; numstat
+    // additions/deletions are the only change signal available beforehand.
+    if (file.lazy && ((file.additions || 0) > 0 || (file.deletions || 0) > 0)) return true;
+    return false;
+  }
+
+  // Find the next deferred/lazy file between fromPath and towardPath.
+  // Optional predicate (e.g. fileLikelyHasChanges) skips mount candidates that
+  // would not qualify — so a deferred no-hunk file cannot block a later one.
+  function findDeferredFileForNav(fromPath, towardPath, direction, predicate) {
+    let fromIdx = -1;
+    let towardIdx = direction > 0 ? files.length : -1;
+    for (let i = 0; i < files.length; i++) {
+      if (files[i].path === fromPath) fromIdx = i;
+      if (towardPath && files[i].path === towardPath) towardIdx = i;
+    }
+    if (fromIdx < 0) return null;
+    if (direction > 0) {
+      for (let i = fromIdx + 1; i < towardIdx; i++) {
+        if (!fileSectionNeedsMount(files[i])) continue;
+        if (predicate && !predicate(files[i])) continue;
+        return files[i];
+      }
+    } else {
+      for (let i = fromIdx - 1; i > towardIdx; i--) {
+        if (!fileSectionNeedsMount(files[i])) continue;
+        if (predicate && !predicate(files[i])) continue;
+        return files[i];
+      }
+    }
+    return null;
+  }
+
+  function mountFileForNav(file, onReady) {
+    const section = document.getElementById('file-section-' + file.path);
+    if (!section) {
+      if (onReady) onReady(false);
+      return;
+    }
+    section.open = true;
+    if (file.lazy) {
+      loadLazyFile(section, file, function() { if (onReady) onReady(true); });
+      return;
+    }
+    ensureFileBodyMounted(section, file);
+    if (onReady) onReady(true);
+  }
+
+  function navElementFilePath(el) {
+    if (!el) return null;
+    return el.dataset.filePath || el.dataset.diffFilePath ||
+      (el.querySelector && (function() {
+        const side = el.querySelector('.diff-split-side[data-diff-file-path]');
+        return side ? side.dataset.diffFilePath : null;
+      })());
+  }
+
+  function navigateBlock(direction, _mountedPath) {
+    const allNav = navElements;
+    if (allNav.length === 0) {
+      const start = direction > 0 ? 0 : files.length - 1;
+      const step = direction > 0 ? 1 : -1;
+      for (let i = start; i >= 0 && i < files.length; i += step) {
+        const section = document.getElementById('file-section-' + files[i].path);
+        if (!section || !section.open) continue;
+        if (fileSectionNeedsMount(files[i]) && files[i].path !== _mountedPath) {
+          mountFileForNav(files[i], function() { navigateBlock(direction, files[i].path); });
+          return;
+        }
+      }
+      return;
+    }
+
+    let curIdx = focusedElement ? allNav.indexOf(focusedElement) : -1;
+    if (curIdx === -1) {
+      const match = findNavElementForFocusTarget(getKeyboardFocusTarget());
+      if (match) curIdx = allNav.indexOf(match);
+    }
+
+    let nextIdx;
+    if (curIdx === -1) {
+      nextIdx = direction > 0 ? 0 : allNav.length - 1;
+    } else {
+      nextIdx = curIdx + direction;
+      const curPath = focusedFilePath || navElementFilePath(focusedElement) || navElementFilePath(allNav[curIdx]);
+      if (nextIdx < 0 || nextIdx >= allNav.length) {
+        const deferred = curPath ? findDeferredFileForNav(curPath, null, direction) : null;
+        if (deferred && deferred.path !== _mountedPath) {
+          mountFileForNav(deferred, function() { navigateBlock(direction, deferred.path); });
+          return;
+        }
+        return;
+      }
+      const nextPath = navElementFilePath(allNav[nextIdx]);
+      if (curPath && nextPath && curPath !== nextPath) {
+        const deferred = findDeferredFileForNav(curPath, nextPath, direction);
+        if (deferred && deferred.path !== _mountedPath) {
+          mountFileForNav(deferred, function() { navigateBlock(direction, deferred.path); });
+          return;
+        }
+      }
+    }
+
+    document.querySelectorAll('.kb-nav.focused').forEach(function(el) { el.classList.remove('focused'); });
+    focusedElement = allNav[nextIdx];
+    focusedElement.classList.add('focused');
+    focusedElement.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    if (focusedElement.dataset.filePath) {
+      focusedFilePath = focusedElement.dataset.filePath;
+      focusedBlockIndex = parseInt(focusedElement.dataset.blockIndex);
+    } else {
+      const navTarget = navFocusTargetFromElement(focusedElement);
+      if (navTarget) {
+        focusedFilePath = navTarget.filePath;
+        focusedBlockIndex = null;
+      }
+    }
+    rememberKeyboardFocusFromNav(focusedElement);
+    if (visualMode) extendVisualSelection();
   }
 
   function rememberKeyboardFocusTarget(target) {
@@ -1864,7 +2330,36 @@
     }
   }
 
+  function changeNavAnchorFromIdx(idx) {
+    if (idx < 0 || idx >= changeGroups.length) return null;
+    const g = changeGroups[idx];
+    let fileGroupIdx = 0;
+    for (let i = 0; i < idx; i++) {
+      if (changeGroups[i].filePath === g.filePath) fileGroupIdx++;
+    }
+    return { filePath: g.filePath, fileGroupIdx: fileGroupIdx };
+  }
+
+  function findChangeIdxForAnchor(anchor) {
+    if (!anchor) return -1;
+    let fileGroupIdx = 0;
+    for (let i = 0; i < changeGroups.length; i++) {
+      if (changeGroups[i].filePath !== anchor.filePath) continue;
+      if (fileGroupIdx === anchor.fileGroupIdx) return i;
+      fileGroupIdx++;
+    }
+    // File still present but group count shrank — land on its last group.
+    let last = -1;
+    for (let i = 0; i < changeGroups.length; i++) {
+      if (changeGroups[i].filePath === anchor.filePath) last = i;
+    }
+    return last;
+  }
+
   function buildChangeGroups() {
+    // Remounting a deferred/lazy body rebuilds groups and would otherwise wipe
+    // currentChangeIdx, breaking atEnd/atStart and wrap chaining on retry.
+    const prevAnchor = changeNavAnchorFromIdx(currentChangeIdx);
     changeGroups = [];
     // Document view: color-coded change blocks + deletion markers
     const docEls = document.querySelectorAll('.line-block-added, .line-block-modified, .deletion-marker');
@@ -1884,7 +2379,7 @@
         group.elements.push(el);
       }
     }
-    currentChangeIdx = -1;
+    currentChangeIdx = findChangeIdxForAnchor(prevAnchor);
     updateChangeCounters();
   }
 
@@ -1905,8 +2400,36 @@
     return node === b;
   }
 
-  function navigateToChange(dir) {
-    if (changeGroups.length === 0) return;
+  function navigateToChange(dir, _mountedPath) {
+    // Empty groups: try mounting a deferred file that has diffs, then retry.
+    if (changeGroups.length === 0) {
+      const start = dir > 0 ? 0 : files.length - 1;
+      const step = dir > 0 ? 1 : -1;
+      for (let i = start; i >= 0 && i < files.length; i += step) {
+        if (!fileLikelyHasChanges(files[i])) continue;
+        if (fileSectionNeedsMount(files[i]) && files[i].path !== _mountedPath) {
+          mountFileForNav(files[i], function() { navigateToChange(dir, files[i].path); });
+          return;
+        }
+      }
+      return;
+    }
+
+    // At the last/first mounted change group — mount deferred neighbors first
+    // so n/N can reach off-screen file bodies.
+    if (currentChangeIdx >= 0 && currentChangeIdx < changeGroups.length) {
+      const atEnd = dir > 0 && currentChangeIdx === changeGroups.length - 1;
+      const atStart = dir < 0 && currentChangeIdx === 0;
+      if (atEnd || atStart) {
+        const curPath = changeGroups[currentChangeIdx].filePath;
+        const deferred = findDeferredFileForNav(curPath, null, dir, fileLikelyHasChanges);
+        if (deferred && deferred.path !== _mountedPath) {
+          mountFileForNav(deferred, function() { navigateToChange(dir, deferred.path); });
+          return;
+        }
+      }
+    }
+
     // Remove previous flash
     document.querySelectorAll('.change-flash').forEach(function(el) { el.classList.remove('change-flash'); });
 
@@ -1946,6 +2469,27 @@
           if (elCenter < viewCenter - threshold) { targetIdx = i; break; }
         }
         if (targetIdx === -1) targetIdx = changeGroups.length - 1;
+      }
+    }
+
+    // Crossing into another file: mount any deferred file between so its
+    // changes aren't skipped.
+    if (currentChangeIdx >= 0 && currentChangeIdx < changeGroups.length && targetIdx >= 0) {
+      const fromPath = changeGroups[currentChangeIdx].filePath;
+      const toPath = changeGroups[targetIdx].filePath;
+      const wrapping = (dir > 0 && targetIdx < currentChangeIdx) || (dir < 0 && targetIdx > currentChangeIdx);
+      if (wrapping) {
+        const deferred = findDeferredFileForNav(fromPath, null, dir, fileLikelyHasChanges);
+        if (deferred && deferred.path !== _mountedPath) {
+          mountFileForNav(deferred, function() { navigateToChange(dir, deferred.path); });
+          return;
+        }
+      } else if (fromPath && toPath && fromPath !== toPath) {
+        const deferred = findDeferredFileForNav(fromPath, toPath, dir, fileLikelyHasChanges);
+        if (deferred && deferred.path !== _mountedPath) {
+          mountFileForNav(deferred, function() { navigateToChange(dir, deferred.path); });
+          return;
+        }
       }
     }
 
@@ -1994,13 +2538,17 @@
         const card = expandedForms[i].closest('.comment-card');
         if (card && card.dataset.commentId) {
           const ta = expandedForms[i].querySelector('.reply-textarea');
-          activeReplyForms.set(card.dataset.commentId, { text: ta ? ta.value : '' });
+          activeReplyForms.set(card.dataset.commentId, { text: ta ? ta.value : '', expanded: true });
         }
       }
     }
   }
 
-  function renderFileByPath(filePath) {
+  // opts.preserveDeferred keeps an off-screen body deferred across the
+  // re-render instead of mounting it, so a section above the viewport doesn't
+  // suddenly grow and shift what the reader is looking at. The mount observer
+  // fills it in once it scrolls near the viewport.
+  function renderFileByPath(filePath, opts) {
     const file = getFileByPath(filePath);
     if (!file) return;
     saveOpenFormContent(filePath);
@@ -2010,8 +2558,18 @@
     }
     const oldSection = document.getElementById('file-section-' + file.path);
     if (!oldSection) { renderAllFiles(); return; }
-    oldSection.replaceWith(renderFileSection(file));
+    const oldBody = oldSection.querySelector(':scope > .file-body');
+    const keepDeferred = !!(opts && opts.preserveDeferred) &&
+      !!oldBody && oldBody.getAttribute('data-body-deferred') === '1';
+    const newSection = renderFileSection(file);
+    oldSection.replaceWith(newSection);
+    if (newSection.open && !keepDeferred) {
+      if (file.lazy) loadLazyFile(newSection, file);
+      else ensureFileBodyMounted(newSection, file);
+    }
     renderMermaidBlocks();
+    setupBodyMountObserver();
+    mountVisibleDeferredBodies();
     rebuildNavList();
     applyHideResolved();
   }
@@ -2057,63 +2615,18 @@
       }
       // Expanding: let native <details> handle it
     });
+    // open is set before this listener is attached, so the create-time open
+    // does not fire toggle here. Do not gate the first event — that would
+    // swallow the user's first collapse/expand.
     section.addEventListener('toggle', function() {
       file.collapsed = !section.open;
+      if (section.open) {
+        if (file.lazy) loadLazyFile(section, file);
+        else ensureFileBodyMounted(section, file);
+      } else if (!fileHasOpenLineForms(file.path)) {
+        deferFileBody(section);
+      }
     });
-
-    // Lazy file: load content on first expand
-    if (file.lazy) {
-      section.addEventListener('toggle', function onLazyExpand() {
-        if (!section.open || !file.lazy) return;
-        if (file._lazyLoading) return;
-        file._lazyLoading = true;
-        section.removeEventListener('toggle', onLazyExpand);
-        section.classList.add('file-section-loading');
-
-        loadSingleFile({
-          path: file.path,
-          old_path: file.oldPath,
-          status: file.status,
-          file_type: file.fileType,
-          additions: file.additions,
-          deletions: file.deletions,
-        }, effectiveDiffScope()).then(function(loaded) {
-          // Copy loaded data into the existing file object
-          file.oldPath = loaded.oldPath;
-          file.content = loaded.content;
-          file.previousContent = loaded.previousContent;
-          file.comments = loaded.comments;
-          file.diffHunks = loaded.diffHunks;
-          file._autoExpandDone = false;
-          file.lineBlocks = loaded.lineBlocks;
-          file.previousLineBlocks = loaded.previousLineBlocks;
-          file.tocItems = loaded.tocItems;
-          file.diffTooLarge = loaded.diffTooLarge;
-          file.diffLoaded = loaded.diffLoaded;
-          file.lazy = false;
-          file._lazyLoading = false;
-          if (loaded.highlightCache) file.highlightCache = loaded.highlightCache;
-          if (loaded.lang) file.lang = loaded.lang;
-
-          // Re-render this file section in place
-          section.classList.remove('file-section-loading');
-          const newSection = renderFileSection(file);
-          newSection.open = section.open;
-          section.replaceWith(newSection);
-
-          // Update UI state
-          renderFileTree();
-          updateCommentCount();
-          rebuildNavList();
-        }).catch(function() {
-          file._lazyLoading = false;
-          // Guard against stale DOM node: only re-attach if still in the document
-          if (!section.isConnected) return;
-          section.classList.remove('file-section-loading');
-          section.addEventListener('toggle', onLazyExpand);
-        });
-      });
-    }
 
     const dirParts = file.path.split('/');
     const fileName = dirParts.pop();
@@ -2192,10 +2705,13 @@
       if (session.mode !== 'git') {
         const changeNav = document.createElement('div');
         changeNav.className = 'change-nav';
+        const sc = window.crit && window.crit.shortcuts;
+        const prevChangeKeys = (sc && sc.getBinding('previous_change')) || 'Shift+N';
+        const nextChangeKeys = (sc && sc.getBinding('next_change')) || 'n';
         changeNav.innerHTML =
-          '<button class="change-nav-btn" data-dir="-1" title="Previous change (N)">&#9650;</button>' +
+          '<button class="change-nav-btn" data-dir="-1" title="Previous change (' + escapeHtml(prevChangeKeys) + ')">&#9650;</button>' +
           '<span class="change-nav-label" data-file-path="' + escapeHtml(file.path) + '"></span>' +
-          '<button class="change-nav-btn" data-dir="1" title="Next change (n)">&#9660;</button>';
+          '<button class="change-nav-btn" data-dir="1" title="Next change (' + escapeHtml(nextChangeKeys) + ')">&#9660;</button>';
         changeNav.addEventListener('click', function(e) {
           const btn = e.target.closest('.change-nav-btn');
           if (!btn) return;
@@ -2271,9 +2787,124 @@
       section.appendChild(fileCommentsContainer);
     }
 
-    // File body
+    // File body — mount heavy diff/document DOM only while expanded. Keeping
+    // <details> open by default (GitHub-style) but deferring the body until it
+    // scrolls near the viewport keeps first paint cheap on large PRs.
     const body = document.createElement('div');
     body.className = 'file-body';
+    section.appendChild(body);
+
+    body.setAttribute('data-body-deferred', '1');
+
+    return section;
+  }
+
+  function fileHasOpenLineForms(filePath) {
+    return getFormsForFile(filePath).some(function(f) { return f.scope !== 'file'; });
+  }
+
+  function loadLazyFile(section, file, onLoaded) {
+    if (!section.open) return;
+    if (!file.lazy) {
+      if (onLoaded) onLoaded(section);
+      return;
+    }
+    if (!file._lazyLoadCallbacks) file._lazyLoadCallbacks = [];
+    if (onLoaded) file._lazyLoadCallbacks.push(onLoaded);
+    if (file._lazyLoading) return;
+    file._lazyLoading = true;
+    section.classList.add('file-section-loading');
+
+    loadSingleFile({
+      path: file.path,
+      old_path: file.oldPath,
+      status: file.status,
+      file_type: file.fileType,
+      additions: file.additions,
+      deletions: file.deletions,
+    }, effectiveDiffScope()).then(function(loaded) {
+      // Copy loaded data into the existing file object
+      file.oldPath = loaded.oldPath;
+      file.content = loaded.content;
+      file.previousContent = loaded.previousContent;
+      file.comments = loaded.comments;
+      file.diffHunks = loaded.diffHunks;
+      file._autoExpandDone = false;
+      file.lineBlocks = loaded.lineBlocks;
+      file.previousLineBlocks = loaded.previousLineBlocks;
+      file.tocItems = loaded.tocItems;
+      file.diffTooLarge = loaded.diffTooLarge;
+      file.diffLoaded = loaded.diffLoaded;
+      file.lazy = false;
+      file._lazyLoading = false;
+      if (loaded.highlightCache) file.highlightCache = loaded.highlightCache;
+      if (loaded.lang) file.lang = loaded.lang;
+
+      const callbacks = file._lazyLoadCallbacks || [];
+      file._lazyLoadCallbacks = [];
+
+      // Re-render this file section in place (prefer live node if caller raced).
+      let liveSection = section;
+      if (!section.isConnected) {
+        liveSection = document.getElementById('file-section-' + file.path);
+        if (!liveSection) {
+          for (let i = 0; i < callbacks.length; i++) callbacks[i](null);
+          return;
+        }
+      }
+      liveSection.classList.remove('file-section-loading');
+      const newSection = renderFileSection(file);
+      newSection.open = liveSection.open;
+      liveSection.replaceWith(newSection);
+      // Always mount when open: observer may be suppressed (scrollToFile) and
+      // will not re-fire for an already-intersecting replacement section.
+      if (newSection.open) ensureFileBodyMounted(newSection, file);
+
+      // Update UI state
+      renderFileTree();
+      updateCommentCount();
+      setupBodyMountObserver();
+      rebuildNavList();
+      for (let i = 0; i < callbacks.length; i++) callbacks[i](newSection);
+    }).catch(function() {
+      file._lazyLoading = false;
+      const callbacks = file._lazyLoadCallbacks || [];
+      file._lazyLoadCallbacks = [];
+      // Guard against stale DOM node: only re-attach if still in the document
+      if (section.isConnected) section.classList.remove('file-section-loading');
+      for (let i = 0; i < callbacks.length; i++) callbacks[i](null);
+    });
+  }
+
+  function deferFileBody(section) {
+    const body = section.querySelector(':scope > .file-body');
+    if (!body || body.getAttribute('data-body-deferred') === '1') return;
+    body.innerHTML = '';
+    body.setAttribute('data-body-deferred', '1');
+    rebuildNavList();
+  }
+
+  function mountDeferredBody(section, file) {
+    const body = section.querySelector(':scope > .file-body');
+    if (!body || body.getAttribute('data-body-deferred') !== '1') return;
+    populateFileBody(body, file);
+    highlightQuotesInSection(section, file);
+  }
+
+  function ensureFileBodyMounted(section, file) {
+    if (!section || !file || file.lazy) return;
+    const body = section.querySelector(':scope > .file-body');
+    if (!body) return;
+    if (body.getAttribute('data-body-deferred') !== '1' && body.childElementCount > 0) return;
+    mountDeferredBody(section, file);
+    renderMermaidBlocks();
+    rebuildNavList();
+    applyHideResolved();
+  }
+
+  function populateFileBody(body, file) {
+    body.innerHTML = '';
+    body.removeAttribute('data-body-deferred');
 
     const showDiff = file.viewMode === 'diff' || (file.fileType === 'code' && session.mode === 'git');
 
@@ -2317,10 +2948,6 @@
     } else {
       body.appendChild(renderDocumentView(file));
     }
-
-    section.appendChild(body);
-    highlightQuotesInSection(section, file);
-    return section;
   }
 
   // ===== Rendered Diff View (Markdown, file mode) =====
@@ -4885,7 +5512,8 @@
     actions.appendChild(cancelBtn);
     actions.appendChild(submitBtn);
 
-    if (agentEnabled && !opts.editingId) {
+    // Callers put editingId on formObj, not opts.
+    if (agentEnabled && !opts.editingId && !formObj.editingId) {
       const sendBtn = document.createElement('button');
       sendBtn.className = 'btn btn-sm btn-agent';
       sendBtn.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" style="vertical-align: -1px"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg> Send now';
@@ -4893,25 +5521,34 @@
       sendBtn.addEventListener('click', async function() {
         sendBtn.disabled = true;
         submitBtn.disabled = true;
-        const fp = formObj.filePath;
-        const comment = await submitComment(textarea.value, formObj);
-        if (comment) {
-          pendingAgentRequests.add(comment.id);
-          renderFileByPath(fp);
-          try {
-            const res = await fetch('/api/agent/request', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ comment_id: comment.id, file_path: fp }),
-            });
-            if (!res.ok) throw new Error('Server returned ' + res.status);
-            showMiniToast('Sent to agent');
-          } catch (err) {
-            console.error('Error sending to agent:', err);
-            showMiniToast('Failed to send to agent');
-            pendingAgentRequests.delete(comment.id);
-            renderFileByPath(fp);
-          }
+        const isReview = formObj.scope === 'review';
+        const fp = isReview ? '' : formObj.filePath;
+        const rerender = isReview
+          ? renderReviewConversation
+          : function() { renderFileByPath(fp); };
+        const comment = isReview
+          ? await addReviewComment(textarea.value)
+          : await submitComment(textarea.value, formObj);
+        if (!comment) {
+          sendBtn.disabled = false;
+          submitBtn.disabled = false;
+          return;
+        }
+        pendingAgentRequests.add(comment.id);
+        rerender();
+        try {
+          const res = await fetch('/api/agent/request', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ comment_id: comment.id, file_path: fp }),
+          });
+          if (!res.ok) throw new Error('Server returned ' + res.status);
+          showMiniToast('Sent to agent');
+        } catch (err) {
+          console.error('Error sending to agent:', err);
+          showMiniToast('Failed to send to agent');
+          pendingAgentRequests.delete(comment.id);
+          rerender();
         }
       });
       actions.appendChild(sendBtn);
@@ -5642,8 +6279,9 @@
   // ===== Review-Level (General) Comments =====
   let reviewCommentSubmitting = false;
   async function addReviewComment(body) {
-    if (!body.trim() || reviewCommentSubmitting) return;
+    if (!body.trim() || reviewCommentSubmitting) return null;
     reviewCommentSubmitting = true;
+    let newComment;
     try {
       const res = await fetch('/api/comments', {
         method: 'POST',
@@ -5651,14 +6289,14 @@
         body: JSON.stringify({ body: body.trim(), author: configAuthor })
       });
       if (!res.ok) throw new Error('Server returned ' + res.status);
-      const newComment = await res.json();
+      newComment = await res.json();
       reviewComments.push(newComment);
       userActedThisRound = true;
     } catch (err) {
       console.error('Error adding review comment:', err);
       showMiniToast('Failed to add comment');
       reviewCommentSubmitting = false;
-      return;
+      return null;
     }
     reviewCommentSubmitting = false;
     reviewCommentFormActive = false;
@@ -5672,6 +6310,7 @@
     renderReviewConversation();
     renderCommentsPanel();
     renderFileTree();
+    return newComment;
   }
 
   async function updateReviewComment(id, body) {
@@ -6127,6 +6766,17 @@
     refreshAfterReplyChange(filePath);
   }
 
+  // The selector skips the panel copy of the comment, which has no reply form.
+  function focusRebuiltReplyForm(commentId) {
+    requestAnimationFrame(function() {
+      const sel = '.comment-card[data-comment-id="' + commentId + '"] ';
+      const ta = document.querySelector(sel + '.reply-textarea');
+      if (ta) ta.focus();
+      const btns = document.querySelector(sel + '.reply-form-buttons');
+      if (btns) btns.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
   function createReplyInput(commentId, filePath) {
     const form = document.createElement('div');
     form.className = 'reply-form';
@@ -6154,43 +6804,65 @@
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn btn-sm';
     cancelBtn.textContent = 'Cancel';
+    cancelBtn.disabled = !!isPending;
 
     const submitBtn = document.createElement('button');
     submitBtn.className = 'btn btn-sm btn-primary';
     submitBtn.textContent = 'Reply';
+    submitBtn.disabled = !!isPending;
 
     buttons.appendChild(cancelBtn);
     buttons.appendChild(submitBtn);
+    // Always mounted; CSS hides the whole form when the card is collapsed.
+    form.appendChild(buttons);
 
     attachFilePicker(textarea);
     attachImageUploads(textarea);
 
+    function activeField() {
+      return form.classList.contains('expanded') ? textarea : input;
+    }
+
     function expand() {
       if (form.classList.contains('expanded')) return;
+      // Set before closing: closeEmptyForms re-renders the file and detaches
+      // the nodes below, and the rebuilt form restores from this.
+      activeReplyForms.set(commentId, { text: input.value, expanded: true });
       closeEmptyReviewForm();
       closeEmptyForms(null);
+      if (!form.isConnected) {
+        // We were replaced by the re-render; hand off to the fresh form.
+        focusRebuiltReplyForm(commentId);
+        return;
+      }
       form.classList.add('expanded');
       textarea.value = input.value;
       input.replaceWith(textarea);
       form.appendChild(buttons);
       textarea.focus();
-      activeReplyForms.set(commentId, { text: textarea.value });
+      activeReplyForms.set(commentId, { text: textarea.value, expanded: true });
+      // The taller textarea can push the actions off screen, and focusing it
+      // does not bring them along.
+      buttons.scrollIntoView({ block: 'nearest' });
     }
 
     function collapse() {
+      textarea.value = '';
+      input.value = '';
+      activeReplyForms.delete(commentId);
       if (!form.classList.contains('expanded')) return;
       form.classList.remove('expanded');
       textarea.replaceWith(input);
-      input.value = '';
-      if (buttons.parentNode) buttons.remove();
-      activeReplyForms.delete(commentId);
     }
 
     input.addEventListener('focus', expand);
 
     // Keep reply form state in sync for surviving re-renders
     textarea.addEventListener('input', function() {
-      activeReplyForms.set(commentId, { text: textarea.value });
+      activeReplyForms.set(commentId, { text: textarea.value, expanded: true });
+    });
+    input.addEventListener('input', function() {
+      activeReplyForms.set(commentId, { text: input.value, expanded: false });
     });
 
     cancelBtn.addEventListener('click', collapse);
@@ -6205,8 +6877,8 @@
     });
 
     submitBtn.addEventListener('click', async function() {
-      const body = textarea.value.trim();
-      if (!body) return;
+      const body = activeField().value.trim();
+      if (!body) { activeField().focus(); return; }
       submitBtn.disabled = true;
       try {
         const payload = { body: body };
@@ -6222,22 +6894,27 @@
         if (!res.ok) throw new Error('Server returned ' + res.status);
         userActedThisRound = true;
 
-        // Live-thread agent dispatch only applies to file-scoped comments.
+        // Keep a live thread talking to the agent.
+        let comment = null;
         if (filePath) {
           const file = getFileByPath(filePath);
-          const comment = file && file.comments ? file.comments.find(function(c) { return c.id === commentId; }) : null;
-          if (comment && (isLiveThread(comment) || pendingAgentRequests.has(commentId))) {
-            pendingAgentRequests.add(commentId);
-            fetch('/api/agent/request', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ comment_id: commentId, file_path: filePath }),
-            }).catch(function(err) {
-              console.error('Error sending reply to agent:', err);
-              pendingAgentRequests.delete(commentId);
-              showMiniToast('Failed to send to agent');
-            });
+          if (file && file.comments) {
+            comment = file.comments.find(function(c) { return c.id === commentId; });
           }
+        } else {
+          comment = reviewComments.find(function(c) { return c.id === commentId; });
+        }
+        if (comment && (isLiveThread(comment) || pendingAgentRequests.has(commentId))) {
+          pendingAgentRequests.add(commentId);
+          fetch('/api/agent/request', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ comment_id: commentId, file_path: filePath }),
+          }).catch(function(err) {
+            console.error('Error sending reply to agent:', err);
+            pendingAgentRequests.delete(commentId);
+            showMiniToast('Failed to send to agent');
+          });
         }
 
         activeReplyForms.delete(commentId);
@@ -6267,11 +6944,15 @@
 
     // Restore saved reply form state after DOM re-render
     const saved = activeReplyForms.get(commentId);
-    if (saved && saved.text) {
-      form.classList.add('expanded');
-      textarea.value = saved.text;
-      input.replaceWith(textarea);
-      form.appendChild(buttons);
+    if (saved && (saved.text || saved.expanded)) {
+      if (saved.expanded) {
+        form.classList.add('expanded');
+        textarea.value = saved.text || '';
+        input.replaceWith(textarea);
+        form.appendChild(buttons);
+      } else {
+        input.value = saved.text || '';
+      }
     }
 
     return form;
@@ -6639,9 +7320,21 @@
     const section = document.getElementById('file-section-' + filePath);
     if (!section) return;
     if (!section.open) section.open = true;
-    const commentCard = section.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
-    if (!commentCard) return;
-    flashCommentCard(commentCard);
+    const file = getFileByPath(filePath);
+    const flashCardIn = function(el) {
+      if (!el) return;
+      const commentCard = el.querySelector('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]');
+      if (commentCard) flashCommentCard(commentCard);
+    };
+    // Line comment cards live inside .file-body — mount (or lazy-load) first.
+    if (file && file.lazy) {
+      loadLazyFile(section, file, function onLoaded(newSection) {
+        flashCardIn(newSection || document.getElementById('file-section-' + filePath));
+      });
+      return;
+    }
+    if (file) ensureFileBodyMounted(section, file);
+    flashCardIn(section);
   }
 
   // ===== PR Overview Panel =====
@@ -7096,6 +7789,7 @@
         for (let i = 0; i < files.length; i++) {
           previousCommentSignatures.set(files[i].path, JSON.stringify(files[i].comments || []));
         }
+        const previousReviewSignature = JSON.stringify(reviewComments || []);
         await Promise.all(files.map(async function(f) {
           return fetch('/api/file/comments?path=' + enc(f.path))
             .then(function(r) { return r.ok ? r.json() : []; })
@@ -7124,14 +7818,20 @@
           checkAgentReplies(files[i].comments);
           saveOpenFormContent(files[i].path);
         }
-        if (storyActive()) {
-          for (let i = 0; i < files.length; i++) {
-            const before = previousCommentSignatures.get(files[i].path) || '[]';
-            const after = JSON.stringify(files[i].comments || []);
-            if (before !== after) renderStoryFileByPath(files[i].path);
-          }
-        } else {
-          renderAllFiles();
+        checkAgentReplies(reviewComments);
+        // Re-render only the files whose comments actually changed. Rebuilding
+        // every section would re-defer all off-screen bodies, collapsing the
+        // document height and throwing the reader back to the top.
+        const inStory = storyActive();
+        for (let i = 0; i < files.length; i++) {
+          const before = previousCommentSignatures.get(files[i].path) || '[]';
+          const after = JSON.stringify(files[i].comments || []);
+          if (before === after) continue;
+          if (inStory) renderStoryFileByPath(files[i].path);
+          else renderFileByPath(files[i].path, { preserveDeferred: true });
+        }
+        if (!inStory && JSON.stringify(reviewComments || []) !== previousReviewSignature) {
+          renderReviewConversation();
         }
         updateCommentCount();
         updateTreeCommentBadges();
@@ -7541,7 +8241,7 @@
       document.querySelectorAll('#diffModeToggle .toggle-btn').forEach(function(b) {
         b.classList.toggle('active', b.dataset.mode === mode);
       });
-      if (storyActive()) renderStory(); else renderAllFiles();
+      if (storyActive()) renderStory(); else renderAllFilesKeepingPlace();
     });
   });
 
@@ -7549,7 +8249,7 @@
   document.getElementById('diffToggle').addEventListener('click', function() {
     diffActive = !diffActive;
     updateDiffModeToggle();
-    renderAllFiles();
+    renderAllFilesKeepingPlace();
   });
 
   // ===== Compare chrome (target + commit range) =====
@@ -8283,58 +8983,147 @@
   let navCommentId = null;
   let navHighlightTimer;
 
-  function navigateToComment(direction) {
+  function collectNavigableComments() {
+    // Document order matching render: file-scope cards above the body, then
+    // line comments by end_line / start_line. Used so [/] can reach comments
+    // whose .file-body is still deferred.
+    const list = [];
+    for (let fi = 0; fi < files.length; fi++) {
+      const file = files[fi];
+      const comments = file.comments || [];
+      if (comments.length === 0) continue;
+      if (file.orphaned) {
+        for (let ci = 0; ci < comments.length; ci++) {
+          list.push({ id: comments[ci].id, filePath: file.path, resolved: !!comments[ci].resolved });
+        }
+        continue;
+      }
+      const fileScope = [];
+      const lineScope = [];
+      for (let ci = 0; ci < comments.length; ci++) {
+        if (comments[ci].scope === 'file') fileScope.push(comments[ci]);
+        else lineScope.push(comments[ci]);
+      }
+      for (let ci = 0; ci < fileScope.length; ci++) {
+        list.push({ id: fileScope[ci].id, filePath: file.path, resolved: !!fileScope[ci].resolved });
+      }
+      lineScope.sort(function(a, b) {
+        const ae = a.end_line || 0, be = b.end_line || 0;
+        if (ae !== be) return ae - be;
+        const as = a.start_line || 0, bs = b.start_line || 0;
+        return as - bs;
+      });
+      for (let ci = 0; ci < lineScope.length; ci++) {
+        list.push({ id: lineScope[ci].id, filePath: file.path, resolved: !!lineScope[ci].resolved });
+      }
+    }
+    return list;
+  }
+
+  function highlightNavComment(commentId, filePath) {
     const panel = document.getElementById('commentsPanel');
-    const container = document.querySelector('.main-content');
-    const cards = Array.from(container.querySelectorAll('.comment-card')).filter(function(card) {
-      return !panel || !panel.contains(card);
-    });
-    if (cards.length === 0) return;
+    function applyHighlight(root) {
+      if (!root) return false;
+      const candidates = root.querySelectorAll
+        ? root.querySelectorAll('.comment-card[data-comment-id="' + CSS.escape(commentId) + '"]')
+        : [];
+      let target = null;
+      for (let i = 0; i < candidates.length; i++) {
+        if (panel && panel.contains(candidates[i])) continue;
+        target = candidates[i];
+        break;
+      }
+      if (!target) return false;
+
+      if (navHighlightTimer) {
+        clearTimeout(navHighlightTimer);
+        document.querySelectorAll('.comment-nav-highlight').forEach(function(el) {
+          el.classList.remove('comment-nav-highlight');
+        });
+      }
+
+      const header = document.querySelector('.header');
+      const headerHeight = header ? header.offsetHeight : 52;
+      const rect = target.getBoundingClientRect();
+      const fileSection = target.closest('.file-section');
+      const fileHeader = fileSection ? fileSection.querySelector('.file-header') : null;
+      const fileHeaderHeight = fileHeader ? fileHeader.offsetHeight : 0;
+      window.scrollTo({ top: rect.top + window.scrollY - headerHeight - fileHeaderHeight - 16, behavior: 'smooth' });
+      target.classList.add('comment-nav-highlight');
+      navHighlightTimer = setTimeout(function() {
+        target.classList.remove('comment-nav-highlight');
+        navHighlightTimer = null;
+      }, 1000);
+      return true;
+    }
+
+    const section = document.getElementById('file-section-' + filePath);
+    if (!section) return;
+    if (!section.open) section.open = true;
+
+    // File-scope cards sit outside .file-body and may already be mounted.
+    if (applyHighlight(section)) return;
+
+    const file = getFileByPath(filePath);
+    if (file && file.lazy) {
+      loadLazyFile(section, file, function onLoaded(newSection) {
+        applyHighlight(newSection || document.getElementById('file-section-' + filePath));
+      });
+      return;
+    }
+    if (file) ensureFileBodyMounted(section, file);
+    applyHighlight(section);
+  }
+
+  function navigateToComment(direction) {
+    const all = collectNavigableComments();
+    const isEligible = function(entry) {
+      return !isHideResolved() || !entry.resolved;
+    };
+    const eligible = all.filter(isEligible);
+    if (eligible.length === 0) return;
 
     const header = document.querySelector('.header');
     const headerHeight = header ? header.offsetHeight : 52;
 
-    // Find current position by stored comment ID (immune to smooth-scroll race conditions)
+    // Keep the current position in the full order even when that comment becomes
+    // hidden, then scan in the requested direction for the next eligible entry.
     let idx = -1;
     if (navCommentId) {
-      for (let i = 0; i < cards.length; i++) {
-        if (cards[i].dataset.commentId === navCommentId) { idx = i; break; }
+      for (let i = 0; i < all.length; i++) {
+        if (all[i].id === navCommentId) { idx = i; break; }
       }
     }
 
-    let targetIdx;
-    if (direction === 1) {
-      if (idx < 0) {
-        // First use: pick first card below the header area by viewport position
-        targetIdx = -1;
-        for (let j = 0; j < cards.length; j++) {
-          if (cards[j].getBoundingClientRect().top > headerHeight + 8) { targetIdx = j; break; }
+    let target;
+    if (idx >= 0) {
+      for (let step = 1; step <= all.length; step++) {
+        const candidateIdx = (idx + direction * step + all.length) % all.length;
+        if (isEligible(all[candidateIdx])) {
+          target = all[candidateIdx];
+          break;
         }
-        if (targetIdx < 0) targetIdx = 0;
-      } else {
-        targetIdx = idx >= cards.length - 1 ? 0 : idx + 1;
       }
+    } else if (direction === 1) {
+      // First use: pick first mounted card below the header when available,
+      // otherwise the first eligible model entry (may need a mount).
+      let targetIdx = -1;
+      for (let j = 0; j < eligible.length; j++) {
+        const card = document.querySelector(
+          '.main-content .comment-card[data-comment-id="' + CSS.escape(eligible[j].id) + '"]'
+        );
+        if (!card) continue;
+        if (card.getBoundingClientRect().top > headerHeight + 8) { targetIdx = j; break; }
+      }
+      if (targetIdx < 0) targetIdx = 0;
+      target = eligible[targetIdx];
     } else {
-      targetIdx = idx <= 0 ? cards.length - 1 : idx - 1;
+      target = eligible[eligible.length - 1];
     }
 
-    const target = cards[targetIdx];
-    navCommentId = target.dataset.commentId;
-
-    if (navHighlightTimer) {
-      clearTimeout(navHighlightTimer);
-      document.querySelectorAll('.comment-nav-highlight').forEach(function(el) {
-        el.classList.remove('comment-nav-highlight');
-      });
-    }
-
-    const rect = target.getBoundingClientRect();
-    const fileSection = target.closest('.file-section');
-    const fileHeader = fileSection ? fileSection.querySelector('.file-header') : null;
-    const fileHeaderHeight = fileHeader ? fileHeader.offsetHeight : 0;
-    window.scrollTo({ top: rect.top + window.scrollY - headerHeight - fileHeaderHeight - 16, behavior: 'smooth' });
-    target.classList.add('comment-nav-highlight');
-    navHighlightTimer = setTimeout(function() { target.classList.remove('comment-nav-highlight'); navHighlightTimer = null; }, 1000);
+    if (!target) return;
+    navCommentId = target.id;
+    highlightNavComment(target.id, target.filePath);
   }
 
   document.getElementById('commentNavPrev').addEventListener('click', function() { navigateToComment(-1); });
@@ -8468,7 +9257,7 @@
         applyWidth: applyWidth,
         getHideResolved: isHideResolved,
         setHideResolved: setHideResolved,
-        onHideResolvedChange: function () { renderAllFiles(); },
+        onHideResolvedChange: function () { refreshHideResolvedView(); },
         hasActivePendingUpdates: hasActivePendingUpdates,
         announceCopy: announceCopy,
         escape: escapeHtml,
@@ -8713,7 +9502,7 @@
     if (hideResolvedToggle) {
       hideResolvedToggle.addEventListener('change', function() {
         setHideResolved(hideResolvedToggle.checked);
-        renderAllFiles();
+        refreshHideResolvedView();
       });
     }
 
@@ -8791,7 +9580,7 @@
 
   document.addEventListener('keydown', function(e) {
     const tag = document.activeElement.tagName;
-    if (tag === 'TEXTAREA' || tag === 'INPUT' || document.activeElement.isContentEditable) {
+    if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT' || document.activeElement.isContentEditable) {
       if (e.key === 'Escape' && activeForms.length > 0) {
         e.preventDefault();
         const ta = document.activeElement;
@@ -8815,49 +9604,25 @@
     // short-circuit the rest of the keymap so we don't double-handle.
     if (settingsPanelOpen) return;
 
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const shortcutRegistry = window.crit && window.crit.shortcuts;
+    const shortcutAction = shortcutRegistry ? shortcutRegistry.actionForEvent(e, 'code-review') : '';
+    if (!shortcutAction && (e.metaKey || e.ctrlKey || e.altKey)) return;
+    const interactive = e.target && e.target.closest && e.target.closest(
+      'button, a[href], summary, [role="button"], [role="link"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], [role="option"], [role="slider"]'
+    );
+    if (interactive && [' ', 'Enter', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
 
-    // Story navigation keys (chapter nav / overview / jump / help). Scoped to
-    // when the story view is active; uses uppercase J/K so lowercase j/k keep
-    // their in-page block navigation below. Returns early if consumed.
-    if (handleStoryKey(e)) return;
+    // Story navigation actions (chapter nav / overview / jump / help). Scoped
+    // to the active story view. Returns early if consumed.
+    if (handleStoryKey(e, shortcutAction)) return;
 
-    switch (e.key) {
-      case 'j': case 'k': {
+    switch (shortcutAction || e.key) {
+      case 'next_block': case 'previous_block': {
         e.preventDefault();
-        const allNav = navElements;
-        if (allNav.length === 0) return;
-        let curIdx = focusedElement ? allNav.indexOf(focusedElement) : -1;
-        if (curIdx === -1) {
-          const match = findNavElementForFocusTarget(getKeyboardFocusTarget());
-          if (match) curIdx = allNav.indexOf(match);
-        }
-        if (curIdx === -1) {
-          curIdx = e.key === 'j' ? 0 : allNav.length - 1;
-        } else {
-          if (e.key === 'j' && curIdx < allNav.length - 1) curIdx++;
-          if (e.key === 'k' && curIdx > 0) curIdx--;
-        }
-        document.querySelectorAll('.kb-nav.focused').forEach(function(el) { el.classList.remove('focused'); });
-        focusedElement = allNav[curIdx];
-        focusedElement.classList.add('focused');
-        focusedElement.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        // Sync legacy state
-        if (focusedElement.dataset.filePath) {
-          focusedFilePath = focusedElement.dataset.filePath;
-          focusedBlockIndex = parseInt(focusedElement.dataset.blockIndex);
-        } else {
-          const navTarget = navFocusTargetFromElement(focusedElement);
-          if (navTarget) {
-            focusedFilePath = navTarget.filePath;
-            focusedBlockIndex = null;
-          }
-        }
-        rememberKeyboardFocusFromNav(focusedElement);
-        if (visualMode) extendVisualSelection();
+        navigateBlock(shortcutAction === 'next_block' ? 1 : -1);
         break;
       }
-      case 'V': {
+      case 'visual_mode': {
         e.preventDefault();
         if (visualMode) {
           // Toggle off — preserve the focus on the current expansion point.
@@ -8867,7 +9632,7 @@
         }
         break;
       }
-      case 'c': {
+      case 'comment': {
         e.preventDefault();
         // Visual mode: comment on the active selection.
         if (visualMode && selectionStart !== null && selectionEnd !== null) {
@@ -8916,8 +9681,8 @@
         }
         break;
       }
-      case 'e':
-      case 'd': {
+      case 'edit_comment':
+      case 'delete_comment': {
         e.preventDefault();
         const loc = getFocusedCommentLocation();
         if (!loc) return;
@@ -8934,68 +9699,66 @@
           comment = file.comments.find(function(c) { return c.end_line === loc.lineNum && (c.side || '') === loc.side; });
         }
         if (!comment) return;
-        if (e.key === 'e') editComment(comment, loc.filePath);
+        if (shortcutAction === 'edit_comment') editComment(comment, loc.filePath);
         else deleteComment(comment.id, loc.filePath);
         break;
       }
-      case 'F': {
+      case 'finish_review': {
         e.preventDefault();
         if (uiState !== 'reviewing') return;
         document.getElementById('finishBtn').click();
         break;
       }
-      case 'G': {
+      case 'general_comment': {
         e.preventDefault();
         openReviewCommentForm();
         break;
       }
-      case 'C': {
+      case 'toggle_comments': {
         e.preventDefault();
         if (storyActive() && tryOpenFormFromSelection()) return;
         toggleCommentsPanel();
         break;
       }
-      case 'h': {
+      case 'toggle_resolved': {
         e.preventDefault();
         setHideResolved(!isHideResolved());
-        renderAllFiles();
+        refreshHideResolvedView();
         const ht = document.getElementById('hideResolvedToggle');
         if (ht) ht.checked = isHideResolved();
         break;
       }
-      case 't': {
+      case 'toggle_toc': {
         const tocBtn = document.getElementById('tocToggle');
         if (tocBtn.style.display === 'none') return;
         e.preventDefault();
         tocBtn.click();
         break;
       }
-      case ']': {
+      case 'next_comment': {
         e.preventDefault();
         navigateToComment(1);
         break;
       }
-      case '[': {
+      case 'previous_comment': {
         e.preventDefault();
         navigateToComment(-1);
         break;
       }
-      case 'n': {
-        if (changeGroups.length === 0) break;
+      case 'next_change': {
         e.preventDefault();
         navigateToChange(1);
         break;
       }
-      case 'N': {
-        if (changeGroups.length === 0) break;
+      case 'previous_change': {
         e.preventDefault();
         navigateToChange(-1);
         break;
       }
-      case '!': case '@': case '#': case '$': {
+      case 'scope_all': case 'scope_branch': case 'scope_staged': case 'scope_unstaged': {
         if (session.mode !== 'git') break;
-        const scopeMap = { '!': 'all', '@': 'branch', '#': 'staged', '$': 'unstaged' };
-        const scope = scopeMap[e.key];
+        const scopeMap = { scope_all: 'all', scope_branch: 'branch', scope_staged: 'staged', scope_unstaged: 'unstaged' };
+        const scope = scopeMap[shortcutAction];
         const btn = document.querySelector('#scopeToggle .toggle-btn[data-scope="' + scope + '"]');
         if (btn && !btn.disabled && !btn.classList.contains('active')) {
           e.preventDefault();
@@ -10490,9 +11253,10 @@
     renderMermaidBlocks();
     rebuildNavList();
     applyHideResolved();
-    // Keep active rail row visible.
+    // Keep active rail row visible. Instant: a smooth scroll here outlives the
+    // resetStoryScroll() that showStory() runs next.
     const activeRow = document.querySelector('.crit-story-row.active');
-    if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+    if (activeRow) activeRow.scrollIntoView({ block: 'nearest', behavior: 'instant' });
   }
 
   function resetStoryScroll() {
@@ -10709,26 +11473,25 @@
   function storyActive() { return !!storyState && document.body.classList.contains('crit-story-active'); }
 
   // Handle a keydown when story view is active. Returns true if consumed.
-  // Uppercase J/K (Shift) drive chapter nav so lowercase j/k keep their
-  // existing in-page block navigation. Scoped keys don't fire when typing.
-  function handleStoryKey(e) {
+  // Scoped story actions don't fire when typing or outside the story view.
+  function handleStoryKey(e, shortcutAction) {
     if (!storyActive()) return false;
     const pages = storyState.pages;
     const curIdx = storyView === 'overview' ? -1 : pages.indexOf(storyPageById(storyView));
-    switch (e.key) {
-      case 'J':
+    switch (shortcutAction || e.key) {
+      case 'story_next':
         e.preventDefault();
         if (curIdx === -1) { if (pages.length) showStory(storyPageId(pages[0])); }
         else if (curIdx < pages.length - 1) showStory(storyPageId(pages[curIdx + 1]));
         return true;
-      case 'K':
+      case 'story_previous':
         e.preventDefault();
         if (curIdx <= 0) showStory('overview');
         else showStory(storyPageId(pages[curIdx - 1]));
         return true;
-      case 'O':
+      case 'story_prologue':
         e.preventDefault(); showStory('overview'); return true;
-      case 'S':
+      case 'story_support':
         e.preventDefault();
         { const sp = storyPageById('support'); if (sp) showStory('support'); }
         return true;
@@ -10739,7 +11502,7 @@
         if (n < chs.length) { e.preventDefault(); showStory(storyPageId(chs[n])); return true; }
         return false;
       }
-      case '\\':
+      case 'story_toggle_list':
         e.preventDefault();
         document.body.classList.toggle('crit-story-rail-open');
         return true;

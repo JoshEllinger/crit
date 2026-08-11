@@ -66,9 +66,9 @@ Options:
 	{name: "comment", handler: runComment, help: `Usage: crit comment [options] <body>
        crit comment [options] <path> <body>
        crit comment [options] <path>:<line[-end]> <body>
-       crit comment --reply-to <id> [--resolve] <body>
-       crit comment --json [--file <path>]
-       crit comment --clear
+       crit comment [options] --reply-to <id> [--resolve] <body>
+       crit comment [options] --json [--file <path>]
+       crit comment [options] --clear
 
 Add, reply to, bulk import, or clear review comments.
 
@@ -76,13 +76,14 @@ Options:
   -o, --output <dir>   Crit data root for reviews
       --author <name>  Comment author
       --plan <name>    Target a stored plan review
+      --session <id>   Target an active review session (all comment modes)
       --reply-to <id>  Reply to an existing comment
       --resolve        Resolve the parent after replying
       --path <path>    File path for a reply
       --json           Read bulk comments as JSON
   -f, --file <path>    Read JSON from a file
       --scope <mode>   Override comment focus scope`},
-	{name: "comments", handler: runComments, help: `Usage: crit comments [--json] [--all] [review]
+	{name: "comments", handler: runComments, help: `Usage: crit comments [--session <id>] [--json] [--all] [review]
 
 List unresolved comments, with review-level comments first.`},
 	{name: "review", handler: runReview, help: `Usage: crit review [options] [file|dir...]
@@ -110,7 +111,7 @@ Options:
       --cdp-url <url>      Reuse cookies from Chrome DevTools
       --share-url <url>    Share service URL
       --no-open            Do not open a browser
-  -q, --quiet              Suppress status output`},
+  -q, --quiet              On success, suppress connect/start status, tips, and session summary`},
 	{name: "preview", handler: runPreview, help: `Usage: crit preview [options] <file.html>
 
 Review a local HTML file in preview mode.
@@ -123,7 +124,7 @@ Options:
                           Allow non-loopback --host or --public-url
       --share-url <url>   Share service URL
       --no-open           Do not open a browser
-  -q, --quiet             Suppress status output`},
+  -q, --quiet             On success, suppress connect/start status, tips, and session summary`},
 	{name: "plan", handler: runPlan, help: `Usage: crit plan [--name <slug>] [options] <file>
        echo "content" | crit plan [--name <slug>] [options]
 
@@ -138,7 +139,7 @@ Options:
   -p, --port <port>       Port to listen on
       --share-url <url>   Share service URL
       --no-open           Do not open a browser
-  -q, --quiet             Suppress status output`},
+  -q, --quiet             On success, suppress connect/start status, tips, and session summary`},
 	{name: "story", handler: runStory, helpFn: printStoryUsage, bareHelp: true},
 	{name: "auth", handler: runAuth, help: `Usage: crit auth <login|logout|whoami>
 
@@ -167,7 +168,7 @@ Stop the review daemon for the current session. Specify files to target an
 exact file-mode session, or use --all to stop every daemon.`},
 	{name: "status", handler: runStatus, help: `Usage: crit status [--json]
 
-Show the review path, daemon status, and comment counts.`},
+Show active session IDs and review paths, daemon status, and comment counts.`},
 	{name: "stats", handler: runStats, help: `Usage: crit stats [--json]
 
 Show lifetime review statistics.`},
@@ -290,7 +291,7 @@ Comments:
   crit comment --reply-to <id> <body>        Reply to a comment
   crit comment --json                        Bulk add comments from JSON on stdin
   crit comment --clear                       Remove all comments
-  crit comments [--json] [--all] [review]    List unresolved comments (review-level first)
+  crit comments [--session <id>] [--json] [--all] [review]    List unresolved comments (review-level first)
 
 Sharing:
   crit share <file> [file...]                Share files to crit-web, print URL
@@ -322,7 +323,7 @@ Options:
   -o, --output <dir>          Crit data root for reviews (default: ~/.crit)
       --no-open               Don't auto-open browser
       --no-ignore             Disable all file ignore patterns
-  -q, --quiet                 Suppress status output
+  -q, --quiet                 On success, suppress connect/start status, tips, and session summary
       --share-url <url>       Share service URL (e.g. https://crit.md or self-hosted)
       --base-branch <branch>  Base branch to diff against (overrides auto-detection)
       --scope <mode>          Diff scope for PR review: layer (default) or full-stack

@@ -156,12 +156,14 @@ AI agents can use `crit comment` to add inline review comments without opening t
 ```bash
 crit comment src/auth.go:42 'Missing null check'
 crit comment src/handler.go:15-28 'Error handling issue'
+crit comment --session 839f3b4cd5d6 src/auth.go:42 'Target this review'
+echo '[{"body":"Overall feedback"}]' | crit comment --session 839f3b4cd5d6 --json
 crit comment --output ~/.crit src/auth.go:42 'comment'  # same as default (~/.crit/reviews/<key>/)
 crit comment --output .crit src/auth.go:42 'comment'    # in-repo: .crit/reviews/<key>/
 crit comment --clear   # remove the review file
 ```
 
-Comments are appended to the review file (stored in `~/.crit/reviews/`) and created automatically if it doesn't exist. Run `crit status` to see the active review file path.
+Comments are appended to the review file (stored in `~/.crit/reviews/`) and created automatically if it doesn't exist. Run `crit status` to see active review session IDs and paths. If multiple sessions match the same directory and branch, select one with `--session <id>` on `crit comment`, `crit comments`, `crit share`, `crit push`, or `crit pull`; an unqualified command fails instead of guessing.
 
 ### Share for Async Review
 
@@ -310,7 +312,7 @@ All keys are optional — omit any you don't need.
 | `port`                 | int      | `0` (random)               | Port for the local server. `0` picks a random available port.                                                                                                                           |
 | `host`                 | string   | `"127.0.0.1"`              | Listen host (global/CLI/env only). Non-loopback values also require `--allow-unauthenticated-network` / `CRIT_ALLOW_UNAUTHENTICATED_NETWORK=1`. Prefer loopback + SSH/Tailscale/Docker host-loopback publish. |
 | `no_open`              | bool     | `false`                    | Don't auto-open the browser when starting a review.                                                                                                                                     |
-| `quiet`                | bool     | `false`                    | Suppress terminal status output.                                                                                                                                                        |
+| `quiet`                | bool     | `false`                    | On success, suppress daemon connect/start lines, integration tips, and the session summary. Errors, `approved:`, and the finish prompt are unchanged. |
 | `output`               | string   | `~/.crit`                  | Crit data root for reviews. Reviews live in `<root>/reviews/<key>/` (same layout as the default). A leftover `<root>/.crit` from when `output` named a single review folder is still used (with a warning) until you move or remove it. |
 | `author`               | string   | VCS user name              | Author name shown on comments. Falls back to your configured VCS user name.                                                                                                            |
 | `base_branch`          | string   | auto-detected              | Base branch to diff against (e.g. `"main"`, `"develop"`). Overrides auto-detection.                                                                                                     |
@@ -376,7 +378,7 @@ These keys can only be set in `~/.crit.config.json` (global). Project-level `.cr
 | `--no-open`     |       | `no_open`             | Don't auto-open browser                |
 | `--share-url`   |       | `share_url`           | Share service URL                      |
 | `--output`      | `-o`  | `output`              | Crit data root for reviews (`<root>/reviews/<key>/`). Honors a leftover `<root>/.crit` from older crit versions until removed. |
-| `--quiet`       | `-q`  | `quiet`               | Suppress status output                 |
+| `--quiet`       | `-q`  | `quiet`               | On success, suppress connect/start status, tips, and session summary                 |
 | `--base-branch` |       | `base_branch`         | Base branch to diff against            |
 | `--vcs`         |       | `vcs`                 | VCS backend (`git`, `sl`, or `jj`)     |
 | `--no-ignore`   |       |                       | Temporarily bypass all ignore patterns |
