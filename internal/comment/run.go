@@ -8,8 +8,11 @@ import (
 
 	"github.com/JoshEllinger/crit/internal/clicmd"
 	"github.com/JoshEllinger/crit/internal/config"
+	"github.com/JoshEllinger/crit/internal/daemon"
 	"github.com/JoshEllinger/crit/internal/review"
+	"github.com/JoshEllinger/crit/internal/reviewpath"
 	"github.com/JoshEllinger/crit/internal/session"
+	"github.com/JoshEllinger/crit/internal/vcs"
 )
 
 // RunComment is the crit comment subcommand implementation.
@@ -22,7 +25,12 @@ func RunComment(args []string) error { //nolint:gocyclo // CLI dispatcher
 		return err
 	}
 
-	scope, err := resolveCommentScopeAtPath(f.scope, f.reviewPath)
+	var scope session.InheritedScope
+	if f.sessionEntry != nil {
+		scope, err = resolveCommentScopeAtPathWithFocus(f.scope, f.reviewPath, session.ProbeDaemonFocusForSession(*f.sessionEntry))
+	} else {
+		scope, err = resolveCommentScopeAtPath(f.scope, f.reviewPath)
+	}
 	if err != nil {
 		return err
 	}
@@ -85,22 +93,8 @@ func resolveCommentFlags(f *commentFlags) error {
 		return err
 	}
 	f.configuredOutput = cfg.Output
-
-	if f.plan != "" {
-		if f.outputDir != "" {
-			return fmt.Errorf("--plan and --output cannot be used together")
-		}
-		planDir, planDirErr := session.PlanStorageDir(session.Slugify(f.plan))
-		if planDirErr != nil {
-			return planDirErr
-		}
-		f.outputDir = planDir
-		f.reviewPath = filepath.Join(planDir, ".crit")
-	} else {
-		f.reviewPath, err = review.ResolveCommandReviewPath(f.outputDir, f.configuredOutput)
-		if err != nil {
-			return err
-		}
+	if err := resolveCommentReviewPath(f); err != nil {
+		return err
 	}
 	if f.author == "" {
 		f.author = cfg.Author
@@ -109,6 +103,90 @@ func resolveCommentFlags(f *commentFlags) error {
 		f.userID = cfg.AuthUserID
 	}
 	return nil
+}
+
+func resolveCommentReviewPath(f *commentFlags) error {
+	switch {
+	case f.sessionID != "":
+		return resolveSessionCommentReviewPath(f)
+	case f.plan != "":
+		return resolvePlanCommentReviewPath(f)
+	default:
+		return resolveUnqualifiedCommentReviewPath(f)
+	}
+}
+
+func resolveSessionCommentReviewPath(f *commentFlags) error {
+	if f.plan != "" || f.outputDir != "" {
+		return fmt.Errorf("--session cannot be used with --plan or --output")
+	}
+	if !daemon.ValidSessionKey(f.sessionID) {
+		return daemon.InvalidSessionIDError(f.sessionID)
+	}
+	entry, alive := daemon.FindAliveSession(f.sessionID)
+	if !alive {
+		return fmt.Errorf("no active review session %s", f.sessionID)
+	}
+	if entry.ReviewPath == "" {
+		return fmt.Errorf("active review session %s has no review path", f.sessionID)
+	}
+	f.reviewPath = entry.ReviewPath
+	f.sessionEntry = &entry
+	return nil
+}
+
+func resolvePlanCommentReviewPath(f *commentFlags) error {
+	if f.outputDir != "" {
+		return fmt.Errorf("--plan and --output cannot be used together")
+	}
+	planDir, err := session.PlanStorageDir(session.Slugify(f.plan))
+	if err != nil {
+		return err
+	}
+	f.outputDir = planDir
+	f.reviewPath = filepath.Join(planDir, ".crit")
+	return nil
+}
+
+func resolveUnqualifiedCommentReviewPath(f *commentFlags) error {
+	cwd, err := daemon.ResolvedCWD()
+	if err != nil {
+		return err
+	}
+	branch := ""
+	backend := vcs.DetectVCS("")
+	if backend != nil {
+		branch = backend.CurrentBranch()
+	}
+	sessions, keys, err := review.MatchingLiveSessions(cwd, branch, backend)
+	if err != nil {
+		return err
+	}
+	if len(sessions) > 1 {
+		return review.AmbiguousSessionsError(keys)
+	}
+	key := daemon.SessionKey(cwd, branch, nil)
+	if len(keys) == 1 {
+		key = keys[0]
+	}
+	if f.outputDir != "" {
+		f.reviewPath, err = reviewpath.IdentityUnderDataRoot(f.outputDir, key)
+		if len(sessions) == 1 {
+			f.sessionEntry = &sessions[0]
+		}
+		return err
+	}
+	if len(sessions) == 1 && sessions[0].ReviewPath != "" {
+		f.reviewPath = sessions[0].ReviewPath
+		f.sessionEntry = &sessions[0]
+		return nil
+	}
+	if f.configuredOutput != "" {
+		f.reviewPath, err = reviewpath.IdentityUnderDataRoot(f.configuredOutput, key)
+		return err
+	}
+	f.reviewPath, err = daemon.ReviewFilePath(key)
+	return err
 }
 
 func runCommentJSONScoped(f commentFlags, scope session.InheritedScope) error {
@@ -122,7 +200,7 @@ func runCommentJSONScoped(f commentFlags, scope session.InheritedScope) error {
 		return err
 	}
 
-	if err := bulkAddCommentsToCritJSONAtPath(entries, f.author, f.userID, f.reviewPath, scope); err != nil {
+	if err := bulkAddCommentsToCritJSONAtPathWithRedirect(entries, f.author, f.userID, f.reviewPath, scope, f.sessionID == ""); err != nil {
 		return err
 	}
 
@@ -155,7 +233,7 @@ func runCommentReply(f commentFlags) error {
 		return clicmd.Usage("Usage: crit comment --reply-to <comment-id> [--resolve] <body>")
 	}
 	replyBody := strings.Join(f.args, " ")
-	if err := addReplyToCritJSONAtPath(f.replyTo, replyBody, f.author, f.userID, f.resolve, f.reviewPath, f.path); err != nil {
+	if err := addReplyToCritJSONAtPathWithRedirect(f.replyTo, replyBody, f.author, f.userID, f.resolve, f.reviewPath, f.path, f.sessionID == ""); err != nil {
 		return err
 	}
 	if f.resolve {
@@ -175,11 +253,11 @@ func runCommentClear(reviewPath string) error {
 }
 
 func commentUsageError() error {
-	fmt.Fprintln(os.Stderr, "Usage: crit comment [--output <dir>] [--author <name>] <body>                    Review-level comment")
-	fmt.Fprintln(os.Stderr, "       crit comment [--output <dir>] [--author <name>] <path> <body>             File-level comment")
-	fmt.Fprintln(os.Stderr, "       crit comment [--output <dir>] [--author <name>] <path>:<line[-end]> <body> Line-level comment")
-	fmt.Fprintln(os.Stderr, "       crit comment --reply-to <id> [--resolve] [--author <name>] <body>")
-	fmt.Fprintln(os.Stderr, "       crit comment --json [--file <path>] [--author <name>] [--output <dir>]")
+	fmt.Fprintln(os.Stderr, "Usage: crit comment [--session <id>] [--output <dir>] [--author <name>] <body>     Review-level comment")
+	fmt.Fprintln(os.Stderr, "       crit comment [--session <id>] [--output <dir>] [--author <name>] <path> <body>             File-level comment")
+	fmt.Fprintln(os.Stderr, "       crit comment [--session <id>] [--output <dir>] [--author <name>] <path>:<line[-end]> <body> Line-level comment")
+	fmt.Fprintln(os.Stderr, "       crit comment [--session <id>] --reply-to <id> [--resolve] [--author <name>] <body>")
+	fmt.Fprintln(os.Stderr, "       crit comment [--session <id>] --json [--file <path>] [--author <name>] [--output <dir>]")
 	fmt.Fprintln(os.Stderr, "                                                                  Bulk add comments from JSON (stdin by default; --file <path> or --file - for stdin)")
 	fmt.Fprintln(os.Stderr, "       crit comment [--output <dir>] --clear")
 	fmt.Fprintln(os.Stderr, "")
@@ -187,10 +265,12 @@ func commentUsageError() error {
 	fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' 'Overall this looks good'")
 	fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' src/auth.go 'Restructure this file'")
 	fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' main.go:42 'Fix this bug'")
+	fmt.Fprintln(os.Stderr, "  crit comment --session 839f3b4cd5d6 --author 'Claude' main.go:42 'Fix this bug'")
 	fmt.Fprintln(os.Stderr, "  crit comment --author 'Claude' src/auth.go:10-25 'This block needs refactoring'")
 	fmt.Fprintln(os.Stderr, "  crit comment --reply-to c_a3f8b2 --resolve --author 'Claude' 'Split into two functions'")
 	fmt.Fprintln(os.Stderr, "  crit comment --output .crit main.go:42 'Fix this bug'")
 	fmt.Fprintln(os.Stderr, "  echo '[{\"file\":\"main.go\",\"line\":42,\"body\":\"Fix this\"}]' | crit comment --json --author 'Claude'")
+	fmt.Fprintln(os.Stderr, "  echo '[{\"body\":\"Overall feedback\"}]' | crit comment --session 839f3b4cd5d6 --json --author 'Claude'")
 	fmt.Fprintln(os.Stderr, "  crit comment --json --file comments.json --author 'Claude'")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Tips:")

@@ -192,6 +192,11 @@ func ValidSessionKey(key string) bool {
 	return true
 }
 
+// InvalidSessionIDError returns the shared error for a malformed --session value.
+func InvalidSessionIDError(id string) error {
+	return fmt.Errorf("invalid session ID %q (expected 12-character hex)", id)
+}
+
 // sessionsDir returns the path to ~/.crit/sessions/.
 func sessionsDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -295,6 +300,26 @@ func FindAliveSession(key string) (SessionEntry, bool) {
 func ListSessionsForCWD(cwd string) ([]SessionEntry, error) {
 	sessions, _, err := scanSessionsForCWD(cwd)
 	return sessions, err
+}
+
+// ListSessionsForCWDWithKeys is like ListSessionsForCWD, but also returns the
+// stable session IDs in the same order as the entries. Commands that present
+// or accept an explicit session selector should use this variant.
+func ListSessionsForCWDWithKeys(cwd string) ([]SessionEntry, []string, error) {
+	return scanSessionsForCWD(cwd)
+}
+
+// SessionsForBranch narrows session candidates to the requested branch.
+func SessionsForBranch(sessions []SessionEntry, keys []string, branch string) ([]SessionEntry, []string) {
+	var matchedSessions []SessionEntry
+	var matchedKeys []string
+	for i, entry := range sessions {
+		if entry.Branch == branch && i < len(keys) {
+			matchedSessions = append(matchedSessions, entry)
+			matchedKeys = append(matchedKeys, keys[i])
+		}
+	}
+	return matchedSessions, matchedKeys
 }
 
 // listSessionsForCWD returns all alive sessions whose CWD matches, along with

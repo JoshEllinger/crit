@@ -1,10 +1,13 @@
 ---
 name: crit
-description: "Review code changes, a plan, a live page (running dev server), or a local HTML file with crit inline comments. Use when asked to review code, a plan, a diff, a running web app, or when you want structured human feedback on your work."
-disable-model-invocation: true
+description: "Review code changes, a plan, a live page (running dev server), or a local HTML file with Crit inline comments and structured human feedback. Use only when the user explicitly invokes /crit or directly asks to use Crit; a generic review request does not count."
 ---
 
 # Review with Crit
+
+This is the interactive, human-in-the-browser review cycle. Run it only after
+the user explicitly invokes `/crit` or directly asks to use Crit. A generic
+request to review code, a plan, a diff, a PR, or a page does not count.
 
 Review and revise code changes, plans, live pages (running dev servers, staging URLs), or local HTML files using `crit` for inline comment review.
 
@@ -22,6 +25,19 @@ If no arguments, check conversation context:
 
 1. A plan file was written earlier in this conversation → `crit <plan-file>`
 2. Otherwise → bare `crit` (branch diff)
+
+<important if="the user wants to open the review from another device — e.g. a phone over Tailscale">
+Keep crit on loopback and reverse-proxy in. Same Step 1 args still apply (file, bare `crit`, etc.):
+
+```bash
+crit --public-url "https://<machine>.ts.net" --allow-unauthenticated-network --no-open [args…]
+# then: tailscale serve --bg --https=443 http://127.0.0.1:<port>
+```
+
+- `--public-url` only changes the URL crit prints — it does **not** expose the server.
+- `--allow-unauthenticated-network` is required with `--public-url` (even on loopback) and with any non-loopback `--host`. Crit has no auth: anyone who can reach the URL can read the repo and post comments that may trigger agents. Confirm the user wants that blast radius.
+- **Do not bind `--host` to a Tailscale/LAN IP** — proxy with `tailscale serve` (or an SSH tunnel). Get `<port>` from crit's startup output, or fix it with `-p`. Relay the URL crit prints (the public one), not localhost.
+</important>
 
 ## Step 2: Launch crit and block until review completes
 

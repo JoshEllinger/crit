@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/JoshEllinger/crit/internal/testutil"
@@ -273,5 +274,422 @@ func TestHandleFileComments_RoundFiltersByReviewRound(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &got)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 comments, got %d", len(got))
+	}
+}
+
+func TestHandleSharePull_MergesRemoteComments(t *testing.T) {
+	var gotAuth string
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/comments") {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"id": "web-1", "body": "from web", "file_path": "plan.md",
+				"start_line": 1, "end_line": 1, "external_id": "web-ext-1",
+			},
+		})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	s.authMu.Lock()
+	s.authToken = "tok_test_bearer"
+	s.authMu.Unlock()
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/pull", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if gotAuth != "Bearer tok_test_bearer" {
+		t.Errorf("Authorization = %q, want Bearer tok_test_bearer", gotAuth)
+	}
+	var result map[string]any
+	json.NewDecoder(w.Body).Decode(&result)
+	if result["merged"].(float64) != 1 {
+		t.Errorf("merged = %v, want 1", result["merged"])
+	}
+}
+
+func TestHandleSharePull_NoSharedReview(t *testing.T) {
+	s, _ := newShareTestServer(t, "https://example.com", true)
+	req := httptest.NewRequest(http.MethodPost, "/api/share/pull", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleSharePull_MethodNotAllowed(t *testing.T) {
+	s, _ := newShareTestServer(t, "https://example.com", true)
+	req := httptest.NewRequest(http.MethodGet, "/api/share/pull", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestHandleShareReshare_PullsAndUpserts(t *testing.T) {
+	var putAuth string
+	var putHits int
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/api/reviews/"):
+			putHits++
+			putAuth = r.Header.Get("Authorization")
+			json.NewEncoder(w).Encode(map[string]any{
+				"url":          "https://crit.md/r/abc123",
+				"review_round": 2,
+				"changed":      true,
+			})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	s.authMu.Lock()
+	s.authToken = "tok_reshare"
+	s.authMu.Unlock()
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if putHits != 1 {
+		t.Errorf("PUT hits = %d, want 1", putHits)
+	}
+	if putAuth != "Bearer tok_reshare" {
+		t.Errorf("Authorization = %q, want Bearer tok_reshare", putAuth)
+	}
+	var result map[string]any
+	json.NewDecoder(w.Body).Decode(&result)
+	if result["changed"] != true {
+		t.Errorf("changed = %v, want true", result["changed"])
+	}
+}
+
+func TestHandleShareURL_LocalOnlySkipsRemoteDelete(t *testing.T) {
+	remoteHits := 0
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteHits++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/share-url?local_only=1", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if remoteHits != 0 {
+		t.Errorf("remote hits = %d, want 0 (local_only must skip UnpublishFromWeb)", remoteHits)
+	}
+	if sess.GetSharedURL() != "" {
+		t.Errorf("hosted URL should be cleared")
+	}
+}
+
+func TestHandleSharePull_Unauthorized(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "authentication required"})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	s.authMu.Lock()
+	s.authToken = "bad"
+	s.authMu.Unlock()
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/pull", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleSharePull_NotFound(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Not found"})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/gone", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/pull", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleSharePull_NoNewComments(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]any{})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/pull", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var result map[string]any
+	json.NewDecoder(w.Body).Decode(&result)
+	if result["merged"].(float64) != 0 {
+		t.Errorf("merged = %v, want 0", result["merged"])
+	}
+}
+
+func TestHandleShareReshare_SoftFailsPullThenUpserts(t *testing.T) {
+	putHits := 0
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			// Non-auth transient failure — reshare should soft-fail pull and still PUT.
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "upstream down"})
+		case r.Method == http.MethodPut:
+			putHits++
+			json.NewEncoder(w).Encode(map[string]any{
+				"url": "https://crit.md/r/abc123", "review_round": 2, "changed": true,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if putHits != 1 {
+		t.Errorf("PUT hits = %d, want 1 after soft-failed pull", putHits)
+	}
+}
+
+func TestHandleShareReshare_FatalUnauthorizedPull(t *testing.T) {
+	putHits := 0
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			putHits++
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "authentication required"})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+	if putHits != 0 {
+		t.Errorf("PUT must not run after fatal pull auth error")
+	}
+}
+
+func TestHandleShareReshare_NoSharedReview(t *testing.T) {
+	s, _ := newShareTestServer(t, "https://example.com", true)
+	req := httptest.NewRequest(http.MethodPost, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	// softPull fatals with no shared review before upsert.
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleShareReshare_MethodNotAllowed(t *testing.T) {
+	s, _ := newShareTestServer(t, "https://example.com", true)
+	req := httptest.NewRequest(http.MethodGet, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestHandleShareURL_DeleteUnpublishesRemotely(t *testing.T) {
+	var gotMethod, gotPath, gotAuth string
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	s.authMu.Lock()
+	s.authToken = "tok_del"
+	s.authMu.Unlock()
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/share-url", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204, body = %s", w.Code, w.Body.String())
+	}
+	if gotMethod != http.MethodDelete || gotPath != "/api/reviews" {
+		t.Errorf("remote = %s %s, want DELETE /api/reviews", gotMethod, gotPath)
+	}
+	if gotAuth != "Bearer tok_del" {
+		t.Errorf("Authorization = %q, want Bearer tok_del", gotAuth)
+	}
+	if sess.GetSharedURL() != "" {
+		t.Errorf("hosted URL should be cleared")
+	}
+}
+
+func TestHandleShareReshare_UpsertUnauthorized(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "authentication required"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleShareReshare_NotFoundOnPull(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Not found"})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/gone", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleShareURL_DeleteRemoteFailure(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "boom"})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc", "delete-tok")
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/share-url", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body = %s", w.Code, w.Body.String())
+	}
+	// Remote failed — local share state must remain so the user can retry.
+	if sess.GetSharedURL() == "" {
+		t.Errorf("hosted URL cleared despite remote unpublish failure")
+	}
+}
+
+func TestHandleSharePull_MissingReviewFile(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]any{})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+	// Remove the seeded review file so pullAndMergeRemoteComments hits the
+	// missing-file branch.
+	reviewPath := filepath.Join(sess.OutputDir, ".crit", "review.json")
+	if err := os.Remove(reviewPath); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/pull", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleShareReshare_EmptyFiles(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			json.NewEncoder(w).Encode([]any{})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+	// Clear session files so reshareUpsertInputs returns errNoFilesInSession.
+	sess.Files = nil
+
+	req := httptest.NewRequest(http.MethodPost, "/api/share/reshare", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
 	}
 }

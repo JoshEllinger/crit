@@ -1,8 +1,10 @@
 package live
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -580,7 +582,7 @@ func TestRunLive_ColdStartBrowserOwnership(t *testing.T) {
 				return daemon.SessionEntry{PID: os.Getpid(), Port: 43123}, nil
 			}
 			clientRan := false
-			runLiveClient = func(daemon.SessionEntry, string) bool {
+			runLiveClient = func(daemon.SessionEntry, string, bool) bool {
 				clientRan = true
 				return false
 			}
@@ -649,7 +651,7 @@ func TestConnectToLiveDaemon_LaunchesBrowserWhenNoneAttached(t *testing.T) {
 		browserCalls <- browserCall{url: url, openCmd: openCmd}
 	}
 	clientRan := false
-	runLiveClient = func(gotEntry daemon.SessionEntry, gotKey string) bool {
+	runLiveClient = func(gotEntry daemon.SessionEntry, gotKey string, _ bool) bool {
 		clientRan = true
 		if gotEntry.Port != entry.Port || gotKey != key {
 			t.Fatalf("run client with entry/key = %+v/%q, want %+v/%q", gotEntry, gotKey, entry, key)
@@ -657,7 +659,7 @@ func TestConnectToLiveDaemon_LaunchesBrowserWhenNoneAttached(t *testing.T) {
 		return false
 	}
 
-	if !connectToLiveDaemon(key, false, "custom-open") {
+	if !connectToLiveDaemon(key, false, "custom-open", false) {
 		t.Fatal("connectToLiveDaemon returned false")
 	}
 	if !clientRan {
@@ -707,9 +709,9 @@ func TestConnectToLiveDaemon_RespectsNoOpen(t *testing.T) {
 	launchLiveBrowser = func(string, string) {
 		browserOpenCalls++
 	}
-	runLiveClient = func(daemon.SessionEntry, string) bool { return false }
+	runLiveClient = func(daemon.SessionEntry, string, bool) bool { return false }
 
-	if !connectToLiveDaemon(key, true, "custom-open") {
+	if !connectToLiveDaemon(key, true, "custom-open", false) {
 		t.Fatal("connectToLiveDaemon returned false")
 	}
 	if browserOpenCalls != 0 {
@@ -1454,5 +1456,56 @@ func TestLiveSession_AuthorFromConfig(t *testing.T) {
 	}
 	if comments[0].Author != "Tomasz" {
 		t.Errorf("comment.Author = %q, want %q", comments[0].Author, "Tomasz")
+	}
+}
+
+func TestConnectToLiveDaemon_QuietSuppressesStatus(t *testing.T) {
+	originalRunClient := runLiveClient
+	originalLaunchBrowser := launchLiveBrowser
+	t.Cleanup(func() {
+		runLiveClient = originalRunClient
+		launchLiveBrowser = originalLaunchBrowser
+	})
+
+	t.Setenv("HOME", t.TempDir())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "browser_clients": true})
+	}))
+	defer srv.Close()
+
+	serverURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	port, err := strconv.Atoi(serverURL.Port())
+	if err != nil {
+		t.Fatalf("parse server port: %v", err)
+	}
+
+	const key = "live-connect-quiet"
+	entry := daemon.SessionEntry{PID: os.Getpid(), Port: port}
+	if err := daemon.WriteSessionFile(key, entry); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	runLiveClient = func(daemon.SessionEntry, string, bool) bool { return false }
+	launchLiveBrowser = func(string, string) {}
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	ok := connectToLiveDaemon(key, true, "", true)
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	if !ok {
+		t.Fatal("expected connect success")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("quiet connect should print nothing, got %q", buf.String())
 	}
 }
