@@ -109,11 +109,19 @@ type Server struct {
 	// double-count. Accessed only from handleFinish (serialized by HTTP) and
 	// the shutdown path (after the server has stopped), so no mutex needed.
 	statsRecorded bool
+
+	// codeFontFamilies is populated on the first /api/code-fonts request. Scanning
+	// font files can be relatively expensive, so keep it per daemon rather than
+	// repeating it whenever the Settings panel is opened.
+	codeFontFamiliesMu     sync.Mutex
+	codeFontFamiliesLoaded bool
+	codeFontFamilies       []string
+	codeFontDiscovery      func() ([]string, error)
 }
 
 // NewServer creates a Server with the given session and configuration.
 func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth bool, authToken string, author string, currentVersion string, port int, agentCmd string) (*Server, error) {
-	s := &Server{assets: frontendFS, shareURL: shareURL, proxyAuth: proxyAuth, authToken: authToken, author: author, agentCmd: agentCmd, currentVersion: currentVersion, port: port, prList: &PRListCache{}}
+	s := &Server{assets: frontendFS, shareURL: shareURL, proxyAuth: proxyAuth, authToken: authToken, author: author, agentCmd: agentCmd, currentVersion: currentVersion, port: port, prList: &PRListCache{}, codeFontDiscovery: discoverCodeFontFamilies}
 	if session != nil {
 		s.session.Store(session)
 	}
@@ -154,6 +162,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	// Session-dependent endpoints (guarded by withReady middleware)
 	mux.HandleFunc("/api/review-cycle", s.withReady(s.handleReviewCycle))
 	mux.HandleFunc("/api/config", s.withReady(s.handleConfig))
+	mux.HandleFunc("/api/code-fonts", s.withReady(s.handleCodeFonts))
 	mux.HandleFunc("/api/session", s.withReady(s.handleSession))
 	mux.HandleFunc("/api/share", s.withReady(s.handleShare))
 	mux.HandleFunc("/api/share-consent", s.withReady(s.handleShareConsent))
@@ -561,6 +570,36 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
+// handleCodeFonts discovers installed coding fonts only when the user opens
+// Settings. Keeping this out of /api/config avoids delaying normal startup.
+func (s *Server) handleCodeFonts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.codeFontFamiliesMu.Lock()
+	if !s.codeFontFamiliesLoaded {
+		families := []string{}
+		var err error
+		if s.codeFontDiscovery != nil {
+			families, err = s.codeFontDiscovery()
+		}
+		if err != nil {
+			s.codeFontFamiliesMu.Unlock()
+			http.Error(w, "Code font discovery failed", http.StatusServiceUnavailable)
+			return
+		}
+		if families == nil {
+			families = []string{}
+		}
+		s.codeFontFamilies = families
+		s.codeFontFamiliesLoaded = true
+	}
+	families := s.codeFontFamilies
+	s.codeFontFamiliesMu.Unlock()
+	writeJSON(w, map[string][]string{"code_fonts": families})
+}
+
 // addIntegrationStatus populates integration detection fields in the config response.
 func (s *Server) addIntegrationStatus(resp map[string]interface{}) {
 	if s.cfg.NoIntegrationCheck {
@@ -861,6 +900,30 @@ func (s *Server) shareFilesForSession() (files []ShareFile, reviewType string, e
 	return sess.LoadShareFilesFromDisk(), "", nil
 }
 
+// shareCLIArgsForSession prefers persisted metadata. Preview metadata is
+// normalized to the canonical ["preview", path] shape and falls back to the
+// live session when the persisted value is stale or malformed. File-review
+// sessions retain their existing review.json-only behavior.
+func (s *Server) shareCLIArgsForSession(sess *Session) []string {
+	if sess == nil {
+		return nil
+	}
+	cliArgs := share.LoadCliArgsFromReviewFile(sess.CritJSONPath())
+	if sess.ReviewType != "preview" {
+		return cliArgs
+	}
+	if len(cliArgs) >= 2 && cliArgs[0] == "preview" && cliArgs[1] != "" {
+		return []string{"preview", cliArgs[1]}
+	}
+	if len(sess.CLIArgs) >= 2 && sess.CLIArgs[0] == "preview" && sess.CLIArgs[1] != "" {
+		return []string{"preview", sess.CLIArgs[1]}
+	}
+	if sess.Origin != "" {
+		return []string{"preview", sess.Origin}
+	}
+	return nil
+}
+
 func (s *Server) writeExistingShareIfPresent(w http.ResponseWriter) (bool, error) {
 	// Uses GetShareState() to read both fields under a single lock (avoids TOCTOU race
 	// where a concurrent DELETE /api/share-url could clear the token between two calls).
@@ -961,7 +1024,8 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		commentPaths = scopePaths
 	}
 
-	res, err := share.ShareReviewFiles(critPath, files, commentPaths, s.shareURL, s.authTokenSnapshot(), s.author, shareReq.Org, shareReq.Visibility, reviewType)
+	cliArgs := s.shareCLIArgsForSession(s.session.Load())
+	res, err := share.ShareReviewFilesWithCLIArgs(critPath, files, commentPaths, s.shareURL, s.authTokenSnapshot(), s.author, cliArgs, shareReq.Org, shareReq.Visibility, reviewType)
 	if err != nil {
 		if errors.Is(err, share.ErrShareUnauthorized) {
 			auth.ClearAuthIdentity()
@@ -1161,7 +1225,7 @@ func (s *Server) handlePreviewPayload(w http.ResponseWriter, r *http.Request) {
 	if reviewRound == 0 {
 		reviewRound = 1
 	}
-	writeJSON(w, share.BuildSharePayload(files, comments, reviewRound, nil, "", "", "preview"))
+	writeJSON(w, share.BuildSharePayload(files, comments, reviewRound, s.shareCLIArgsForSession(sess), "", "", "preview"))
 }
 
 // handleUpsertPayload returns the JSON payload that would be PUT to
@@ -1203,7 +1267,7 @@ func (s *Server) handleUpsertPayload(w http.ResponseWriter, r *http.Request) {
 		}
 		comments, reviewRound = share.LoadCommentsForShare(critPath, filePaths, s.author)
 	}
-	cliArgs := share.LoadCliArgsFromReviewFile(critPath)
+	cliArgs := s.shareCLIArgsForSession(sess)
 	deleteToken := sess.GetDeleteToken()
 	writeJSON(w, buildUpsertPayload(files, comments, deleteToken, reviewRound, cliArgs))
 }
@@ -1319,7 +1383,7 @@ func (s *Server) reshareUpsertInputs(sess *Session, hostedURL, deleteToken strin
 		ShareURL:    hostedURL,
 		DeleteToken: deleteToken,
 		ReviewRound: sess.ReviewRound,
-		CliArgs:     share.LoadCliArgsFromReviewFile(critPath),
+		CliArgs:     s.shareCLIArgsForSession(sess),
 	}
 	if data, readErr := session.ReadFileShared(review.ReviewPathsFor(critPath).Review); readErr == nil {
 		var onDisk CritJSON
@@ -1327,9 +1391,6 @@ func (s *Server) reshareUpsertInputs(sess *Session, hostedURL, deleteToken strin
 			existingCfg.LastShareHash = onDisk.LastShareHash
 			if onDisk.ReviewRound > 0 {
 				existingCfg.ReviewRound = onDisk.ReviewRound
-			}
-			if len(onDisk.CliArgs) > 0 {
-				existingCfg.CliArgs = onDisk.CliArgs
 			}
 		}
 	}
