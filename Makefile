@@ -28,15 +28,14 @@ build-linux:
 build-all: build-macos build-linux
 
 update-deps:
-	bun install
-	bun run update-deps
+	npm install
+	npm run update-deps
 
 test:
 	go test ./...
 
 test-frontend:
-	node web/__tests__/markdown-patch.test.mjs
-	node web/test-diff-render.mjs
+	npm run test:frontend
 
 setup-hooks:
 	git config core.hooksPath .githooks
