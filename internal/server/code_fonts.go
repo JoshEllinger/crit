@@ -7,11 +7,17 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-text/typesetting/font"
 	ot "github.com/go-text/typesetting/font/opentype"
 	"github.com/go-text/typesetting/fontscan"
 )
+
+// codeFontInspectTimeout bounds a single font parse. go-text/typesetting
+// v0.3.4 hangs (not panics) parsing some real-world fonts — e.g. macOS's
+// bundled SFIndia.ttc — so recover() alone can't protect discovery.
+const codeFontInspectTimeout = 2 * time.Second
 
 // codeFontASCIIRunes are deliberately limited to characters code reviewers
 // commonly read. Some CJK programming fonts use a different width for CJK
@@ -72,14 +78,27 @@ func collectCodeFontFamilies(footprints []fontscan.Footprint, inspect codeFontIn
 }
 
 func safelyInspectCodeFont(inspect codeFontInspector, location fontscan.Location) (family string, accepted bool, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			family = ""
-			accepted = false
-			err = fmt.Errorf("inspect code font: %v", recovered)
-		}
+	type result struct {
+		family   string
+		accepted bool
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- result{err: fmt.Errorf("inspect code font: %v", recovered)}
+			}
+		}()
+		family, accepted, err := inspect(location)
+		done <- result{family: family, accepted: accepted, err: err}
 	}()
-	return inspect(location)
+	select {
+	case r := <-done:
+		return r.family, r.accepted, r.err
+	case <-time.After(codeFontInspectTimeout):
+		return "", false, fmt.Errorf("inspect code font: timed out parsing %s", location.File)
+	}
 }
 
 func inspectCodeFont(location fontscan.Location) (string, bool, error) {
