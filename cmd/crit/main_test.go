@@ -361,7 +361,8 @@ func TestRunShare_ConsentDenied(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_ShareConsentDenied", "--")
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home,
+	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home,
 		"GO_TEST_SHARE_FILE="+f, "GO_TEST_SHARE_OUT="+outDir)
 	cmd.Stdin = strings.NewReader("n\n")
 	out, err := cmd.CombinedOutput()

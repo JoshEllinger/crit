@@ -469,7 +469,8 @@ func TestRunAuthWhoami_NotLoggedIn(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(`{"share_url":"https://crit.md"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home)
+	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home)
 	// Ensure CRIT_AUTH_TOKEN is not set
 	var env []string
 	for _, e := range cmd.Env {
@@ -503,7 +504,8 @@ func TestRunAuthLogout_NotLoggedIn(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(`{"share_url":"https://crit.md"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home)
+	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home)
 	var env []string
 	for _, e := range cmd.Env {
 		if !strings.HasPrefix(e, "CRIT_AUTH_TOKEN=") {
@@ -536,7 +538,8 @@ func TestRunAuthLogout_EnvToken(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(`{"share_url":"https://crit.md"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "CRIT_AUTH_TOKEN=crit_env_token")
+	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home, "CRIT_AUTH_TOKEN=crit_env_token")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("logout exited with error: %v\noutput: %s", err, out)
