@@ -247,10 +247,12 @@
   })();
   const renderCommentMarkdown = commentMd.render.bind(commentMd);
   commentMd.render = function(src, env) {
+    src = window.crit.commentHtml.normalizeCommentMarkdown(src);
     return window.crit.commentHtml.sanitize(renderCommentMarkdown(src, env));
   };
   const renderInlineCommentMarkdown = commentMd.renderInline.bind(commentMd);
   commentMd.renderInline = function(src, env) {
+    src = window.crit.commentHtml.normalizeCommentMarkdown(src);
     return window.crit.commentHtml.sanitize(renderInlineCommentMarkdown(src, env));
   };
 
@@ -510,6 +512,13 @@
 
   function findFormForEdit(commentId) {
     return activeForms.find(function(f) { return f.editingId === commentId; });
+  }
+
+  // File compose only — edits use createInlineEditor in place of the card.
+  function getFileComposeForm(filePath) {
+    return getFormsForFile(filePath).find(function(f) {
+      return f.scope === 'file' && !f.editingId;
+    });
   }
   let selectionStart = null;
   let selectionEnd = null;
@@ -874,7 +883,9 @@
       .catch(() => { /* fire-and-forget */ });
 
     // Config
-    shareURL = configRes.share_url || '';
+    const configuredShareTargets = Array.isArray(configRes.share_targets) ? configRes.share_targets : [];
+    const initialShareTarget = configuredShareTargets.find(t => t.url === configRes.share_base_url) || configuredShareTargets.find(t => t.default) || (configuredShareTargets.length === 1 ? configuredShareTargets[0] : null);
+    shareURL = initialShareTarget ? initialShareTarget.url : '';
     autoViewedPatterns = Array.isArray(configRes.auto_viewed_patterns) ? configRes.auto_viewed_patterns : [];
     authUserName = configRes.auth_user_name || '';
     configAuthor = configRes.author || '';
@@ -887,10 +898,12 @@
     //
     // Share is available in files + preview review, but not vcs/diff (git):
     // canShare = session.mode !== 'git'. The controller's reveal() shows the
-    // button iff (shareURL && canShare) and sets the 'shared' state when a
-    // hosted URL already exists.
+    // button iff (hostedURL || shareTargets.length > 0) && canShare and sets
+    // the 'shared' state when a hosted URL already exists.
     shareCtl = window.crit.share.create({
       shareURL: shareURL,
+      shareTargets: configuredShareTargets,
+      shareBaseURL: configRes.share_base_url || '',
       hostedURL: configRes.hosted_url || '',
       deleteToken: configRes.delete_token || '',
       hostedToken: configRes.hosted_token || '',
@@ -989,7 +1002,7 @@
       }
     } else if (session.mode !== 'git' && session.files && session.files.length === 1) {
       document.getElementById('branchContext').style.display = '';
-      document.querySelector('.branch-icon').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>';
+      document.querySelector('.branch-icon').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v11.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>';
       document.getElementById('branchName').textContent = session.files[0].path.split('/').pop();
       const headerCopyBtn = document.createElement('button');
       headerCopyBtn.className = 'header-copy-path';
@@ -1144,6 +1157,8 @@
     md: 'markdown',    // normalize: callers compare lang against 'markdown'
     heex: 'heex',
     leex: 'heex',
+    vue: 'vue',        // third-party grammar (highlightjs-vue)
+    astro: 'astro',    // third-party grammar (highlightjs-astro-js)
     rake: 'ruby',      // hljs has no .rake alias (Rakefiles are Ruby)
   };
   // Files identified by basename rather than extension.
@@ -1480,7 +1495,7 @@
 
   function fileStatusIcon(status) {
     // GitHub-style: document icon with colored +/- badge
-    const doc = '<path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/>';
+    const doc = '<path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v11.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/>';
     if (status === 'added' || status === 'untracked') {
       return '<svg class="tree-file-status-icon added" viewBox="0 0 16 16">' + doc +
         '<rect x="8" y="8" width="7" height="7" rx="1.5" fill="var(--crit-green)"/>' +
@@ -2691,7 +2706,7 @@
 
     header.innerHTML =
       '<div class="file-header-chevron"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"/></svg></div>' +
-      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
+      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v11.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
       '<span class="file-header-name">' + renameHeader +
         '<button type="button" class="file-header-copy-path" aria-label="Copy file path">' + ICON_COPY_PATH + '</button>' +
       '</span>' +
@@ -2798,7 +2813,7 @@
     const fileComments = isOrphaned
       ? file.comments
       : file.comments.filter(function(c) { return c.scope === 'file'; });
-    const fileForm = getFormsForFile(file.path).find(function(f) { return f.scope === 'file'; });
+    const fileForm = getFileComposeForm(file.path);
     if (fileComments.length > 0 || (fileForm && !isOrphaned)) {
       const fileCommentsContainer = document.createElement('div');
       fileCommentsContainer.className = 'file-comments';
@@ -3066,6 +3081,7 @@
 
     // Two-pointer merge for horizontal alignment
     const { commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+    const fileForms = getFormsForFile(file.path);
     let oldIdx = 0, newIdx = 0;
 
     while (oldIdx < prevBlocks.length || newIdx < currBlocks.length) {
@@ -3076,30 +3092,30 @@
 
       if (oldIdx >= prevBlocks.length) {
         // Old exhausted — remaining new blocks are additions
-        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet, fileForms));
         newIdx++;
       } else if (newIdx >= currBlocks.length) {
         // New exhausted — remaining old blocks are deletions
-        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null, fileForms));
         oldIdx++;
       } else if (prevBlocks[oldIdx].isDiff && currBlocks[newIdx].isDiff) {
         // Both changed — paired change
-        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
-        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null, fileForms));
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet, fileForms));
         oldIdx++;
         newIdx++;
       } else if (prevBlocks[oldIdx].isDiff) {
         // Old removed only — spacer on right
-        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null, fileForms));
         oldIdx++;
       } else if (currBlocks[newIdx].isDiff) {
         // New added only — spacer on left
-        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet, fileForms));
         newIdx++;
       } else {
         // Both unchanged — render both, advance both
-        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], null, file, false, oldIdx, null, null));
-        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], null, file, true, newIdx, commentsMap, commentRangeSet));
+        leftCell.appendChild(renderUnifiedBlock(prevBlocks[oldIdx], null, file, false, oldIdx, null, null, fileForms));
+        rightCell.appendChild(renderUnifiedBlock(currBlocks[newIdx], null, file, true, newIdx, commentsMap, commentRangeSet, fileForms));
         oldIdx++;
         newIdx++;
       }
@@ -3108,6 +3124,7 @@
       container.appendChild(rightCell);
     }
 
+    attachDocGutterMouseHandler(container);
     return container;
   }
 
@@ -3120,7 +3137,9 @@
 
   // Render a single block for the unified diff view.
   // When commentable=true, includes gutter, keyboard nav, comments. Otherwise read-only.
-  function renderUnifiedBlock(block, diffClass, file, commentable, blockIndex, commentsMap, commentRangeSet) {
+  // fileForms is threaded down from the top-level render (one filtered array
+  // per file render instead of one per block); callers must pass it.
+  function renderUnifiedBlock(block, diffClass, file, commentable, blockIndex, commentsMap, commentRangeSet, fileForms) {
     const frag = document.createDocumentFragment();
 
     const lineBlockEl = document.createElement('div');
@@ -3154,7 +3173,8 @@
       lineAdd.className = 'line-add';
       lineAdd.textContent = '+';
       commentGutter.appendChild(lineAdd);
-      commentGutter.addEventListener('mousedown', handleGutterMouseDown);
+      // Mousedown is delegated once per container (attachDocGutterMouseHandler),
+      // not per gutter — see #657 for the diff-button equivalent.
       lineBlockEl.appendChild(commentGutter);
     } else {
       // Non-commentable block: still add gutter but mark as read-only
@@ -3191,10 +3211,10 @@
           frag.appendChild(createCommentElement(blockComments[ci], file.path));
         }
       }
-      const fileForms = getFormsForFile(file.path);
-      for (let fi = 0; fi < fileForms.length; fi++) {
-        if (!fileForms[fi].editingId && fileForms[fi].afterBlockIndex === blockIndex) {
-          frag.appendChild(createCommentForm(fileForms[fi]));
+      const forms = fileForms || getFormsForFile(file.path);
+      for (let fi = 0; fi < forms.length; fi++) {
+        if (!forms[fi].editingId && forms[fi].afterBlockIndex === blockIndex) {
+          frag.appendChild(createCommentForm(forms[fi]));
         }
       }
     }
@@ -3211,6 +3231,7 @@
     const newBlocks = file.lineBlocks;
 
     const { commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+    const fileForms = getFormsForFile(file.path);
 
     // Two-pointer merge: walk both block lists simultaneously
     let oldIdx = 0;
@@ -3219,11 +3240,11 @@
     while (oldIdx < oldBlocks.length || newIdx < newBlocks.length) {
       if (oldIdx >= oldBlocks.length) {
         // Old exhausted — remaining new blocks are additions
-        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet, fileForms));
         newIdx++;
       } else if (newIdx >= newBlocks.length) {
         // New exhausted — remaining old blocks are deletions
-        container.appendChild(renderUnifiedBlock(oldBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null));
+        container.appendChild(renderUnifiedBlock(oldBlocks[oldIdx], 'diff-removed', file, false, oldIdx, null, null, fileForms));
         oldIdx++;
       } else if (classifyBlock(oldBlocks[oldIdx], lineSets.removed)) {
         // Collect consecutive removed blocks
@@ -3247,23 +3268,24 @@
         }
         // Emit all removed then all added
         for (let ri = 0; ri < removedRun.length; ri++) {
-          container.appendChild(renderUnifiedBlock(oldBlocks[removedRun[ri]], 'diff-removed', file, false, removedRun[ri], null, null));
+          container.appendChild(renderUnifiedBlock(oldBlocks[removedRun[ri]], 'diff-removed', file, false, removedRun[ri], null, null, fileForms));
         }
         for (let ai = 0; ai < addedRun.length; ai++) {
-          container.appendChild(renderUnifiedBlock(newBlocks[addedRun[ai]], 'diff-added', file, true, addedRun[ai], commentsMap, commentRangeSet));
+          container.appendChild(renderUnifiedBlock(newBlocks[addedRun[ai]], 'diff-added', file, true, addedRun[ai], commentsMap, commentRangeSet, fileForms));
         }
       } else if (classifyBlock(newBlocks[newIdx], lineSets.added)) {
         // New block is added (no preceding removal) — emit with green highlight + comments
-        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet));
+        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], 'diff-added', file, true, newIdx, commentsMap, commentRangeSet, fileForms));
         newIdx++;
       } else {
         // Both unchanged — emit new block once (with comments), advance both
-        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], null, file, true, newIdx, commentsMap, commentRangeSet));
+        container.appendChild(renderUnifiedBlock(newBlocks[newIdx], null, file, true, newIdx, commentsMap, commentRangeSet, fileForms));
         newIdx++;
         oldIdx++;
       }
     }
 
+    attachDocGutterMouseHandler(container);
     return container;
   }
 
@@ -3356,10 +3378,13 @@
       section.appendChild(row);
     }
 
+    // Hoisted: one filtered array per render instead of one per block
+    // (activeForms is stable within a synchronous render pass).
+    const docFileForms = getFormsForFile(file.path);
+
     for (let bi = 0; bi < file.lineBlocks.length; bi++) {
       const block = file.lineBlocks[bi];
       const isTableBlock = !!block.tableId;
-
       if (isTableBlock && block.tableId !== activeTableId) {
         const wrapper = document.createElement('div');
         wrapper.className = 'native-table-wrapper';
@@ -3446,7 +3471,7 @@
       lineAdd.className = 'line-add';
       lineAdd.textContent = '+';
       commentGutter.appendChild(lineAdd);
-      commentGutter.addEventListener('mousedown', handleGutterMouseDown);
+      // Mousedown is delegated once per container (attachDocGutterMouseHandler).
 
       gutter.appendChild(commentGutter);
       if (isTableBlock) {
@@ -3522,16 +3547,16 @@
       }
 
       // Comment form
-      const fileForms = getFormsForFile(file.path);
-      for (let fi = 0; fi < fileForms.length; fi++) {
-        if (!fileForms[fi].editingId && fileForms[fi].afterBlockIndex === bi) {
-          const formEl = createCommentForm(fileForms[fi]);
+      for (let fi = 0; fi < docFileForms.length; fi++) {
+        if (!docFileForms[fi].editingId && docFileForms[fi].afterBlockIndex === bi) {
+          const formEl = createCommentForm(docFileForms[fi]);
           if (isTableBlock) appendTableAnnotation(tableSection, formEl);
           else container.appendChild(formEl);
         }
       }
     }
 
+    attachDocGutterMouseHandler(container);
     return container;
   }
 
@@ -4102,11 +4127,13 @@
     }
   }
 
-  // Helper: append comment form if it targets this line and side
-  function appendDiffForm(container, filePath, lineNum, side) {
-    const fileForms = getFormsForFile(filePath);
-    for (let fi = 0; fi < fileForms.length; fi++) {
-      const form = fileForms[fi];
+  // Helper: append comment form if it targets this line and side.
+  // fileForms is threaded down from the top-level diff renders
+  // (renderDiffUnified/renderDiffSplit) — one filtered array per render.
+  function appendDiffForm(container, filePath, lineNum, side, fileForms) {
+    const forms = fileForms || getFormsForFile(filePath);
+    for (let fi = 0; fi < forms.length; fi++) {
+      const form = forms[fi];
       const formSide = form.side || '';
       if (!form.editingId && form.endLine === lineNum && formSide === (side || '')) {
         const el = createCommentForm(form);
@@ -4257,6 +4284,8 @@
 
     const { diffCommentsMap: commentsMap } = buildCommentIndices(file.comments);
     const commentVisualSet = buildUnifiedCommentVisualSet(hunks, file.comments);
+    // Hoisted: one filtered array per render instead of one per diff line.
+    const fileForms = getFormsForFile(file.path);
     let visualIdx = 0; // sequential index for unified drag (old/new nums are different spaces)
 
     // Leading spacer before first hunk (includes hunk header text)
@@ -4311,7 +4340,7 @@
             const inCurrentForm = !diffDragState && selectionStart !== null && selectionEnd !== null &&
                 relevantNum > 0 && relevantNum >= selectionStart && relevantNum <= selectionEnd;
             const inCurrentSelUnified = inCurrentDrag || inCurrentForm;
-            const hasFormUnified = getFormsForFile(file.path).some(function(f) {
+            const hasFormUnified = fileForms.some(function(f) {
               const fSide = f.side || '';
               const fNum = fSide === 'old' ? line.OldNum : line.NewNum;
               return !f.editingId && fNum > 0 && fNum >= f.startLine && fNum <= f.endLine;
@@ -4354,7 +4383,7 @@
         container.appendChild(lineEl);
 
         appendDiffComments(container, file.path, commentLineNum, lineSide, commentsMap);
-        appendDiffForm(container, file.path, commentLineNum, lineSide);
+        appendDiffForm(container, file.path, commentLineNum, lineSide, fileForms);
         visualIdx++;
       }
     }
@@ -4386,6 +4415,8 @@
     autoExpandSmallGaps(file);
 
     const { diffCommentsMap: commentsMap, rangeSet: commentRangeSet } = buildCommentIndices(file.comments);
+    // Hoisted: one filtered array per render instead of one per diff line.
+    const fileForms = getFormsForFile(file.path);
 
     // Leading spacer before first hunk (includes hunk header text)
     const leadingSpacerSplit = renderLeadingSpacer(hunks[0], file);
@@ -4436,7 +4467,7 @@
           const row = makeSplitRow(
             { num: line.OldNum, content: line.Content, type: 'context' },
             { num: line.NewNum, content: line.Content, type: 'context' },
-            file, commentRangeSet
+            file, commentRangeSet, fileForms
           );
           container.appendChild(row.el);
           // Context lines: form appears where clicked (left or right),
@@ -4452,8 +4483,8 @@
             el.classList.add('diff-comment-right');
             container.appendChild(el);
           }
-          appendDiffForm(container, file.path, line.OldNum, 'old');
-          appendDiffForm(container, file.path, line.NewNum, '');
+          appendDiffForm(container, file.path, line.OldNum, 'old', fileForms);
+          appendDiffForm(container, file.path, line.NewNum, '', fileForms);
         } else {
           // Positional alignment (GitHub-style): del[i] beside add[i], surplus single-sided.
           const splitRows = buildSplitChangeRows(seg.dels, seg.adds, wordDiff);
@@ -4466,15 +4497,15 @@
             const row = makeSplitRow(
               del ? { num: del.OldNum, content: del.Content, type: 'del', wordRanges: wd ? wd.oldRanges : null } : null,
               add ? { num: add.NewNum, content: add.Content, type: 'add', wordRanges: wd ? wd.newRanges : null } : null,
-              file, commentRangeSet
+              file, commentRangeSet, fileForms
             );
             container.appendChild(row.el);
             // Comments for both sides (different keys)
             if (del) appendDiffComments(container, file.path, del.OldNum, 'old', commentsMap);
             if (add) appendDiffComments(container, file.path, add.NewNum, '', commentsMap);
             // Form: render for whichever side was clicked
-            if (del) appendDiffForm(container, file.path, del.OldNum, 'old');
-            if (add) appendDiffForm(container, file.path, add.NewNum, '');
+            if (del) appendDiffForm(container, file.path, del.OldNum, 'old', fileForms);
+            if (add) appendDiffForm(container, file.path, add.NewNum, '', fileForms);
           }
         }
       }
@@ -4491,7 +4522,7 @@
 
   // Build one split row: left (old) side + right (new) side
   // left/right: { num, content, type } or null for empty
-  function makeSplitRow(left, right, file, commentRangeSet) {
+  function makeSplitRow(left, right, file, commentRangeSet, fileForms) {
     const row = document.createElement('div');
     row.className = 'diff-split-row';
 
@@ -4512,7 +4543,7 @@
       const selSide = diffDragState ? diffDragState.side : (activeForms.length > 0 ? activeForms[activeForms.length - 1].side : null);
       const inCurrentSelLeft = activeFilePath === file.path && selectionStart !== null && selectionEnd !== null &&
           left.num >= selectionStart && left.num <= selectionEnd && selSide === 'old';
-      const hasFormLeft = getFormsForFile(file.path).some(function(f) {
+      const hasFormLeft = fileForms.some(function(f) {
         return !f.editingId && left.num >= f.startLine && left.num <= f.endLine && (f.side || '') === 'old';
       });
       if (inCurrentSelLeft) { leftEl.classList.add('selected'); }
@@ -4554,7 +4585,7 @@
       const selSideR = diffDragState ? diffDragState.side : (activeForms.length > 0 ? activeForms[activeForms.length - 1].side : null);
       const inCurrentSelRight = activeFilePath === file.path && selectionStart !== null && selectionEnd !== null &&
           right.num >= selectionStart && right.num <= selectionEnd && (selSideR || '') === '';
-      const hasFormRight = getFormsForFile(file.path).some(function(f) {
+      const hasFormRight = fileForms.some(function(f) {
         return !f.editingId && right.num >= f.startLine && right.num <= f.endLine && (f.side || '') === '';
       });
       if (inCurrentSelRight) { rightEl.classList.add('selected'); }
@@ -4825,9 +4856,24 @@
   // ===== Gutter Drag Selection =====
   let dragState = null;
 
-  function handleGutterMouseDown(e) {
-    e.preventDefault();
-    const gutter = e.currentTarget;
+  // Desktop mouse path for document/markdown gutters, delegated: a single
+  // mousedown on the file container instead of one listener per
+  // .line-comment-gutter. A 10k-line markdown file renders ~10k gutters and
+  // the per-gutter approach stalled the main thread on mount — the same bug
+  // class as #657 (fixed for diff buttons via attachDiffMouseHandler).
+  // One delegated handler is O(1) regardless of file size.
+  function attachDocGutterMouseHandler(container) {
+    container.addEventListener('mousedown', function(e) {
+      const gutter = e.target.closest('.line-comment-gutter');
+      if (!gutter || !container.contains(gutter)) return;
+      // Read-only gutters never had a listener; they carry no line dataset.
+      if (gutter.classList.contains('diff-no-comment')) return;
+      e.preventDefault();
+      beginDocGutterDrag(gutter, e.shiftKey);
+    });
+  }
+
+  function beginDocGutterDrag(gutter, shiftKey) {
     const startLine = parseInt(gutter.dataset.startLine);
     const endLine = parseInt(gutter.dataset.endLine);
     const filePath = gutter.dataset.filePath;
@@ -4835,7 +4881,7 @@
     const blockIndex = parseInt(blockEl.dataset.blockIndex);
 
     // Shift+click: extend selection
-    if (e.shiftKey && selectionStart !== null && activeFilePath === filePath) {
+    if (shiftKey && selectionStart !== null && activeFilePath === filePath) {
       const rangeStart = Math.min(selectionStart, startLine);
       const rangeEnd = Math.max(selectionEnd, endLine);
       const file = getFileByPath(filePath);
@@ -4874,6 +4920,10 @@
     const section = currentRenderedFileSection(filePath);
     if (!section) return;
 
+    // Hoisted: one filtered array per pass instead of one per line per
+    // mousemove frame (activeForms is stable within a synchronous pass).
+    const fileForms = getFormsForFile(filePath);
+
     // Markdown line blocks: toggle .selected on line-block, update comment gutter drag classes
     const lineBlocks = section.querySelectorAll('.line-block[data-file-path="' + filePath + '"]');
     for (let i = 0; i < lineBlocks.length; i++) {
@@ -4906,7 +4956,7 @@
                         uVisualIdx >= unifiedVisualStart && uVisualIdx <= unifiedVisualEnd;
         const uLineNum = parseInt(uLine.dataset.diffLineNum);
         const uSide = uLine.dataset.diffSide || '';
-        const uHasForm = getFormsForFile(filePath).some(function(f) {
+        const uHasForm = fileForms.some(function(f) {
           return !f.editingId && uLineNum >= f.startLine && uLineNum <= f.endLine && (f.side || '') === uSide;
         });
         uLine.classList.toggle('selected', uSelected);
@@ -4922,7 +4972,7 @@
         const sSideMatch = diffDragState.side === sSideVal;
         const sSelected = sSideMatch && selectionStart !== null && selectionEnd !== null &&
                         sLineNum >= selectionStart && sLineNum <= selectionEnd;
-        const sHasForm = getFormsForFile(filePath).some(function(f) {
+        const sHasForm = fileForms.some(function(f) {
           return !f.editingId && sLineNum >= f.startLine && sLineNum <= f.endLine && (f.side || '') === sSideVal;
         });
         sSide.classList.toggle('selected', sSelected);
@@ -5135,21 +5185,11 @@
   }
 
   function createFileCommentForm(formObj) {
-    let initialBody = '';
-    if (formObj.editingId) {
-      const file = getFileByPath(formObj.filePath);
-      if (file) {
-        const existing = file.comments.find(function(c) { return c.id === formObj.editingId; });
-        if (existing) initialBody = existing.body;
-      }
-    } else if (formObj.draftBody) {
-      initialBody = formObj.draftBody;
-    }
     return createCommentFormUI({
       formObj: formObj,
-      headerText: formObj.editingId ? 'Editing comment' : 'Comment',
-      submitText: formObj.editingId ? 'Update' : 'Comment',
-      initialBody: initialBody,
+      headerText: 'Comment',
+      submitText: 'Comment',
+      initialBody: formObj.draftBody || '',
       autoFocus: false
     });
   }
@@ -6187,31 +6227,70 @@
     const allQuoted = quotedComments.concat(formQuotes);
     if (allQuoted.length === 0) return;
 
+    // Index content elements once per mount. The old code ran two
+    // full-section querySelectorAll scans per quoted line (O(Q × L) DOM
+    // queries), which dominated mount time on large files with quoted
+    // comments. One pass here, O(1) map lookups per quoted line below.
+    const pathEsc = CSS.escape(file.path);
+    const docLineMap = new Map(); // source line -> .line-content elements
+    sectionEl.querySelectorAll('.line-block[data-file-path="' + pathEsc + '"]').forEach(function(el) {
+      const s = parseInt(el.dataset.startLine);
+      const e = parseInt(el.dataset.endLine);
+      // Native table rows have one content element per cell. Other
+      // blocks have one content div.
+      const contents = [];
+      el.querySelectorAll('.line-content').forEach(function(content) {
+        contents.push(content);
+      });
+      if (contents.length === 0) return;
+      for (let ln = s; ln <= e; ln++) {
+        let arr = docLineMap.get(ln);
+        if (!arr) {
+          arr = [];
+          docLineMap.set(ln, arr);
+        }
+        for (let ci = 0; ci < contents.length; ci++) {
+          if (arr.indexOf(contents[ci]) === -1) arr.push(contents[ci]);
+        }
+      }
+    });
+    const diffLineMap = new Map(); // lineNum + side -> .diff-content elements
+    sectionEl.querySelectorAll('[data-diff-file-path="' + pathEsc + '"]').forEach(function(el) {
+      // Elements without data-diff-side never matched (undefined !== any
+      // comment side string), so they are left out of the index entirely.
+      if (el.dataset.diffSide === undefined) return;
+      const key = el.dataset.diffLineNum + '' + el.dataset.diffSide;
+      const content = el.querySelector('.diff-content');
+      if (!content) return;
+      let arr = diffLineMap.get(key);
+      if (!arr) {
+        arr = [];
+        diffLineMap.set(key, arr);
+      }
+      if (arr.indexOf(content) === -1) arr.push(content);
+    });
+
     allQuoted.forEach(function(comment) {
       // Find the content elements in this comment's line range
       const contentEls = [];
+      // Filter by side to avoid matching the wrong line in unified diff
+      // (deleted and added lines can share the same line number)
+      const commentSide = comment.side || '';
       for (let ln = comment.start_line; ln <= comment.end_line; ln++) {
         // Document view: line-blocks with data-file-path
-        sectionEl.querySelectorAll('.line-block[data-file-path="' + CSS.escape(file.path) + '"]').forEach(function(el) {
-          const s = parseInt(el.dataset.startLine);
-          const e = parseInt(el.dataset.endLine);
-          if (s <= ln && e >= ln) {
-            // Native table rows have one content element per cell. Other
-            // blocks have one content div.
-            el.querySelectorAll('.line-content').forEach(function(content) {
-              if (contentEls.indexOf(content) === -1) contentEls.push(content);
-            });
+        const docEls = docLineMap.get(ln);
+        if (docEls) {
+          for (let di = 0; di < docEls.length; di++) {
+            if (contentEls.indexOf(docEls[di]) === -1) contentEls.push(docEls[di]);
           }
-        });
+        }
         // Diff view: diff lines with data-diff-line-num
-        // Filter by side to avoid matching the wrong line in unified diff
-        // (deleted and added lines can share the same line number)
-        const commentSide = comment.side || '';
-        sectionEl.querySelectorAll('[data-diff-file-path="' + CSS.escape(file.path) + '"][data-diff-line-num="' + ln + '"]').forEach(function(el) {
-          if (el.dataset.diffSide !== commentSide) return;
-          const content = el.querySelector('.diff-content');
-          if (content && contentEls.indexOf(content) === -1) contentEls.push(content);
-        });
+        const diffEls = diffLineMap.get(ln + '' + commentSide);
+        if (diffEls) {
+          for (let fi = 0; fi < diffEls.length; fi++) {
+            if (contentEls.indexOf(diffEls[fi]) === -1) contentEls.push(diffEls[fi]);
+          }
+        }
       }
 
       if (contentEls.length === 0) return;
@@ -7583,7 +7662,7 @@
     if (pr.pr_changed_files !== undefined) {
       const filesStat = document.createElement('span');
       filesStat.className = 'pr-panel-stat';
-      filesStat.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
+      filesStat.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v11.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
         pr.pr_changed_files + ' file' + (pr.pr_changed_files !== 1 ? 's' : '');
       statsSection.appendChild(filesStat);
     }
@@ -8303,6 +8382,9 @@
   }
 
   function renderMermaidBlocks() {
+    // Any document rebuild invalidates the detached overlay clone (and its
+    // theme) — close the overlay rather than show a stale diagram.
+    closeMermaidOverlay();
     if (typeof mermaid === 'undefined') return;
     mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
     const codes = document.querySelectorAll('code.language-mermaid');
@@ -8315,6 +8397,293 @@
       pre.replaceWith(container);
     });
     try { mermaid.run(); } catch {}
+    decorateMermaidBlocks();
+  }
+
+  // ===== Mermaid fullscreen overlay (GitHub-style pan/zoom) =====
+  // Expand button on each rendered diagram opens #mermaidOverlay with a
+  // detached SVG clone. Pan via drag, zoom via wheel / pinch / buttons.
+  // Pure CSS transform — no new dependencies. The clone is detached, so
+  // inline re-renders never disturb the overlay; a theme change closes it
+  // because the clone keeps the old theme's colors.
+  const mermaidOverlayState = {
+    open: false,
+    trigger: null,
+    scale: 1,
+    x: 0,
+    y: 0,
+    installed: false
+  };
+  const MERMAID_ZOOM_MIN = 0.1;
+  const MERMAID_ZOOM_MAX = 8;
+
+  function mermaidOverlayNodes() {
+    return {
+      overlay: document.getElementById('mermaidOverlay'),
+      viewport: document.getElementById('mermaidOverlayViewport'),
+      canvas: document.getElementById('mermaidOverlayCanvas'),
+      label: document.getElementById('mermaidZoomLabel'),
+      closeBtn: document.getElementById('mermaidOverlayClose'),
+      zoomIn: document.getElementById('mermaidZoomIn'),
+      zoomOut: document.getElementById('mermaidZoomOut'),
+      zoomReset: document.getElementById('mermaidZoomReset')
+    };
+  }
+
+  function mermaidOverlayApply() {
+    const nodes = mermaidOverlayNodes();
+    if (!nodes.canvas) return;
+    nodes.canvas.style.transform = 'translate(' + mermaidOverlayState.x + 'px, ' + mermaidOverlayState.y + 'px) scale(' + mermaidOverlayState.scale + ')';
+    if (nodes.label) nodes.label.textContent = Math.round(mermaidOverlayState.scale * 100) + '%';
+  }
+
+  function mermaidOverlayZoomAt(factor, clientX, clientY) {
+    const nodes = mermaidOverlayNodes();
+    if (!nodes.viewport) return;
+    const rect = nodes.viewport.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+    const next = Math.min(MERMAID_ZOOM_MAX, Math.max(MERMAID_ZOOM_MIN, mermaidOverlayState.scale * factor));
+    if (next === mermaidOverlayState.scale) return;
+    const ratio = next / mermaidOverlayState.scale;
+    mermaidOverlayState.x = px - (px - mermaidOverlayState.x) * ratio;
+    mermaidOverlayState.y = py - (py - mermaidOverlayState.y) * ratio;
+    mermaidOverlayState.scale = next;
+    mermaidOverlayApply();
+  }
+
+  function mermaidOverlayZoomCenter(factor) {
+    const nodes = mermaidOverlayNodes();
+    if (!nodes.viewport) return;
+    const rect = nodes.viewport.getBoundingClientRect();
+    mermaidOverlayZoomAt(factor, rect.left + rect.width / 2, rect.top + rect.height / 2);
+  }
+
+  // Fit the cloned SVG into the viewport (capped so tiny diagrams don't blow up).
+  function mermaidOverlayFit() {
+    const nodes = mermaidOverlayNodes();
+    if (!nodes.viewport || !nodes.canvas) return;
+    const svg = nodes.canvas.querySelector('svg');
+    mermaidOverlayState.scale = 1;
+    mermaidOverlayState.x = 0;
+    mermaidOverlayState.y = 0;
+    if (svg) {
+      let w = 0;
+      let h = 0;
+      const vb = svg.getAttribute('viewBox');
+      if (vb) {
+        const parts = vb.trim().split(/[\s,]+/);
+        w = parseFloat(parts[2]);
+        h = parseFloat(parts[3]);
+      }
+      if (!(w > 0) || !(h > 0)) {
+        const r = svg.getBoundingClientRect();
+        w = r.width;
+        h = r.height;
+      }
+      if (w > 0 && h > 0) {
+        const vw = nodes.viewport.clientWidth - 48;
+        const vh = nodes.viewport.clientHeight - 48;
+        if (vw > 0 && vh > 0) {
+          mermaidOverlayState.scale = Math.min(vw / w, vh / h, 2);
+          mermaidOverlayState.x = (nodes.viewport.clientWidth - w * mermaidOverlayState.scale) / 2;
+          mermaidOverlayState.y = (nodes.viewport.clientHeight - h * mermaidOverlayState.scale) / 2;
+        }
+      }
+    }
+    mermaidOverlayApply();
+  }
+
+  function openMermaidOverlay(sourceSvg, trigger) {
+    const nodes = mermaidOverlayNodes();
+    if (!nodes.overlay || !sourceSvg || !nodes.canvas) return;
+    nodes.canvas.innerHTML = '';
+    const clone = sourceSvg.cloneNode(true);
+    // Mermaid emits width="100%" + a max-width cap. Inside the overlay the
+    // canvas sizes to content (width: max-content), which makes a percentage
+    // width resolve circularly and the diagram collapse. Pin the clone to its
+    // natural size so fit/center math holds. Prefer the viewBox; fall back to
+    // the live source rect (the clone itself may already be collapsed).
+    let natW = 0;
+    let natH = 0;
+    const vb = clone.getAttribute('viewBox');
+    if (vb) {
+      const parts = vb.trim().split(/[\s,]+/);
+      natW = parseFloat(parts[2]);
+      natH = parseFloat(parts[3]);
+    }
+    if (!(natW > 0) || !(natH > 0)) {
+      const srcRect = sourceSvg.getBoundingClientRect();
+      natW = srcRect.width;
+      natH = srcRect.height;
+    }
+    if (natW > 0 && natH > 0) {
+      clone.setAttribute('width', String(natW));
+      clone.setAttribute('height', String(natH));
+      if (clone.style) clone.style.removeProperty('max-width');
+    }
+    nodes.canvas.appendChild(clone);
+    mermaidOverlayState.open = true;
+    mermaidOverlayState.trigger = trigger || null;
+    installMermaidOverlay();
+    nodes.overlay.classList.add('active');
+    document.body.style.overflow = 'hidden';
+    mermaidOverlayFit();
+    if (nodes.closeBtn && nodes.closeBtn.focus) nodes.closeBtn.focus();
+  }
+
+  function closeMermaidOverlay() {
+    const nodes = mermaidOverlayNodes();
+    if (!mermaidOverlayState.open) return;
+    mermaidOverlayState.open = false;
+    if (nodes.overlay) nodes.overlay.classList.remove('active');
+    if (nodes.canvas) nodes.canvas.innerHTML = '';
+    document.body.style.overflow = '';
+    const trigger = mermaidOverlayState.trigger;
+    mermaidOverlayState.trigger = null;
+    // The trigger stays rendered (transparent until hover/focus), so focus()
+    // lands even outside hover — e.g. the keyboard flow.
+    if (trigger && document.contains(trigger) && trigger.focus) trigger.focus();
+  }
+
+  function mermaidOverlayTrapTab(e) {
+    if (e.key !== 'Tab') return;
+    const nodes = mermaidOverlayNodes();
+    if (!nodes.overlay) return;
+    const focusables = nodes.overlay.querySelectorAll('button:not([disabled])');
+    if (!focusables || focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
+  // One-pointer drag pans; two-pointer pinch zooms. Installed once — the
+  // overlay shell lives in index.html and survives document re-renders.
+  function installMermaidOverlay() {
+    if (mermaidOverlayState.installed) return;
+    const nodes = mermaidOverlayNodes();
+    if (!nodes.overlay || !nodes.viewport) return;
+    mermaidOverlayState.installed = true;
+
+    const activePointers = new Map();
+    let panAnchor = null;
+    let pinchStart = 0;
+    let pinchScale = 1;
+
+    // Re-anchor the pinch baseline on every pointer-count change so adding
+    // or lifting a finger mid-gesture never causes a zoom jump.
+    function capturePinchBaseline() {
+      const pts = Array.from(activePointers.values());
+      if (pts.length < 2) return;
+      pinchStart = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      pinchScale = mermaidOverlayState.scale;
+    }
+
+    if (nodes.zoomIn) nodes.zoomIn.addEventListener('click', function () { mermaidOverlayZoomCenter(1.25); });
+    if (nodes.zoomOut) nodes.zoomOut.addEventListener('click', function () { mermaidOverlayZoomCenter(1 / 1.25); });
+    if (nodes.zoomReset) nodes.zoomReset.addEventListener('click', function () { mermaidOverlayFit(); });
+    if (nodes.closeBtn) nodes.closeBtn.addEventListener('click', function () { closeMermaidOverlay(); });
+    nodes.overlay.addEventListener('click', function (e) {
+      if (e.target === nodes.overlay) closeMermaidOverlay();
+    });
+    nodes.overlay.addEventListener('keydown', mermaidOverlayTrapTab);
+    document.addEventListener('keydown', function (e) {
+      // Note: no defaultPrevented check — the app-wide keymap (below)
+      // unconditionally preventDefaults Escape, so honoring it would break
+      // Esc-to-close entirely. Esc dismissing both the overlay and any
+      // background form matches the existing "cancel whatever" convention.
+      if (e.key !== 'Escape') return;
+      if (mermaidOverlayState.open) {
+        e.preventDefault();
+        closeMermaidOverlay();
+      }
+    });
+
+    nodes.viewport.addEventListener('wheel', function (e) {
+      if (!mermaidOverlayState.open) return;
+      e.preventDefault();
+      mermaidOverlayZoomAt(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
+    }, { passive: false });
+
+    nodes.viewport.addEventListener('pointerdown', function (e) {
+      if (!mermaidOverlayState.open) return;
+      try { nodes.viewport.setPointerCapture(e.pointerId); } catch { /* noop */ }
+      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activePointers.size === 1) {
+        panAnchor = { x: e.clientX - mermaidOverlayState.x, y: e.clientY - mermaidOverlayState.y };
+        nodes.viewport.classList.add('panning');
+      } else {
+        panAnchor = null;
+        capturePinchBaseline();
+      }
+    });
+    nodes.viewport.addEventListener('pointermove', function (e) {
+      if (!activePointers.has(e.pointerId)) return;
+      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activePointers.size === 2) {
+        const pts = Array.from(activePointers.values());
+        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        if (pinchStart > 0 && dist > 0) {
+          const midX = (pts[0].x + pts[1].x) / 2;
+          const midY = (pts[0].y + pts[1].y) / 2;
+          // Zoom relative to the scale captured when the second pointer
+          // landed, anchored at the gesture midpoint.
+          const rel = (pinchScale * dist / pinchStart) / mermaidOverlayState.scale;
+          mermaidOverlayZoomAt(rel, midX, midY);
+        }
+        return;
+      }
+      if (panAnchor) {
+        mermaidOverlayState.x = e.clientX - panAnchor.x;
+        mermaidOverlayState.y = e.clientY - panAnchor.y;
+        mermaidOverlayApply();
+      }
+    });
+    function endMermaidPointer(e) {
+      activePointers.delete(e.pointerId);
+      if (activePointers.size === 1) {
+        const remaining = Array.from(activePointers.values())[0];
+        panAnchor = { x: remaining.x - mermaidOverlayState.x, y: remaining.y - mermaidOverlayState.y };
+      } else if (activePointers.size >= 2) {
+        capturePinchBaseline();
+      } else {
+        panAnchor = null;
+        nodes.viewport.classList.remove('panning');
+      }
+    }
+    nodes.viewport.addEventListener('pointerup', endMermaidPointer);
+    nodes.viewport.addEventListener('pointercancel', endMermaidPointer);
+  }
+
+  // Expand affordance on each rendered diagram. Idempotent — safe to run
+  // after every renderMermaidBlocks() call. The button lives on the
+  // .mermaid-block (not inside .mermaid) so mermaid re-renders never wipe
+  // it, and clicks stopPropagation so comment gestures are unaffected.
+  function decorateMermaidBlocks() {
+    installMermaidOverlay();
+    const blocks = document.querySelectorAll('.line-content.mermaid-block');
+    blocks.forEach(function (block) {
+      if (block.querySelector('.mermaid-expand')) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mermaid-expand';
+      btn.setAttribute('aria-label', 'Open diagram fullscreen');
+      btn.setAttribute('title', 'Open fullscreen');
+      btn.textContent = '⛶ Expand';
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        const svg = block.querySelector('.mermaid svg');
+        if (!svg) return;
+        openMermaidOverlay(svg, btn);
+      });
+      block.appendChild(btn);
+    });
   }
 
   // ===== Theme =====
@@ -8329,6 +8698,8 @@
     else if (choice === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
     else document.documentElement.removeAttribute('data-theme');
 
+    // The fullscreen clone keeps the old theme's colors — close it.
+    closeMermaidOverlay();
     // Re-initialize mermaid diagrams with updated theme
     if (typeof mermaid !== 'undefined') {
       mermaid.initialize({ startOnLoad: false, theme: getMermaidTheme() });
@@ -10588,6 +10959,50 @@
     clone.viewMode = 'diff';
   }
 
+  // Story chapters render independently of the flat Diff-view <details>
+  // sections. Lazy files ship with empty diffHunks until opened there, which
+  // made Story show "These hunks are no longer in the diff." (#869). Hydrate
+  // the file data here so chapter groups can filter real hunks.
+  function ensureStoryLazyFile(file) {
+    if (!file || !file.lazy) return Promise.resolve(file);
+    if (file._storyLazyPromise) return file._storyLazyPromise;
+    // Match loadAllFileData: when Story is visible, file data is scoped to
+    // 'all' so chapter hunk_refs line up with the loaded diff.
+    file._storyLazyPromise = loadSingleFile({
+      path: file.path,
+      old_path: file.oldPath,
+      status: file.status,
+      file_type: file.fileType,
+      additions: file.additions,
+      deletions: file.deletions,
+    }, currentFileDataScope()).then(function (loaded) {
+      file.oldPath = loaded.oldPath;
+      file.content = loaded.content;
+      file.previousContent = loaded.previousContent;
+      file.comments = loaded.comments;
+      file.diffHunks = loaded.diffHunks;
+      file._autoExpandDone = false;
+      file.lineBlocks = loaded.lineBlocks;
+      file.previousLineBlocks = loaded.previousLineBlocks;
+      file.tocItems = loaded.tocItems;
+      file.diffTooLarge = loaded.diffTooLarge;
+      file.diffLoaded = loaded.diffLoaded;
+      file.fileHash = loaded.fileHash;
+      file.lazy = false;
+      file._lazyLoading = false;
+      if (loaded.highlightCache) file.highlightCache = loaded.highlightCache;
+      if (loaded.lang) file.lang = loaded.lang;
+      delete file._storyLazyPromise;
+      // Drop clones built against the empty lazy placeholder.
+      storyExpandedFileCache.clear();
+      return file;
+    }).catch(function (err) {
+      delete file._storyLazyPromise;
+      throw err;
+    });
+    return file._storyLazyPromise;
+  }
+
   // Build a shallow file clone whose diffHunks are just the referenced ones,
   // preserving comments/path so the existing diff+comment renderer works
   // unchanged. Returns null if the file isn't loaded or has no matching hunks.
@@ -10974,8 +11389,9 @@
 
   function renderStoryFileGroup(page, filePath, oldStarts, supportReason) {
     const pid = storyPageId(page);
-    const built = cloneFileForHunks(filePath, oldStarts, pid);
     const file = getFileByPath(filePath);
+    // Lazy placeholders have empty diffHunks — don't filter/cache them as a miss.
+    const built = (file && file.lazy) ? null : cloneFileForHunks(filePath, oldStarts, pid);
     const section = document.createElement('details');
     section.className = 'file-section crit-story-file-group';
     section.id = 'story-file-section-' + pid + '-' + filePath;
@@ -11005,6 +11421,7 @@
     const total = built ? built.total : 0;
     let statText;
     if (supportReason) statText = escapeHtml(supportReason);
+    else if (file && file.lazy) statText = 'Loading\u2026';
     else if (total > 1 && shown < total) statText = 'hunk' + (shown === 1 ? ' ' : 's ') + shown + ' of ' + total;
     else statText = shown + ' hunk' + (shown === 1 ? '' : 's');
     const adds = file ? (file.additions || 0) : 0;
@@ -11014,7 +11431,7 @@
     const dirPath = dirParts.length > 0 ? dirParts.join('/') + '/' : '';
     header.innerHTML =
       '<div class="file-header-chevron"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"/></svg></div>' +
-      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
+      '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v11.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
       '<span class="file-header-name"><span class="dir">' + escapeHtml(dirPath) + '</span><span class="filename">' + escapeHtml(fileName || filePath) + '</span>' +
         '<button type="button" class="file-header-copy-path" aria-label="Copy file path">' + ICON_COPY_PATH + '</button>' +
       '</span>' +
@@ -11088,7 +11505,7 @@
 
     if (file) {
       const fileComments = file.comments.filter(function(c) { return c.scope === 'file'; });
-      const fileForm = getFormsForFile(file.path).find(function(f) { return f.scope === 'file'; });
+      const fileForm = getFileComposeForm(file.path);
       if (fileComments.length > 0 || fileForm) {
         const fileCommentsContainer = document.createElement('div');
         fileCommentsContainer.className = 'file-comments';
@@ -11108,11 +11525,30 @@
     } else {
       const empty = document.createElement('div');
       empty.className = 'crit-story-file-group__empty';
-      empty.textContent = file ? 'These hunks are no longer in the diff.' : 'File not loaded.';
+      if (!file) empty.textContent = 'File not loaded.';
+      else if (file.lazy) empty.textContent = 'Loading diff\u2026';
+      else empty.textContent = 'These hunks are no longer in the diff.';
       body.appendChild(empty);
     }
     section.appendChild(body);
     if (built && built.clone) highlightQuotesInSection(section, built.clone);
+
+    if (file && file.lazy) {
+      ensureStoryLazyFile(file).then(function () {
+        if (!section.isConnected) return;
+        const replacement = renderStoryFileGroup(page, filePath, oldStarts, supportReason);
+        replacement.open = section.open;
+        section.replaceWith(replacement);
+        renderMermaidBlocks();
+        rebuildNavList();
+        applyHideResolved();
+        renderStoryRail();
+      }).catch(function () {
+        const emptyEl = section.querySelector('.crit-story-file-group__empty');
+        if (emptyEl) emptyEl.textContent = 'Failed to load diff.';
+      });
+    }
+
     return section;
   }
 

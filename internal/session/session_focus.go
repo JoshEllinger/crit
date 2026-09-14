@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,38 +68,6 @@ type Focus struct {
 	IsStacked         bool      `json:"is_stacked,omitempty"`
 }
 
-// UnmarshalJSON is a backward-compatibility boundary. Canonical payloads use
-// Forge + ChangeNumber; older sessions and clients may still provide the
-// provider-specific pr_number/mr_number aliases.
-func (f *Focus) UnmarshalJSON(data []byte) error {
-	type plain Focus
-	var wire struct {
-		*plain
-		PRNumber int `json:"pr_number,omitempty"`
-		MRNumber int `json:"mr_number,omitempty"`
-	}
-	wire.plain = (*plain)(f)
-	if err := json.Unmarshal(data, &wire); err != nil {
-		return err
-	}
-	if f.Forge == "" {
-		switch {
-		case wire.MRNumber > 0:
-			f.Forge = "gitlab"
-		case wire.PRNumber > 0:
-			f.Forge = "github"
-		}
-	}
-	if f.ChangeNumber == 0 {
-		if f.Forge == "gitlab" {
-			f.ChangeNumber = wire.MRNumber
-		} else if f.Forge == "github" {
-			f.ChangeNumber = wire.PRNumber
-		}
-	}
-	return nil
-}
-
 // ReadOnly reports whether comments may be added/edited in this focus.
 // v1: always false. Range mode is fully writable so users can annotate;
 // pushes to GitHub are gated separately (see runPush).
@@ -133,6 +102,9 @@ func (f Focus) PickerVisible() bool {
 // focusKeyFor returns the per-view key used to scope comment visibility.
 //
 //	pr:<num>                       — range focus with PR number
+//	pr:<project>#<num>             — URL-qualified GitHub PR
+//	mr:<num>                       — range focus with MR IID (checkout-scoped)
+//	mr:<project>#<num>             — URL-qualified GitLab MR
 //	range:<baseSHA>..<headSHA>     — range focus without PR number
 //	""                             — working-tree (and unknown)
 //
@@ -145,12 +117,40 @@ func focusKeyFor(f Focus) string {
 	}
 	if f.ChangeNumber > 0 {
 		if f.Forge == "gitlab" {
-			return fmt.Sprintf("mr:%d", f.ChangeNumber)
+			return MRFocusKey(f.ChangeNumber, f.RemoteBaseProject, f.RemoteHost)
 		}
-		// github or empty forge (legacy ChangeNumber without Forge) → pr:N
-		return fmt.Sprintf("pr:%d", f.ChangeNumber)
+		// github or empty forge (legacy ChangeNumber without Forge) → pr:…
+		return PRFocusKey(f.ChangeNumber, f.RemoteBaseProject, f.RemoteHost)
 	}
 	return fmt.Sprintf("range:%s..%s", f.BaseSHA, f.HeadSHA)
+}
+
+// PRFocusKey is the GitHub PR identity used for daemon session keys and
+// comment FocusKey stamping. URL-qualified reviews include owner/repo (and
+// non-github.com host) so same-number PRs do not collide (#870).
+// Bare numbers (empty project) keep the legacy "pr:N" form so existing
+// checkout-scoped sessions continue to match.
+func PRFocusKey(number int, project, host string) string {
+	if project == "" {
+		return fmt.Sprintf("pr:%d", number)
+	}
+	if host != "" && !strings.EqualFold(host, "github.com") {
+		return fmt.Sprintf("pr:%s/%s#%d", host, project, number)
+	}
+	return fmt.Sprintf("pr:%s#%d", project, number)
+}
+
+// MRFocusKey is the GitLab MR identity used for daemon session keys and
+// comment FocusKey stamping. Mirrors PRFocusKey: bare IIDs stay "mr:N";
+// URL-qualified reviews include project (and non-gitlab.com host).
+func MRFocusKey(number int, project, host string) string {
+	if project == "" {
+		return fmt.Sprintf("mr:%d", number)
+	}
+	if host != "" && !strings.EqualFold(host, "gitlab.com") {
+		return fmt.Sprintf("mr:%s/%s#%d", host, project, number)
+	}
+	return fmt.Sprintf("mr:%s#%d", project, number)
 }
 
 // visibleInFocus reports whether c should be shown in the given focus.
@@ -158,7 +158,15 @@ func focusKeyFor(f Focus) string {
 // FocusKey. Within a range focus, the layer/full-stack DiffScope filter
 // also applies. Pure function — no I/O, no locks.
 func visibleInFocus(c Comment, f Focus) bool {
-	if c.FocusKey != focusKeyFor(f) {
+	return visibleInFocusKey(c, focusKeyFor(f), f)
+}
+
+// visibleInFocusKey is visibleInFocus with a precomputed focus key. Use it in
+// per-comment loops: focusKeyFor allocates (Sprintf) on every call, so
+// calling visibleInFocus per comment pays one allocation per comment.
+// Hoisting the key out of the loop makes the scan allocation-free.
+func visibleInFocusKey(c Comment, key string, f Focus) bool {
+	if c.FocusKey != key {
 		return false
 	}
 	if f.Kind == FocusRange {
@@ -195,9 +203,10 @@ func StampWithFocus(c Comment, f Focus) Comment {
 
 // countVisibleComments returns the count of comments visible in the given focus.
 func countVisibleComments(comments []Comment, f Focus) int {
+	key := focusKeyFor(f)
 	n := 0
 	for _, c := range comments {
-		if visibleInFocus(c, f) {
+		if visibleInFocusKey(c, key, f) {
 			n++
 		}
 	}
@@ -398,11 +407,13 @@ func dropStaleCacheOnPRSwitch(oldFocus, newFocus Focus) {
 	if oldFocus.Forge != "github" || newFocus.Forge != "github" || oldFocus.ChangeNumber == 0 || newFocus.ChangeNumber == 0 {
 		return
 	}
-	if oldFocus.ChangeNumber == newFocus.ChangeNumber {
+	if oldFocus.ChangeNumber == newFocus.ChangeNumber &&
+		oldFocus.RemoteBaseProject == newFocus.RemoteBaseProject &&
+		oldFocus.RemoteHost == newFocus.RemoteHost {
 		return
 	}
 	if InvalidatePRCache != nil {
-		InvalidatePRCache(oldFocus.ChangeNumber)
+		InvalidatePRCache(oldFocus.ChangeNumber, oldFocus.RemoteBaseProject, oldFocus.RemoteHost)
 	}
 }
 
@@ -766,11 +777,12 @@ func (s *Session) snapshotForScoped() scopedSessionSnapshot {
 		}
 	}
 	rc := make([]Comment, 0, len(s.reviewComments))
+	focusKey := focusKeyFor(s.Focus)
 	for _, c := range s.reviewComments {
 		if !c.Resolved {
 			totalUnresolved++
 		}
-		if !visibleInFocus(c, s.Focus) {
+		if !visibleInFocusKey(c, focusKey, s.Focus) {
 			continue
 		}
 		rc = append(rc, c)

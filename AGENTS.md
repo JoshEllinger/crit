@@ -43,6 +43,10 @@ crit/
 15. **VCS abstraction** — `vcs.go` defines a backend interface; `git_vcs.go`, `sapling.go`, and `jj.go` are the implementations. Auto-detected, overridable via `--vcs` flag or `vcs` config key. Subcommands not yet threaded through (see TODO at `main.go:1826`).
 16. **Focus mode** — sub-views over the file list: file focus, range focus (`--range A..B`), stacked focus (range layer in a stacked PR). Lives in `focus_*.go` and `/api/focus`.
 
+<important if="you are writing a plan, design doc, or implementation proposal, or about to commit">
+Do not commit plan files to the repo — keep them as untracked local files (or in `/tmp`). This includes `*-plan.md`, `*-proposal.md`, and other AI-generated design docs. Repo history should contain implementation, not planning artifacts. Exception: test fixtures under `test/` that a test explicitly reads.
+</important>
+
 <important if="you need to build, test, lint, or run crit">
 
 ```bash
@@ -106,7 +110,7 @@ Config keys: `port`, `host`, `no_open`, `share_url`, `quiet`, `output`, `author`
 - `close_on_approve_after_ms` (default: unset/disabled) — auto-close the review tab N ms after Approve with no unresolved comments; negative values are treated as unset. Not included in `crit config --generate` scaffolding.
 - `proxy_auth` (default: `false`) — when `true`, terminal `crit share` / `crit fetch` / `crit unpublish` are blocked (SSO proxy); the browser UI uses a popup relay instead. Global-only for security. See proxy-auth transport rules.
 - `cleanup_on_approve` (default: `true`) — auto-delete review file when reviewer approves with no unresolved comments
-- `notify_on_round_ready` (default: `false`) — opt in to a desktop notification when a review round becomes ready for the human
+- `notify_on_round_ready` (default: `false`) — opt in to a desktop notification when a review round becomes ready for the human. On macOS, install `terminal-notifier` so the notification's click action opens the review URL; without it, clicking falls back to AppleScript `display notification`, which macOS attributes to Script Editor instead of the browser
 - `disable_stats` (default: `false`) — disable session stats recording to `~/.crit/stats.json`
 - `ignore_patterns` are unioned (global + project both apply); types: `*.ext`, `dir/`, `exact.file`, `path/*.ext`
 - `auto_viewed_patterns` are unioned (global + project both apply); matched client-side against file paths and applied once per launch to auto-mark matching files viewed (collapsed). No runtime default (empty). Plumbed through `/api/config` only — Go does no glob matching.
@@ -216,7 +220,7 @@ All routes wrapped with `s.withReady` return 503 until session init completes �
 
 Session-scoped:
 
-- `GET  /api/health` — liveness probe (no readiness gate; used for daemon health checks)
+- `GET  /api/health` — liveness probe (no readiness gate; used for daemon health checks); `{status, browser_clients, api_version}` — bump `APIVersion` only for breaking HTTP API changes; missing `api_version` = 0
 - `GET  /api/qr` — QR code for current shared URL
 - `GET  /api/session` — session metadata
 - `GET  /api/config` — `{share_url, hosted_url, delete_token, version, latest_version, ...}`

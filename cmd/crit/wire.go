@@ -104,10 +104,6 @@ func glabOwnsHost(host string) bool {
 	return exec.CommandContext(ctx, "glab", "auth", "status", "--hostname", host).Run() == nil
 }
 
-func fetchChange(provider forge.Provider, number int) (forge.ChangeRequest, error) {
-	return provider.Get(context.Background(), forge.RepoContext{}, forge.ChangeID{Number: number})
-}
-
 func listOpenGitLabChanges(ctx context.Context) ([]forge.ChangeSummary, error) {
 	provider, err := gitlab.NewProvider(config.LoadConfig("").GitLabURL)
 	if err != nil {
@@ -119,7 +115,11 @@ func listOpenGitLabChanges(ctx context.Context) ([]forge.ChangeSummary, error) {
 func init() {
 	forge.SelectProviderFn = selectProvider
 	forge.ReviewFn = session.RunReview
-	session.InvalidatePRCache = github.InvalidatePRCache
+	session.InvalidatePRCache = func(number int, _, _ string) {
+		// Drop bare and project-qualified sibling keys for this number —
+		// matching crit pull — so a focus switch cannot leave a stale twin.
+		github.InvalidatePRCache(number)
+	}
 	session.FetchMRFileContent = func(f session.Focus, sha, path string) ([]byte, error) {
 		project := f.RemoteProject
 		if sha == f.BaseSHA && f.RemoteBaseProject != "" {
@@ -198,9 +198,18 @@ func init() {
 			IgnorePatterns: sc.IgnorePatterns,
 		})
 	}
+	wirePRResolveHooks()
+	wireMRResolveHooks()
+}
+
+func wirePRResolveHooks() {
 	focus.SetPRResolveHooks(
-		func(prNum int) (focus.ChangeResolveInfo, error) {
-			info, err := github.FetchPRByNumber(prNum)
+		func(spec string) (focus.ChangeResolveInfo, error) {
+			id, err := github.ParsePRSpec(spec)
+			if err != nil {
+				return focus.ChangeResolveInfo{}, err
+			}
+			info, err := github.FetchPR(id)
 			if err != nil {
 				return focus.ChangeResolveInfo{}, err
 			}
@@ -213,6 +222,9 @@ func init() {
 				BaseRefName:       info.BaseRefName,
 				HeadRefName:       info.HeadRefName,
 				HeadRepoURL:       info.HeadRepoURL,
+				BaseRepoProject:   id.Project, // only URL-derived; bare --pr stays checkout-scoped
+				HeadRepoProject:   github.ProjectFromRemoteURL(info.HeadRepoURL),
+				HeadRepoHost:      id.Host,
 				IsCrossRepository: info.IsCrossRepository,
 			}, nil
 		},
@@ -230,6 +242,9 @@ func init() {
 			}, v)
 		},
 	)
+}
+
+func wireMRResolveHooks() {
 	focus.SetMRResolveHooks(
 		func(spec string) (focus.ChangeResolveInfo, error) {
 			id, err := gitlab.ParseMRSpec(spec)

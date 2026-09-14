@@ -90,10 +90,24 @@ crit landing.html                 # review a static HTML file
 
 If talking to an agent, you can invoke the `/crit` command and optionally provide arguments like the above examples or the agent will try to launch the right thing based on the context of the conversation.
 
-For larger branch, PR, or range reviews, `crit story` can generate an optional
-chaptered overview of the diff before you review it. See the
-**[story mode guide](docs/story-mode.md)** for the workflow and custom prompt
-setup.
+### Story mode
+
+For larger branch, PR, MR, or range reviews, **story mode** adds a chaptered
+overview of the diff — thematic chapters, a prologue, and a support bucket for
+noise — so you can understand the shape of the change before line-by-line
+review. It is an explainer, not a reviewer.
+
+**Recommended:** invoke `/crit-story` (or `$crit-story`, `/skill:crit-story`,
+depending on your agent) after `crit install <tool>`. Your agent authors the
+story in-session via `crit story --prep` / `--story-file`. Only run it when you
+explicitly ask — agents will not infer it from a normal `/crit` review.
+
+**Alternative:** `crit story` from the terminal uses your global `agent_cmd`
+(separate LLM spend). Generation is LLM-driven exploration — cost depends on
+change complexity more than raw file/diff size, and does not scale linearly.
+In our experience, complex PRs (~20–50 files, ~2k–5k lines) land around
+$1–$1.40 with Claude Opus 5. See the **[story mode guide](docs/story-mode.md)**
+for commands, custom prompts, JSON shape, and token-cost notes.
 
 ### Live mode
 
@@ -181,9 +195,18 @@ crit unpublish                        # remove the shared review
 
 When sharing under an org, visibility defaults to `organization` (members only). Override with `--visibility` (`organization`, `unlisted`, or `public`). The browser UI shows an org picker when you're signed in and belong to an organization.
 
-Sharing uses [crit.md](https://crit.md) by default. To self-host, deploy [`crit-web`](https://github.com/tomasz-tomczyk/crit-web) and point `CRIT_SHARE_URL` (or `--share-url`, or `share_url` in config) at your instance. Set `share_url` to `""` to disable sharing entirely.
+Sharing uses [crit.md](https://crit.md) when no sharing key exists. To use several deployments, configure global `share_targets`; the browser asks for a destination and each review stays bound to its first destination:
 
-If your self-hosted `crit-web` sits behind an SSO reverse proxy that the terminal can't authenticate against, set `proxy_auth: true` in your `~/.crit.config.json` (this option is config-only and global-only — it's a property of the deployment, not a per-invocation choice, so there's no flag or env var). Browser-driven Share / Pull / Re-share / Unpublish then route through a popup window where the proxy can complete its interactive auth flow. Terminal `crit share`, `crit fetch`, and `crit unpublish` remain unavailable behind SSO — use the browser UI buttons.
+```json
+{"share_targets":[
+  {"name":"Acme Crit","url":"https://crit.acme.com","default":true,"proxy_auth":true},
+  {"name":"crit.md","url":"https://crit.md"}
+]}
+```
+
+Run `crit auth login --share-url https://crit.acme.com` to add or authenticate a target, and add `--set-default` to make it the CLI default. `crit auth status` lists every target. An explicit `"share_targets": []` disables sharing and never injects crit.md. Legacy `share_url` remains readable; `crit config --migrate` converts it atomically. `--share-url` and `CRIT_SHARE_URL` are process-only overrides and never persist a new target; an explicitly empty `CRIT_SHARE_URL` disables sharing for that process.
+
+If a target sits behind an SSO reverse proxy, set `proxy_auth: true` on that target. Browser-driven Share / Pull / Re-share / Unpublish then use its popup relay; terminal operations remain unavailable for that target.
 
 #### Authentication
 
@@ -191,8 +214,9 @@ You can share anonymously or you can create a free crit.md account (using GitHub
 
 ```bash
 crit auth login                    # opens browser to log in
-crit auth whoami                   # show current user info
-crit auth logout                   # log out and revoke token
+crit auth login --share-url https://crit.acme.com --set-default
+crit auth status                   # list targets and identities
+crit auth logout --share-url https://crit.md
 ```
 
 `crit auth login` uses the OAuth Device Flow - it opens your browser, you confirm, and the CLI receives a token automatically. The token is stored in your global config (`~/.crit.config.json`).
@@ -330,7 +354,7 @@ All keys are optional — omit any you don't need.
 | `host`                 | string   | `"127.0.0.1"`              | Listen host (global/CLI/env only). Non-loopback values also require `--allow-unauthenticated-network` / `CRIT_ALLOW_UNAUTHENTICATED_NETWORK=1`. Prefer loopback + SSH/Tailscale/Docker host-loopback publish. |
 | `no_open`              | bool     | `false`                    | Don't auto-open the browser when starting a review.                                                                                                                                     |
 | `quiet`                | bool     | `false`                    | On success, suppress daemon connect/start lines, integration tips, and the session summary. Errors, `approved:`, and the finish prompt are unchanged. |
-| `output`               | string   | `~/.crit`                  | Crit data root for reviews. Reviews live in `<root>/reviews/<key>/` (same layout as the default). A leftover `<root>/.crit` from when `output` named a single review folder is still used (with a warning) until you move or remove it. |
+| `output`               | string   | `~/.crit`                  | Crit data root for reviews. Reviews live in `<root>/reviews/<key>/` (same layout as the default). |
 | `author`               | string   | VCS user name              | Author name shown on comments. Falls back to your configured VCS user name.                                                                                                            |
 | `forge`                | string   | `"auto"`                   | Remote review provider: `"auto"`, `"github"`, or `"gitlab"`. Auto-detection uses the repository remote; set this for ambiguous self-managed hosts. |
 | `gitlab_url`           | string   | `"https://gitlab.com"`     | GitLab base URL used for every MR operation. Set once for a self-managed instance; MR URL arguments must use the same host. |
@@ -338,7 +362,7 @@ All keys are optional — omit any you don't need.
 | `ignore_patterns`      | string[] | `[".crit/"]` | File patterns to exclude from git-mode file lists. Global and project patterns are merged.                                                                                              |
 | `auto_viewed_patterns` | string[] | `[]`                       | File patterns auto-marked as viewed (collapsed) once when a review opens — e.g. `["*.lock", "generated/", "PLAN.md"]`. Manually un-marking a file keeps it open. Global and project patterns are merged. |
 | `cleanup_on_approve`   | bool     | `true`                     | Automatically delete the review file when you approve with no unresolved comments. Set to `false` to preserve review history.                                                           |
-| `notify_on_round_ready`| bool     | `false`                    | Opt in to a desktop notification when a review round becomes ready for you (after the agent finishes addressing comments).       |
+| `notify_on_round_ready`| bool     | `false`                    | Opt in to a desktop notification when a review round becomes ready for you (after the agent finishes addressing comments). On macOS, install [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) (`brew install terminal-notifier`) so clicking the notification opens the review URL — without it, clicking falls back to AppleScript's `display notification`, which macOS attributes to Script Editor and activates that instead of your browser. |
 | `no_update_check`      | bool     | `false`                    | Don't check for new versions on startup.                                                                                                                                                |
 | `no_integration_check` | bool     | `false`                    | Skip the integration config freshness check on startup.                                                                                                                                 |
 | `vcs`                  | string   | auto-detected              | Preferred VCS backend: `"git"`, `"sl"`, or `"jj"`. When set, crit uses this VCS instead of auto-detecting. Falls back to git if the configured VCS isn't available. Can also be set via `--vcs` CLI flag (flag takes precedence over config). |
@@ -378,8 +402,9 @@ These keys can only be set in `~/.crit.config.json` (global). Project-level `.cr
 | ---------------------- | -------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `agent_cmd`            | string   | `""`                       | Shell command for "Send to agent" (e.g. `"claude -p"`). See [Send to agent](#send-to-agent-experimental). |
 | `open_cmd`             | string   | `""`                       | Custom command to open review URLs — receives the URL as its only argument (must be a single executable, no flags). Use when the browser isn't on the machine running crit, e.g. crit runs on a remote host over SSH and a small wrapper script opens the URL on your local machine. When unset, crit uses the platform default opener. |
-| `auth_token`           | string   | `""`                       | Authentication token for crit.md. Set automatically by `crit auth login`. |
-| `share_url`            | string   | `"https://crit.md"`        | Base URL of the share service. Set to `""` to disable sharing entirely. Self-host with [`crit-web`](https://github.com/tomasz-tomczyk/crit-web). |
+| `share_targets`        | array    | implicit crit.md when absent | Deployment list with per-target `name`, `url`, `default`, `proxy_auth`, nested `auth`, and public `share_consented`. An explicit empty array disables sharing. |
+| `auth_token`           | string   | `""`                       | Legacy singleton token; read only while `share_targets` is absent. |
+| `share_url`            | string   | implicit `"https://crit.md"` | Legacy singleton URL. An explicitly empty value disables sharing; migrate with `crit config --migrate`. |
 | `public_url`           | string   | `""`                       | Advertised base URL for stderr and browser-open (e.g. `https://machine.ts.net` via tailscale serve). Listen address unchanged. Requires `--allow-unauthenticated-network` / `CRIT_ALLOW_UNAUTHENTICATED_NETWORK=1`. |
 | `share_consented`      | bool     | `false`                    | Written automatically to `true` after you confirm the first-time share prompt. Reset to `false` to see the prompt again. Not used when `share_url` is a custom (self-hosted) URL. |
 | `proxy_auth`           | bool     | `false`                    | When `true`, share / pull / unpublish / re-share use the browser popup relay instead of the local Go server contacting crit-web directly. Use when crit-web is behind an SSO reverse proxy that the terminal cannot authenticate against. No flag or env var — this is a property of the deployment, not a per-invocation choice. |
@@ -396,7 +421,7 @@ These keys can only be set in `~/.crit.config.json` (global). Project-level `.cr
 | `--allow-unauthenticated-network` | | — | Required with non-loopback `--host` or any `--public-url` |
 | `--no-open`     |       | `no_open`             | Don't auto-open browser                |
 | `--share-url`   |       | `share_url`           | Share service URL                      |
-| `--output`      | `-o`  | `output`              | Crit data root for reviews (`<root>/reviews/<key>/`). Honors a leftover `<root>/.crit` from older crit versions until removed. |
+| `--output`      | `-o`  | `output`              | Crit data root for reviews (`<root>/reviews/<key>/`). |
 | `--quiet`       | `-q`  | `quiet`               | On success, suppress connect/start status, tips, and session summary                 |
 | `--base-branch` |       | `base_branch`         | Base branch to diff against            |
 | `--vcs`         |       | `vcs`                 | VCS backend (`git`, `sl`, or `jj`)     |

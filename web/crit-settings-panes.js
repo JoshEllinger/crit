@@ -420,10 +420,23 @@
         html += '</div></div></div>';
       }
 
-      // Account card
-      if (show.account && cfg.share_url) {
-        if (cfg.auth_logged_in) {
-          var display = cfg.auth_user_email || cfg.auth_user_name || 'Logged in';
+      // Legacy share_url-only configs have no per-target auth; top-level cfg.auth_*
+      // still applies. Modern share_targets carry auth_logged_in per target.
+      var settingsTargets = Array.isArray(cfg.share_targets) ? cfg.share_targets : (cfg.share_url ? [{ url: cfg.share_url }] : []);
+      // Account card — logged-in if ANY target is authenticated (localhost CLI).
+      if (show.account && settingsTargets.length > 0) {
+        var loggedInTarget = null;
+        for (var ti = 0; ti < settingsTargets.length; ti++) {
+          if (settingsTargets[ti].auth_logged_in) {
+            loggedInTarget = settingsTargets[ti];
+            break;
+          }
+        }
+        if (!loggedInTarget && !Array.isArray(cfg.share_targets) && cfg.auth_logged_in) {
+          loggedInTarget = { auth_user_email: cfg.auth_user_email, auth_user_name: cfg.auth_user_name };
+        }
+        if (loggedInTarget) {
+          var display = loggedInTarget.auth_user_email || loggedInTarget.auth_user_name || 'Logged in';
           html += '<div class="config-card config-card--green"><div class="config-card-header">';
           html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
           html += '<span class="config-card-title">Account</span>';
@@ -542,9 +555,8 @@
 
       // Share card
       if (show.share) {
-        if (cfg.share_url) {
-          var hostname;
-          try { hostname = new URL(cfg.share_url).hostname; } catch (_) { hostname = cfg.share_url; }
+        if (settingsTargets.length > 0) {
+          var hostname = settingsTargets.map(function(t) { return t.name || t.url; }).join(' · ');
           html += '<div class="config-card config-card--green"><div class="config-card-header">';
           html += '<span class="config-card-icon" style="color:var(--crit-green)">&#10003;</span>';
           html += '<span class="config-card-title">Sharing enabled</span>';

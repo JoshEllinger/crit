@@ -80,11 +80,26 @@ test('create() wires a click handler onto shareBtnEl', () => {
   assert.equal((btn._listeners.click || []).length, 1);
 });
 
-test('reveal() shows the button when shareURL && canShare', () => {
+test('reveal() shows the button when (shareURL || shareTargets) && canShare', () => {
   const btn = wireButton(makeButton());
   installDomStub({ shareBtn: btn });
   share = require('../crit-share.js');
   const ctl = share.create({ shareBtnEl: btn, shareURL: 'https://crit.md', canShare: true });
+  assert.equal(btn.style.display, 'none');
+  ctl.reveal();
+  assert.equal(btn.style.display, '');
+});
+
+test('reveal() shows the button when shareTargets is non-empty even if shareURL is empty', () => {
+  const btn = wireButton(makeButton());
+  installDomStub({ shareBtn: btn });
+  share = require('../crit-share.js');
+  const ctl = share.create({
+    shareBtnEl: btn,
+    shareURL: '',
+    shareTargets: [{ name: 'crit.md', url: 'https://crit.md', default: true }],
+    canShare: true,
+  });
   assert.equal(btn.style.display, 'none');
   ctl.reveal();
   assert.equal(btn.style.display, '');
@@ -99,7 +114,7 @@ test('reveal() does NOT show the button when canShare is false (e.g. git mode)',
   assert.equal(btn.style.display, 'none');
 });
 
-test('reveal() does NOT show the button when shareURL is empty', () => {
+test('reveal() does NOT show the button when shareURL and shareTargets are empty', () => {
   const btn = wireButton(makeButton());
   installDomStub({ shareBtn: btn });
   share = require('../crit-share.js');
@@ -150,9 +165,25 @@ test('share policy fetch falls back to historical allowed visibility options', (
   const src = fs.readFileSync(path.join(__dirname, '..', 'crit-share.js'), 'utf8');
 
   assert.match(src, /DEFAULT_SHARE_POLICY[\s\S]*allowed_review_visibilities:\s*\['organization', 'unlisted', 'public'\]/);
-  assert.match(src, /fetch\('\/api\/share-policy'\)/);
+  assert.match(src, /fetch\('\/api\/share-policy\?target_url=' \+ encodeURIComponent\(key\)\)/);
   assert.match(src, /popupSession\.run\('sharePolicy'/);
-  assert.match(src, /cachedSharePolicy = normalizeSharePolicy\(null\)/);
+  assert.match(src, /cachedSharePolicy\.set\(key, normalizeSharePolicy\(null\)\)/);
+});
+
+test('multi-target sharing scopes transport, API requests, caches, and settings by URL', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'crit-share.js'), 'utf8');
+
+  assert.match(src, /shareTargets\.length > 1/);
+  assert.match(src, /showDestinationModal\(\)/);
+  assert.match(src, /target_url: shareURL/);
+  assert.match(src, /\/api\/auth\/orgs\?target_url=/);
+  assert.match(src, /getSetting\('shareOrg' \+ settingSuffix/);
+  assert.match(src, /External to your organization/);
+  assert.match(src, /originating instance[\s\S]*no longer configured/);
+  assert.match(src, /selectedTarget\.needs_share_consent = false/);
+  assert.match(src, /beginShareToTarget\(continueTarget\)/);
+  assert.match(src, /Clear local link/);
+  assert.match(src, /keydown[\s\S]*Escape[\s\S]*closeShareModal/);
 });
 
 test('share modal disables policy-blocked visibility options', () => {

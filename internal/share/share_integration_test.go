@@ -9,17 +9,131 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/JoshEllinger/crit/internal/daemon"
 	"github.com/JoshEllinger/crit/internal/session"
 )
+
+// TestShareSyncMultiInstanceTargets exercises two independently-addressed
+// targets backed by the local crit-web harness. Reverse proxies give each
+// target a distinct canonical URL and traffic counter while preserving a real
+// crit-web on the other side.
+func TestShareSyncMultiInstanceTargets(t *testing.T) {
+	upstream, err := url.Parse(critWebURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTarget := func() (*httptest.Server, *atomic.Int64) {
+		var count atomic.Int64
+		proxy := httputil.NewSingleHostReverseProxy(upstream)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/reviews") {
+				count.Add(1)
+			}
+			proxy.ServeHTTP(w, r)
+		}))
+		return server, &count
+	}
+	targetA, countA := newTarget()
+	defer targetA.Close()
+	targetB, countB := newTarget()
+	defer targetB.Close()
+
+	home := t.TempDir()
+	configBody, _ := json.Marshal(map[string]any{"share_targets": []map[string]any{
+		{"name": "Instance A", "url": targetA.URL},
+		{"name": "Instance B", "url": targetB.URL, "default": true},
+	}})
+	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), configBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := critBinary(t)
+	run := func(dir string, args ...string) (string, error) {
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = dir
+		env := make([]string, 0, len(os.Environ())+2)
+		for _, item := range os.Environ() {
+			if strings.HasPrefix(item, "HOME=") || strings.HasPrefix(item, "CRIT_SHARE_URL=") || strings.HasPrefix(item, "CRIT_AUTH_TOKEN=") {
+				continue
+			}
+			env = append(env, item)
+		}
+		cmd.Env = append(env, "HOME="+home, "CRIT_AUTH_TOKEN=")
+		out, err := cmd.CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	shareOne := func(name, targetURL string) (string, string) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "plan.md"), []byte("# "+name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeTestCritJSON(t, dir, CritJSON{ReviewRound: 1, Files: map[string]CritJSONFile{"plan.md": {}}})
+		out, err := run(dir, "share", "--share-url", targetURL, "--output", dir, "plan.md")
+		if err != nil {
+			t.Fatalf("share %s failed: %v\n%s", name, err, out)
+		}
+		logReview(t, out)
+		cj := readCritJSON(t, dir)
+		if cj.ShareBaseURL != targetURL {
+			t.Fatalf("%s share_base_url=%q want %q", name, cj.ShareBaseURL, targetURL)
+		}
+		return dir, extractToken(t, out)
+	}
+
+	dirA, _ := shareOne("A", targetA.URL)
+	_, tokenB := shareOne("B", targetB.URL)
+	if countA.Load() == 0 || countB.Load() == 0 {
+		t.Fatalf("expected traffic to both targets: A=%d B=%d", countA.Load(), countB.Load())
+	}
+
+	// Default is B, but re-sharing A without --share-url must remain on A.
+	bBefore := countB.Load()
+	if err := os.WriteFile(filepath.Join(dirA, "plan.md"), []byte("# A round two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(dirA, "share", "--output", dirA, "plan.md")
+	if err != nil {
+		t.Fatalf("bound re-share failed: %v\n%s", err, out)
+	}
+	if countB.Load() != bBefore {
+		t.Fatalf("bound A review contacted default B: before=%d after=%d", bBefore, countB.Load())
+	}
+
+	// Taking A offline must fail locally and never fall back to B.
+	targetA.Close()
+	if err := os.WriteFile(filepath.Join(dirA, "plan.md"), []byte("# A unavailable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bBefore = countB.Load()
+	if out, err = run(dirA, "share", "--output", dirA, "plan.md"); err == nil {
+		t.Fatalf("expected unavailable A to fail, got %s", out)
+	}
+	if countB.Load() != bBefore {
+		t.Fatalf("unavailable A fell back to B: before=%d after=%d", bBefore, countB.Load())
+	}
+
+	// B's independently shared review remains intact.
+	docB := reviewDocFromAPI(t, critWebURL(t), tokenB)
+	filesB, ok := docB["files"].([]any)
+	if !ok || len(filesB) != 1 {
+		t.Fatalf("B document files=%#v, want one file", docB["files"])
+	}
+	fileB, ok := filesB[0].(map[string]any)
+	if !ok || fileB["content"] != "# B\n" {
+		t.Fatalf("B document changed through A routing: %#v", filesB[0])
+	}
+}
 
 func critWebURL(t *testing.T) string {
 	t.Helper()
@@ -159,15 +273,13 @@ func TestShareSyncIntegration(t *testing.T) {
 		t.Errorf("crit-web should have updated content, got: %s", docBody.Files[0].Content)
 	}
 
-	// g) Verify the web reviewer comment was pulled into local .crit.json
-	// (post-v4 .crit.json is a folder; the canonical review payload lives at
-	// .crit/review.json).
-	localData, err := os.ReadFile(filepath.Join(dir, ".crit", "review.json"))
+	// g) Verify the web reviewer comment was pulled into local review.json
+	localData, err := os.ReadFile(filepath.Join(testOutputIdentity(t, dir), "review.json"))
 	if err != nil {
-		t.Fatalf("reading .crit.json: %v", err)
+		t.Fatalf("reading review.json: %v", err)
 	}
 	if !strings.Contains(string(localData), "web reviewer comment") {
-		t.Errorf("expected web reviewer comment in local .crit.json, got: %s", string(localData))
+		t.Errorf("expected web reviewer comment in local review.json, got: %s", string(localData))
 	}
 
 	// h) Verify export endpoint returns .crit.json-compatible shape
@@ -339,12 +451,9 @@ func reviewRoundFromAPI(t *testing.T, baseURL, token string) int {
 	return body.ReviewRound
 }
 
-// writeTestCritJSON writes a CritJSON to .crit/review.json in dir.
+// writeTestCritJSON writes a CritJSON to the keyed review folder under dir,
+// matching `--output <dir>` resolution (`<dir>/reviews/<key>/review.json`).
 //
-// `--output <dir>` names a crit data root, so a fresh root would key the review
-// as <dir>/reviews/<key>/. Seeding <dir>/.crit puts the tests on the
-// pre-data-root layout that crit still honors for existing users, which is what
-// keeps every helper below (and readCritJSON) pointed at one review folder.
 // NOTE: readCritJSON is defined in integration_export_test.go and shared across
 // test files.
 func writeTestCritJSON(t *testing.T, dir string, cj CritJSON) {
@@ -353,7 +462,7 @@ func writeTestCritJSON(t *testing.T, dir string, cj CritJSON) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := filepath.Join(dir, ".crit")
+	identity := testOutputIdentity(t, dir)
 	if err := os.MkdirAll(identity, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -362,9 +471,25 @@ func writeTestCritJSON(t *testing.T, dir string, cj CritJSON) {
 	}
 }
 
+// testOutputIdentity is the keyed review folder under --output data root dir.
+// Matches ResolveCommandReviewPathWithSession when cwd is dir, there is no live
+// daemon, and the directory is not a VCS checkout (integration temps aren't).
+func testOutputIdentity(t *testing.T, dir string) string {
+	t.Helper()
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := abs
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		cwd = resolved
+	}
+	return filepath.Join(abs, "reviews", daemon.SessionKey(cwd, "", nil))
+}
+
 // critShareCmd runs `crit share` and returns stdout. Fails the test on error.
 // Uses --output to point at the temp dir seeded by writeTestCritJSON, so crit
-// reads/writes .crit/review.json there.
+// reads/writes reviews/<key>/review.json there.
 func critShareCmd(t *testing.T, binary, baseURL, dir string, files ...string) string {
 	t.Helper()
 	args := append([]string{"share", "--share-url", baseURL, "--output", dir}, files...)
@@ -2166,13 +2291,13 @@ func TestShareReceiver_LegacyShareStillWorks(t *testing.T) {
 	}
 
 	// The review file should now record the share URL + delete token.
-	data, err := os.ReadFile(filepath.Join(dir, ".crit", "review.json"))
+	data, err := os.ReadFile(filepath.Join(testOutputIdentity(t, dir), "review.json"))
 	if err != nil {
-		t.Fatalf("read .crit/review.json: %v", err)
+		t.Fatalf("read review.json: %v", err)
 	}
 	var cj CritJSON
 	if err := json.Unmarshal(data, &cj); err != nil {
-		t.Fatalf("decode .crit/review.json: %v", err)
+		t.Fatalf("decode review.json: %v", err)
 	}
 	if cj.ShareURL != "https://crit.stub/r/stubtoken" {
 		t.Errorf("share_url = %q, want https://crit.stub/r/stubtoken", cj.ShareURL)
@@ -2393,7 +2518,7 @@ func TestShareSyncOrgPersistence(t *testing.T) {
 	critShareCmdWithEnv(t, binary, baseURL, dir, []string{"--org", slug, "--visibility", "organization"}, authEnv, "readme.md")
 
 	// Read the review file and verify org fields are persisted
-	reviewPath := filepath.Join(dir, ".crit", "review.json")
+	reviewPath := filepath.Join(testOutputIdentity(t, dir), "review.json")
 	data, err := os.ReadFile(reviewPath)
 	if err != nil {
 		t.Fatalf("reading review file: %v", err)
