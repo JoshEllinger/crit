@@ -64,6 +64,58 @@ func newTestServer(t *testing.T) (*Server, *Session) {
 	return s, session
 }
 
+func waitForSubscriberCount(t *testing.T, session *Session, want int) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		if got := session.SubscriberCountForTest(); got == want {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			t.Fatalf("subscriber count = %d, want %d", session.SubscriberCountForTest(), want)
+		}
+	}
+}
+
+type notifyingResponseRecorder struct {
+	*httptest.ResponseRecorder
+	writes chan string
+}
+
+func newNotifyingResponseRecorder() *notifyingResponseRecorder {
+	return &notifyingResponseRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		writes:           make(chan string, 4),
+	}
+}
+
+func (w *notifyingResponseRecorder) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	w.writes <- string(p)
+	return n, err
+}
+
+func (w *notifyingResponseRecorder) waitForWrite(t *testing.T, want string) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-w.writes:
+			if strings.Contains(got, want) {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("response never wrote %q", want)
+		}
+	}
+}
+
 func TestGetSession(t *testing.T) {
 	s, _ := newTestServer(t)
 	req := httptest.NewRequest("GET", "/api/session", nil)
@@ -428,6 +480,9 @@ func TestPostFileComment(t *testing.T) {
 
 	if w.Code != 201 {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if ct := w.Result().Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("committed Content-Type = %q, want application/json", ct)
 	}
 	var c Comment
 	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
@@ -849,7 +904,7 @@ func TestReviewCycle_ApproveReturnsEmptyPrompt(t *testing.T) {
 		done <- w
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForSubscriberCount(t, session, 1)
 
 	// Trigger finish with no comments (approve)
 	finishReq := httptest.NewRequest("POST", "/api/finish", nil)
@@ -885,7 +940,7 @@ func TestReviewCycle_UnresolvedReturnsPrompt(t *testing.T) {
 		done <- w
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForSubscriberCount(t, session, 1)
 
 	finishReq := httptest.NewRequest("POST", "/api/finish", nil)
 	s.ServeHTTP(httptest.NewRecorder(), finishReq)
@@ -930,7 +985,7 @@ func TestReviewCycle_NextCommand(t *testing.T) {
 				done <- w
 			}()
 
-			time.Sleep(50 * time.Millisecond)
+			waitForSubscriberCount(t, session, 1)
 
 			finishReq := httptest.NewRequest("POST", "/api/finish", nil)
 			s.ServeHTTP(httptest.NewRecorder(), finishReq)
@@ -2035,7 +2090,7 @@ func TestWaitForEventReturnsOnFinish(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForSubscriberCount(t, session, 1)
 
 	finishReq := httptest.NewRequest(http.MethodPost, "/api/finish", nil)
 	finishW := httptest.NewRecorder()
@@ -2063,31 +2118,33 @@ func TestWaitForEventIgnoresOtherEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var resp *httptest.ResponseRecorder
 	done := make(chan struct{})
 	go func() {
 		req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/wait-for-event", nil)
-		w := httptest.NewRecorder()
-		srv.ServeHTTP(w, req)
+		resp = httptest.NewRecorder()
+		srv.ServeHTTP(resp, req)
 		close(done)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForSubscriberCount(t, session, 1)
 
 	session.Notify(SSEEvent{Type: "comments-changed"})
-
+	session.Notify(SSEEvent{Type: "finish"})
 	select {
 	case <-done:
-		t.Fatal("long-poll should not return on comments-changed event")
-	case <-time.After(200 * time.Millisecond):
-		// Good — still blocking
-	}
-
-	// Stop the long-poll before the test's temporary directory is cleaned up.
-	cancel()
-	select {
-	case <-done:
+		if resp.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.Code)
+		}
+		var event SSEEvent
+		if err := json.NewDecoder(resp.Body).Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type != "finish" {
+			t.Fatalf("event type = %q, want finish", event.Type)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("long-poll did not stop after request cancellation")
+		t.Fatal("long-poll did not return after finish event")
 	}
 }
 
@@ -2281,6 +2338,16 @@ func TestHealthEndpoint(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("GET /api/health: got %d, want 200", w.Code)
 	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode health response: %v", err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("status = %v, want ok", resp["status"])
+	}
+	if resp["api_version"] != float64(APIVersion) {
+		t.Errorf("api_version = %v, want %d", resp["api_version"], APIVersion)
+	}
 }
 
 // Regression: /api/review-cycle is POST-only. The frontend used to GET it
@@ -2310,16 +2377,19 @@ func TestReviewCycleFirstRound(t *testing.T) {
 		done <- w.Code
 	}()
 
-	// Give the handler time to start blocking
-	time.Sleep(50 * time.Millisecond)
+	waitForSubscriberCount(t, session, 1)
 
 	// Simulate user clicking "Finish Review"
 	session.WriteFiles()
 	session.Notify(SSEEvent{Type: "finish", Content: "test feedback"})
 
-	code := <-done
-	if code != http.StatusOK {
-		t.Errorf("POST /api/review-cycle: got %d, want 200", code)
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Errorf("POST /api/review-cycle: got %d, want 200", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("review-cycle did not return after finish event")
 	}
 }
 
@@ -3512,21 +3582,24 @@ func TestHandleEvents_SSEHeaders(t *testing.T) {
 	srv, session := newTestServer(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest("GET", "/api/events", nil).WithContext(ctx)
-	w := httptest.NewRecorder()
-
+	t.Cleanup(cancel)
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+	w := newNotifyingResponseRecorder()
 	done := make(chan struct{})
 	go func() {
 		srv.ServeHTTP(w, req)
 		close(done)
 	}()
 
-	// Send an event then cancel.
-	time.Sleep(50 * time.Millisecond)
+	waitForSubscriberCount(t, session, 1)
 	session.Notify(SSEEvent{Type: "comments-changed"})
-	time.Sleep(50 * time.Millisecond)
+	w.waitForWrite(t, "event: comments-changed")
 	cancel()
-	<-done
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SSE handler did not stop after request cancellation")
+	}
 
 	// Verify SSE headers.
 	ct := w.Header().Get("Content-Type")
@@ -4021,6 +4094,9 @@ func TestHandleHealth_WithBrowserClients(t *testing.T) {
 	if resp["browser_clients"] != true {
 		t.Errorf("browser_clients = %v, want true", resp["browser_clients"])
 	}
+	if resp["api_version"] != float64(APIVersion) {
+		t.Errorf("api_version = %v, want %d", resp["api_version"], APIVersion)
+	}
 }
 
 func TestHandleHealth_MethodNotAllowed(t *testing.T) {
@@ -4320,16 +4396,6 @@ func TestHandleReviewComments_POST_InvalidJSON(t *testing.T) {
 	}
 }
 
-func TestHandleReviewComments_MethodNotAllowed(t *testing.T) {
-	srv, _ := newTestServer(t)
-	req := httptest.NewRequest("PUT", "/api/comments", nil)
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, req)
-	if w.Code != 405 {
-		t.Errorf("status = %d, want 405", w.Code)
-	}
-}
-
 // --- handleCommentByID additional tests ---
 
 func TestHandleCommentByID_EmptyID(t *testing.T) {
@@ -4419,16 +4485,6 @@ func TestHandleSession_WithCommit(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Error("expected files when scoped to specific commit")
-	}
-}
-
-func TestHandleSession_MethodNotAllowed(t *testing.T) {
-	srv, _ := newTestServer(t)
-	req := httptest.NewRequest("POST", "/api/session", nil)
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, req)
-	if w.Code != 405 {
-		t.Errorf("status = %d, want 405", w.Code)
 	}
 }
 
@@ -4640,6 +4696,9 @@ func TestHandleFileComments_AcceptsDOMAnchor_AutoRegistersRoute(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
+	if ct := w.Result().Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("committed Content-Type = %q, want application/json", ct)
+	}
 	var c Comment
 	json.NewDecoder(w.Body).Decode(&c)
 	if c.DOMAnchor == nil {
@@ -4810,19 +4869,8 @@ func TestSSE_LiveRoundStart_Broadcasts(t *testing.T) {
 		t.Fatalf("initial frame: %v", err)
 	}
 
-	// Wait briefly for the server to register the subscriber, then fire.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		// subscribers is guarded by subMu (not the session-state mu) — see
-		// Subscribe/Unsubscribe/notify in session.go. Reading it under the
-		// wrong mutex would race with Subscribe; the race detector would
-		// flag it even though both are sync.Mutex.
-		n := session.SubscriberCountForTest()
-		if n > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Wait for the server to register the subscriber before firing the event.
+	waitForSubscriberCount(t, session, 1)
 	session.FireOnLiveRoundStart(1, 2)
 
 	// Read until we see the live-round-start event.

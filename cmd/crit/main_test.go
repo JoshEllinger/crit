@@ -354,8 +354,15 @@ func TestRunShare_ConsentDenied(t *testing.T) {
 	if err := os.WriteFile(f, []byte("# Hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Fork customization: no default share target (see upstream-merge-plan.md);
+	// the config must explicitly opt in to the public crit.md target for the
+	// consent prompt to be reached at all.
+	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(`{"share_url":"https://crit.md"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_ShareConsentDenied", "--")
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home,
+	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home,
 		"GO_TEST_SHARE_FILE="+f, "GO_TEST_SHARE_OUT="+outDir)
 	cmd.Stdin = strings.NewReader("n\n")
 	out, err := cmd.CombinedOutput()

@@ -6,17 +6,15 @@ import (
 	"testing"
 )
 
-func TestFocusUnmarshalNormalizesChangeIdentity(t *testing.T) {
+func TestFocusUnmarshalChangeIdentity(t *testing.T) {
 	tests := []struct {
 		name       string
 		payload    string
 		wantForge  string
 		wantNumber int
 	}{
-		{"canonical gitlab", `{"kind":"range","forge":"gitlab","change_number":17}`, "gitlab", 17},
-		{"canonical github", `{"kind":"range","forge":"github","change_number":42}`, "github", 42},
-		{"legacy gitlab", `{"kind":"range","mr_number":17}`, "gitlab", 17},
-		{"legacy github", `{"kind":"range","pr_number":42}`, "github", 42},
+		{"gitlab", `{"kind":"range","forge":"gitlab","change_number":17}`, "gitlab", 17},
+		{"github", `{"kind":"range","forge":"github","change_number":42}`, "github", 42},
 		{"unknown forge is preserved", `{"kind":"range","forge":"other","change_number":9}`, "other", 9},
 	}
 	for _, tt := range tests {
@@ -152,6 +150,7 @@ func TestFocusKeyFor(t *testing.T) {
 		{"empty kind", Focus{}, ""},
 		{"range with GitHub change", Focus{Kind: FocusRange, Forge: "github", ChangeNumber: 42, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb"}, "pr:42"},
 		{"range with GitLab change", Focus{Kind: FocusRange, Forge: "gitlab", ChangeNumber: 17, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb"}, "mr:17"},
+		{"range with GitLab project", Focus{Kind: FocusRange, Forge: "gitlab", ChangeNumber: 17, RemoteBaseProject: "acme/widget", BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb"}, "mr:acme/widget#17"},
 		{"range with empty forge + change", Focus{Kind: FocusRange, ChangeNumber: 9, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb"}, "pr:9"},
 		{"range with unknown forge", Focus{Kind: FocusRange, Forge: "other", ChangeNumber: 9, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb"}, "pr:9"},
 		{"range without PR", Focus{Kind: FocusRange, BaseSHA: "aaaaaaa1234", HeadSHA: "bbbbbbb1234"}, "range:aaaaaaa1234..bbbbbbb1234"},
@@ -284,8 +283,10 @@ func TestCarryForwardComment_PreservesScope(t *testing.T) {
 }
 
 // BenchmarkVisibleInFocus measures the cost of the linear filter scan that
-// every GetComments call runs. visibleInFocus is a pure pointer comparison +
-// two string compares, so we expect single-digit ns per call. Locking in this
+// every GetComments call runs, via countVisibleComments (the real path,
+// with the focus key hoisted out of the loop). visibleInFocus itself is a
+// pure pointer comparison + two string compares once the key is hoisted, so
+// we expect single-digit ns per comment and zero allocs. Locking in this
 // assumption makes "should we add an index?" decisions evidence-based.
 //
 // Run: go test -bench=BenchmarkVisibleInFocus -benchmem
@@ -295,14 +296,8 @@ func BenchmarkVisibleInFocus(b *testing.B) {
 		f := Focus{Kind: FocusRange, Forge: "github", ChangeNumber: 295, DiffScope: DiffScopeLayer}
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
 			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				count := 0
-				for _, c := range comments {
-					if visibleInFocus(c, f) {
-						count++
-					}
-				}
-				if count == 0 {
+			for b.Loop() {
+				if count := countVisibleComments(comments, f); count == 0 {
 					b.Fatal("expected non-zero matches")
 				}
 			}

@@ -37,7 +37,7 @@ const lazyFileThreshold = 25
 // computeFileHash returns the hex-encoded SHA256 hash of data.
 func computeFileHash(data []byte) string {
 	h := sha256.Sum256(data)
-	return fmt.Sprintf("%x", h)
+	return hex.EncodeToString(h[:])
 }
 
 // fileHash returns a stable, prefixed hash string for file content tracking.
@@ -455,6 +455,7 @@ type Session struct {
 	writeMu             sync.Mutex
 	pendingWrite        bool
 	sharedURL           string
+	shareBaseURL        string
 	deleteToken         string
 	shareScope          string
 	shareOrg            string
@@ -512,6 +513,7 @@ type CritJSON struct {
 	UpdatedAt       string                  `json:"updated_at"`
 	ReviewRound     int                     `json:"review_round"`
 	ShareURL        string                  `json:"share_url,omitempty"`
+	ShareBaseURL    string                  `json:"share_base_url,omitempty"`
 	DeleteToken     string                  `json:"delete_token,omitempty"`
 	ShareScope      string                  `json:"share_scope,omitempty"`
 	ShareOrg        string                  `json:"share_org,omitempty"`
@@ -542,42 +544,6 @@ type CritJSON struct {
 	// buildCritJSON): as long as the field exists here, an externally-set story
 	// survives the debounced writes.
 	Story *Story `json:"story,omitempty"`
-}
-
-// UnmarshalJSON provides read compatibility for review files written before
-// the provider-neutral PendingRemoteDeletes queue existed. New review files
-// only write PendingRemoteDeletes; on read, the legacy GitHub and GitLab queues
-// are folded into it while every other field is decoded unchanged.
-func (cj *CritJSON) UnmarshalJSON(data []byte) error {
-	type plain CritJSON
-	var payload struct {
-		*plain
-		PendingGitHubDeletes []int64 `json:"pending_github_deletes"`
-		PendingGitLabDeletes []struct {
-			NoteID       int64  `json:"note_id"`
-			DiscussionID string `json:"discussion_id"`
-		} `json:"pending_gitlab_deletes"`
-	}
-	payload.plain = (*plain)(cj)
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return err
-	}
-	for _, id := range payload.PendingGitHubDeletes {
-		cj.PendingRemoteDeletes = appendUniqueRemoteRef(cj.PendingRemoteDeletes, RemoteRef{Forge: forge.GitHub, CommentID: id})
-	}
-	for _, ref := range payload.PendingGitLabDeletes {
-		cj.PendingRemoteDeletes = appendUniqueRemoteRef(cj.PendingRemoteDeletes, RemoteRef{Forge: forge.GitLab, CommentID: ref.NoteID, ThreadID: ref.DiscussionID})
-	}
-	return nil
-}
-
-func appendUniqueRemoteRef(refs []RemoteRef, ref RemoteRef) []RemoteRef {
-	for _, existing := range refs {
-		if existing == ref {
-			return refs
-		}
-	}
-	return append(refs, ref)
 }
 
 // RemoteDeletesFor returns one provider's pending delete operations.
@@ -1411,8 +1377,9 @@ func (s *Session) GetReviewComments() []Comment {
 	defer s.mu.RUnlock()
 	out := make([]Comment, 0, len(s.reviewComments))
 	seen := make(map[string]struct{}, len(s.reviewComments))
+	focusKey := focusKeyFor(s.Focus)
 	for _, c := range s.reviewComments {
-		if !visibleInFocus(c, s.Focus) {
+		if !visibleInFocusKey(c, focusKey, s.Focus) {
 			continue
 		}
 		if c.ID != "" {
@@ -1851,8 +1818,9 @@ func (s *Session) GetComments(filePath string) []Comment {
 		return []Comment{}
 	}
 	result := make([]Comment, 0, len(f.Comments))
+	focusKey := focusKeyFor(s.Focus)
 	for _, c := range f.Comments {
-		if !visibleInFocus(c, s.Focus) {
+		if !visibleInFocusKey(c, focusKey, s.Focus) {
 			continue
 		}
 		if len(c.Replies) > 0 {
@@ -2070,12 +2038,26 @@ func (s *Session) GetToken() string {
 }
 
 // SetSharedURLAndToken atomically updates both the shared URL and delete token.
+// Prefer SetSharedTarget when the deployment base URL is known.
 func (s *Session) SetSharedURLAndToken(url, token string) {
+	s.SetSharedTarget(url, "", token)
+}
+
+// SetSharedTarget binds the remote URL and delete token to the deployment that
+// issued them.
+func (s *Session) SetSharedTarget(url, baseURL, token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sharedURL = url
+	s.shareBaseURL = baseURL
 	s.deleteToken = token
 	s.scheduleWrite()
+}
+
+func (s *Session) GetShareBaseURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.shareBaseURL
 }
 
 // SetShareScope stores the scope hash for the current share.
@@ -2472,6 +2454,7 @@ func (s *Session) restoreShareStateLocked(cj *CritJSON) {
 		}
 		if shareScope(paths) == cj.ShareScope {
 			s.sharedURL = cj.ShareURL
+			s.shareBaseURL = cj.ShareBaseURL
 			s.deleteToken = cj.DeleteToken
 			s.shareScope = cj.ShareScope
 			s.shareOrg = cj.ShareOrg
@@ -2482,6 +2465,7 @@ func (s *Session) restoreShareStateLocked(cj *CritJSON) {
 	}
 	if cj.ShareURL != "" {
 		s.sharedURL = cj.ShareURL
+		s.shareBaseURL = cj.ShareBaseURL
 		s.deleteToken = cj.DeleteToken
 		s.shareOrg = cj.ShareOrg
 		s.shareOrgName = cj.ShareOrgName
@@ -2909,8 +2893,9 @@ func (s *Session) GetSessionInfo() SessionInfo {
 	defer s.mu.RUnlock()
 
 	reviewComments := make([]Comment, 0, len(s.reviewComments))
+	focusKey := focusKeyFor(s.Focus)
 	for _, c := range s.reviewComments {
-		if !visibleInFocus(c, s.Focus) {
+		if !visibleInFocusKey(c, focusKey, s.Focus) {
 			continue
 		}
 		reviewComments = append(reviewComments, c)

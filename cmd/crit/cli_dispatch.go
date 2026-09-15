@@ -54,7 +54,7 @@ Open a GitHub pull request for review.`},
 	{name: "mr", handler: runMR, help: `Usage: crit mr <iid|url>
 
 Open a GitLab merge request for review.`},
-	{name: "pull", handler: runPull, help: `Usage: crit pull [--output <dir>] [number|url]
+	{name: "pull", handler: runPull, help: `Usage: crit pull [--session <id>] [--output <dir>] [number|url]
 
 Fetch PR/MR comments into the local review file.`},
 	{name: "push", handler: runPush, help: `Usage: crit push [options] [number|url]
@@ -62,6 +62,7 @@ Fetch PR/MR comments into the local review file.`},
 Post local comments as a PR/MR review.
 
 Options:
+      --session <id>     Target an active review session
       --dry-run          Preview without posting
   -e, --event <type>     comment, approve, or request-changes
   -m, --message <text>   Review-level message
@@ -145,26 +146,32 @@ Options:
       --no-open           Do not open a browser
   -q, --quiet             On success, suppress connect/start status, tips, and session summary`},
 	{name: "story", handler: runStory, helpFn: printStoryUsage, bareHelp: true},
-	{name: "auth", handler: runAuth, help: `Usage: crit auth <login|logout|whoami>
+	{name: "auth", handler: runAuth, help: `Usage: crit auth <login|logout|whoami|status>
 
 Manage crit-web authentication.
 
 Commands:
   login     Log in to crit-web
   logout    Log out and revoke the saved token
-  whoami    Show the current user`, subcommands: []commandDescriptor{
-		{name: "login", help: `Usage: crit auth login [--force]
+	  whoami    Show the selected user
+	  status    List configured targets and identities`, subcommands: []commandDescriptor{
+		{name: "login", help: `Usage: crit auth login [--force] [--share-url <url>] [--set-default]
 
 Log in to crit-web with the device authorization flow.
 
 Options:
-      --force  Reauthenticate even when already logged in`},
-		{name: "logout", help: `Usage: crit auth logout
+      --force         Reauthenticate even when already logged in
+      --share-url     Add or update this target
+      --set-default   Make this the sole default target`},
+		{name: "logout", help: `Usage: crit auth logout [--share-url <url>]
 
 Revoke the current token and remove saved credentials.`},
 		{name: "whoami", help: `Usage: crit auth whoami
 
 Show the currently authenticated crit-web user.`},
+		{name: "status", help: `Usage: crit auth status [--share-url <url>]
+
+List configured share targets and their authentication state.`},
 	}},
 	{name: "stop", handler: runStop, help: `Usage: crit stop [--all] [file...]
 
@@ -304,8 +311,8 @@ Sharing:
   crit unpublish [file...]                   Remove a shared review from crit-web
 
 Remote review sync (provider auto-detected, or set "forge" in config):
-  crit pull [number|url]                     Fetch PR/MR comments into the review file
-  crit push [--dry-run] [number|url]         Post review comments to a PR/MR
+  crit pull [--session <id>] [number|url]    Fetch PR/MR comments into the review file
+  crit push [--session <id>] [--dry-run] [number|url]  Post review comments to a PR/MR
 
 Setup & management:
   crit install <agent>                       Install integration for an AI coding tool
