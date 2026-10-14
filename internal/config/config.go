@@ -34,13 +34,19 @@ type Config struct {
 	BaseBranch         string        `json:"base_branch,omitempty"`
 	IgnorePatterns     []string      `json:"ignore_patterns,omitempty"`
 	AutoViewedPatterns []string      `json:"auto_viewed_patterns,omitempty"`
-	NoIntegrationCheck bool          `json:"no_integration_check,omitempty"`
-	NoUpdateCheck      bool          `json:"no_update_check,omitempty"`
-	AgentCmd           string        `json:"agent_cmd,omitempty"`
-	AuthToken          string        `json:"auth_token,omitempty"`
-	AuthUserName       string        `json:"auth_user_name,omitempty"`
-	AuthUserEmail      string        `json:"auth_user_email,omitempty"`
-	AuthUserID         string        `json:"auth_user_id,omitempty"`
+	// DefaultMarkdownView selects the initial view for files that support
+	// document view (markdown with the Document/Diff toggle) in git mode.
+	// Allowed values: "diff" | "document". Empty (unset) keeps today's
+	// behavior: diff in git mode, document in file mode. Project overrides
+	// global (scalar, not unioned). No CLI flag.
+	DefaultMarkdownView string `json:"default_markdown_view,omitempty"`
+	NoIntegrationCheck  bool   `json:"no_integration_check,omitempty"`
+	NoUpdateCheck       bool   `json:"no_update_check,omitempty"`
+	AgentCmd            string `json:"agent_cmd,omitempty"`
+	AuthToken           string `json:"auth_token,omitempty"`
+	AuthUserName        string `json:"auth_user_name,omitempty"`
+	AuthUserEmail       string `json:"auth_user_email,omitempty"`
+	AuthUserID          string `json:"auth_user_id,omitempty"`
 	// PlanApproveMode selects the Claude Code permission mode after a plan-hook
 	// approval. Global-only so a repository cannot weaken a user's permission
 	// policy. Empty leaves Claude Code's current behavior unchanged.
@@ -50,6 +56,9 @@ type Config struct {
 	// becomes ready for the human. Defaults to false when unset (opt-in).
 	NotifyOnRoundReady *bool `json:"notify_on_round_ready,omitempty"`
 	DisableStats       bool  `json:"disable_stats,omitempty"`
+	// StaleReviewDays is global-only because the background sweep deletes
+	// reviews from every project, not just the current one.
+	StaleReviewDays *int `json:"stale_review_days,omitempty"`
 	// CloseOnApproveAfterMs, when set, auto-closes the review tab this many
 	// milliseconds after an Approve. Global-only (like open_cmd/agent_cmd) so
 	// a project repo cannot force tabs to close. Nil means disabled; the CLI
@@ -109,6 +118,19 @@ func (c Config) CloseOnApproveAfterMsEnabled() (ms int, enabled bool) {
 	return *c.CloseOnApproveAfterMs, true
 }
 
+// DefaultStaleReviewDays is the background sweep age when stale_review_days is unset.
+const DefaultStaleReviewDays = 14
+
+// StaleReviewDaysOrDefault returns the idle age in days after which the
+// background sweep deletes a review. Unset or non-positive values fall back to
+// DefaultStaleReviewDays.
+func (c Config) StaleReviewDaysOrDefault() int {
+	if c.StaleReviewDays == nil || *c.StaleReviewDays < 1 {
+		return DefaultStaleReviewDays
+	}
+	return *c.StaleReviewDays
+}
+
 // NotifyOnRoundReadyEnabled returns whether desktop notifications should fire
 // when a review round becomes ready. Defaults to false if not explicitly set.
 func (c Config) NotifyOnRoundReadyEnabled() bool {
@@ -163,16 +185,18 @@ func defaultConfig() generatedConfig {
 			"*.min.css",
 			".crit/",
 		},
-		AutoViewedPatterns: []string{},
-		AgentCmd:           "",
-		PlanApproveMode:    "",
-		CleanupOnApprove:   true,
-		NotifyOnRoundReady: false,
-		VCS:                "",
-		Forge:              "auto",
-		GitLabURL:          "https://gitlab.com",
-		Prompts:            map[string]string{},
-		Hooks:              map[string]string{},
+		AutoViewedPatterns:  []string{},
+		DefaultMarkdownView: "",
+		AgentCmd:            "",
+		PlanApproveMode:     "",
+		CleanupOnApprove:    true,
+		NotifyOnRoundReady:  false,
+		StaleReviewDays:     DefaultStaleReviewDays,
+		VCS:                 "",
+		Forge:               "auto",
+		GitLabURL:           "https://gitlab.com",
+		Prompts:             map[string]string{},
+		Hooks:               map[string]string{},
 	}
 }
 
@@ -187,27 +211,33 @@ type generatedConfig struct {
 	OpenCmd   string `json:"open_cmd"`
 	// Deprecated singleton fields remain in generated output for one release;
 	// share_targets is authoritative when present.
-	ShareURL           string            `json:"share_url"`
-	ProxyAuth          bool              `json:"proxy_auth"`
-	ShareTargets       []ShareTarget     `json:"share_targets"`
-	Quiet              bool              `json:"quiet"`
-	Output             string            `json:"output"`
-	Author             string            `json:"author"`
-	BaseBranch         string            `json:"base_branch"`
-	IgnorePatterns     []string          `json:"ignore_patterns"`
-	AutoViewedPatterns []string          `json:"auto_viewed_patterns"`
-	NoIntegrationCheck bool              `json:"no_integration_check"`
-	NoUpdateCheck      bool              `json:"no_update_check"`
-	DisableStats       bool              `json:"disable_stats"`
-	AgentCmd           string            `json:"agent_cmd"`
-	PlanApproveMode    string            `json:"plan_approve_mode"`
-	CleanupOnApprove   bool              `json:"cleanup_on_approve"`
-	NotifyOnRoundReady bool              `json:"notify_on_round_ready"`
-	VCS                string            `json:"vcs"`
-	Forge              string            `json:"forge"`
-	GitLabURL          string            `json:"gitlab_url"`
-	Prompts            map[string]string `json:"prompts"`
-	Hooks              map[string]string `json:"hooks"`
+	ShareURL            string        `json:"share_url"`
+	ProxyAuth           bool          `json:"proxy_auth"`
+	ShareTargets        []ShareTarget `json:"share_targets"`
+	Quiet               bool          `json:"quiet"`
+	Output              string        `json:"output"`
+	Author              string        `json:"author"`
+	BaseBranch          string        `json:"base_branch"`
+	IgnorePatterns      []string      `json:"ignore_patterns"`
+	AutoViewedPatterns  []string      `json:"auto_viewed_patterns"`
+	DefaultMarkdownView string        `json:"default_markdown_view"`
+	NoIntegrationCheck  bool          `json:"no_integration_check"`
+	NoUpdateCheck       bool          `json:"no_update_check"`
+	DisableStats        bool          `json:"disable_stats"`
+	AgentCmd            string        `json:"agent_cmd"`
+	PlanApproveMode     string        `json:"plan_approve_mode"`
+	CleanupOnApprove    bool          `json:"cleanup_on_approve"`
+	NotifyOnRoundReady  bool          `json:"notify_on_round_ready"`
+	// StaleReviewDays is included (unlike close_on_approve_after_ms) because
+	// scaffolding the default 14 is safe — the sweep already uses that value
+	// when the key is unset. close_on_approve_after_ms is omitted because a
+	// scaffolded 0 would enable auto-close.
+	StaleReviewDays int               `json:"stale_review_days"`
+	VCS             string            `json:"vcs"`
+	Forge           string            `json:"forge"`
+	GitLabURL       string            `json:"gitlab_url"`
+	Prompts         map[string]string `json:"prompts"`
+	Hooks           map[string]string `json:"hooks"`
 }
 
 func (c generatedConfig) String() string {
@@ -237,6 +267,7 @@ type ConfigPresence struct {
 	Quiet              bool
 	NoIntegrationCheck bool
 	NoUpdateCheck      bool
+	DisableStats       bool
 	CleanupOnApprove   bool
 	NotifyOnRoundReady bool
 	ShareConsented     bool
@@ -268,12 +299,17 @@ func LoadConfigFile(path string) (Config, ConfigPresence, error) {
 	_, presence.Quiet = raw["quiet"]
 	_, presence.NoIntegrationCheck = raw["no_integration_check"]
 	_, presence.NoUpdateCheck = raw["no_update_check"]
+	_, presence.DisableStats = raw["disable_stats"]
 	_, presence.CleanupOnApprove = raw["cleanup_on_approve"]
 	_, presence.NotifyOnRoundReady = raw["notify_on_round_ready"]
 	_, presence.ShareConsented = raw["share_consented"]
 
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, presence, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if !validDefaultMarkdownView(cfg.DefaultMarkdownView) {
+		fmt.Fprintf(os.Stderr, "Warning: invalid default_markdown_view %q in %s (want \"diff\" or \"document\"); ignoring\n", cfg.DefaultMarkdownView, path)
+		cfg.DefaultMarkdownView = ""
 	}
 	cfg.shareURLPresent = presence.ShareURL
 	cfg.shareTargetsPresent = presence.ShareTargets
@@ -295,14 +331,9 @@ func mergeConfigs(global, project Config, projectPresence ConfigPresence) Config
 	// Security: host is intentionally NOT merged from project config.
 	// A malicious repo setting host to "0.0.0.0" would disable the
 	// DNS-rebinding defense. Use --host flag or CRIT_HOST env var instead.
-	if projectPresence.NoOpen {
-		merged.NoOpen = project.NoOpen
-	}
 	// Security: proxy_auth is intentionally NOT merged from project config.
 	// It is global-only, like agent_cmd, auth_token, and share_url.
-	if projectPresence.Quiet {
-		merged.Quiet = project.Quiet
-	}
+	mergePresenceBools(&merged, &project, projectPresence)
 	if project.Output != "" {
 		merged.Output = project.Output
 	}
@@ -317,18 +348,6 @@ func mergeConfigs(global, project Config, projectPresence ConfigPresence) Config
 	}
 	merged.Forge = preferProjectString(project.Forge, merged.Forge)
 	merged.GitLabURL = preferProjectString(project.GitLabURL, merged.GitLabURL)
-	if projectPresence.NoIntegrationCheck {
-		merged.NoIntegrationCheck = project.NoIntegrationCheck
-	}
-	if projectPresence.NoUpdateCheck {
-		merged.NoUpdateCheck = project.NoUpdateCheck
-	}
-	if projectPresence.CleanupOnApprove {
-		merged.CleanupOnApprove = project.CleanupOnApprove
-	}
-	if projectPresence.NotifyOnRoundReady {
-		merged.NotifyOnRoundReady = project.NotifyOnRoundReady
-	}
 	if project.LiveCookie != "" {
 		merged.LiveCookie = project.LiveCookie
 	}
@@ -350,7 +369,9 @@ func mergeConfigs(global, project Config, projectPresence ConfigPresence) Config
 	// plan_approve_mode to prevent a repo from weakening the user's Claude Code
 	// permission policy after plan approval;
 	// close_on_approve_after_ms so a project repo cannot force the reviewer's
-	// tab to auto-close — that's a personal preference, not a repo policy.
+	// tab to auto-close — that's a personal preference, not a repo policy;
+	// stale_review_days so a project repo cannot shorten the retention of
+	// every other project's reviews.
 	// live_cookie/live_cookie_file/live_cdp_url DO merge from project config — common for local
 	// dev auth. Prefer live_cookie_file pointing at a gitignored path (e.g.
 	// .crit/live-cookies.txt) over committing live_cookie inline. live_cdp_url
@@ -359,9 +380,45 @@ func mergeConfigs(global, project Config, projectPresence ConfigPresence) Config
 	merged.IgnorePatterns = append(merged.IgnorePatterns, project.IgnorePatterns...)
 	// Union auto-viewed patterns (global + project both apply)
 	merged.AutoViewedPatterns = append(merged.AutoViewedPatterns, project.AutoViewedPatterns...)
+	// Scalar override (not unioned): a non-empty project value wins via
+	// preferProjectString. Empty keeps today's behavior (diff in git mode).
+	merged.DefaultMarkdownView = preferProjectString(project.DefaultMarkdownView, merged.DefaultMarkdownView)
 	mergeProjectPrompts(&merged, project)
 	mergeProjectHooks(&merged, project)
 	return merged
+}
+
+// mergePresenceBools copies project bool fields that use ConfigPresence so an
+// explicit false can override a global true. Pointer *bool fields are copied
+// by value (including nil) when present.
+func mergePresenceBools(merged, project *Config, presence ConfigPresence) {
+	if presence.NoOpen {
+		merged.NoOpen = project.NoOpen
+	}
+	if presence.Quiet {
+		merged.Quiet = project.Quiet
+	}
+	if presence.NoIntegrationCheck {
+		merged.NoIntegrationCheck = project.NoIntegrationCheck
+	}
+	if presence.NoUpdateCheck {
+		merged.NoUpdateCheck = project.NoUpdateCheck
+	}
+	if presence.DisableStats {
+		merged.DisableStats = project.DisableStats
+	}
+	if presence.CleanupOnApprove {
+		merged.CleanupOnApprove = project.CleanupOnApprove
+	}
+	if presence.NotifyOnRoundReady {
+		merged.NotifyOnRoundReady = project.NotifyOnRoundReady
+	}
+}
+
+// validDefaultMarkdownView reports whether v is an allowed
+// default_markdown_view value. Empty means unset (today's behavior).
+func validDefaultMarkdownView(v string) bool {
+	return v == "" || v == "diff" || v == "document"
 }
 
 func preferProjectString(project, global string) string {

@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/JoshEllinger/crit/internal/daemon"
-	"github.com/JoshEllinger/crit/internal/session"
 )
 
 // TestShareSyncMultiInstanceTargets exercises two independently-addressed
@@ -201,14 +200,8 @@ func TestShareSyncIntegration(t *testing.T) {
 		t.Fatalf("crit share failed: %s\n%s", err, out)
 	}
 
-	// First share output is just the URL
-	shareOutput := strings.TrimSpace(string(out))
-	// Extract the URL — it may be preceded by warnings on stderr
-	lines := strings.Split(shareOutput, "\n")
-	shareURL := lines[len(lines)-1]
-	if !strings.Contains(shareURL, "/r/") {
-		t.Fatalf("expected a review URL, got: %s", shareURL)
-	}
+	// Output may include warnings or the one-time login tip around the URL.
+	shareURL := extractURL(t, string(out))
 	token := path.Base(shareURL)
 	t.Logf("Shared to: %s (token: %s)", shareURL, token)
 
@@ -587,8 +580,9 @@ func documentFromAPI(t *testing.T, baseURL, token string) []map[string]any {
 // --- New test cases ---
 
 // TestShareSyncPreviewPreservesOriginalPath verifies the standalone preview
-// share keeps the source path as display metadata without renaming the crawled
-// entry HTML artifact.
+// share keeps the source path for both the crawled entry HTML artifact and the
+// review title (#983). internal/preview's TestShareSyncPreviewOriginalPath_*
+// cover assets, og tags, absolute paths and comment round-trips.
 func TestShareSyncPreviewPreservesOriginalPath(t *testing.T) {
 	baseURL := critWebURL(t)
 	binary := critBinary(t)
@@ -614,8 +608,8 @@ func TestShareSyncPreviewPreservesOriginalPath(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("expected 1 crawled file, got %d", len(files))
 	}
-	if files[0]["path"] != session.PreviewMainHTMLKey {
-		t.Errorf("preview artifact path = %v, want %q", files[0]["path"], session.PreviewMainHTMLKey)
+	if files[0]["path"] != filepath.ToSlash(originalPath) {
+		t.Errorf("preview artifact path = %v, want %q", files[0]["path"], filepath.ToSlash(originalPath))
 	}
 
 	resp, err := http.Get(fmt.Sprintf("%s/r/%s", baseURL, token))
@@ -2356,6 +2350,39 @@ func TestShareSyncOrgVisibility(t *testing.T) {
 	doc := reviewDocFromAPI(t, baseURL, token, authToken)
 	visibility, _ := doc["visibility"].(string)
 	if visibility != "unlisted" {
+		t.Errorf("expected visibility 'unlisted', got %q", visibility)
+	}
+
+	// Org-scoped review should NOT be accessible without auth
+	reviewDocInaccessible(t, baseURL, token)
+}
+
+// TestShareSyncPreviewOrgVisibility verifies `crit share --preview` sends
+// --org and --visibility instead of dropping them.
+func TestShareSyncPreviewOrgVisibility(t *testing.T) {
+	baseURL := critWebURL(t)
+	binary := critBinary(t)
+	dir := t.TempDir()
+	authToken, userID, _ := seedUser(t, baseURL, "Preview Vis Sharer")
+	slug := seedOrg(t, baseURL, userID, "Preview Vis Org", fmt.Sprintf("preview-vis-%d", time.Now().UnixNano()))
+
+	if err := os.WriteFile(filepath.Join(dir, "design.html"), []byte("<!doctype html><h1>Design</h1>"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(binary, "share", "--share-url", baseURL, "--preview", "design.html", "--org", slug, "--visibility", "unlisted")
+	cmd.Dir = dir
+	cmd.Env = append(envWithout("CRIT_AUTH_TOKEN=", "HOME=", "CRIT_SHARE_URL="), "HOME="+t.TempDir(), "CRIT_AUTH_TOKEN="+authToken)
+	out, err := cmd.CombinedOutput()
+	output := strings.TrimSpace(string(out))
+	if err != nil {
+		t.Fatalf("crit share --preview failed: %s\n%s", err, output)
+	}
+	logReview(t, output)
+	token := extractToken(t, output)
+
+	doc := reviewDocFromAPI(t, baseURL, token, authToken)
+	if visibility, _ := doc["visibility"].(string); visibility != "unlisted" {
 		t.Errorf("expected visibility 'unlisted', got %q", visibility)
 	}
 

@@ -332,7 +332,7 @@ func TestCommentCLIGuard_LiveReview(t *testing.T) {
 	if err := saveCritJSON(critPath, cj); err != nil {
 		t.Fatalf("saveCritJSON: %v", err)
 	}
-	err := checkCommentCLIAllowed(critPath)
+	err := checkCommentCLIAllowed(critPath, "crit comment <path>:<line>")
 	if err == nil {
 		t.Fatal("expected error for live review")
 	}
@@ -348,7 +348,7 @@ func TestCommentCLIGuard_CodeReview_Allowed(t *testing.T) {
 	if err := saveCritJSON(critPath, cj); err != nil {
 		t.Fatalf("saveCritJSON: %v", err)
 	}
-	if err := checkCommentCLIAllowed(critPath); err != nil {
+	if err := checkCommentCLIAllowed(critPath, "crit comment <path>:<line>"); err != nil {
 		t.Errorf("code review should allow crit comment: %v", err)
 	}
 }
@@ -860,7 +860,7 @@ func TestCarryForwardComment_PreservesLivePinFields(t *testing.T) {
 		DriftedOnRound: 2,
 	}
 
-	carried := carryForwardComment(old, "pin-new", "2026-02-01T00:00:00Z")
+	carried := carryForwardComment(old, "2026-02-01T00:00:00Z")
 
 	if carried.DOMAnchor == nil {
 		t.Fatal("DOMAnchor lost on carry-forward")
@@ -900,7 +900,7 @@ func TestCarryForwardComment_CodeCommentDriftPreserved(t *testing.T) {
 		DriftedOnRound: 2,
 	}
 
-	carried := carryForwardComment(old, "code-new", "2026-02-01T00:00:00Z")
+	carried := carryForwardComment(old, "2026-02-01T00:00:00Z")
 
 	if !carried.Drifted {
 		t.Error("Drifted = false, want true (code comments preserve drift)")

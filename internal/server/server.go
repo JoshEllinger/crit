@@ -69,6 +69,7 @@ type Server struct {
 	agentCmd            string
 	currentVersion      string
 	latestVersion       string
+	installationSource  string
 	versionMu           sync.RWMutex
 	staleIntegrations   []StaleIntegration
 	missingIntegrations []string
@@ -99,10 +100,19 @@ type Server struct {
 	// SIGINT/SIGTERM cancels them instead of leaking. Set via
 	// SetShutdownCtx; nil in tests, in which case a background context is used.
 	shutdownCtx context.Context
+	// stopDaemon cancels shutdownCtx. Set via SetStopFunc; nil in tests.
+	stopDaemon func()
 	// bgWG tracks long-running background goroutines (e.g. agent subprocess
 	// runners) that must complete before the daemon writes the review file
 	// during shutdown. The shutdown path Wait()s on this with a timeout.
 	bgWG sync.WaitGroup
+
+	// relaySharedLines holds the comment lines of the last payload built for
+	// the browser's proxy relay. The browser uploads it itself, and crit only
+	// learns of success from the POST /api/share-url that follows, which is
+	// where the lines are recorded. Guarded by relaySharedLinesMu.
+	relaySharedLines   map[string]session.SharedLine
+	relaySharedLinesMu sync.Mutex
 
 	// sessionStartedAt records when the daemon started, used by stats recording.
 	sessionStartedAt time.Time
@@ -122,7 +132,7 @@ type Server struct {
 
 // NewServer creates a Server with the given session and configuration.
 func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth bool, authToken string, author string, currentVersion string, port int, agentCmd string) (*Server, error) {
-	s := &Server{assets: frontendFS, shareURL: shareURL, proxyAuth: proxyAuth, authToken: authToken, author: author, agentCmd: agentCmd, currentVersion: currentVersion, port: port, prList: &PRListCache{}, codeFontDiscovery: discoverCodeFontFamilies}
+	s := &Server{assets: frontendFS, shareURL: shareURL, proxyAuth: proxyAuth, authToken: authToken, author: author, agentCmd: agentCmd, currentVersion: currentVersion, installationSource: detectInstallationSource(), port: port, prList: &PRListCache{}, codeFontDiscovery: discoverCodeFontFamilies}
 	if session != nil {
 		s.session.Store(session)
 	}
@@ -137,6 +147,9 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/preview", s.serveIndexHTML())
 	mux.HandleFunc("/preview-content/", s.handlePreviewContent)
 	mux.HandleFunc("/preview-content", s.handlePreviewContent)
+
+	// Theme preview page — static samples, no session needed.
+	mux.HandleFunc("/themes", s.serveHTML("themes.html"))
 
 	// Live-mode routes — NOT wrapped in withReady.
 	mux.HandleFunc("/live", s.serveIndexHTML())
@@ -159,6 +172,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/live-mode-round-resolve.js", s.serveEmbeddedJS("live-mode-round-resolve.js"))
 	mux.HandleFunc("/live-mode-round-tooltip.js", s.serveEmbeddedJS("live-mode-round-tooltip.js"))
 	mux.HandleFunc("/live-mode.menu-controller.js", s.serveEmbeddedJS("live-mode.menu-controller.js"))
+	mux.HandleFunc("/crit-settings-panes.js", s.serveEmbeddedJS("crit-settings-panes.js"))
 
 	// Session-dependent endpoints (guarded by withReady middleware)
 	mux.HandleFunc("/api/review-cycle", s.withReady(s.handleReviewCycle))
@@ -177,6 +191,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/api/share-url", s.withReady(s.handleShareURL))
 	mux.HandleFunc("/api/comments/merge", s.withReady(s.handleMergeComments))
 	mux.HandleFunc("/api/finish", s.withReady(s.handleFinish))
+	mux.HandleFunc("/api/shutdown", s.handleShutdown)
 	mux.HandleFunc("/api/events", s.withReady(s.handleEvents))
 	mux.HandleFunc("/api/wait-for-event", s.withReady(s.handleWaitForEvent))
 	mux.HandleFunc("/api/round-complete", s.withReady(s.handleRoundComplete))
@@ -192,6 +207,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/api/comments", s.withReady(s.handleReviewComments))
 	mux.HandleFunc("/api/review-comment/", s.withReady(s.handleReviewCommentByID))
 	mux.HandleFunc("/api/files/list", s.withReady(s.handleFilesList))
+	mux.HandleFunc("/api/files/comments", s.withReady(s.handleAllFileComments))
 	mux.HandleFunc("/api/story", s.withReady(s.handleStory))
 
 	// File-scoped endpoints (use ?path= query param)
@@ -212,6 +228,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 
 	// Static file serving (repo files need session; embedded assets do not)
 	mux.HandleFunc("/files/", s.withReady(s.handleFiles))
+	mux.Handle(precompressedPrefix, servePrecompressed(frontendFS))
 	mux.Handle("/", http.FileServer(http.FS(frontendFS)))
 
 	s.mux = mux
@@ -366,6 +383,12 @@ func (s *Server) SetShutdownCtx(ctx context.Context) {
 	s.shutdownCtx = ctx
 }
 
+// SetStopFunc wires the cancel func of the daemon's shutdown context, which
+// POST /api/shutdown calls.
+func (s *Server) SetStopFunc(stop func()) {
+	s.stopDaemon = stop
+}
+
 // effectiveCtx returns the daemon shutdown ctx if set, otherwise a background
 // ctx. Used by background goroutines so test paths (which don't run a real
 // daemon and never call SetShutdownCtx) keep working.
@@ -480,20 +503,21 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) { //nolint
 		selectedURL = selected.URL
 	}
 	resp := map[string]interface{}{
-		"share_targets":     targetMetadata(targets),
-		"share_base_url":    sess.GetShareBaseURL(),
-		"hosted_url":        sess.GetSharedURL(),
-		"hosted_token":      sess.GetToken(),
-		"delete_token":      sess.GetDeleteToken(),
-		"share_org":         shareOrg,
-		"share_org_name":    shareOrgName,
-		"share_visibility":  shareVis,
-		"version":           s.currentVersion,
-		"latest_version":    latestVersion,
-		"author":            s.author,
-		"agent_cmd_enabled": s.agentCmd != "",
-		"agent_name":        agentName(s.agentCmd),
-		"agent_cmd":         s.agentCmd,
+		"share_targets":       targetMetadata(targets),
+		"share_base_url":      sess.GetShareBaseURL(),
+		"hosted_url":          sess.GetSharedURL(),
+		"hosted_token":        sess.GetToken(),
+		"delete_token":        sess.GetDeleteToken(),
+		"share_org":           shareOrg,
+		"share_org_name":      shareOrgName,
+		"share_visibility":    shareVis,
+		"version":             s.currentVersion,
+		"latest_version":      latestVersion,
+		"installation_source": s.installationSource,
+		"author":              s.author,
+		"agent_cmd_enabled":   s.agentCmd != "",
+		"agent_name":          agentName(s.agentCmd),
+		"agent_cmd":           s.agentCmd,
 
 		// Auth status
 		"auth_logged_in":  selectedErr == nil && selected.Auth.Token != "",
@@ -509,6 +533,11 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) { //nolint
 
 		// Glob patterns the frontend auto-marks viewed (collapsed) once per launch
 		"auto_viewed_patterns": s.cfg.AutoViewedPatterns,
+
+		// Initial view for files with a Document/Diff toggle (markdown) in
+		// git mode: "document" forces document view, anything else keeps the
+		// historical default (diff in git mode, document in file mode).
+		"default_markdown_view": s.cfg.DefaultMarkdownView,
 
 		// Available integrations (always included)
 		"integrations_available": availableIntegrations(),
@@ -703,12 +732,17 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 // serveIndexHTML returns a handler that serves the embedded index.html shell.
 // Used for routes (such as /live and /preview) that all render the same shell.
 func (s *Server) serveIndexHTML() http.HandlerFunc {
+	return s.serveHTML("index.html")
+}
+
+// serveHTML serves an embedded HTML page at a clean path (e.g. /themes).
+func (s *Server) serveHTML(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		f, err := s.assets.Open("index.html")
+		f, err := s.assets.Open(name)
 		if err != nil {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -716,7 +750,7 @@ func (s *Server) serveIndexHTML() http.HandlerFunc {
 		defer f.Close()
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if _, err := io.Copy(w, f); err != nil {
-			log.Printf("serveIndexHTML: %v", err)
+			log.Printf("serveHTML %s: %v", name, err)
 		}
 	}
 }
@@ -925,6 +959,9 @@ func (s *Server) handleShareURL(w http.ResponseWriter, r *http.Request) { //noli
 		// direct POST /api/share path) so the shared status is restored on
 		// restart in proxy-auth mode too, not just direct mode.
 		s.session.Load().SetShareScope(share.ShareScope(s.session.Load().FilePathsSnapshot()))
+		if lines := s.takeRelaySharedLines(); lines != nil {
+			s.recordSharedLines(lines)
+		}
 		if s.configConfigured {
 			_ = config.MutateShareTargets(func(_ *[]config.ShareTarget) error { return nil })
 		}
@@ -934,6 +971,7 @@ func (s *Server) handleShareURL(w http.ResponseWriter, r *http.Request) { //noli
 		})
 
 	case http.MethodDelete:
+		s.takeRelaySharedLines() // a pending relay record belongs to the share being removed
 		// Unpublish from crit-web unless the caller already deleted remotely
 		// (proxy_auth popup path passes local_only=1 after the relay DELETE).
 		localOnly := r.URL.Query().Get("local_only") == "1"
@@ -966,7 +1004,7 @@ func (s *Server) handleShareURL(w http.ResponseWriter, r *http.Request) { //noli
 func (s *Server) shareFilesForSession() (files []ShareFile, reviewType string, err error) {
 	sess := s.session.Load()
 	if sess != nil && sess.ReviewType == "preview" {
-		files, err = session.CrawlPreview(sess.Origin)
+		files, err = session.CrawlPreview(sess.Origin, s.previewEntryPath(sess))
 		if err != nil {
 			return nil, "", fmt.Errorf("crawling preview assets: %w", err)
 		}
@@ -975,28 +1013,31 @@ func (s *Server) shareFilesForSession() (files []ShareFile, reviewType string, e
 	return sess.LoadShareFilesFromDisk(), "", nil
 }
 
-// shareCLIArgsForSession prefers persisted metadata. Preview metadata is
-// normalized to the canonical ["preview", path] shape and falls back to the
-// live session when the persisted value is stale or malformed. File-review
-// sessions retain their existing review.json-only behavior.
+// shareCLIArgsForSession returns the cli_args sent with a share. For preview
+// sessions it is the canonical ["preview", entryPath] shape, where entryPath
+// is the previewed file's path relative to the session root (see
+// session.PreviewEntryPath). crit-web uses it as the review title and the
+// crawl keys the entry HTML by the same value, so title and artifact path
+// match. NewPreviewSession always sets Origin; a preview session without one
+// gets nil. File-review sessions retain their existing review.json-only
+// behavior.
 func (s *Server) shareCLIArgsForSession(sess *Session) []string {
 	if sess == nil {
 		return nil
 	}
-	cliArgs := share.LoadCliArgsFromReviewFile(sess.CritJSONPath())
 	if sess.ReviewType != "preview" {
-		return cliArgs
+		return share.LoadCliArgsFromReviewFile(sess.CritJSONPath())
 	}
-	if len(cliArgs) >= 2 && cliArgs[0] == "preview" && cliArgs[1] != "" {
-		return []string{"preview", cliArgs[1]}
+	if sess.Origin == "" {
+		return nil
 	}
-	if len(sess.CLIArgs) >= 2 && sess.CLIArgs[0] == "preview" && sess.CLIArgs[1] != "" {
-		return []string{"preview", sess.CLIArgs[1]}
-	}
-	if sess.Origin != "" {
-		return []string{"preview", sess.Origin}
-	}
-	return nil
+	return []string{"preview", s.previewEntryPath(sess)}
+}
+
+// previewEntryPath is the share-payload path of a preview session's HTML —
+// the crawl key, the comment re-key and the title shareCLIArgsForSession sends.
+func (s *Server) previewEntryPath(sess *Session) string {
+	return session.PreviewEntryPath(sess.Origin, sess.RepoRoot)
 }
 
 func (s *Server) writeExistingShareIfPresent(w http.ResponseWriter) (bool, error) {
@@ -1040,6 +1081,9 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) { //nolint:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// A direct share records its own lines; drop any left from a relay upload
+	// that never confirmed, so a later POST /api/share-url can't write them.
+	s.takeRelaySharedLines()
 	// Read file content for the share. Preview sessions crawl the previewed
 	// HTML origin + assets; other sessions use the on-disk review files (kept
 	// current by review.SaveCritJSON). shareFilesForSession is the single source of
@@ -1054,10 +1098,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) { //nolint:
 		return
 	}
 
-	filePaths := make([]string, len(files))
-	for i, f := range files {
-		filePaths[i] = f.Path
-	}
+	filePaths := share.ShareFilePaths(files)
 
 	// Parse optional org + visibility from request body.
 	var shareReq struct {
@@ -1095,7 +1136,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) { //nolint:
 	critPath := s.session.Load().CritJSONPath()
 
 	// Comments are loaded from the review file by their session path. For a
-	// preview the uploaded files are crawled (keyed "index.html"), but the
+	// preview the uploaded files are crawled (keyed by the entry path), but the
 	// comments live under the session's previewed-file path — pass that so they
 	// load, then shareReviewFiles re-keys them to the crawl entry. The scope is
 	// always the session's file identity so restoreShareStateLocked matches it
@@ -1122,6 +1163,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) { //nolint:
 	s.session.Load().SetSharedTarget(res.URL, target.URL, res.DeleteToken)
 	s.session.Load().SetShareScope(share.ShareScope(scopePaths))
 	s.session.Load().SetShareOrgInfo(shareReq.Org, shareReq.OrgName, shareReq.Visibility)
+	s.recordSharedLines(share.SharedLines(res.Comments))
 	if s.configConfigured {
 		_ = config.MutateShareTargets(func(_ *[]config.ShareTarget) error { return nil })
 	}
@@ -1270,13 +1312,11 @@ func (s *Server) handleSharePayload(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "no files in session"})
 		return
 	}
-	filePaths := make([]string, len(files))
-	for i, f := range files {
-		filePaths[i] = f.Path
-	}
+	filePaths := share.ShareFilePaths(files)
 	critPath := sess.CritJSONPath()
 	comments, reviewRound := share.LoadCommentsForShare(critPath, filePaths, s.author)
 	cliArgs := share.LoadCliArgsFromReviewFile(critPath)
+	s.setRelaySharedLines(comments)
 	writeJSON(w, share.BuildSharePayload(files, comments, reviewRound, cliArgs, "", "", ""))
 }
 
@@ -1296,7 +1336,8 @@ func (s *Server) handlePreviewPayload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not a preview session", http.StatusBadRequest)
 		return
 	}
-	files, err := session.CrawlPreview(sess.Origin)
+	entryPath := s.previewEntryPath(sess)
+	files, err := session.CrawlPreview(sess.Origin, entryPath)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1306,7 +1347,8 @@ func (s *Server) handlePreviewPayload(w http.ResponseWriter, r *http.Request) {
 	// POST /api/share path. Comments span all session paths (DOM pins live on
 	// live-route entries, not the HTML's "code" entry), so load across all of
 	// them — not just the first. Without this, sharing via popup loses comments.
-	comments, reviewRound := share.LoadPreviewShareComments(sess.CritJSONPath(), sess.FilePathsSnapshot(), s.author)
+	comments, reviewRound := share.LoadPreviewShareComments(sess.CritJSONPath(), sess.FilePathsSnapshot(), s.author, entryPath)
+	s.setRelaySharedLines(comments)
 	if reviewRound == 0 {
 		reviewRound = 1
 	}
@@ -1339,22 +1381,38 @@ func (s *Server) handleUpsertPayload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	critPath := sess.CritJSONPath()
-	var comments []shareComment
-	var reviewRound int
-	if reviewType == "preview" {
-		// Load comments across all session paths (DOM pins on live-route entries)
-		// and collapse onto the crawl entry, matching the initial-share payload.
-		comments, reviewRound = share.LoadPreviewShareComments(critPath, sess.FilePathsSnapshot(), s.author)
-	} else {
-		filePaths := make([]string, len(files))
-		for i, f := range files {
-			filePaths[i] = f.Path
-		}
-		comments, reviewRound = share.LoadCommentsForShare(critPath, filePaths, s.author)
-	}
+	// Preview: load across all session paths (DOM pins on live-route entries)
+	// and collapse onto the crawl entry, matching the initial-share payload.
+	comments, reviewRound := share.LoadShareComments(critPath, files, sess.FilePathsSnapshot(), share.ShareFilePaths(files), s.author, reviewType)
 	cliArgs := s.shareCLIArgsForSession(sess)
 	deleteToken := sess.GetDeleteToken()
+	s.setRelaySharedLines(comments)
 	writeJSON(w, buildUpsertPayload(files, comments, deleteToken, reviewRound, cliArgs))
+}
+
+// setRelaySharedLines remembers the comment lines of a payload handed to the
+// browser's proxy relay, until POST /api/share-url confirms the upload.
+func (s *Server) setRelaySharedLines(comments []shareComment) {
+	s.relaySharedLinesMu.Lock()
+	s.relaySharedLines = share.SharedLines(comments)
+	s.relaySharedLinesMu.Unlock()
+}
+
+func (s *Server) takeRelaySharedLines() map[string]session.SharedLine {
+	s.relaySharedLinesMu.Lock()
+	defer s.relaySharedLinesMu.Unlock()
+	lines := s.relaySharedLines
+	s.relaySharedLines = nil
+	return lines
+}
+
+// recordSharedLines flushes pending session state so the review file exists
+// and holds the new share fields, then writes the shared comment lines.
+// Best effort: without a record, a later pull keeps local placements.
+func (s *Server) recordSharedLines(lines map[string]session.SharedLine) {
+	sess := s.session.Load()
+	_ = sess.SyncWriteFiles()
+	_ = share.RecordSharedLines(sess.CritJSONPath(), lines)
 }
 
 // handleSharePull fetches remote comments from crit-web (with the local bearer
@@ -1386,6 +1444,7 @@ func (s *Server) handleShareReshare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.takeRelaySharedLines() // see handleShare
 
 	merged, repliesUpdated := s.softPullForReshare(w)
 	if merged < 0 {
@@ -1415,7 +1474,7 @@ func (s *Server) handleShareReshare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Non-fatal if local hash/round persistence fails — remote upsert already succeeded.
-	_ = share.UpdateShareState(sess.CritJSONPath(), share.ComputeShareHash(files, comments), result.ReviewRound)
+	_ = share.UpdateShareState(sess.CritJSONPath(), files, comments, result.ReviewRound, result.Sent)
 	sess.SyncCommentsFromDisk()
 
 	writeJSON(w, map[string]any{
@@ -1453,16 +1512,7 @@ func (s *Server) reshareUpsertInputs(sess *Session, hostedURL, deleteToken strin
 	}
 
 	critPath := sess.CritJSONPath()
-	var comments []shareComment
-	if reviewType == "preview" {
-		comments, _ = share.LoadPreviewShareComments(critPath, sess.FilePathsSnapshot(), s.author)
-	} else {
-		filePaths := make([]string, len(files))
-		for i, f := range files {
-			filePaths[i] = f.Path
-		}
-		comments, _ = share.LoadCommentsForShare(critPath, filePaths, s.author)
-	}
+	comments, _ := share.LoadShareComments(critPath, files, sess.FilePathsSnapshot(), share.ShareFilePaths(files), s.author, reviewType)
 
 	existingCfg := CritJSON{
 		ShareURL:     hostedURL,
@@ -1503,6 +1553,16 @@ func (s *Server) pullAndMergeRemoteComments() (merged, repliesUpdated int, err e
 		return 0, 0, errNoSharedReview
 	}
 	critPath := sess.CritJSONPath()
+	// Flush pending edits and cancel the debounced save first. Otherwise a
+	// save firing after MergeWebComments rewrites the review file from
+	// in-memory state and drops the comments just pulled — and a re-share
+	// then deletes them on crit-web. Skip it when there is no review file,
+	// so a missing file still reports as an error below.
+	if _, statErr := os.Stat(review.ReviewPathsFor(critPath).Review); statErr == nil {
+		if err := sess.SyncWriteFiles(); err != nil {
+			return 0, 0, fmt.Errorf("flushing review before pull: %w", err)
+		}
+	}
 	data, readErr := session.ReadFileShared(review.ReviewPathsFor(critPath).Review)
 	if readErr != nil {
 		if os.IsNotExist(readErr) {
@@ -1515,25 +1575,45 @@ func (s *Server) pullAndMergeRemoteComments() (merged, repliesUpdated int, err e
 		return 0, 0, err
 	}
 
-	localIDs := share.BuildLocalIDSet(cj)
-	localFingerprints, localFingerprintIDs := share.BuildLocalFingerprintIndex(cj)
 	target, targetErr := s.targetForRequest("")
 	if targetErr != nil {
 		return 0, 0, targetErr
 	}
-	fetched, err := share.FetchWebCommentsFromTarget(hostedURL, target.URL, localIDs, localFingerprints, localFingerprintIDs, target.Auth.Token)
+	fetched, err := share.FetchWebCommentsForReview(hostedURL, target.URL, cj, target.Auth.Token)
 	if err != nil {
 		return 0, 0, err
 	}
-	if len(fetched.NewComments) == 0 && len(fetched.ReplyUpdates) == 0 {
+	if !share.FetchHasUpdates(fetched) {
 		sess.SyncCommentsFromDisk()
 		return 0, 0, nil
 	}
-	if err := share.MergeWebComments(critPath, fetched.NewComments, fetched.ReplyUpdates); err != nil {
+	rekeyPulledPreviewComments(sess, fetched.NewComments)
+	if err := share.MergeFetchedComments(critPath, fetched); err != nil {
 		return 0, 0, err
 	}
 	sess.SyncCommentsFromDisk()
 	return len(fetched.NewComments), len(fetched.ReplyUpdates), nil
+}
+
+// rekeyPulledPreviewComments files comments pulled into a preview session
+// under the previewed HTML's session path. crit-web keys them by the payload
+// path (the entry path, or "index.html" for older shares), which is not a
+// session file when the HTML is outside the session root. Under such a key
+// the session never loads them and drops them on its next save, and the next
+// re-share then deletes them on crit-web.
+func rekeyPulledPreviewComments(sess *Session, comments []share.WebComment) {
+	if sess == nil || sess.ReviewType != "preview" {
+		return
+	}
+	paths := sess.FilePathsSnapshot()
+	if len(paths) == 0 {
+		return
+	}
+	for i := range comments {
+		if comments[i].Scope != "review" && comments[i].FilePath != "" {
+			comments[i].FilePath = paths[0]
+		}
+	}
 }
 
 var (
@@ -1795,6 +1875,33 @@ func serveFileDiffAtRound(w http.ResponseWriter, r *http.Request, session *Sessi
 	}
 	writeJSON(w, resp)
 	return true
+}
+
+// handleAllFileComments returns every file's visible comments in one
+// response, keyed by path. The page loads diffs lazily on large reviews, and
+// fetching comments per file costs one request each, so it reads them all
+// here instead.
+func (s *Server) handleAllFileComments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	round, hasRound, valid := parseRoundParam(w, r)
+	if !valid {
+		return
+	}
+	sess := s.session.Load()
+	byPath := sess.GetVisibleComments()
+	if hasRound && sess.Mode == "files" {
+		for path, comments := range byPath {
+			if atRound := commentsAtOrBeforeRound(comments, round); len(atRound) > 0 {
+				byPath[path] = atRound
+			} else {
+				delete(byPath, path)
+			}
+		}
+	}
+	writeJSON(w, byPath)
 }
 
 // handleFileComments handles GET (list) and POST (create) for file-scoped comments.
@@ -2457,7 +2564,11 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	// $CRIT_REVIEW_PATH; failures/timeouts are logged and never block finish.
 	s.runFinishHooks(sess, approved, stats)
 
-	writeJSON(w, map[string]any{
+	// Auto-close-after-approve delay travels with the finish payload so the
+	// browser does not need a second /api/config round-trip after approval.
+	// That round-trip races with stopDaemonOnApproval, which stops the daemon
+	// as soon as the approved finish response has been processed.
+	finishResp := map[string]any{
 		"status":       "finished",
 		"prompt":       prompt,
 		"approved":     approved,
@@ -2465,18 +2576,29 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		"next_command": nextCommand,
 		"stats":        stats,
 		"prompt_meta":  promptMeta,
-	})
+	}
+	if ms, enabled := s.cfg.CloseOnApproveAfterMsEnabled(); enabled {
+		finishResp["close_on_approve_after_ms"] = ms
+	}
+	// The finish event below lets a waiting client stop the daemon at once, so
+	// the browser's response must be complete on the wire before it is sent.
+	writeJSONComplete(w, finishResp)
 
 	// Encode approved status into SSE event content as JSON so review-cycle
 	// clients can extract it without string matching on the prompt.
-	eventData, _ := json.Marshal(map[string]any{
+	// Mirror the finish response so review-cycle consumers see the same fields.
+	eventDataMap := map[string]any{
 		"prompt":       prompt,
 		"approved":     approved,
 		"stats":        stats,
 		"comments":     comments,
 		"next_command": nextCommand,
 		"prompt_meta":  promptMeta,
-	})
+	}
+	if ms, enabled := s.cfg.CloseOnApproveAfterMsEnabled(); enabled {
+		eventDataMap["close_on_approve_after_ms"] = ms
+	}
+	eventData, _ := json.Marshal(eventDataMap)
 	sess.Notify(SSEEvent{
 		Type:    "finish",
 		Content: string(eventData),
@@ -2540,6 +2662,38 @@ func buildCommentsListCommand(sess *Session) string {
 // changes do not require a bump. Clients treat a missing field as version 0.
 const APIVersion = 1
 
+// handleShutdown stops the daemon the way SIGTERM does: in-flight responses
+// complete and browsers receive server-shutdown. It is readiness-gated because
+// an initialising daemon cannot act on the stop until init ends.
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Any page script, even a same-origin preview, sends Sec-Fetch-Site or
+	// Origin; only the CLI may stop the daemon.
+	if r.Header.Get("Sec-Fetch-Site") != "" || r.Header.Get("Origin") != "" {
+		http.Error(w, "Forbidden: shutdown is CLI-only", http.StatusForbidden)
+		return
+	}
+	// The caller names the daemon it means, so a stale session entry whose
+	// port now belongs to another daemon cannot stop that one, even while it
+	// is still initialising.
+	if pid, err := strconv.Atoi(r.URL.Query().Get("pid")); err != nil || pid != os.Getpid() {
+		http.Error(w, "pid does not match this daemon", http.StatusConflict)
+		return
+	}
+	if !s.requireReady(w) {
+		return
+	}
+	if s.stopDaemon == nil {
+		http.Error(w, "shutdown not available", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, map[string]any{"status": "stopping"})
+	s.stopDaemon()
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2599,19 +2753,20 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 				sess.SetAwaitingFirstReview(false)
 				// Parse the structured finish event data
 				var finishData struct {
-					Prompt      string                  `json:"prompt"`
-					Approved    bool                    `json:"approved"`
-					Stats       map[string]any          `json:"stats"`
-					Comments    []comment.ListedComment `json:"comments"`
-					PromptMeta  *prompt.Meta            `json:"prompt_meta"`
-					NextCommand string                  `json:"next_command"`
+					Prompt                string                  `json:"prompt"`
+					Approved              bool                    `json:"approved"`
+					Stats                 map[string]any          `json:"stats"`
+					Comments              []comment.ListedComment `json:"comments"`
+					PromptMeta            *prompt.Meta            `json:"prompt_meta"`
+					NextCommand           string                  `json:"next_command"`
+					CloseOnApproveAfterMs *int                    `json:"close_on_approve_after_ms"`
 				}
 				json.Unmarshal([]byte(event.Content), &finishData)
 				nextCommand := finishData.NextCommand
 				if nextCommand == "" {
 					nextCommand = session.NextRoundCommand(sess)
 				}
-				writeJSON(w, map[string]any{
+				cycleResp := map[string]any{
 					"status":       "finished",
 					"prompt":       finishData.Prompt,
 					"approved":     finishData.Approved,
@@ -2619,7 +2774,11 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 					"stats":        finishData.Stats,
 					"next_command": nextCommand,
 					"prompt_meta":  finishData.PromptMeta,
-				})
+				}
+				if finishData.CloseOnApproveAfterMs != nil {
+					cycleResp["close_on_approve_after_ms"] = *finishData.CloseOnApproveAfterMs
+				}
+				writeJSON(w, cycleResp)
 				return
 			}
 			if event.Type == "server-shutdown" {
@@ -2710,6 +2869,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			data, _ := json.Marshal(event)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
 			flusher.Flush()
+			// server-shutdown is the last event; returning lets the HTTP
+			// server finish shutting down instead of waiting for the client.
+			if event.Type == "server-shutdown" {
+				return
+			}
 		}
 	}
 }
@@ -3401,6 +3565,22 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("writeJSON: encode error: %v", err)
+	}
+}
+
+// writeJSONComplete writes v with a Content-Length and flushes it, so the
+// response is fully delivered even if the process ends right afterwards.
+func writeJSONComplete(w http.ResponseWriter, v any) {
+	var body bytes.Buffer
+	if err := json.NewEncoder(&body).Encode(v); err != nil {
+		log.Printf("writeJSONComplete: encode error: %v", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(body.Len()))
+	_, _ = w.Write(body.Bytes())
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 

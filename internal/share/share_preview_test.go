@@ -2,11 +2,15 @@ package share
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/JoshEllinger/crit/internal/testutil"
 )
 
 // TestParseShareFlagsPreview verifies the --preview flag is parsed into the
@@ -31,7 +35,12 @@ func TestParseShareFlagsPreview(t *testing.T) {
 // the network.
 func TestPostPreviewShareDispatch(t *testing.T) {
 	dir := t.TempDir()
-	writeSharePreviewFixture(t, dir)
+	site := filepath.Join(dir, "docs", "site")
+	if err := os.MkdirAll(site, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeSharePreviewFixture(t, site)
+	t.Chdir(dir)
 
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +56,7 @@ func TestPostPreviewShareDispatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	url, err := postPreviewShare(filepath.Join(dir, "index.html"), srv.URL, "")
+	url, err := postPreviewShare(filepath.Join("docs", "site", "index.html"), srv.URL, "", "", "")
 	if err != nil {
 		t.Fatalf("postPreviewShare: %v", err)
 	}
@@ -58,7 +67,8 @@ func TestPostPreviewShareDispatch(t *testing.T) {
 	if got["review_type"] != "preview" {
 		t.Errorf("review_type = %v, want preview", got["review_type"])
 	}
-	wantPath := filepath.Join(dir, "index.html")
+	// The title and the entry artifact both keep the original relative path.
+	const wantPath = "docs/site/index.html"
 	cliArgs, ok := got["cli_args"].([]any)
 	if !ok || len(cliArgs) != 2 || cliArgs[0] != "preview" || cliArgs[1] != wantPath {
 		t.Errorf("cli_args = %v, want [preview %s]", got["cli_args"], wantPath)
@@ -67,6 +77,14 @@ func TestPostPreviewShareDispatch(t *testing.T) {
 	files, ok := got["files"].([]any)
 	if !ok || len(files) == 0 {
 		t.Fatalf("files = %v, want non-empty slice", got["files"])
+	}
+	if p := files[0].(map[string]any)["path"]; p != wantPath {
+		t.Errorf("entry artifact path = %v, want %q", p, wantPath)
+	}
+	for _, f := range files[1:] {
+		if p, _ := f.(map[string]any)["path"].(string); !strings.HasPrefix(p, "docs/site/") {
+			t.Errorf("asset %q not keyed under the entry's directory docs/site/", p)
+		}
 	}
 	if !sharePreviewHasBase64(files) {
 		t.Errorf("expected at least one file with encoding=base64, got %v", files)
@@ -100,4 +118,91 @@ func sharePreviewHasBase64(files []any) bool {
 		}
 	}
 	return false
+}
+
+// runSharePreviewStub runs `crit share --preview` against a stub crit-web and
+// returns the decoded POST body plus anything written to stderr.
+func runSharePreviewStub(t *testing.T, extraArgs ...string) (map[string]any, string, error) {
+	t.Helper()
+	testutil.SetHome(t, t.TempDir())
+	t.Setenv("CRIT_AUTH_TOKEN", "")
+	t.Setenv("CRIT_SHARE_URL", "")
+	dir := t.TempDir()
+	writeSharePreviewFixture(t, dir)
+
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"url":"https://crit.md/r/abc","delete_token":"t"}`))
+	}))
+	defer srv.Close()
+
+	args := append([]string{"--preview", filepath.Join(dir, "index.html"), "--share-url", srv.URL}, extraArgs...)
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+	runErr := RunShare(args)
+	_ = w.Close()
+	os.Stderr = oldStderr
+	stderr, _ := io.ReadAll(r)
+	return got, string(stderr), runErr
+}
+
+func TestRunSharePreview_OrgAndVisibility(t *testing.T) {
+	cases := []struct {
+		name           string
+		args           []string
+		wantOrg        any
+		wantVisibility any
+	}{
+		{"flags sent", []string{"--org", "acme", "--visibility", "public"}, "acme", "public"},
+		{"omitted by default", nil, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, err := runSharePreviewStub(t, tc.args...)
+			if err != nil {
+				t.Fatalf("RunShare: %v", err)
+			}
+			if got["org"] != tc.wantOrg {
+				t.Errorf("org = %v, want %v", got["org"], tc.wantOrg)
+			}
+			if got["visibility"] != tc.wantVisibility {
+				t.Errorf("visibility = %v, want %v", got["visibility"], tc.wantVisibility)
+			}
+		})
+	}
+}
+
+func TestRunSharePreview_PrintsQR(t *testing.T) {
+	_, stderr, err := runSharePreviewStub(t, "--qr")
+	if err != nil {
+		t.Fatalf("RunShare: %v", err)
+	}
+	if !strings.ContainsAny(stderr, "█▀▄") {
+		t.Errorf("stderr = %q, want a QR code", stderr)
+	}
+}
+
+func TestRunSharePreview_RejectsReviewFileFlags(t *testing.T) {
+	for _, flag := range []string{"--output", "-o", "--session"} {
+		t.Run(flag, func(t *testing.T) {
+			got, _, err := runSharePreviewStub(t, flag, "x")
+			if err == nil || !strings.Contains(err.Error(), flag) {
+				t.Fatalf("err = %v, want usage error naming %s", err, flag)
+			}
+			if got != nil {
+				t.Errorf("share was posted despite %s: %v", flag, got)
+			}
+		})
+	}
 }

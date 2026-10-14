@@ -42,6 +42,11 @@ func (s *Session) critJSONPath() string {
 	if s.ReviewFilePath != "" {
 		return s.ReviewFilePath
 	}
+	if s.RepoRoot == "" {
+		// No review destination configured. Returning "" keeps writes out of
+		// the process working directory, which tests mutate with os.Chdir.
+		return ""
+	}
 	// Fallback for tests and backwards compat
 	return filepath.Join(s.RepoRoot, ".crit")
 }
@@ -63,6 +68,7 @@ type writeFilesSnapshot struct {
 	shareVisibility string
 	reviewComments  []Comment
 	cliArgs         []string
+	cwd             string
 	// story is the session's in-memory narrative (nil if none). Carried into
 	// CritJSON like the other daemon-managed fields above so `crit story`'s
 	// daemon-side mutators (set via s.SetStory) are actually persisted —
@@ -70,17 +76,17 @@ type writeFilesSnapshot struct {
 	story                   *Story
 	pendingRemoteDeletes    []RemoteRef
 	lastLoadedRemoteDeletes map[RemoteRef]struct{}
+	deletedCommentIDs       map[string]map[string]struct{}
 	// Per-file data needed for the merge. We copy comments so the snapshot
 	// is independent of later in-memory mutations.
 	files []writeFileSnapshot
 }
 
 type writeFileSnapshot struct {
-	path       string
-	status     string
-	fileHash   string
-	comments   []Comment
-	deletedIDs map[string]struct{} // comment IDs deleted in-memory, skip during merge
+	path     string
+	status   string
+	fileHash string
+	comments []Comment
 }
 
 // handleExternalDeletion checks if the review file was deleted externally and clears
@@ -159,6 +165,12 @@ func buildCritJSON(snap writeFilesSnapshot) CritJSON {
 	cj.ShareVisibility = snap.shareVisibility
 	cj.ReviewComments = snap.reviewComments
 	cj.CliArgs = snap.cliArgs
+	// Only daemon-built snapshots carry a cwd; an empty one must leave the
+	// recorded directory alone rather than erase a resumable review's only
+	// pointer back to its working tree.
+	if snap.cwd != "" {
+		cj.CWD = snap.cwd
+	}
 	cj.Story = snap.story
 	cj.PendingRemoteDeletes = reconcilePendingRemoteDeletes(
 		snap.pendingRemoteDeletes, cj.PendingRemoteDeletes, snap.lastLoadedRemoteDeletes,
@@ -167,7 +179,32 @@ func buildCritJSON(snap writeFilesSnapshot) CritJSON {
 	for _, fs := range snap.files {
 		mergeFileSnapshotIntoCritJSON(&cj, fs)
 	}
+	applyDeletedCommentIDs(&cj, snap.deletedCommentIDs)
 	return cj
+}
+
+// applyDeletedCommentIDs removes explicitly deleted comments even when their
+// paths no longer have a FileEntry (for example, after a base change or rename).
+// Tombstones are authoritative over both disk-only and in-memory copies.
+func applyDeletedCommentIDs(cj *CritJSON, deletedByPath map[string]map[string]struct{}) {
+	for path, deletedIDs := range deletedByPath {
+		file, ok := cj.Files[path]
+		if !ok || len(deletedIDs) == 0 {
+			continue
+		}
+		comments := file.Comments[:0]
+		for _, c := range file.Comments {
+			if _, deleted := deletedIDs[c.ID]; !deleted {
+				comments = append(comments, c)
+			}
+		}
+		if len(comments) == 0 {
+			delete(cj.Files, path)
+			continue
+		}
+		file.Comments = comments
+		cj.Files[path] = file
+	}
 }
 
 func reconcilePendingRemoteDeletes(snap, disk []RemoteRef, lastLoaded map[RemoteRef]struct{}) []RemoteRef {
@@ -211,11 +248,8 @@ func mergeFileSnapshotIntoCritJSON(cj *CritJSON, fs writeFileSnapshot) {
 	merged := fs.comments
 	if hasDisk {
 		for _, dc := range diskFile.Comments {
+			// Deleted IDs are dropped afterwards by applyDeletedCommentIDs.
 			if _, exists := memIDs[dc.ID]; exists {
-				continue
-			}
-			// Skip comments that were explicitly deleted in-memory
-			if _, deleted := fs.deletedIDs[dc.ID]; deleted {
 				continue
 			}
 			merged = append(merged, dc)
@@ -283,6 +317,9 @@ func (s *Session) SyncWriteFiles() error {
 // pre-existing log-and-continue behaviour).
 func (s *Session) writeFilesErr() error {
 	critPath := s.critJSONPath()
+	if critPath == "" {
+		return nil
+	}
 
 	if s.handleExternalDeletion(critPath) {
 		return nil
@@ -297,11 +334,13 @@ func (s *Session) writeFilesErr() error {
 		// may still be valid for the timeline; full-folder cleanup belongs to
 		// explicit cleanup paths (clearCritJSON, ClearAllComments,
 		// deleteStaleReviews, cleanupOnApproval).
-		os.Remove(paths.Review)
+		if err := os.Remove(paths.Review); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing empty review file: %w", err)
+		}
 		s.mu.Lock()
 		s.lastCritJSONMtime = time.Time{}
 		s.pendingWrite = false
-		s.deletedCommentIDs = nil
+		s.clearWrittenDeletedCommentIDs(snap.deletedCommentIDs)
 		s.pendingRemoteDeletes = nil
 		s.lastLoadedPendingDeletes = nil
 		s.mu.Unlock()
@@ -321,7 +360,7 @@ func (s *Session) writeFilesErr() error {
 		s.mu.Lock()
 		s.lastCritJSONMtime = info.ModTime()
 		s.pendingWrite = false
-		s.deletedCommentIDs = nil // written to disk, no longer needed
+		s.clearWrittenDeletedCommentIDs(snap.deletedCommentIDs)
 		// Sync in-memory pending-delete state to what we just wrote, so the
 		// next snapshot does not re-include IDs that a concurrent
 		// `crit push` already drained. See reconcilePendingRemoteDeletes.
@@ -333,6 +372,24 @@ func (s *Session) writeFilesErr() error {
 		s.mu.Unlock()
 	}
 	return nil
+}
+
+// clearWrittenDeletedCommentIDs acknowledges only tombstones included in a
+// completed write snapshot. Deletions recorded while that write was doing disk
+// I/O belong to a later write and must remain pending. Caller must hold s.mu.
+func (s *Session) clearWrittenDeletedCommentIDs(written map[string]map[string]struct{}) {
+	for path, ids := range written {
+		current := s.deletedCommentIDs[path]
+		for id := range ids {
+			delete(current, id)
+		}
+		if len(current) == 0 {
+			delete(s.deletedCommentIDs, path)
+		}
+	}
+	if len(s.deletedCommentIDs) == 0 {
+		s.deletedCommentIDs = nil
+	}
 }
 
 // snapshotForWrite captures all session state needed by WriteFiles under RLock.
@@ -349,6 +406,13 @@ func (s *Session) snapshotForWrite(critPath string) writeFilesSnapshot {
 	for ref := range s.lastLoadedPendingDeletes {
 		lastLoaded[ref] = struct{}{}
 	}
+	deletedByPath := make(map[string]map[string]struct{}, len(s.deletedCommentIDs))
+	for path, ids := range s.deletedCommentIDs {
+		deletedByPath[path] = make(map[string]struct{}, len(ids))
+		for id := range ids {
+			deletedByPath[path][id] = struct{}{}
+		}
+	}
 	snap := writeFilesSnapshot{
 		critPath:                critPath,
 		lastMtime:               s.lastCritJSONMtime,
@@ -364,27 +428,21 @@ func (s *Session) snapshotForWrite(critPath string) writeFilesSnapshot {
 		shareVisibility:         s.shareVisibility,
 		reviewComments:          rc,
 		cliArgs:                 s.CLIArgs,
+		cwd:                     s.CWD,
 		story:                   s.story,
 		pendingRemoteDeletes:    pendDeletes,
 		lastLoadedRemoteDeletes: lastLoaded,
+		deletedCommentIDs:       deletedByPath,
 		files:                   make([]writeFileSnapshot, len(s.Files)),
 	}
 	for i, f := range s.Files {
 		comments := make([]Comment, len(f.Comments))
 		copy(comments, f.Comments)
-		var deleted map[string]struct{}
-		if ids := s.deletedCommentIDs[f.Path]; len(ids) > 0 {
-			deleted = make(map[string]struct{}, len(ids))
-			for k, v := range ids {
-				deleted[k] = v
-			}
-		}
 		snap.files[i] = writeFileSnapshot{
-			path:       f.Path,
-			status:     f.Status,
-			fileHash:   f.FileHash,
-			comments:   comments,
-			deletedIDs: deleted,
+			path:     f.Path,
+			status:   f.Status,
+			fileHash: f.FileHash,
+			comments: comments,
 		}
 	}
 	return snap
@@ -596,6 +654,22 @@ func (s *Session) mergeExternalCritJSON() bool {
 		return false
 	}
 
+	s.mu.RLock()
+	memRound := s.ReviewRound
+	s.mu.RUnlock()
+	// Memory is ahead of an explicit on-disk round (round-complete remapped
+	// comments, write pending/failed, or a stale review.json raced in).
+	// Applying that disk file would replace carried-forward IDs with the
+	// prior round's comments and wipe drift bits — refuse until disk catches
+	// up. Disk review_round 0 means unset/legacy (tests and older files);
+	// never treat that as "stale prior round" or share merges stop applying.
+	if cj.ReviewRound > 0 && memRound > cj.ReviewRound {
+		s.mu.Lock()
+		s.lastCritJSONMtime = info.ModTime()
+		s.mu.Unlock()
+		return false
+	}
+
 	s.mu.Lock()
 	s.lastCritJSONMtime = info.ModTime()
 	// Disk is authoritative for external edits — clear deleted tracking
@@ -614,6 +688,7 @@ func (s *Session) mergeExternalCritJSON() bool {
 		}
 		changed = s.mergeFileCommentsFromDisk(f, diskFile) || changed
 	}
+	changed = s.adoptExternalPinRoutes(&cj) || changed
 
 	changed = s.mergeReviewCommentsFromDisk(cj.ReviewComments) || changed
 	s.mu.Unlock()
@@ -623,4 +698,50 @@ func (s *Session) mergeExternalCritJSON() bool {
 	}
 
 	return changed
+}
+
+// adoptExternalPinRoutes adds live-route file entries for DOM pins written
+// by `crit comment` while this session is running. The merge above only
+// updates paths the session already has, and the first pin on a page is
+// what creates that path. Must be called with s.mu held.
+func (s *Session) adoptExternalPinRoutes(cj *CritJSON) bool {
+	if s.ReviewType != "live" && s.ReviewType != "preview" {
+		return false
+	}
+	known := make(map[string]struct{}, len(s.Files))
+	for _, f := range s.Files {
+		known[f.Path] = struct{}{}
+	}
+	changed := false
+	for path, diskFile := range cj.Files {
+		if _, ok := known[path]; ok {
+			continue
+		}
+		if !diskFileHasDOMPin(diskFile) {
+			continue
+		}
+		comments := make([]Comment, len(diskFile.Comments))
+		copy(comments, diskFile.Comments)
+		status := diskFile.Status
+		if status == "" {
+			status = "added"
+		}
+		s.Files = append(s.Files, &FileEntry{
+			Path:     path,
+			Status:   status,
+			FileType: "live-route",
+			Comments: comments,
+		})
+		changed = true
+	}
+	return changed
+}
+
+func diskFileHasDOMPin(f CritJSONFile) bool {
+	for _, c := range f.Comments {
+		if c.DOMAnchor != nil {
+			return true
+		}
+	}
+	return false
 }

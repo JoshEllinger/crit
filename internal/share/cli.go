@@ -44,13 +44,14 @@ type unpublishFlags struct {
 	files            []string
 }
 
-func postPreviewShare(htmlPath, svcURL, authToken string) (string, error) {
-	files, err := session.CrawlPreview(htmlPath)
+func postPreviewShare(htmlPath, svcURL, authToken, org, visibility string) (string, error) {
+	entryPath := session.PreviewEntryPath(htmlPath, "")
+	files, err := session.CrawlPreview(htmlPath, entryPath)
 	if err != nil {
 		return "", fmt.Errorf("crawling preview assets: %w", err)
 	}
 
-	payload := BuildSharePayload(files, nil, 1, []string{"preview", htmlPath}, "", "", "preview")
+	payload := BuildSharePayload(files, nil, 1, []string{"preview", entryPath}, org, visibility, "preview")
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshaling preview payload: %w", err)
@@ -139,6 +140,13 @@ func runSharePreview(sf shareFlags) error {
 	if len(sf.files) > 0 {
 		return clicmd.Usage("Error: --preview cannot be combined with file arguments")
 	}
+	// Preview shares keep no review file, so these flags have nothing to act on.
+	if sf.outputDir != "" {
+		return clicmd.Usage("Error: --preview cannot be combined with --output/-o")
+	}
+	if sf.sessionID != "" {
+		return clicmd.Usage("Error: --preview cannot be combined with --session")
+	}
 	cfg := LoadShareConfig()
 	target, ok, err := config.SelectShareTarget(sf.svcURL, sf.svcURLSet, cfg)
 	if err != nil {
@@ -150,11 +158,12 @@ func runSharePreview(sf shareFlags) error {
 	if target.ProxyAuth {
 		return proxyAuthCLIError("crit share")
 	}
-	url, err := postPreviewShare(sf.preview, target.URL, target.Auth.Token)
+	url, err := postPreviewShare(sf.preview, target.URL, target.Auth.Token, sf.org, sf.visibility)
 	if err != nil {
 		return err
 	}
 	fmt.Println(url)
+	printQR(url, sf.showQR)
 	return nil
 }
 
@@ -225,9 +234,7 @@ func handleShareAuthError(targetURL string) {
 }
 
 func runShareExisting(existingCfg session.CritJSON, critPath string, files []ShareFile, sharePaths []string, svcURL, authToken, fallbackAuthor, org, visibility string, showQR bool) error {
-	localIDs := BuildLocalIDSet(existingCfg)
-	localFingerprints, localFingerprintIDs := BuildLocalFingerprintIndex(existingCfg)
-	if fetched, err := FetchWebCommentsFromTarget(existingCfg.ShareURL, svcURL, localIDs, localFingerprints, localFingerprintIDs, authToken); err != nil {
+	if fetched, err := fetchWebCommentsForReview(existingCfg.ShareURL, svcURL, existingCfg, authToken); err != nil {
 		if errors.Is(err, ErrShareUnauthorized) {
 			handleShareAuthError(svcURL)
 			return clicmd.ExitError{Code: 1, Err: errors.New("exit")}
@@ -240,10 +247,8 @@ func runShareExisting(existingCfg session.CritJSON, critPath string, files []Sha
 			return runShareNew(critPath, files, sharePaths, svcURL, authToken, fallbackAuthor, org, visibility, showQR)
 		}
 		fmt.Fprintf(os.Stderr, "warning: could not pull remote comments: %v\n", err)
-	} else if len(fetched.NewComments) > 0 || len(fetched.ReplyUpdates) > 0 {
-		if err := MergeWebComments(critPath, fetched.NewComments, fetched.ReplyUpdates); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not merge remote comments: %v\n", err)
-		}
+	} else if err := mergeFetchedComments(critPath, fetched); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not merge remote comments: %v\n", err)
 	}
 
 	allComments, _ := LoadCommentsForShare(critPath, sharePaths, fallbackAuthor)
@@ -263,7 +268,7 @@ func runShareExisting(existingCfg session.CritJSON, critPath string, files []Sha
 		return err
 	}
 
-	if err := UpdateShareState(critPath, ComputeShareHash(files, allComments), result.ReviewRound); err != nil {
+	if err := updateShareState(critPath, files, allComments, result.ReviewRound, result.Sent); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save share state: %v\n", err)
 	}
 	if existingCfg.ShareBaseURL == "" {
@@ -291,8 +296,7 @@ func runShareNew(critPath string, files []ShareFile, filePaths []string, svcURL,
 		fmt.Fprintf(os.Stderr, "Warning: could not save share state to review file: %v\n", err)
 	}
 
-	initialComments, _ := LoadCommentsForShare(critPath, filePaths, fallbackAuthor)
-	_ = UpdateShareState(critPath, ComputeShareHash(files, initialComments), res.ReviewRound)
+	_ = updateShareState(critPath, files, res.Comments, res.ReviewRound, true)
 
 	fmt.Println(res.URL)
 	printQR(res.URL, showQR)
@@ -351,10 +355,7 @@ func RunShare(args []string) error { //nolint:gocyclo // CLI dispatcher
 	}
 	noteStoryNotShared(critPath)
 
-	sharePaths := make([]string, len(files))
-	for i, f := range files {
-		sharePaths[i] = f.Path
-	}
+	sharePaths := ShareFilePaths(files)
 
 	existing, existingOK, err := LoadExistingShareCfg(critPath, sharePaths)
 	if err != nil {
@@ -576,10 +577,7 @@ func runFetchUnderLock(critPath string) error {
 		return proxyAuthCLIError("crit fetch")
 	}
 	authToken := target.Auth.Token
-	localIDs := BuildLocalIDSet(cj)
-	localFingerprints, localFingerprintIDs := BuildLocalFingerprintIndex(cj)
-
-	fetched, err := FetchWebCommentsFromTarget(cj.ShareURL, target.URL, localIDs, localFingerprints, localFingerprintIDs, authToken)
+	fetched, err := fetchWebCommentsForReview(cj.ShareURL, target.URL, cj, authToken)
 	if err != nil {
 		if errors.Is(err, ErrShareUnauthorized) {
 			handleShareAuthError(target.URL)
@@ -588,29 +586,39 @@ func runFetchUnderLock(critPath string) error {
 		return fmt.Errorf("fetching remote comments: %w", err)
 	}
 
-	if len(fetched.NewComments) == 0 && len(fetched.ReplyUpdates) == 0 {
+	if !fetchHasUpdates(fetched) {
 		fmt.Println("No new comments.")
 		fmt.Printf("Review file: %s\n", session.ReviewPathsFor(critPath).Review)
 		return nil
 	}
 
-	if err := MergeWebComments(critPath, fetched.NewComments, fetched.ReplyUpdates); err != nil {
+	if err := mergeFetchedComments(critPath, fetched); err != nil {
 		return fmt.Errorf("saving review file: %w", err)
 	}
 	if cj.ShareBaseURL == "" {
 		_ = bindShareBaseURL(critPath, target.URL)
 	}
 
-	printFetchedComments(fetched.NewComments)
-	if len(fetched.ReplyUpdates) > 0 {
-		replyCount := 0
-		for _, replies := range fetched.ReplyUpdates {
-			replyCount += len(replies)
-		}
-		fmt.Printf("Updated %d comment(s) with %d new reply(ies).\n", len(fetched.ReplyUpdates), replyCount)
-	}
+	printFetchResult(fetched)
 	fmt.Printf("Review file: %s\n", session.ReviewPathsFor(critPath).Review)
 	return nil
+}
+
+func printFetchResult(fetched fetchWebCommentsResult) {
+	if len(fetched.NewComments) > 0 {
+		printFetchedComments(fetched.NewComments)
+	}
+	if len(fetched.Placements) > 0 {
+		fmt.Printf("Updated %d comment placement(s).\n", len(fetched.Placements))
+	}
+	if len(fetched.ReplyUpdates) == 0 {
+		return
+	}
+	replyCount := 0
+	for _, replies := range fetched.ReplyUpdates {
+		replyCount += len(replies)
+	}
+	fmt.Printf("Updated %d comment(s) with %d new reply(ies).\n", len(fetched.ReplyUpdates), replyCount)
 }
 
 func parseUnpublishFlags(args []string) (unpublishFlags, error) {

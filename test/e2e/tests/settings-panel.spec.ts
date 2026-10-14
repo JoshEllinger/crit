@@ -1,5 +1,10 @@
-import { test, expect } from '@playwright/test';
-import { loadPage, clearAllComments } from './helpers';
+import { test, expect, type Page } from '@playwright/test';
+import { loadPage, clearAllComments, selectedLines } from './helpers';
+
+// Keyboard focus: a Pierre-selected diff line, or a focused document block.
+function keyboardFocus(page: Page) {
+  return page.locator('.kb-nav.focused').or(selectedLines(page));
+}
 
 test.describe('Settings Panel', () => {
   test.beforeEach(async ({ page, request }) => {
@@ -39,10 +44,28 @@ test.describe('Settings Panel', () => {
     await page.click('#settingsToggle');
     await page.click('.settings-tab[data-tab="shortcuts"]');
     await expect(page.locator('.settings-pane[data-pane="shortcuts"]')).toHaveClass(/active/);
+    await page.click('.settings-tab[data-tab="updates"]');
+    await expect(page.locator('.settings-pane[data-pane="updates"]')).toHaveClass(/active/);
     await page.click('.settings-tab[data-tab="about"]');
     await expect(page.locator('.settings-pane[data-pane="about"]')).toHaveClass(/active/);
     await page.click('.settings-tab[data-tab="settings"]');
     await expect(page.locator('.settings-pane[data-pane="settings"]')).toHaveClass(/active/);
+  });
+
+  test('tab switching resets the shared content scroll position', async ({ page }) => {
+    await page.click('#settingsToggle');
+    const content = page.locator('.settings-content');
+    const scrolled = await content.evaluate((element) => {
+      const spacer = document.createElement('div');
+      spacer.style.height = '2000px';
+      element.appendChild(spacer);
+      element.scrollTop = element.scrollHeight;
+      return element.scrollTop;
+    });
+    expect(scrolled).toBeGreaterThan(0);
+
+    await page.click('.settings-tab[data-tab="about"]');
+    await expect.poll(() => content.evaluate((element) => element.scrollTop)).toBe(0);
   });
 
   test('? key toggles shortcuts tab when panel is open on shortcuts', async ({ page }) => {
@@ -80,20 +103,21 @@ test.describe('Settings Panel', () => {
 
     await page.locator('.settings-overlay').click({ position: { x: 10, y: 10 } });
     await page.keyboard.press('j');
-    await expect(page.locator('.kb-nav.focused')).toHaveCount(0);
+    await expect(keyboardFocus(page)).toHaveCount(0);
     await page.keyboard.press('ArrowDown');
-    await expect(page.locator('.kb-nav.focused')).toHaveCount(1);
+    await expect(keyboardFocus(page).first()).toBeVisible();
 
     // A write through app.js must merge with the freshly saved shortcut,
     // rather than replacing it with an older cached settings object.
     await page.keyboard.press('h');
     await page.reload();
+    await expect(page.locator('.loading')).toBeHidden();
     await page.keyboard.press('?');
     await expect(page.locator('[data-shortcut-id="next_block"]')).toContainText('ArrowDown');
     await page.locator('.shortcut-reset-all').click();
     await page.locator('.settings-overlay').click({ position: { x: 10, y: 10 } });
     await page.keyboard.press('j');
-    await expect(page.locator('.kb-nav.focused')).toHaveCount(1);
+    await expect(keyboardFocus(page).first()).toBeVisible();
   });
 
   test('shortcut conflicts are shown without changing the row height', async ({ page }) => {
@@ -227,18 +251,23 @@ test.describe('Settings Panel', () => {
     //
     // Cards rendered in git-mode with empty share_url:
     //   - "Agent Command"   — unconditional
-    //   - "AI Integration"  — unconditional unless no_integration_check
     //   - "Share"           — always rendered (the else-branch when share_url is empty)
     //   - "Account"         — NOT rendered (gated on share_url)
     //   - "Sharing enabled" — NOT rendered (gated on share_url)
     await expect(pane.locator('.config-card-title', { hasText: 'Agent Command' })).toBeVisible();
-    await expect(
-      pane.locator('.config-card-title', { hasText: /AI Integration|Integration Available/ }).first(),
-    ).toBeVisible();
     // "Share" title renders when share_url is empty (the disabled/unconfigured state).
     await expect(pane.locator('.config-card-title', { hasText: 'Share' })).toBeVisible();
     // Account card must NOT appear when share_url is empty (fork's privacy default).
     await expect(pane.locator('.config-card-title', { hasText: 'Account' })).toHaveCount(0);
+  });
+
+  test('updates pane shows Crit status and AI integrations', async ({ page }) => {
+    await page.click('#settingsToggle');
+    await page.click('.settings-tab[data-tab="updates"]');
+    const pane = page.locator('.settings-pane[data-pane="updates"]');
+    await expect(pane.locator('.settings-section-label', { hasText: 'Crit' })).toBeVisible();
+    await expect(pane.locator('.updates-crit-row')).toBeVisible();
+    await expect(pane.locator('.settings-section-label', { hasText: 'AI integrations' })).toBeVisible();
   });
 
   test('about pane shows version and session info', async ({ page }) => {
