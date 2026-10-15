@@ -20,3 +20,4 @@ test-results/
 .agents
 .mcp.json
 .DS_Store
+.design-exploration/

@@ -46,17 +46,12 @@
       var commentMd = null;
       try {
         if (typeof window.markdownit === 'function') {
+          // Same options as code review's comment renderer: fenced code
+          // renders plain (code review upgrades it with Shiki afterwards).
           commentMd = window.markdownit({
             html: true,
             linkify: true,
             typographer: true,
-            highlight: function (str, lang) {
-              var highlighter = window.hljs;
-              if (lang && highlighter && highlighter.getLanguage(lang)) {
-                try { return highlighter.highlight(str, { language: lang }).value; } catch (_) {}
-              }
-              return '';
-            },
           });
           commentMd.disable('replacements');
           commentMd.renderer.rules.image = function (tokens, idx, options, _env, self) {
@@ -428,6 +423,15 @@
     function applyCommentsPanelOpen(open) {
       var panel = els.commentsPanel;
       if (!panel) return;
+      // Match code-review setCommentsPanelCollapsed: measure before toggling
+      // so --comments-panel-width tracks a user-resized panel (margin-right:-W
+      // slide). Without this, a stale default (480px) on a narrower panel
+      // over-collapses and clips the live iframe under overflow-x:clip.
+      var w = panel.getBoundingClientRect().width;
+      if (w > 0) document.body.style.setProperty('--comments-panel-width', w + 'px');
+      // Transition is gated on body.comments-panel-anim (same as code-review).
+      document.body.classList.add('comments-panel-anim');
+      document.body.getBoundingClientRect();
       if (open) panel.classList.remove('comments-panel-hidden');
       else panel.classList.add('comments-panel-hidden');
       state.commentsPanelOpen = !!open;
@@ -559,24 +563,14 @@
       updateUnresolvedBadge();
     }
 
-    // Scroll to pinned element and flash its marker badge when a comment
-    // card is clicked in the panel. keep-highlight scrolls into view +
-    // adds a transient highlight; clear-highlight removes it after 1s.
-    // flash-marker pulses the badge overlay (1.5s, agent-managed).
-    var _highlightTimer = null;
-    function scrollAndFlashPin(comment) {
-      if (!comment || !comment.id) return;
-      if (!state || !state.postToAgent) return;
-      if (_highlightTimer) { clearTimeout(_highlightTimer); _highlightTimer = null; }
-      var anchor = comment.dom_anchor || comment.domAnchor;
-      if (anchor && anchor.css_selector) {
-        state.postToAgent({ type: 'keep-highlight', selector: anchor.css_selector, scroll: true });
-        _highlightTimer = setTimeout(function () {
-          state.postToAgent({ type: 'clear-highlight' });
-          _highlightTimer = null;
-        }, 1000);
+    function activatePinCard(card) {
+      if (!card || !state || !state.comments) return;
+      var id = card.dataset && card.dataset.id;
+      if (!id) return;
+      var comment = state.comments.find(function (c) { return String(c.id) === id; });
+      if (comment && typeof state.openPinAndFocus === 'function') {
+        state.openPinAndFocus(comment);
       }
-      state.postToAgent({ type: 'flash-marker', pin_id: comment.id });
     }
 
     var _cardClickInstalled = false;
@@ -588,10 +582,15 @@
         if (e.target.closest && e.target.closest('button, a, input, textarea')) return;
         var card = e.target.closest && e.target.closest('.comment-card[data-id]');
         if (!card) return;
-        var id = card.dataset.id;
-        if (!id || !state.comments) return;
-        var comment = state.comments.find(function (c) { return String(c.id) === id; });
-        if (comment) scrollAndFlashPin(comment);
+        activatePinCard(card);
+      });
+      els.panelBody.addEventListener('keydown', function (e) {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        var card = e.target;
+        if (!card || !card.classList || !card.classList.contains('comment-card')) return;
+        if (!card.dataset || !card.dataset.id) return;
+        e.preventDefault();
+        activatePinCard(card);
       });
     }
 

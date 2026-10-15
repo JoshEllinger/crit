@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/JoshEllinger/crit/internal/session"
+	"github.com/JoshEllinger/crit/internal/share"
 	"github.com/JoshEllinger/crit/internal/testutil"
 )
 
@@ -143,13 +144,14 @@ func TestHandleShare_FreshPreviewPreservesMetadataWithoutReviewFile(t *testing.T
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
+	wantPath := filepath.ToSlash(originalPath)
 	cliArgs, _ := captured["cli_args"].([]any)
-	if len(cliArgs) != 2 || cliArgs[0] != "preview" || cliArgs[1] != origin {
-		t.Errorf("cli_args = %v, want [preview %s]", cliArgs, origin)
+	if len(cliArgs) != 2 || cliArgs[0] != "preview" || cliArgs[1] != wantPath {
+		t.Errorf("cli_args = %v, want [preview %s]", cliArgs, wantPath)
 	}
 	files, _ := captured["files"].([]any)
-	if len(files) != 1 || files[0].(map[string]any)["path"] != session.PreviewMainHTMLKey {
-		t.Errorf("files = %v, want entry HTML at %q", files, session.PreviewMainHTMLKey)
+	if len(files) != 1 || files[0].(map[string]any)["path"] != wantPath {
+		t.Errorf("files = %v, want entry HTML at %q", files, wantPath)
 	}
 
 	// A stale review file must not override the live preview's canonical path.
@@ -164,49 +166,21 @@ func TestHandleShare_FreshPreviewPreservesMetadataWithoutReviewFile(t *testing.T
 	if err := os.WriteFile(reviewPath, stale, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.shareCLIArgsForSession(sess); len(got) != 2 || got[0] != "preview" || got[1] != origin {
-		t.Errorf("cli args with stale persisted metadata = %v, want [preview %s]", got, origin)
+	if got := s.shareCLIArgsForSession(sess); len(got) != 2 || got[0] != "preview" || got[1] != wantPath {
+		t.Errorf("cli args with stale persisted metadata = %v, want [preview %s]", got, wantPath)
 	}
 }
 
-func TestShareCLIArgsForSession_PreviewFallbacks(t *testing.T) {
+func TestShareCLIArgsForSession_NilAndPreviewWithoutOrigin(t *testing.T) {
 	s := &Server{}
 
 	if got := s.shareCLIArgsForSession(nil); got != nil {
 		t.Fatalf("nil session cli args = %v, want nil", got)
 	}
 
-	live := &Session{ReviewType: "preview", CLIArgs: []string{"preview", "live.html", "ignored"}}
-	if got := s.shareCLIArgsForSession(live); len(got) != 2 || got[0] != "preview" || got[1] != "live.html" {
-		t.Fatalf("live session cli args = %v, want [preview live.html]", got)
-	}
-
-	empty := &Session{ReviewType: "preview"}
-	if got := s.shareCLIArgsForSession(empty); got != nil {
-		t.Fatalf("empty preview cli args = %v, want nil", got)
-	}
-}
-
-func TestShareCLIArgsForSession_NormalizesPersistedPreviewArgs(t *testing.T) {
-	dir := t.TempDir()
-	sess := &Session{ReviewType: "preview", OutputDir: dir, RepoRoot: dir}
-	persisted, err := json.Marshal(CritJSON{
-		CliArgs: []string{"preview", "persisted.html", "ignored"},
-		Files:   map[string]CritJSONFile{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	reviewPath := session.ReviewPathsFor(sess.CritJSONPath()).Review
-	if err := os.MkdirAll(filepath.Dir(reviewPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(reviewPath, persisted, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := (&Server{}).shareCLIArgsForSession(sess); len(got) != 2 || got[0] != "preview" || got[1] != "persisted.html" {
-		t.Fatalf("persisted cli args = %v, want [preview persisted.html]", got)
+	noOrigin := &Session{ReviewType: "preview", CLIArgs: []string{"preview", "live.html"}}
+	if got := s.shareCLIArgsForSession(noOrigin); got != nil {
+		t.Fatalf("preview without origin cli args = %v, want nil", got)
 	}
 }
 
@@ -252,7 +226,7 @@ func newPreviewReshareTestServer(t *testing.T) (*Server, *Session, string) {
 }
 
 func TestHandleUpsertPayload_PreviewPreservesOriginalCLIPath(t *testing.T) {
-	s, _, origin := newPreviewReshareTestServer(t)
+	s, _, _ := newPreviewReshareTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/share/upsert-payload", nil)
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, req)
@@ -261,23 +235,34 @@ func TestHandleUpsertPayload_PreviewPreservesOriginalCLIPath(t *testing.T) {
 	}
 	var payload struct {
 		CLIArgs []string `json:"cli_args"`
+		Files   []struct {
+			Path string `json:"path"`
+		} `json:"files"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(payload.CLIArgs, []string{"preview", origin}) {
-		t.Fatalf("cli_args = %v, want [preview %s]", payload.CLIArgs, origin)
+	// Title (cli_args) and the crawled entry HTML both use the path relative to
+	// the session root — never the absolute origin, never "index.html".
+	if !reflect.DeepEqual(payload.CLIArgs, []string{"preview", "original-preview.html"}) {
+		t.Fatalf("cli_args = %v, want [preview original-preview.html]", payload.CLIArgs)
+	}
+	if len(payload.Files) == 0 || payload.Files[0].Path != "original-preview.html" {
+		t.Fatalf("files = %v, want entry HTML at original-preview.html", payload.Files)
 	}
 }
 
 func TestReshareUpsertInputs_PreviewPreservesOriginalCLIPath(t *testing.T) {
-	s, sess, origin := newPreviewReshareTestServer(t)
-	_, _, cfg, err := s.reshareUpsertInputs(sess, "https://crit.md/r/preview", "delete-token")
+	s, sess, _ := newPreviewReshareTestServer(t)
+	files, _, cfg, err := s.reshareUpsertInputs(sess, "https://crit.md/r/preview", "delete-token")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(cfg.CliArgs, []string{"preview", origin}) {
-		t.Fatalf("cli args = %v, want [preview %s]", cfg.CliArgs, origin)
+	if !reflect.DeepEqual(cfg.CliArgs, []string{"preview", "original-preview.html"}) {
+		t.Fatalf("cli args = %v, want [preview original-preview.html]", cfg.CliArgs)
+	}
+	if len(files) == 0 || files[0].Path != "original-preview.html" {
+		t.Fatalf("files = %v, want entry HTML at original-preview.html", files)
 	}
 }
 
@@ -883,5 +868,169 @@ func TestHandleShareReshare_EmptyFiles(t *testing.T) {
 	s.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRekeyPulledPreviewComments(t *testing.T) {
+	comments := func() []share.WebComment {
+		return []share.WebComment{
+			{Body: "entry", FilePath: "page.html"},
+			{Body: "legacy", FilePath: "index.html"},
+			{Body: "review-level", Scope: "review"},
+		}
+	}
+
+	preview := &Session{ReviewType: "preview", Files: []*FileEntry{
+		{Path: "../site/page.html", FileType: "code"},
+		{Path: "/preview-content", FileType: "live-route"},
+	}}
+	got := comments()
+	rekeyPulledPreviewComments(preview, got)
+	if got[0].FilePath != "../site/page.html" || got[1].FilePath != "../site/page.html" {
+		t.Errorf("per-file comments = %q, %q; want both on ../site/page.html", got[0].FilePath, got[1].FilePath)
+	}
+	if got[2].FilePath != "" {
+		t.Errorf("review-level comment file = %q, want empty", got[2].FilePath)
+	}
+
+	empty := &Session{ReviewType: "preview"}
+	got = comments()
+	rekeyPulledPreviewComments(empty, got)
+	if got[0].FilePath != "page.html" {
+		t.Errorf("preview session without files re-keyed comments: %+v", got)
+	}
+
+	files := &Session{Files: []*FileEntry{{Path: "plan.md"}}}
+	got = comments()
+	rekeyPulledPreviewComments(files, got)
+	if got[0].FilePath != "page.html" || got[1].FilePath != "index.html" {
+		t.Errorf("non-preview session re-keyed comments: %+v", got)
+	}
+}
+
+// A pull takes crit-web's placement for a comment only when the local comment
+// is still on the lines it was last shared with; a local carry wins.
+func TestHandleSharePull_PlacementSkipsLocallyMovedComment(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		sharedLine int
+		wantLine   int
+	}{
+		{"unmoved comment takes web line", 1, 3},
+		{"locally moved comment keeps local line", 5, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]any{{
+					"body": "Fix this", "file_path": "plan.md", "external_id": "c1",
+					"start_line": 3, "end_line": 3, "anchor": "Plan",
+				}})
+			}))
+			defer critWeb.Close()
+
+			s, sess := newShareTestServer(t, critWeb.URL, true)
+			sess.SetSharedURLAndToken(critWeb.URL+"/r/abc123", "delete-tok")
+			cj := readShareTestReview(t, sess)
+			cj.SharedLines = map[string]session.SharedLine{"c1": {StartLine: tc.sharedLine, EndLine: tc.sharedLine}}
+			writeShareTestReview(t, sess, cj)
+
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/share/pull", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			got := readShareTestReview(t, sess)
+			found := false
+			for _, c := range got.Files["plan.md"].Comments {
+				if c.ID == "c1" {
+					found = true
+					if c.StartLine != tc.wantLine {
+						t.Fatalf("c1 start_line = %d, want %d", c.StartLine, tc.wantLine)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("c1 missing after pull")
+			}
+		})
+	}
+}
+
+func readShareTestReview(t *testing.T, sess *Session) CritJSON {
+	t.Helper()
+	data, err := os.ReadFile(session.ReviewPathsFor(sess.CritJSONPath()).Review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		t.Fatal(err)
+	}
+	return cj
+}
+
+func writeShareTestReview(t *testing.T, sess *Session, cj CritJSON) {
+	t.Helper()
+	data, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(session.ReviewPathsFor(sess.CritJSONPath()).Review, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The browser's first share records the lines it sent, so a later pull can
+// take crit-web's placements for comments that did not move locally.
+func TestHandleShare_RecordsSharedLines(t *testing.T) {
+	critWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{
+			"url":          "https://crit.md/r/test123",
+			"delete_token": "tok_test",
+		})
+	}))
+	defer critWeb.Close()
+
+	s, sess := newShareTestServer(t, critWeb.URL, true)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/share", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	got := readShareTestReview(t, sess)
+	if got.SharedLines["c1"] != (session.SharedLine{StartLine: 1, EndLine: 1}) {
+		t.Fatalf("shared lines = %+v", got.SharedLines)
+	}
+	if got.ShareURL != "https://crit.md/r/test123" {
+		t.Fatalf("share url = %q", got.ShareURL)
+	}
+}
+
+// In the proxy relay the browser uploads the payload itself. The lines of the
+// payload are recorded only when POST /api/share-url confirms the upload.
+func TestHandleShareURL_RecordsRelayPayloadLines(t *testing.T) {
+	s, sess := newShareTestServer(t, "https://crit.example", true)
+	sess.SetSharedURLAndToken("https://crit.example/r/abc123", "delete-tok")
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/share/upsert-payload", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("payload status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if got := readShareTestReview(t, sess); got.SharedLines != nil {
+		t.Fatalf("lines recorded before the upload was confirmed: %+v", got.SharedLines)
+	}
+
+	body := `{"url":"https://crit.example/r/abc123","target_url":"https://crit.example","delete_token":"delete-tok"}`
+	w = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/share-url", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("share-url status = %d, body = %s", w.Code, w.Body.String())
+	}
+	got := readShareTestReview(t, sess)
+	if got.SharedLines["c1"] != (session.SharedLine{StartLine: 1, EndLine: 1}) {
+		t.Fatalf("shared lines = %+v", got.SharedLines)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,11 @@ func newTestServer(t *testing.T) (*Server, *Session) {
 		},
 	}
 	session.InitTestChannels()
+	// AddComment/AddReply arm a 200ms debounced disk write to RepoRoot/.crit.
+	// Quiesce before t.TempDir's cleanup so a delayed WriteFiles doesn't race
+	// with RemoveAll — on Windows that manifests as "directory is not empty"
+	// (seen on TestRunAgentCmd_IDCollisionPrefersFileComment in unit-windows).
+	t.Cleanup(session.QuiesceForTest)
 
 	s, err := NewServer(session, frontendFS, "", false, "", "", "test", 0, "")
 	if err != nil {
@@ -1254,6 +1260,24 @@ func TestApiConfig_IncludesProxyAuth(t *testing.T) {
 	}
 }
 
+func TestApiConfig_DefaultMarkdownView(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.cfg.DefaultMarkdownView = "document"
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body["default_markdown_view"] != "document" {
+		t.Errorf("got default_markdown_view=%v, want document", body["default_markdown_view"])
+	}
+}
+
 func TestAPICodeFonts_CachesCodeFontDiscovery(t *testing.T) {
 	s, _ := newTestServer(t)
 	calls := 0
@@ -1421,6 +1445,9 @@ func TestGetConfig(t *testing.T) {
 	}
 	if resp["latest_version"] != "" {
 		t.Errorf("latest_version should be empty before update check, got %v", resp["latest_version"])
+	}
+	if resp["installation_source"] == "" {
+		t.Error("installation_source should always be present")
 	}
 }
 
@@ -3578,6 +3605,27 @@ func TestHandleEvents_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandleEvents_ReturnsAfterServerShutdown(t *testing.T) {
+	srv, session := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	w := newNotifyingResponseRecorder()
+	done := make(chan struct{})
+	go func() {
+		srv.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	waitForSubscriberCount(t, session, 1)
+	session.Notify(SSEEvent{Type: "server-shutdown"})
+	w.waitForWrite(t, "event: server-shutdown")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SSE handler kept the stream open after server-shutdown")
+	}
+}
+
 func TestHandleEvents_SSEHeaders(t *testing.T) {
 	srv, session := newTestServer(t)
 
@@ -4109,6 +4157,104 @@ func TestHandleHealth_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandleShutdown(t *testing.T) {
+	pid := strconv.Itoa(os.Getpid())
+	tests := []struct {
+		name        string
+		method      string
+		query       string
+		headers     map[string]string
+		notReady    bool
+		withStop    bool
+		wantCode    int
+		wantStopped bool
+	}{
+		{name: "CLI request stops the daemon", method: "POST", query: "pid=" + pid, withStop: true, wantCode: http.StatusOK, wantStopped: true},
+		{name: "GET is not allowed", method: "GET", query: "pid=" + pid, withStop: true, wantCode: http.StatusMethodNotAllowed},
+		{name: "no stop func wired", method: "POST", query: "pid=" + pid, wantCode: http.StatusServiceUnavailable},
+		{name: "missing pid", method: "POST", withStop: true, wantCode: http.StatusConflict},
+		{name: "pid of another daemon", method: "POST", query: "pid=1", withStop: true, wantCode: http.StatusConflict},
+		{name: "still initialising", method: "POST", query: "pid=" + pid, notReady: true, withStop: true, wantCode: http.StatusServiceUnavailable},
+		{name: "pid of another daemon while initialising", method: "POST", query: "pid=1", notReady: true, withStop: true, wantCode: http.StatusConflict},
+		{name: "cross-site browser request", method: "POST", query: "pid=" + pid, headers: map[string]string{"Sec-Fetch-Site": "cross-site"}, withStop: true, wantCode: http.StatusForbidden},
+		{name: "same-origin page script", method: "POST", query: "pid=" + pid, headers: map[string]string{"Sec-Fetch-Site": "same-origin"}, withStop: true, wantCode: http.StatusForbidden},
+		{name: "request with Origin", method: "POST", query: "pid=" + pid, headers: map[string]string{"Origin": "http://localhost"}, withStop: true, wantCode: http.StatusForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var srv *Server
+			if tt.notReady {
+				var err error
+				if srv, err = NewServer(nil, frontendFS, "", false, "", "", "test", 0, ""); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				srv, _ = newTestServer(t)
+			}
+			stopped := false
+			if tt.withStop {
+				srv.SetStopFunc(func() { stopped = true })
+			}
+			req := httptest.NewRequest(tt.method, "/api/shutdown?"+tt.query, nil)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, req)
+			if w.Code != tt.wantCode {
+				t.Errorf("status = %d, want %d", w.Code, tt.wantCode)
+			}
+			if stopped != tt.wantStopped {
+				t.Errorf("stopped = %v, want %v", stopped, tt.wantStopped)
+			}
+			if tt.wantStopped && !strings.Contains(w.Body.String(), `"stopping"`) {
+				t.Errorf("body = %q, want status stopping", w.Body.String())
+			}
+		})
+	}
+}
+
+// flushOrderRecorder records whether the response was flushed before any
+// event reached the subscribed channel.
+type flushOrderRecorder struct {
+	*httptest.ResponseRecorder
+	events             chan SSEEvent
+	flushedBeforeEvent bool
+}
+
+func (r *flushOrderRecorder) Flush() {
+	if len(r.events) == 0 {
+		r.flushedBeforeEvent = true
+	}
+	r.ResponseRecorder.Flush()
+}
+
+func TestHandleFinish_ResponseCompleteBeforeFinishEvent(t *testing.T) {
+	srv, sess := newTestServer(t)
+	ch := sess.Subscribe()
+	defer sess.Unsubscribe(ch)
+
+	w := &flushOrderRecorder{ResponseRecorder: httptest.NewRecorder(), events: ch}
+	srv.ServeHTTP(w, httptest.NewRequest("POST", "/api/finish", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !w.flushedBeforeEvent {
+		t.Error("the finish response must be flushed before the finish event, which may stop the daemon")
+	}
+	if got, want := w.Header().Get("Content-Length"), strconv.Itoa(w.Body.Len()); got != want {
+		t.Errorf("Content-Length = %q, want %q so the response is complete on its own", got, want)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != "finish" {
+			t.Errorf("event = %q, want finish", ev.Type)
+		}
+	default:
+		t.Error("no finish event was sent")
+	}
+}
+
 // --- handleFinish additional tests ---
 
 func TestHandleFinish_AllResolved(t *testing.T) {
@@ -4217,6 +4363,53 @@ func TestHandleFinish_MethodNotAllowed(t *testing.T) {
 	srv.ServeHTTP(w, req)
 	if w.Code != 405 {
 		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestHandleFinish_CloseOnApproveAfterMs_IncludedWhenSet(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ms := 2500
+	srv.cfg = Config{CloseOnApproveAfterMs: &ms}
+
+	req := httptest.NewRequest("POST", "/api/finish", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["approved"] != true {
+		t.Errorf("approved = %v, want true", resp["approved"])
+	}
+	got, ok := resp["close_on_approve_after_ms"].(float64)
+	if !ok || int(got) != 2500 {
+		t.Errorf("close_on_approve_after_ms = %v, want 2500", resp["close_on_approve_after_ms"])
+	}
+}
+
+func TestHandleFinish_CloseOnApproveAfterMs_OmittedWhenUnset(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	req := httptest.NewRequest("POST", "/api/finish", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["approved"] != true {
+		t.Errorf("approved = %v, want true", resp["approved"])
+	}
+	if _, ok := resp["close_on_approve_after_ms"]; ok {
+		t.Errorf("close_on_approve_after_ms = %v, want omitted when unset", resp["close_on_approve_after_ms"])
 	}
 }
 
@@ -5743,5 +5936,21 @@ func TestHandleFileCommentsGitHubID(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, `"github_id":12345`) {
 		t.Errorf("response missing github_id field:\n%s", body)
+	}
+}
+
+func TestThemesPage_ServedWithoutSession(t *testing.T) {
+	s, err := NewServer(nil, frontendFS, "", false, "", "", "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/themes", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /themes = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "crit-theme-preview.js") {
+		t.Errorf("GET /themes did not serve the theme preview page")
 	}
 }

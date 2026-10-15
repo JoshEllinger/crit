@@ -1,6 +1,9 @@
 import { test, expect } from '@playwright/test';
-import type { Page } from '@playwright/test';
-import { clearAllComments, loadPage, mdSection, goSection, switchToDocumentView } from './helpers';
+import type { Page, Locator } from '@playwright/test';
+import {
+  clearAllComments, getMdPath, loadPage, goSection, mdSection,
+  switchToDocumentView, diffLine, setDiffStyle, expectPaintedQuote, selectInLineAndPressC,
+} from './helpers';
 
 // Helper: drag-select between two coordinates, then press `c` to comment.
 // Selection alone never opens the form — `c` is the explicit commit.
@@ -9,11 +12,38 @@ async function selectAndPressC(
   x1: number, y1: number, x2: number, y2: number,
   steps = 5,
 ) {
+  // Pierre turns pointer events off briefly after any scroll; wait until the
+  // drag start hit-tests to rendered content.
+  await expect.poll(() => page.evaluate(([x, y]) =>
+    !!document.elementFromPoint(x, y)?.closest('.line-block, diffs-container'), [x1, y1])).toBe(true);
   await page.mouse.move(x1, y1);
   await page.mouse.down();
   await page.mouse.move(x2, y2, { steps });
   await page.mouse.up();
   await page.keyboard.press('c');
+}
+
+// Quote highlights in Pierre diffs are CSS custom highlights (the "crit-quote"
+// registry entry) over ranges inside the shadow roots. Describe each range by
+// its text and the diff line it sits on.
+function quoteHighlights(page: Page) {
+  return page.evaluate(() => {
+    const h = CSS.highlights.get('crit-quote');
+    if (!h) return [];
+    return [...h].map((r) => {
+      const range = r as AbstractRange & { toString?: () => string };
+      const node = range.startContainer;
+      const el = (node.nodeType === 1 ? node : node.parentElement) as HTMLElement | null;
+      const line = el?.closest('[data-line]') as HTMLElement | null;
+      const text = range instanceof Range ? range.toString() : '';
+      return {
+        text,
+        line: line ? Number(line.dataset.line) : null,
+        type: line?.dataset.lineType ?? null,
+        column: line?.closest('code[data-deletions]') ? 'old' : 'new',
+      };
+    });
+  });
 }
 
 test.describe('Select-to-comment (git mode)', () => {
@@ -23,12 +53,13 @@ test.describe('Select-to-comment (git mode)', () => {
   });
 
   test.describe('document view', () => {
+    let section: Locator;
+
     test.beforeEach(async ({ page }) => {
-      await switchToDocumentView(page);
+      section = await switchToDocumentView(page);
     });
 
     test('selecting text alone does not open form; selection preserved for copying', async ({ page }) => {
-      const section = mdSection(page);
       const firstBlock = section.locator('.line-block').first();
       await expect(firstBlock).toBeVisible();
 
@@ -49,28 +80,7 @@ test.describe('Select-to-comment (git mode)', () => {
       expect(selectedText).toBeTruthy();
     });
 
-    test('selecting text then pressing c opens the comment form', async ({ page }) => {
-      const section = mdSection(page);
-      const firstBlock = section.locator('.line-block').first();
-      await expect(firstBlock).toBeVisible();
-
-      const blockBox = await firstBlock.boundingBox();
-      expect(blockBox).toBeTruthy();
-      if (!blockBox) return;
-
-      await selectAndPressC(
-        page,
-        blockBox.x + 60, blockBox.y + blockBox.height / 2,
-        blockBox.x + blockBox.width - 10, blockBox.y + blockBox.height / 2,
-      );
-
-      const textarea = section.locator('.comment-form textarea');
-      await expect(textarea).toBeVisible();
-      await expect(textarea).toBeFocused();
-    });
-
     test('Escape cancels the comment form once opened', async ({ page }) => {
-      const section = mdSection(page);
       const firstBlock = section.locator('.line-block').first();
       const blockBox = await firstBlock.boundingBox();
       expect(blockBox).toBeTruthy();
@@ -89,7 +99,6 @@ test.describe('Select-to-comment (git mode)', () => {
     });
 
     test('full comment lifecycle via text selection', async ({ page }) => {
-      const section = mdSection(page);
       const firstBlock = section.locator('.line-block').first();
       const blockBox = await firstBlock.boundingBox();
       expect(blockBox).toBeTruthy();
@@ -112,7 +121,6 @@ test.describe('Select-to-comment (git mode)', () => {
     });
 
     test('selecting alone does not open a second form when one is already open', async ({ page }) => {
-      const section = mdSection(page);
 
       // Open a comment form via gutter click first
       const firstBlock = section.locator('.line-block').first();
@@ -139,7 +147,6 @@ test.describe('Select-to-comment (git mode)', () => {
     });
 
     test('pressing c with a new selection opens a second form (multi-form workflow)', async ({ page }) => {
-      const section = mdSection(page);
       const blocks = section.locator('.line-block');
 
       // First form: select-and-c on first block
@@ -182,7 +189,6 @@ test.describe('Select-to-comment (git mode)', () => {
     });
 
     test('multi-block selection spans correct line range', async ({ page }) => {
-      const section = mdSection(page);
       const blocks = section.locator('.line-block');
       const firstBlock = blocks.first();
       const thirdBlock = blocks.nth(2);
@@ -203,12 +209,14 @@ test.describe('Select-to-comment (git mode)', () => {
       );
 
       const formHeader = section.locator('.comment-form-header');
-      await expect(formHeader).toBeVisible();
-      await expect(formHeader).toContainText('Comment on');
+      const expectedStart = await firstBlock.getAttribute('data-start-line');
+      const expectedEnd = await thirdBlock.getAttribute('data-end-line');
+      expect(expectedStart).not.toBeNull();
+      expect(expectedEnd).not.toBeNull();
+      await expect(formHeader).toHaveText(`Comment on Lines ${expectedStart}-${expectedEnd}`);
     });
 
     test('selection endpoint on a gap container still spans full range (regression)', async ({ page, request }) => {
-      const section = mdSection(page);
       const overviewBlock = section.locator('.line-block', { hasText: 'Overview' }).first();
       const paraBlock = section.locator('.line-block', { hasText: 'API key authentication' });
       await expect(overviewBlock).toBeVisible();
@@ -266,7 +274,6 @@ test.describe('Select-to-comment (git mode)', () => {
     });
 
 test('single click (no drag) does not open a form', async ({ page }) => {
-      const section = mdSection(page);
       const firstBlock = section.locator('.line-block').first();
       await expect(firstBlock).toBeVisible();
 
@@ -282,12 +289,13 @@ test('single click (no drag) does not open a form', async ({ page }) => {
   });
 
   test.describe('quote highlight', () => {
+    let section: Locator;
+
     test.beforeEach(async ({ page }) => {
-      await switchToDocumentView(page);
+      section = await switchToDocumentView(page);
     });
 
-    test('quote highlight appears while comment form is still open', async ({ page }) => {
-      const section = mdSection(page);
+    test('partial selection highlights while open and persists its quote', async ({ page, request }) => {
       const block = section.locator('.line-block', { hasText: 'API key authentication' });
       await expect(block).toBeVisible();
       const content = block.locator('.line-content');
@@ -304,33 +312,21 @@ test('single click (no drag) does not open a form', async ({ page }) => {
       const textarea = section.locator('.comment-form textarea');
       await expect(textarea).toBeVisible();
       await expect(section.locator('mark.quote-highlight')).toBeVisible();
-    });
-
-    test('partial text selection saves quote and shows highlight mark', async ({ page }) => {
-      const section = mdSection(page);
-      const block = section.locator('.line-block', { hasText: 'API key authentication' });
-      await expect(block).toBeVisible();
-      const content = block.locator('.line-content');
-      const box = await content.boundingBox();
-      expect(box).toBeTruthy();
-      if (!box) return;
-
-      await selectAndPressC(
-        page,
-        box.x + 80, box.y + box.height / 2,
-        box.x + 250, box.y + box.height / 2,
-      );
-
-      const textarea = section.locator('.comment-form textarea');
-      await expect(textarea).toBeVisible();
-      await textarea.fill('Check this part');
+      await textarea.fill('Persisted quote');
       await textarea.press('Control+Enter');
 
+      await expect(section.locator('.comment-form')).toHaveCount(0);
+      await expect(section.locator('.comment-card', { hasText: 'Persisted quote' })).toHaveCount(1);
       await expect(section.locator('mark.quote-highlight')).toBeVisible();
+      const mdPath = await getMdPath(request);
+      const response = await request.get(`/api/file/comments?path=${encodeURIComponent(mdPath)}`);
+      await expect(response).toBeOK();
+      const comments = await response.json() as Array<{ body: string; quote?: string }>;
+      const persisted = comments.find(comment => comment.body === 'Persisted quote');
+      expect(persisted?.quote).toBeTruthy();
     });
 
     test('cross-line partial selection saves quote and shows highlight', async ({ page, request }) => {
-      const section = mdSection(page);
       const overviewBlock = section.locator('.line-block', { hasText: 'Overview' }).first();
       const authBlock = section.locator('.line-block', { hasText: 'API key authentication' });
       await expect(overviewBlock).toBeVisible();
@@ -372,7 +368,6 @@ test('single click (no drag) does not open a form', async ({ page }) => {
     });
 
     test('quote highlight inherits text color (not black)', async ({ page }) => {
-      const section = mdSection(page);
       const block = section.locator('.line-block', { hasText: 'API key authentication' });
       await expect(block).toBeVisible();
       const content = block.locator('.line-content');
@@ -398,7 +393,6 @@ test('single click (no drag) does not open a form', async ({ page }) => {
     });
 
     test('full-line selection does NOT produce a quote highlight', async ({ page }) => {
-      const section = mdSection(page);
       const block = section.locator('.line-block', { hasText: 'API key authentication' });
       await expect(block).toBeVisible();
       const content = block.locator('.line-content');
@@ -427,186 +421,74 @@ test('single click (no drag) does not open a form', async ({ page }) => {
       await expect(section.locator('mark.quote-highlight')).not.toBeVisible();
     });
 
-    test('quote is stored in API response', async ({ page, request }) => {
-      const section = mdSection(page);
-      const block = section.locator('.line-block', { hasText: 'API key authentication' });
-      await expect(block).toBeVisible();
-      const content = block.locator('.line-content');
-      const box = await content.boundingBox();
-      if (!box) return;
-
-      await selectAndPressC(
-        page,
-        box.x + 80, box.y + box.height / 2,
-        box.x + 250, box.y + box.height / 2,
-      );
-
-      const textarea = section.locator('.comment-form textarea');
-      await expect(textarea).toBeVisible();
-      await textarea.fill('API check');
-      await textarea.press('Control+Enter');
-      await expect(section.locator('.comment-card')).toBeVisible();
-
-      const mdPath = await page.evaluate(() => {
-        const el = document.querySelector('.file-section[id*="plan"] .line-block[data-file-path]');
-        return el ? (el as HTMLElement).dataset.filePath : null;
-      });
-      expect(mdPath).toBeTruthy();
-      const res = await request.get(`/api/file/comments?path=${mdPath}`);
-      const comments = await res.json();
-      const withQuote = comments.filter((c: any) => c.quote);
-      expect(withQuote.length).toBeGreaterThan(0);
-      expect(withQuote[0].quote.length).toBeGreaterThan(0);
-    });
   });
 
   test.describe('diff view', () => {
-    test('selecting diff text and pressing c opens comment form', async ({ page }) => {
-      const section = goSection(page);
-      const additionLine = section.locator('.diff-split-side.addition').first();
-      await additionLine.scrollIntoViewIfNeeded();
-      await expect(additionLine).toBeVisible();
+    test('quote highlight appears in split diff view while form is open', async ({ page, request }) => {
+      // server.go new 24: `func authMiddleware(next http.HandlerFunc) ...`
+      const item = await goSection(page);
+      const selected = await selectInLineAndPressC(page, item, 24);
 
-      const diffContent = additionLine.locator('.diff-content');
-      await expect(diffContent).toBeVisible();
-      const box = await diffContent.boundingBox();
-      expect(box).toBeTruthy();
-      if (!box) return;
-
-      await selectAndPressC(
-        page,
-        box.x + 10, box.y + box.height / 2,
-        box.x + box.width - 10, box.y + box.height / 2,
-      );
-
-      const textarea = section.locator('.comment-form textarea');
+      const form = item.locator('.comment-form');
+      const textarea = form.locator('textarea');
       await expect(textarea).toBeVisible();
       await expect(textarea).toBeFocused();
-    });
+      await expect(form.locator('.comment-form-header')).toHaveText('Comment on Line 24');
 
-    test('quote highlight appears in split diff view while form is open', async ({ page }) => {
-      const section = goSection(page);
-      const additionLines = section.locator('.diff-split-side.addition');
-      let targetBox: any = null;
-      const count = await additionLines.count();
-      for (let i = 0; i < count; i++) {
-        const line = additionLines.nth(i);
-        const content = line.locator('.diff-content');
-        const text = await content.textContent();
-        if (text && text.trim().length > 20) {
-          await line.scrollIntoViewIfNeeded();
-          targetBox = await content.boundingBox();
-          break;
-        }
-      }
-      expect(targetBox).toBeTruthy();
-      if (!targetBox) return;
+      const text = selected.trim();
+      await expect.poll(() => quoteHighlights(page)).toEqual([
+        { text, line: 24, type: 'change-addition', column: 'new' },
+      ]);
+      await expectPaintedQuote(page);
 
-      await selectAndPressC(
-        page,
-        targetBox.x + 10, targetBox.y + targetBox.height / 2,
-        targetBox.x + Math.min(targetBox.width / 2, 150), targetBox.y + targetBox.height / 2,
-      );
-
-      const textarea = section.locator('.comment-form textarea');
-      await expect(textarea).toBeVisible();
-      await expect(section.locator('mark.quote-highlight')).toBeVisible();
-    });
-
-    test('quote highlight appears in unified diff view while form is open', async ({ page }) => {
-      const unifiedBtn = page.locator('#diffModeToggle .toggle-btn[data-mode="unified"]');
-      await expect(unifiedBtn).toBeVisible();
-      await unifiedBtn.click();
-
-      const section = goSection(page);
-      const additionLines = section.locator('.diff-line.addition');
-      let targetBox: any = null;
-      const count = await additionLines.count();
-      for (let i = 0; i < count; i++) {
-        const line = additionLines.nth(i);
-        const content = line.locator('.diff-content');
-        const text = await content.textContent();
-        if (text && text.trim().length > 20) {
-          await line.scrollIntoViewIfNeeded();
-          targetBox = await content.boundingBox();
-          break;
-        }
-      }
-      expect(targetBox).toBeTruthy();
-      if (!targetBox) return;
-
-      await selectAndPressC(
-        page,
-        targetBox.x + 10, targetBox.y + targetBox.height / 2,
-        targetBox.x + Math.min(targetBox.width / 2, 150), targetBox.y + targetBox.height / 2,
-      );
-
-      const textarea = section.locator('.comment-form textarea');
-      await expect(textarea).toBeVisible();
-      await expect(section.locator('mark.quote-highlight')).toBeVisible();
+      // The quote is saved with the comment.
+      await textarea.fill('split quote');
+      await textarea.press('Control+Enter');
+      await expect(item.locator('.comment-card', { hasText: 'split quote' })).toBeVisible();
+      const comments = await (await request.get('/api/file/comments?path=server.go')).json() as Array<{ body: string; quote?: string; start_line: number; end_line: number }>;
+      const saved = comments.find(c => c.body === 'split quote');
+      expect(saved?.quote).toBe(text);
+      expect([saved?.start_line, saved?.end_line]).toEqual([24, 24]);
+      await expect.poll(() => quoteHighlights(page)).toEqual([
+        { text, line: 24, type: 'change-addition', column: 'new' },
+      ]);
+      await expectPaintedQuote(page);
     });
 
     test('quote highlight appears on addition line, not deletion line in unified diff (issue #133)', async ({ page }) => {
-      const unifiedBtn = page.locator('#diffModeToggle .toggle-btn[data-mode="unified"]');
-      await expect(unifiedBtn).toBeVisible();
-      await unifiedBtn.click();
+      await setDiffStyle(page, 'unified');
 
-      const section = goSection(page);
-      const additionLines = section.locator('.diff-line.addition');
-      let targetLine: any = null;
-      let targetBox: any = null;
-      const count = await additionLines.count();
-      for (let i = 0; i < count; i++) {
-        const line = additionLines.nth(i);
-        const content = line.locator('.diff-content');
-        const text = await content.textContent();
-        if (text && text.trim().length > 20) {
-          await line.scrollIntoViewIfNeeded();
-          targetLine = line;
-          targetBox = await content.boundingBox();
-          break;
-        }
-      }
-      expect(targetBox).toBeTruthy();
-      if (!targetBox || !targetLine) return;
+      // server.go: new 24 is an addition and old 24 a deletion — both render
+      // with data-line="24" in the unified column (the #133 collision).
+      const diff = await (await page.request.get('/api/file/diff?path=server.go')).json() as { hunks: Array<{ Lines: Array<{ Type: string; OldNum: number }> }> };
+      expect(diff.hunks.flatMap(h => h.Lines).some(l => l.Type === 'del' && l.OldNum === 24)).toBe(true);
+      const item = await goSection(page);
+      const addition = diffLine(item, 24);
+      await expect(addition).toHaveAttribute('data-line-type', 'change-addition');
 
-      await selectAndPressC(
-        page,
-        targetBox.x + 10, targetBox.y + targetBox.height / 2,
-        targetBox.x + Math.min(targetBox.width / 2, 150), targetBox.y + targetBox.height / 2,
-      );
+      const selected = await selectInLineAndPressC(page, item, 24);
 
-      const textarea = section.locator('.comment-form textarea');
+      const textarea = item.locator('.comment-form textarea');
       await expect(textarea).toBeVisible();
-
-      const highlightMark = section.locator('mark.quote-highlight').first();
-      await expect(highlightMark).toBeVisible();
-      const parentLine = highlightMark.locator('xpath=ancestor::div[contains(@class, "diff-line")]');
-      await expect(parentLine).toHaveClass(/addition/);
-      await expect(parentLine).not.toHaveClass(/deletion/);
+      await expect.poll(() => quoteHighlights(page)).toEqual([
+        { text: selected.trim(), line: 24, type: 'change-addition', column: 'new' },
+      ]);
+      await expectPaintedQuote(page);
     });
 
     test('quote highlight appears in markdown diff view while form is open', async ({ page }) => {
-      const section = mdSection(page);
-      const additionLine = section.locator('.diff-split-side.addition').first();
-      await additionLine.scrollIntoViewIfNeeded();
-      await expect(additionLine).toBeVisible();
+      // plan.md defaults to diff view in git mode; new line 5 is the
+      // "We're adding API key authentication..." paragraph.
+      const item = await mdSection(page);
+      await expect(diffLine(item, 5)).toContainText('API key authentication');
+      const selected = await selectInLineAndPressC(page, item, 5);
 
-      const diffContent = additionLine.locator('.diff-content');
-      await expect(diffContent).toBeVisible();
-      const box = await diffContent.boundingBox();
-      expect(box).toBeTruthy();
-      if (!box) return;
-
-      await selectAndPressC(
-        page,
-        box.x + 10, box.y + box.height / 2,
-        box.x + Math.min(box.width / 2, 150), box.y + box.height / 2,
-      );
-
-      const textarea = section.locator('.comment-form textarea');
+      const textarea = item.locator('.comment-form textarea');
       await expect(textarea).toBeVisible();
-      await expect(section.locator('mark.quote-highlight')).toBeVisible();
+      await expect.poll(() => quoteHighlights(page)).toEqual([
+        { text: selected.trim(), line: 5, type: 'change-addition', column: 'new' },
+      ]);
+      await expectPaintedQuote(page);
     });
   });
 });

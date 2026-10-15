@@ -70,23 +70,27 @@ Options:
 	{name: "comment", handler: runComment, help: `Usage: crit comment [options] <body>
        crit comment [options] <path> <body>
        crit comment [options] <path>:<line[-end]> <body>
+       crit comment [options] --selector <css> [--route <path>] <body>
        crit comment [options] --reply-to <id> [--resolve] <body>
        crit comment [options] --json [--file <path>]
        crit comment [options] --clear
 
 Add, reply to, bulk import, or clear review comments.
+Live reviews and HTML preview use --selector to pin a DOM element.
 
 Options:
-  -o, --output <dir>   Crit data root for reviews
-      --author <name>  Comment author
-      --plan <name>    Target a stored plan review
-      --session <id>   Target an active review session (all comment modes)
-      --reply-to <id>  Reply to an existing comment
-      --resolve        Resolve the parent after replying
-      --path <path>    File path for a reply
-      --json           Read bulk comments as JSON
-  -f, --file <path>    Read JSON from a file
-      --scope <mode>   Override comment focus scope`},
+  -o, --output <dir>     Crit data root for reviews
+      --author <name>    Comment author
+      --plan <name>      Target a stored plan review
+      --session <id>     Target an active review session (all comment modes)
+      --reply-to <id>    Reply to an existing comment
+      --resolve          Resolve the parent after replying
+      --path <path>      File path for a reply
+      --selector <css>   CSS selector for a live or preview pin
+      --route <path>     Page path for that pin
+      --json             Read bulk comments as JSON
+  -f, --file <path>      Read JSON from a file
+      --scope <mode>     Override comment focus scope`},
 	{name: "comments", handler: runComments, help: `Usage: crit comments [--session <id>] [--json] [--all] [review]
 
 List unresolved comments, with review-level comments first.`},
@@ -136,6 +140,10 @@ Options:
 Create or continue a plan-file review. If --name is omitted, crit derives it
 from the plan content.
 
+With --no-wait, crit saves the plan as its next version and exits without
+starting a review (no version is added when the content is unchanged). It
+prints the slug, for use with crit comment --plan <slug>.
+
 Options:
       --host <host>       Host to listen on
       --public-url <url>  Advertised base URL
@@ -144,6 +152,7 @@ Options:
   -p, --port <port>       Port to listen on
       --share-url <url>   Share service URL
       --no-open           Do not open a browser
+      --no-wait           Save the version and exit; do not start a review
   -q, --quiet             On success, suppress connect/start status, tips, and session summary`},
 	{name: "story", handler: runStory, helpFn: printStoryUsage, bareHelp: true},
 	{name: "auth", handler: runAuth, help: `Usage: crit auth <login|logout|whoami|status>
@@ -180,6 +189,19 @@ exact file-mode session, or use --all to stop every daemon.`},
 	{name: "status", handler: runStatus, help: `Usage: crit status [--json]
 
 Show active session IDs and review paths, daemon status, and comment counts.`},
+	{name: "resume", handler: runResume, help: `Usage: crit resume [--list | <id>] [review options]
+
+Pick a stored review to reopen. Without arguments this shows an interactive
+list of every review in ~/.crit/reviews, newest first, and reconnects to the
+one you choose — restarting its daemon in the directory it came from when that
+daemon has stopped. Pass a session ID to skip the picker.
+
+Options:
+  -l, --list               Print the list instead of opening the picker
+
+Any other option is passed through to the review, so flags like --no-open work.
+Reviews stored outside ~/.crit/reviews are not listed: reopen a plan with
+crit plan --name <slug>, and an --output review with crit --session <id>.`},
 	{name: "stats", handler: runStats, help: `Usage: crit stats [--json]
 
 Show lifetime review statistics.`},
@@ -297,6 +319,7 @@ Review:
   crit plan --name <slug> <file>             Review a plan file
   crit story                                 Generate and review a story-mode diff
   crit --session <id>                        Reconnect to an existing review session
+  crit resume [--list | <id>]               Pick a stored review to reopen
 
 Comments:
   crit comment <path>:<line[-end]> <body>    Add a comment (headless, no server needed)
