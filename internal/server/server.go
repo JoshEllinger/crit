@@ -2734,6 +2734,13 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sess := s.session.Load()
+	// A plan hook starts the next round when the agent submits the plan
+	// again. While it waits, the finish prompt says that instead of
+	// `crit plan --name`.
+	if planHook := planHookParam(r, sess); planHook != "" {
+		sess.SetPlanHook(planHook)
+		defer sess.SetPlanHook("")
+	}
 
 	// Subscribe BEFORE round-complete to avoid missing the finish event
 	// if the user clicks "Finish Review" in the brief window between
@@ -2797,6 +2804,20 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusGatewayTimeout)
 			return
 		}
+	}
+}
+
+// planHookParam returns the plan hook kind a review-cycle client declared
+// (plan_mode or codex), or "" for any other client or session mode.
+func planHookParam(r *http.Request, sess *Session) string {
+	if sess.Mode != "plan" {
+		return ""
+	}
+	switch v := r.URL.Query().Get("plan_hook"); v {
+	case "plan_mode", "codex":
+		return v
+	default:
+		return ""
 	}
 }
 

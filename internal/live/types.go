@@ -8,10 +8,7 @@ import (
 	"github.com/JoshEllinger/crit/internal/server"
 	"github.com/JoshEllinger/crit/internal/session"
 	"github.com/JoshEllinger/crit/internal/share"
-	"github.com/JoshEllinger/crit/internal/testutil"
 )
-
-var writeFile = testutil.WriteFile
 
 type (
 	Config       = config.Config
