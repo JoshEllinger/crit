@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/JoshEllinger/crit/internal/testutil"
 )
@@ -464,13 +465,8 @@ func TestHelperProcess_AuthUnknown(t *testing.T) {
 func TestRunAuthWhoami_NotLoggedIn(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_AuthWhoamiNotLoggedIn", "--")
 	home := t.TempDir()
-	// Fork customization: no default share target (see upstream-merge-plan.md);
-	// a target must be explicitly configured to reach the "Not logged in" path.
-	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(`{"share_url":"https://crit.md"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home)
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home, forkShareEnv)
 	// Ensure CRIT_AUTH_TOKEN is not set
 	var env []string
 	for _, e := range cmd.Env {
@@ -499,13 +495,8 @@ func TestHelperProcess_AuthWhoamiNotLoggedIn(t *testing.T) {
 func TestRunAuthLogout_NotLoggedIn(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_AuthLogoutNotLoggedIn", "--")
 	home := t.TempDir()
-	// Fork customization: no default share target (see upstream-merge-plan.md);
-	// a target must be explicitly configured to reach the "Not logged in" path.
-	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(`{"share_url":"https://crit.md"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home)
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home, forkShareEnv)
 	var env []string
 	for _, e := range cmd.Env {
 		if !strings.HasPrefix(e, "CRIT_AUTH_TOKEN=") {
@@ -533,13 +524,8 @@ func TestHelperProcess_AuthLogoutNotLoggedIn(t *testing.T) {
 func TestRunAuthLogout_EnvToken(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess_AuthLogoutEnvToken", "--")
 	home := t.TempDir()
-	// Fork customization: no default share target (see upstream-merge-plan.md);
-	// a target must be explicitly configured to reach the CRIT_AUTH_TOKEN path.
-	if err := os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(`{"share_url":"https://crit.md"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	// USERPROFILE is what os.UserHomeDir() reads on Windows; HOME is a no-op there.
-	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home, "CRIT_AUTH_TOKEN=crit_env_token")
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "HOME="+home, "USERPROFILE="+home, forkShareEnv, "CRIT_AUTH_TOKEN=crit_env_token")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("logout exited with error: %v\noutput: %s", err, out)
@@ -685,9 +671,13 @@ func TestPollForToken_Integration(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// Interval is in seconds; scale it to milliseconds for the test.
+	oldUnit := pollIntervalUnit
+	pollIntervalUnit = time.Millisecond
+	t.Cleanup(func() { pollIntervalUnit = oldUnit })
 	code := deviceCodeResponse{
 		DeviceCode: "dc_integration",
-		Interval:   1, // 1 second per poll to keep the test fast
+		Interval:   1,
 		ExpiresIn:  30,
 	}
 
@@ -1398,3 +1388,8 @@ func TestConfirmReauth_NonTTY(t *testing.T) {
 		t.Fatal("non-TTY confirmReauth should return false")
 	}
 }
+
+// forkShareEnv opts helper subprocesses in to the public crit.md target: this
+// fork has no default share target, and the helper's TestMain resets HOME, so a
+// config file written to the test's HOME would be lost.
+const forkShareEnv = "CRIT_SHARE_URL=https://crit.md"
