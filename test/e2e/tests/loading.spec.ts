@@ -37,11 +37,12 @@ test.describe('Page Loading', () => {
     expect(requested.filter(u => u.includes('mermaid.min.js'))).toEqual([]);
   });
 
-  test('config API reports the default share URL and no hosted review yet', async ({ request }) => {
+  test('config API reports no share URL (fork default) and no hosted review yet', async ({ request }) => {
     const res = await request.get('/api/config');
     await expect(res).toBeOK();
     const config = await res.json();
-    expect(config.share_url).toBe('https://crit.md');
+    // Fork divergence: share_url defaults to "" (upstream: https://crit.md).
+    expect(config.share_url).toBe('');
     expect(config.hosted_url).toBe('');
     expect(config.delete_token).toBe('');
   });
