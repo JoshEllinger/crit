@@ -292,7 +292,7 @@ jobs:
           ALL=$(go list ./... | grep -v /node_modules/ | sort)
           # Explicit groups, not NR%3: a new package must not reshuffle every
           # shard. Shard 2 is the complement, so nothing is ever left out.
-          M=github.com/tomasz-tomczyk/crit
+          M=github.com/JoshEllinger/crit
           G0="^$M/internal/session\$"
           G1="^$M/internal/(server|comment|share|live|auth|review|focus|gitlab|preview)\$"
           case "$SHARD" in
