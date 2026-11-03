@@ -1688,12 +1688,15 @@ func TestResolveOperationTargetNewShareAndBoundConflicts(t *testing.T) {
 	if _, err := resolveOperationTarget(cfg, "https://b.example", true, cj, true); err == nil {
 		t.Fatal("expected bound/explicit mismatch to fail")
 	}
-	target, err := resolveOperationTarget(cfg, "", false, session.CritJSON{ShareURL: "https://a.example/r/tok"}, true)
-	if err != nil {
-		t.Fatal(err)
+	got, err := resolveOperationTarget(cfg, "", false, session.CritJSON{ShareURL: "https://a.example/r/tok"}, true)
+	if err != nil || got.URL != "https://a.example" {
+		t.Fatalf("legacy review matching a deployment got=%#v err=%v, want https://a.example", got, err)
 	}
-	if target.URL != "https://a.example" {
-		t.Fatalf("inferred base = %q", target.URL)
+	if _, err := resolveOperationTarget(cfg, "", false, session.CritJSON{ShareURL: "https://legacy.example.com/unknown/r/review-token"}, true); err == nil || !strings.Contains(err.Error(), "cannot identify") {
+		t.Fatalf("uninferable legacy review must keep the explicit error, got %v", err)
+	}
+	if _, err := resolveOperationTarget(cfg, "", false, session.CritJSON{ShareURL: "https://other.example/r/tok"}, true); err == nil || !strings.Contains(err.Error(), "cannot identify") {
+		t.Fatalf("inferred base that is not configured must not fall through to the default, got %v", err)
 	}
 }
 
@@ -2583,5 +2586,23 @@ func TestLoadPreviewShareComments_IncludesPulledKeys(t *testing.T) {
 		if got[body] != file {
 			t.Errorf("comment %q file = %q, want %q", body, got[body], file)
 		}
+	}
+}
+
+func TestPersistShareState_DoesNotOverwriteCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	reviewPath := session.MustMkdirAll(filepath.Join(dir, ".crit", "review.json"))
+	if err := os.WriteFile(reviewPath, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := persistShareState(filepath.Join(dir, ".crit"), "https://crit.md/r/abc", "tok_123", "", "", "", "")
+
+	if err == nil {
+		t.Fatal("expected an error for a corrupt review file")
+	}
+	data, _ := os.ReadFile(reviewPath)
+	if string(data) != "{not json" {
+		t.Errorf("corrupt review file was overwritten: %q", data)
 	}
 }

@@ -261,7 +261,7 @@ File-scoped (require `?path=X`):
 - `POST|PUT|DELETE /api/comment/{id}/replies[/{rid}]?path=X` — reply CRUD
 - `PUT /api/comment/{id}/resolve?path=X` — set resolved state
 
-Static: `GET /files/<path>` — serve files from repo root (path traversal protected). `GET /` — embedded frontend assets.
+Static: `GET /files/<path>` — serve files from repo root (path traversal protected). `GET /custom.css` — the user's `~/.crit/custom.css` (204 when absent or unusable). `GET /` — embedded frontend assets.
 </important>
 
 <important if="you are modifying server security, request handling, or path-validation logic">
@@ -272,12 +272,14 @@ Static: `GET /files/<path>` — serve files from repo root (path traversal prote
 - Body size: 10MB for comments, 1MB for share-url via `http.MaxBytesReader`
 - HTTP server: `ReadTimeout: 15s`, `IdleTimeout: 60s` (no `WriteTimeout` — SSE needs open connections)
 - Comment renderer uses `html: true` then DOMPurify with a pinned GitHub-compatible allowlist (`web/comment-html.js`) before `innerHTML` — never trust raw comment HTML
-- Document renderer uses `html: true` intentionally (reviewing local files)
+- Document renderer uses `html: true` so raw HTML in Markdown still renders, but `web/document-html.js` runs html_block tokens and inline runs with html_inline through DOMPurify (default profile, no `<style>`/`<form>`/`style=`). Word-diff HTML is spliced in as a string after that, so `app.js` cleans it again with `sanitizeRendered` (keeps crit's own inline styles). A reviewed file is untrusted: it must not run script in the daemon origin
 </important>
 
 <important if="you are modifying web/ — app.js, style.css, theme.css, or index.html">
 
 Frontend split: `index.html` (HTML shell), `app.js` (all logic), `style.css` (layout/components), `theme.css` (theme variables).
+
+User stylesheet: `~/.crit/custom.css` (`config.CustomCSSPath()`) is served at `GET /custom.css` and linked as `<link id="critCustomCSS">`, which must stay the last stylesheet in `index.html` and `themes.html` (the live bootstrap inserts `style-live.css` before it). The Settings "Custom CSS" card reads `custom_css_path` / `custom_css_exists` from `/api/config`; the "Use custom CSS" switch (`customCSS` setting) disables the link via `crit-theme-palette.js`. `data-crit-mode` (`light` | `dark`) on `<html>` is for user stylesheets, so keep it and the `--crit-*` variables stable.
 
 ### Multi-file state model
 

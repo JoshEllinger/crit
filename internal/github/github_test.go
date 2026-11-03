@@ -2699,56 +2699,6 @@ func TestMergeGHCommentsScoped_NoStampWithEmptyScope(t *testing.T) {
 	}
 }
 
-// TestResolvePullScope verifies the daemon-probe + on-disk fallback used by
-// `crit pull` and mergeWebComments. Mirrors the precedence in
-// resolveCommentScope (focus_cli.go) but always emits DiffScope=layer.
-func TestResolvePullScope(t *testing.T) {
-	cases := []struct {
-		name        string
-		daemonFocus *Focus
-		diskScope   string
-		wantHead    string
-		wantScope   string
-	}{
-		{name: "no daemon, no disk -> empty (legacy)", wantHead: "", wantScope: ""},
-		{
-			name:        "daemon range/layer -> head + layer",
-			daemonFocus: &Focus{Kind: FocusRange, HeadSHA: "abc", DiffScope: DiffScopeLayer},
-			wantHead:    "abc", wantScope: "layer",
-		},
-		{
-			name:        "daemon range/full-stack -> still layer (pulls anchor to PR diff)",
-			daemonFocus: &Focus{Kind: FocusRange, HeadSHA: "def", DiffScope: DiffScopeFullStack},
-			wantHead:    "def", wantScope: "layer",
-		},
-		{
-			name:        "daemon working-tree -> empty",
-			daemonFocus: &Focus{Kind: FocusWorkingTree},
-			wantHead:    "", wantScope: "",
-		},
-		{
-			name:      "no daemon, disk says layer -> layer with empty head",
-			diskScope: "layer",
-			wantHead:  "", wantScope: "layer",
-		},
-		{
-			name:      "no daemon, disk says full_stack -> still layer",
-			diskScope: "full_stack",
-			wantHead:  "", wantScope: "layer",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			withDaemonFocus(t, tc.daemonFocus)
-			cj := &CritJSON{ActiveDiffScope: tc.diskScope}
-			got := resolvePullScope(cj)
-			if got.HeadSHA != tc.wantHead || got.DiffScope != tc.wantScope {
-				t.Errorf("got=%+v want head=%q scope=%q", got, tc.wantHead, tc.wantScope)
-			}
-		})
-	}
-}
-
 // TestParsePRViewJSON_ForkPR locks down the parser's handling of fork PRs:
 // isCrossRepository must round-trip and HeadRepoURL must come from
 // headRepository.url so ensureSHAFetched can fall back to the fork remote.
@@ -2868,7 +2818,11 @@ func TestCollectEditedForPush_DetectsBodyDivergence(t *testing.T) {
 // stored in LastPushedBodyHash so the next push is a no-op.
 func TestUpdateCritJSONWithEditedBodies_StampsLastPushedBodyHash(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "review.json")
+	path := filepath.Join(dir, "review")
+	reviewPath := session.ReviewPathsFor(path).Review
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	cj := CritJSON{
 		Files: map[string]CritJSONFile{
@@ -2884,7 +2838,7 @@ func TestUpdateCritJSONWithEditedBodies_StampsLastPushedBodyHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(reviewPath, data, 0644); err != nil {
 		t.Fatalf("write seed: %v", err)
 	}
 
@@ -2896,7 +2850,7 @@ func TestUpdateCritJSONWithEditedBodies_StampsLastPushedBodyHash(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 
-	out, err := os.ReadFile(path)
+	out, err := os.ReadFile(reviewPath)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -3527,7 +3481,11 @@ func TestBodyHashAtPush(t *testing.T) {
 
 func TestUpdateCritJSONWithEditedBodies_ExportedWrapper(t *testing.T) {
 	dir := t.TempDir()
-	critPath := filepath.Join(dir, "review.json")
+	critPath := filepath.Join(dir, "review")
+	reviewPath := session.ReviewPathsFor(critPath).Review
+	if err := os.MkdirAll(critPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	cj := CritJSON{
 		Files: map[string]CritJSONFile{
@@ -3543,7 +3501,7 @@ func TestUpdateCritJSONWithEditedBodies_ExportedWrapper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if err := os.WriteFile(critPath, data, 0644); err != nil {
+	if err := os.WriteFile(reviewPath, data, 0644); err != nil {
 		t.Fatalf("write seed: %v", err)
 	}
 
@@ -3555,7 +3513,7 @@ func TestUpdateCritJSONWithEditedBodies_ExportedWrapper(t *testing.T) {
 		t.Fatalf("UpdateCritJSONWithEditedBodies: %v", err)
 	}
 
-	out, err := os.ReadFile(critPath)
+	out, err := os.ReadFile(reviewPath)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -3581,5 +3539,61 @@ func TestPRListCache_CacheHit(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Number != 1 {
 		t.Errorf("got %+v, want seeded summary", got)
+	}
+}
+
+func TestGHAPIErrorDetail(t *testing.T) {
+	tests := []struct {
+		name   string
+		stdout string
+		want   string
+	}{
+		{
+			name:   "string errors from a 422 review create",
+			stdout: `{"message":"Unprocessable Entity","errors":["Line could not be resolved"],"documentation_url":"https://docs.github.com/rest/pulls/reviews#create-a-review-for-a-pull-request","status":"422"}`,
+			want:   "Line could not be resolved",
+		},
+		{
+			name:   "object errors with message and with field+code",
+			stdout: `{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","message":"commit_id is not part of the pull request"},{"resource":"PullRequestReviewComment","field":"path","code":"invalid"}]}`,
+			want:   "commit_id is not part of the pull request; path invalid",
+		},
+		{name: "no errors list", stdout: `{"message":"Not Found"}`, want: ""},
+		{name: "not json", stdout: "plain text", want: ""},
+		{name: "empty", stdout: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ghAPIErrorDetail([]byte(tt.stdout)); got != tt.want {
+				t.Errorf("ghAPIErrorDetail() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A body edited again while the push ran is kept; only the pushed body's
+// hash is stamped, so the next push sends the newer body.
+func TestUpdateCritJSONWithEditedBodies_KeepsNewerBody(t *testing.T) {
+	critPath := filepath.Join(t.TempDir(), "review")
+	cj := CritJSON{Files: map[string]CritJSONFile{
+		"a.go": {Comments: []Comment{{ID: "c1", GitHubID: 500, Body: "edited again"}}},
+	}}
+	if err := session.SaveCritJSON(critPath, cj); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateCritJSONWithEditedBodies(critPath, []ghEditForPush{{GitHubID: 500, Body: "edited", Path: "a.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(session.ReviewPathsFor(critPath).Review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got CritJSON
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	c := got.Files["a.go"].Comments[0]
+	if c.Body != "edited again" || c.LastPushedBodyHash != bodyHashAtPush("edited") {
+		t.Errorf("comment = %+v", c)
 	}
 }

@@ -49,6 +49,15 @@ export async function loadPage(page: Page) {
   await expect(page.locator('.loading')).toBeHidden({ timeout: 10_000 });
 }
 
+// loadPage, then wait for the /api/events stream: SSE-driven updates (rounds,
+// edit-detected) can otherwise land before the page is listening.
+export async function loadPageWithEvents(page: Page) {
+  const connected = page.waitForResponse(response =>
+    new URL(response.url()).pathname === '/api/events' && response.ok());
+  await loadPage(page);
+  await connected;
+}
+
 // ----- Pierre diff surface -----
 //
 // Git-mode files render through @pierre/diffs CodeView. Each file is a
@@ -249,25 +258,47 @@ export async function showLine(page: Page, line: Locator) {
 }
 
 /**
- * Wait until the review pane's scroll offset and height hold still for a few
- * frames (re-layout after an update, virtualized items mounting).
+ * Wait until the review pane has settled: fonts loaded, every mounted
+ * pluggable render target (`.crit-render`, e.g. a Mermaid diagram) has
+ * finished, and the pane's scroll offset, height and first item position hold
+ * still for a few frames (re-layout after an update, virtualized items
+ * mounting).
+ *
+ * A diagram that mounts as the pane scrolls renders asynchronously: its file
+ * keeps the source's height for ~150ms, then grows when the SVG lands, and
+ * the virtualizer shifts the items for a frame while it re-measures. Height
+ * alone looks stable during that wait, so pending targets count as unsettled.
  */
 export async function waitForScrollStable(page: Page) {
-  await reviewScroller(page).evaluate((el) => new Promise<void>((resolve) => {
-    let last = '';
-    let stable = 0;
-    const check = () => {
-      const now = `${el.scrollTop}:${el.scrollHeight}`;
-      if (now === last) {
-        if (++stable >= 5) return resolve();
-      } else {
-        stable = 0;
-        last = now;
-      }
+  await reviewScroller(page).evaluate(async (el) => {
+    await document.fonts.ready;
+    await new Promise<void>((resolve, reject) => {
+      const deadline = performance.now() + 10_000;
+      let last = '';
+      let stable = 0;
+      const unsettled = () => [...el.querySelectorAll('.crit-render')].filter((t) => {
+        const state = t.getAttribute('data-crit-state');
+        return state !== 'rendered' && state !== 'error';
+      }).length;
+      const check = () => {
+        const first = el.querySelector('diffs-container');
+        const firstTop = first ? first.getBoundingClientRect().top : 0;
+        const pending = unsettled();
+        const now = `${el.scrollTop}:${el.scrollHeight}:${firstTop}:${pending}`;
+        if (now === last && pending === 0) {
+          if (++stable >= 5) return resolve();
+        } else {
+          stable = 0;
+          last = now;
+        }
+        if (performance.now() > deadline) {
+          return reject(new Error(`review pane did not settle in 10s (${now})`));
+        }
+        requestAnimationFrame(check);
+      };
       requestAnimationFrame(check);
-    };
-    requestAnimationFrame(check);
-  }));
+    });
+  });
 }
 
 /**
@@ -469,6 +500,31 @@ export async function pressUntil(
   throw new Error(`pressed ${key} ${max} times without reaching the target`);
 }
 
+/** Keyboard-focused diff rows as "path:line" (Pierre marks them selected). */
+export function focusedRows(page: Page): Promise<string[]> {
+  return page.locator('diffs-container [data-content] > [data-selected-line][data-line]').evaluateAll(els =>
+    els.flatMap((el) => {
+      // Skip rows detached mid-read by a re-render.
+      const root = el.getRootNode();
+      if (!(root instanceof ShadowRoot) || !root.host.isConnected) return [];
+      const path = (root.host.querySelector('.pierre-file-header') as HTMLElement | null)?.dataset.filePath;
+      return [`${path}:${(el as HTMLElement).dataset.line}`];
+    }));
+}
+
+/** The file of the first `focusedRows` entry, or '' when nothing is focused. */
+export function focusedFile(rows: string[]): string {
+  return rows.length ? rows[0].slice(0, rows[0].lastIndexOf(':')) : '';
+}
+
+/** Path of the review-list file under the mouse pointer, or null. */
+export function hoveredFile(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const host = Array.from(document.querySelectorAll('#filesContainer diffs-container')).find(el => el.matches(':hover'));
+    return (host?.querySelector('.pierre-file-header') as HTMLElement | null)?.dataset.filePath ?? null;
+  });
+}
+
 /** File paths in the file tree, in tree order. */
 export async function treePaths(page: Page): Promise<string[]> {
   const tree = page.locator('.tree-file[data-tree-path]');
@@ -483,6 +539,35 @@ export async function addComment(request: APIRequestContext, path: string, line:
   });
   expect(resp.ok()).toBeTruthy();
   return resp.json();
+}
+
+/** Add a comment on the whole review (the "Review conversation" section); returns its id. */
+export async function addReviewComment(request: APIRequestContext, body: string): Promise<string> {
+  const response = await request.post('/api/comments', { data: { body } });
+  await expect(response).toBeOK();
+  return (await response.json()).id;
+}
+
+/** Add a comment on the whole file `path`; returns its id. */
+export async function addFileComment(request: APIRequestContext, path: string, body: string): Promise<string> {
+  const response = await request.post(`/api/file/comments?path=${encodeURIComponent(path)}`, {
+    data: { scope: 'file', start_line: 0, end_line: 0, body },
+  });
+  await expect(response).toBeOK();
+  return (await response.json()).id;
+}
+
+/** Wait until the comment card lies wholly inside the visible part of the review list. */
+export async function expectCardOnScreen(page: Page, commentId: string) {
+  await expect.poll(() => page.evaluate((id) => {
+    const card = document.querySelector(`#filesContainer .comment-card[data-comment-id="${CSS.escape(id)}"]`);
+    const list = document.getElementById('filesContainer');
+    if (!card || !list) return 'not mounted';
+    const cardBox = card.getBoundingClientRect();
+    const listBox = list.getBoundingClientRect();
+    if (cardBox.top >= listBox.top && cardBox.bottom <= listBox.bottom) return 'on screen';
+    return `off screen: card ${Math.round(cardBox.top)}..${Math.round(cardBox.bottom)}, list ${Math.round(listBox.top)}..${Math.round(listBox.bottom)}`;
+  }, commentId)).toBe('on screen');
 }
 
 // Get the markdown file path from the session.
