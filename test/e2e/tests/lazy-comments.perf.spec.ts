@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { loadPage, clearAllComments, addComment, waitForScrollStable } from './helpers';
+import { loadPage, clearAllComments, addComment, waitForScrollStable, reviewScroller } from './helpers';
 
 // Comments on files past the eager load limit (25) must show on open, before
 // the file's diff loads (#1032). plan-big.md sorts last in the 301-file perf
@@ -185,4 +185,86 @@ test('a ref chip at the bottom to a review comment scrolls back to it', async ({
 
   await chip.click();
   await expect(page.locator('#reviewConversation .comment-card')).toBeInViewport();
+});
+
+// A jump to an unmounted card asks Pierre to scroll to its file, then centers
+// the card. Pierre kept that file target pending, so the next click (card
+// now mounted) re-applied it and the card bounced to the file top.
+test('clicking the same panel card again leaves the inline card in place', async ({ page, request }) => {
+  const path = 'file150.go';
+  const res = await request.post(`/api/file/comments?path=${encodeURIComponent(path)}`, {
+    data: { scope: 'file', start_line: 0, end_line: 0, body: 'Click me twice' },
+  });
+  expect(res.ok()).toBeTruthy();
+  const { id } = await res.json();
+  await loadPage(page);
+  const inline = page.locator(`#filesContainer .comment-card[data-comment-id="${id}"]`);
+  await expect(inline).toHaveCount(0);
+
+  await page.keyboard.press('Shift+C');
+  const panel = page.locator(`.panel-comment-block .comment-card[data-comment-id="${id}"]`);
+  // The card's top once it has not moved for 400ms: longer than the jump's
+  // own quiet window, so a late resize can't land between reads.
+  const settledTop = () => inline.evaluate(el => new Promise<number>((resolve) => {
+    let last = Math.round(el.getBoundingClientRect().top);
+    let since = performance.now();
+    (function tick() {
+      const top = Math.round(el.getBoundingClientRect().top);
+      const now = performance.now();
+      if (top !== last) {
+        last = top;
+        since = now;
+      }
+      if (now - since >= 400) resolve(top);
+      else requestAnimationFrame(tick);
+    })();
+  }));
+  // Files around the card finish measuring after the first jump has placed
+  // it; the jump keeps it centered through that, so compare from the first
+  // click.
+  await panel.click();
+  await waitForScrollStable(page);
+  await expect(inline).toBeInViewport();
+  const placed = await settledTop();
+
+  for (let i = 0; i < 3; i++) {
+    await panel.click();
+    expect(Math.abs(await settledTop() - placed)).toBeLessThanOrEqual(2);
+  }
+});
+
+// The jump keeps re-centering the card while files around it measure. A key
+// the reader presses in that window must end it, not get pulled back.
+test('a key pressed right after a jump keeps the list where the key put it', async ({ page, request }) => {
+  const path = 'file150.go';
+  const res = await request.post(`/api/file/comments?path=${encodeURIComponent(path)}`, {
+    data: { scope: 'file', start_line: 0, end_line: 0, body: 'Scroll away from me' },
+  });
+  expect(res.ok()).toBeTruthy();
+  const { id } = await res.json();
+  await loadPage(page);
+
+  await page.keyboard.press('Shift+C');
+  const inline = page.locator(`#filesContainer .comment-card[data-comment-id="${id}"]`);
+  await page.locator(`.panel-comment-block .comment-card[data-comment-id="${id}"]`).click();
+  await expect(inline).toBeInViewport();
+
+  // Focus without a pointer event so PageDown scrolls the review list.
+  await inline.getByRole('button', { name: /resolve/i }).first().focus();
+  const scroller = reviewScroller(page);
+  const before = await scroller.evaluate((el) => el.scrollTop);
+  await page.keyboard.press('PageDown');
+  await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBeGreaterThan(before + 200);
+
+  // Sample for ~500ms: the list must not return toward the card.
+  const lowest = await scroller.evaluate((el) => new Promise<number>((resolve) => {
+    const end = performance.now() + 500;
+    let min = el.scrollTop;
+    (function sample() {
+      min = Math.min(min, el.scrollTop);
+      if (performance.now() >= end) resolve(min);
+      else requestAnimationFrame(sample);
+    })();
+  }));
+  expect(lowest).toBeGreaterThan(before + 200);
 });

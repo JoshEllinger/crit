@@ -1115,6 +1115,33 @@ func TestBuildSharePayload_WithStatusAndOrphaned(t *testing.T) {
 	}
 }
 
+// A `languages` override travels as lang and file_type on POST and PUT;
+// files without one omit both keys.
+func TestBuildSharePayload_LangAndFileType(t *testing.T) {
+	files := []ShareFile{
+		{Path: "app.conf", Content: "a: 1", Lang: "yaml", FileType: "code"},
+		{Path: "notes.md", Content: "# Hi"},
+	}
+	payloads := map[string]map[string]any{
+		"share":  buildSharePayload(files, nil, 1, nil, "", "", ""),
+		"upsert": BuildUpsertPayload(files, nil, "tok", 1, nil),
+	}
+	for name, payload := range payloads {
+		pFiles, ok := payload["files"].([]map[string]any)
+		if !ok || len(pFiles) != 2 {
+			t.Fatalf("%s: files = %v", name, payload["files"])
+		}
+		if pFiles[0]["lang"] != "yaml" || pFiles[0]["file_type"] != "code" {
+			t.Errorf("%s: app.conf lang=%v file_type=%v, want yaml code", name, pFiles[0]["lang"], pFiles[0]["file_type"])
+		}
+		for _, key := range []string{"lang", "file_type"} {
+			if _, has := pFiles[1][key]; has {
+				t.Errorf("%s: notes.md has %s key, want it omitted", name, key)
+			}
+		}
+	}
+}
+
 func TestLoadShareFilesFromDisk_OrphanedFiles(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1286,6 +1313,20 @@ func TestLoadCliArgsFromReviewFile(t *testing.T) {
 		got := LoadCliArgsFromReviewFile("/nonexistent/path.json")
 		if got != nil {
 			t.Errorf("expected nil, got %v", got)
+		}
+	})
+
+	t.Run("drops a focus key", func(t *testing.T) {
+		for _, key := range []string{"range:abc..def", "pr:42", "mr:o/r#7"} {
+			dir := t.TempDir()
+			critPath := filepath.Join(dir, "review.json")
+			cj := CritJSON{Branch: "main", CliArgs: []string{key}, Files: map[string]CritJSONFile{}}
+			data, _ := json.Marshal(cj)
+			os.WriteFile(session.MustMkdirAll(review.ReviewPathsFor(critPath).Review), data, 0644)
+
+			if got := LoadCliArgsFromReviewFile(critPath); got != nil {
+				t.Errorf("cli_args %q: expected nil, got %v", key, got)
+			}
 		}
 	})
 

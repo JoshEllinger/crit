@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/JoshEllinger/crit/internal/config"
 	"github.com/JoshEllinger/crit/internal/diff"
@@ -111,13 +113,7 @@ func (s *Session) RefreshFileList() {
 	changes = config.FilterIgnored(changes, s.IgnorePatterns)
 	changes = filterBinary(changes)
 
-	// Snapshot existing files under read lock
-	s.mu.RLock()
-	existing := make(map[string]*FileEntry, len(s.Files))
-	for _, f := range s.Files {
-		existing[f.Path] = f
-	}
-	s.mu.RUnlock()
+	existing, lazyEntries := s.snapshotFilesForRefresh()
 
 	// Fetch numstats if we might need them for lazy files
 	var numstats map[string]vcs.NumstatEntry
@@ -127,17 +123,30 @@ func (s *Session) RefreshFileList() {
 		}
 	}
 
-	built := buildRefreshedFileList(existing, changes, repoRoot, numstats)
+	built := buildRefreshedFileList(existing, changes, repoRoot, numstats, s.languages)
+	hashLazyUpdates(built.updates, lazyEntries)
 
 	// Assign under write lock
 	s.mu.Lock()
 	for _, u := range built.updates {
 		u.entry.Status = u.status
+		// Keep the previous hash when the read failed (e.g. mid-rewrite);
+		// a deleted file has no working-tree hash.
+		if u.entry.Lazy && (u.listedHash != "" || u.status == "deleted") {
+			u.entry.ListedHash = u.listedHash
+		}
+		// A phantom that reappears in the live change list is no longer
+		// orphaned — Branch scope (and other Orphaned readers) must not
+		// keep treating it as "left the review".
+		u.entry.Orphaned = false
 		if u.oldPath != "" {
 			u.entry.OldPath = u.oldPath
 		}
 		if u.newPath != "" {
 			u.entry.Path = u.newPath
+			u.entry.AbsPath = u.absPath
+		} else if u.absPath != "" && u.entry.AbsPath == "" {
+			// Phantoms are created without AbsPath; fill it in on reuse.
 			u.entry.AbsPath = u.absPath
 		}
 	}
@@ -155,6 +164,22 @@ func (s *Session) RefreshFileList() {
 	}
 }
 
+// snapshotFilesForRefresh returns the current entries by path and the set of
+// entries that are lazy, read under the session read lock.
+func (s *Session) snapshotFilesForRefresh() (map[string]*FileEntry, map[*FileEntry]bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	existing := make(map[string]*FileEntry, len(s.Files))
+	lazyEntries := make(map[*FileEntry]bool)
+	for _, f := range s.Files {
+		existing[f.Path] = f
+		if f.Lazy {
+			lazyEntries[f] = true
+		}
+	}
+	return existing, lazyEntries
+}
+
 // fileListUpdate defers Path/Status/OldPath mutation until the write lock.
 type fileListUpdate struct {
 	entry   *FileEntry
@@ -162,6 +187,8 @@ type fileListUpdate struct {
 	oldPath string // set FileEntry.OldPath when non-empty (rename)
 	newPath string // when set, retarget Path/AbsPath (rename handoff)
 	absPath string
+	// listedHash is the refreshed working-tree hash for a still-lazy entry.
+	listedHash string
 }
 
 type refreshedFileList struct {
@@ -173,12 +200,14 @@ type refreshedFileList struct {
 // buildRefreshedFileList maps VCS changes onto existing FileEntries, carrying
 // comments across renames via OldPath (#917). Pure aside from reading new
 // file contents from disk for newly discovered paths.
-func buildRefreshedFileList(existing map[string]*FileEntry, changes []vcs.FileChange, repoRoot string, numstats map[string]vcs.NumstatEntry) refreshedFileList {
+func buildRefreshedFileList(existing map[string]*FileEntry, changes []vcs.FileChange, repoRoot string, numstats map[string]vcs.NumstatEntry, languages config.LanguageRules) refreshedFileList {
 	var out refreshedFileList
 	for i, fc := range changes {
 		absPath := filepath.Join(repoRoot, fc.Path)
 		if f, ok := existing[fc.Path]; ok {
-			out.updates = append(out.updates, fileListUpdate{entry: f, status: fc.Status, oldPath: fc.OldPath})
+			out.updates = append(out.updates, fileListUpdate{
+				entry: f, status: fc.Status, oldPath: fc.OldPath, absPath: absPath,
+			})
 			out.files = append(out.files, f)
 			delete(existing, fc.Path)
 			if fc.OldPath != "" {
@@ -210,16 +239,12 @@ func buildRefreshedFileList(existing map[string]*FileEntry, changes []vcs.FileCh
 			OldPath:  fc.OldPath,
 			AbsPath:  absPath,
 			Status:   fc.Status,
-			FileType: detectFileType(fc.Path),
+			FileType: detectFileType(languages, fc.Path),
 			Comments: []Comment{},
 		}
 
 		if len(changes) > lazyFileThreshold && i >= lazyFileThreshold {
-			fe.Lazy = true
-			if ns, ok := numstats[fc.Path]; ok {
-				fe.LazyAdditions = ns.Additions
-				fe.LazyDeletions = ns.Deletions
-			}
+			populateLazyFile(fe, fc, numstats, true)
 		} else if fc.Status != "deleted" {
 			if data, err := os.ReadFile(absPath); err == nil {
 				fe.Content = string(data)
@@ -230,6 +255,22 @@ func buildRefreshedFileList(existing map[string]*FileEntry, changes []vcs.FileCh
 		out.files = append(out.files, fe)
 	}
 	return out
+}
+
+// hashLazyUpdates re-hashes the working-tree content of entries that were
+// lazy when the file list was snapshotted, so a stale "viewed" mark on a file
+// that never loaded is still dropped. Eager entries are skipped: they carry
+// FileHash from their loaded content.
+func hashLazyUpdates(updates []fileListUpdate, lazyEntries map[*FileEntry]bool) {
+	for i := range updates {
+		u := &updates[i]
+		if !lazyEntries[u.entry] || u.status == "deleted" {
+			continue
+		}
+		if data, err := os.ReadFile(u.absPath); err == nil {
+			u.listedHash = fileHash(data)
+		}
+	}
 }
 
 // pathRename is old→new path for a VCS-reported rename.
@@ -630,6 +671,10 @@ func (s *Session) handleRoundCompleteGit() {
 
 	s.loadResolvedComments()
 
+	// The branch may have been rebased onto (or merged with) a newer default
+	// branch since the last round; diff against the current merge-base.
+	s.refreshWorkingTreeBaseRef()
+
 	// Refresh file list (agent may have created/deleted files)
 	s.RefreshFileList()
 
@@ -681,6 +726,35 @@ func (s *Session) handleRoundCompleteGit() {
 	s.finishRoundComplete(edits)
 }
 
+// refreshWorkingTreeBaseRef recomputes BaseRef for the working-tree focus so a
+// rebase or merge of the default branch between rounds does not leave the
+// review diffing against the old merge-base (which would pull every commit the
+// default branch gained into the diff). Keeps the current base on error.
+// No-op under FocusRange: the base is pinned to the range.
+func (s *Session) refreshWorkingTreeBaseRef() {
+	s.mu.RLock()
+	v := s.VCS
+	rangeFocus := s.Focus.Kind == FocusRange
+	prev := s.BaseRef
+	s.mu.RUnlock()
+	if v == nil || rangeFocus {
+		return
+	}
+	mb, err := s.baseRefForWorkingTreeDiscovery(v)
+	if err != nil || mb == "" {
+		return
+	}
+	s.mu.Lock()
+	// Skip if a base-branch change or focus switch landed while merge-base ran.
+	if s.Focus.Kind != FocusRange && s.BaseRef == prev {
+		s.BaseRef = mb
+		if s.Focus.Kind == FocusWorkingTree {
+			s.Focus.BaseRef = mb
+		}
+	}
+	s.mu.Unlock()
+}
+
 // relPathFromRoot returns a slash-separated path relative to repoRoot, falling
 // back to the absolute path when the result would escape the root.
 func relPathFromRoot(absPath, repoRoot string) string {
@@ -712,7 +786,7 @@ func (s *Session) buildFileEntry(absPath, repoRoot, baseRef string, vc vcs.VCS) 
 		Path:      relPath,
 		AbsPath:   absPath,
 		Status:    "modified",
-		FileType:  detectFileType(absPath),
+		FileType:  detectFileType(s.languages, relPath),
 		Content:   string(data),
 		FileHash:  fileHash(data),
 		Comments:  []Comment{},
@@ -1140,9 +1214,10 @@ func remapLines(lineMap map[int]int, oldStart, oldEnd, maxLine int) (int, int) {
 }
 
 // remapCommentPosition maps a line comment onto new content: LCS line mapping
-// first, then anchor verification to correct the position. Drifted reports
-// that the anchor text was not found where the mapping put it; it is false for
-// a comment without an anchor.
+// first, then anchor verification to correct the position. Drifted is true when
+// the anchor is not found where the mapping put it, or when a quoted comment's
+// quote is no longer on its lines. With neither anchor nor quote it is false
+// (callers that must keep a prior Drifted flag do so themselves).
 func remapCommentPosition(c Comment, lineMap map[int]int, newLines []string, newLineCount int) (start, end int, drifted bool) {
 	start, end = remapLines(lineMap, c.StartLine, c.EndLine, newLineCount)
 	if c.Anchor != "" {
@@ -1150,7 +1225,58 @@ func remapCommentPosition(c Comment, lineMap map[int]int, newLines []string, new
 		start, end, drift = verifyAndCorrectPosition(newLines, c.Anchor, start, end)
 		drifted = drift != 0
 	}
+	// The anchor check tolerates small edits to the line, but a comment on
+	// selected text is about its quote: once the quoted words are gone from
+	// its lines, the comment is Drifted (approximates the browser highlight).
+	if !drifted && c.Quote != "" && !quoteOnLines(newLines, start, end, c.Quote) {
+		drifted = true
+	}
 	return start, end, drifted
+}
+
+var (
+	quoteLinkTargetRe = regexp.MustCompile(`\]\([^)]*\)`)
+	quoteHTMLTagRe    = regexp.MustCompile(`</?[A-Za-z][A-Za-z0-9-]*(\s[^>]*)?/?>`)
+)
+
+// normalizeQuoteText keeps only letters and digits, lowercased, after
+// dropping markdown link targets and HTML tags. A quote is copied from the
+// rendered page (no `**`, link URLs or `<br/>` from the source), so both
+// sides are compared in this form.
+func normalizeQuoteText(s string) string {
+	if strings.Contains(s, "](") {
+		s = quoteLinkTargetRe.ReplaceAllString(s, "]")
+	}
+	if strings.Contains(s, "<") {
+		s = quoteHTMLTagRe.ReplaceAllString(s, " ")
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+// quoteOnLines reports whether quote is still on lines start..end (1-based,
+// inclusive), compared as normalizeQuoteText does. That approximates the
+// browser highlight (exact words after whitespace collapse): punctuation-only
+// edits are ignored here, and source markup the page does not show (list
+// markers, HTML entities, reference-link ids) can still disagree.
+func quoteOnLines(lines []string, start, end int, quote string) bool {
+	if start < 1 || end > len(lines) || start > end {
+		return true
+	}
+	span := lines[start-1 : end]
+	for _, line := range span {
+		if strings.Contains(line, quote) { // the usual case: quote unchanged
+			return true
+		}
+	}
+	q := normalizeQuoteText(quote)
+	return q == "" || strings.Contains(normalizeQuoteText(strings.Join(span, "\n")), q)
 }
 
 // carryForwardComments maps comments from the previous round to new document

@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"log"
 	"math"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -148,6 +147,9 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/preview-content/", s.handlePreviewContent)
 	mux.HandleFunc("/preview-content", s.handlePreviewContent)
 
+	// Click-to-load frame for one remote image (see csp.go). No session needed.
+	mux.HandleFunc("/remote-image", s.handleRemoteImage)
+
 	// Theme preview page — static samples, no session needed.
 	mux.HandleFunc("/themes", s.serveHTML("themes.html"))
 
@@ -211,6 +213,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/api/review-comment/", s.withReady(s.handleReviewCommentByID))
 	mux.HandleFunc("/api/files/list", s.withReady(s.handleFilesList))
 	mux.HandleFunc("/api/files/comments", s.withReady(s.handleAllFileComments))
+	mux.HandleFunc("/api/viewed", s.withReady(s.handleViewed))
 	mux.HandleFunc("/api/story", s.withReady(s.handleStory))
 
 	// File-scoped endpoints (use ?path= query param)
@@ -232,7 +235,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	// Static file serving (repo files need session; embedded assets do not)
 	mux.HandleFunc("/files/", s.withReady(s.handleFiles))
 	mux.Handle(precompressedPrefix, servePrecompressed(frontendFS))
-	mux.Handle("/", http.FileServer(http.FS(frontendFS)))
+	mux.Handle("/", s.serveAssets(frontendFS))
 
 	s.mux = mux
 	return s, nil
@@ -264,7 +267,7 @@ func isLoopbackHost(host string) bool {
 // is bound to a loopback address, the request's Host header must also resolve
 // to a loopback hostname — this is the canonical DNS-rebinding defense.
 func (s *Server) checkHost(r *http.Request) bool {
-	host := requestHost(r.Host)
+	host := config.RequestHost(r.Host)
 	if s.publicURLHost != "" && strings.EqualFold(host, s.publicURLHost) {
 		return true
 	}
@@ -272,18 +275,6 @@ func (s *Server) checkHost(r *http.Request) bool {
 		return true
 	}
 	return isLoopbackHost(host)
-}
-
-func requestHost(hostport string) string {
-	host := hostport
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	} else {
-		// SplitHostPort fails when there's no port (e.g. "Host: [::1]").
-		// Strip IPv6 brackets so ParseIP can recognise the address.
-		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
-	}
-	return host
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -306,7 +297,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // hostForbiddenMessage explains a checkHost rejection so a reverse-proxy /
 // --public-url misconfig is diagnosable from the 403 body (see #788).
 func (s *Server) hostForbiddenMessage(r *http.Request) string {
-	host := requestHost(r.Host)
+	host := config.RequestHost(r.Host)
 	if s.publicURLHost == "" {
 		return fmt.Sprintf(
 			"Forbidden: request Host %q does not match loopback (set --public-url if reaching Crit via a reverse proxy)",
@@ -436,6 +427,11 @@ func (s *Server) WaitBackground(timeout time.Duration) bool {
 func (s *Server) SetSession(session *Session) {
 	if session != nil {
 		session.MarkSessionStarted()
+		if s.configConfigured {
+			for _, problem := range s.checkFinishPrompts(session) {
+				fmt.Fprintf(os.Stderr, "Warning: finish prompt %s\n", problem)
+			}
+		}
 	}
 	s.session.Store(session)
 }
@@ -579,14 +575,19 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) { //nolint
 	// Integration detection
 	s.addIntegrationStatus(resp)
 
-	for k, v := range s.projectPromptTrustPayload() {
-		resp[k] = v
+	globalPrompts, projectPrompts, trust := s.loadPromptConfig()
+	resp["project_prompts_untrusted"] = trust.Untrusted
+	if trust.HasProjectPrompts {
+		resp["project_prompt_sources"] = trust.Sources
+		resp["project_prompt_content_hash"] = trust.ContentHash
 	}
-	if sess != nil && s.projectPromptsUntrusted() {
-		resp["project_prompt_preview"] = s.renderProjectPromptPreview(sess)
+	mode := finishPromptMode(sess)
+	resp["prompt_problems"] = prompt.Check(globalPrompts, projectPrompts, s.projectDir, s.homeDir, mode, trust.UseProject)
+	if trust.Untrusted {
+		resp["project_prompt_preview"] = prompt.PreviewProjectFinish(projectPrompts, s.projectDir, mode)
 	}
 
-	if sess != nil && sess.ReviewType != "" {
+	if sess.ReviewType != "" {
 		resp["review_type"] = sess.ReviewType
 	}
 
@@ -726,15 +727,19 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	type liveSessionResponse struct {
 		SessionInfo
-		ReviewType string `json:"review_type,omitempty"`
-		Origin     string `json:"origin,omitempty"`
-		ProxyPort  int    `json:"proxy_port,omitempty"`
+		ReviewType     string           `json:"review_type,omitempty"`
+		Origin         string           `json:"origin,omitempty"`
+		ProxyPort      int              `json:"proxy_port,omitempty"`
+		PromptProblems []prompt.Problem `json:"prompt_problems,omitempty"`
 	}
 	resp := liveSessionResponse{SessionInfo: info}
 	if session != nil {
 		resp.ReviewType = session.ReviewType
 		resp.Origin = session.Origin
 		resp.ProxyPort = session.ProxyPort
+		if r.URL.Query().Get("check_prompts") == "1" {
+			resp.PromptProblems = s.checkFinishPrompts(session)
+		}
 	}
 	writeJSON(w, resp)
 }
@@ -748,21 +753,30 @@ func (s *Server) serveIndexHTML() http.HandlerFunc {
 // serveHTML serves an embedded HTML page at a clean path (e.g. /themes).
 func (s *Server) serveHTML(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		f, err := s.assets.Open(name)
-		if err != nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		defer f.Close()
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if _, err := io.Copy(w, f); err != nil {
-			log.Printf("serveHTML %s: %v", name, err)
-		}
+		s.serveShell(w, name)
 	}
+}
+
+// serveAssets serves the embedded frontend. The HTML shells go through
+// serveShell so they carry the review page's Content-Security-Policy.
+func (s *Server) serveAssets(frontendFS embed.FS) http.Handler {
+	files := http.FileServer(http.FS(frontendFS))
+	index := s.serveHTML("index.html")
+	themes := s.serveHTML("themes.html")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/", "/index.html":
+			index(w, r)
+		case "/themes.html":
+			themes(w, r)
+		default:
+			files.ServeHTTP(w, r)
+		}
+	})
 }
 
 func (s *Server) handleCritAgentJS(w http.ResponseWriter, r *http.Request) {
@@ -1037,7 +1051,7 @@ func (s *Server) handleShareURL(w http.ResponseWriter, r *http.Request) { //noli
 // button path (handleShare) and the proxy-auth relay (handlePreviewPayload).
 func (s *Server) shareFilesForSession() (files []ShareFile, reviewType string, err error) {
 	sess := s.session.Load()
-	if sess != nil && sess.ReviewType == "preview" {
+	if sess.ReviewType == "preview" {
 		files, err = session.CrawlPreview(sess.Origin, s.previewEntryPath(sess))
 		if err != nil {
 			return nil, "", fmt.Errorf("crawling preview assets: %w", err)
@@ -2556,7 +2570,9 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.session.Load().SetFocus(req); err != nil {
+	sess := s.session.Load()
+	// A range picked at the branch tip follows HEAD from round to round.
+	if err := sess.SetFocus(sess.WithHeadRefAtTip(req)); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -2569,7 +2585,7 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.projectPromptsUntrusted() {
+	if _, _, trust := s.loadPromptConfig(); trust.Untrusted {
 		http.Error(w, "project prompt trust required", http.StatusForbidden)
 		return
 	}
@@ -2593,7 +2609,10 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	if unresolvedComments > 0 {
 		comments = listUnresolvedComments(sess)
 	}
-	prompt, promptMeta := s.renderFinishPrompts(sess, approved, stats)
+	finish, ok := s.renderFinishPrompt(w, sess, approved, stats)
+	if !ok {
+		return
+	}
 	nextCommand := session.NextRoundCommand(sess)
 	if !approved {
 		sess.SetWaitingForAgent(true)
@@ -2610,12 +2629,12 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	// as soon as the approved finish response has been processed.
 	finishResp := map[string]any{
 		"status":       "finished",
-		"prompt":       prompt,
+		"prompt":       finish.Prompt,
 		"approved":     approved,
 		"comments":     comments,
 		"next_command": nextCommand,
 		"stats":        stats,
-		"prompt_meta":  promptMeta,
+		"prompt_meta":  finish.Meta,
 	}
 	if ms, enabled := s.cfg.CloseOnApproveAfterMsEnabled(); enabled {
 		finishResp["close_on_approve_after_ms"] = ms
@@ -2628,12 +2647,12 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	// clients can extract it without string matching on the prompt.
 	// Mirror the finish response so review-cycle consumers see the same fields.
 	eventDataMap := map[string]any{
-		"prompt":       prompt,
+		"prompt":       finish.Prompt,
 		"approved":     approved,
 		"stats":        stats,
 		"comments":     comments,
 		"next_command": nextCommand,
-		"prompt_meta":  promptMeta,
+		"prompt_meta":  finish.Meta,
 	}
 	if ms, enabled := s.cfg.CloseOnApproveAfterMsEnabled(); enabled {
 		eventDataMap["close_on_approve_after_ms"] = ms
@@ -2789,6 +2808,13 @@ func (s *Server) handleReviewCycle(w http.ResponseWriter, r *http.Request) {
 	defer sess.Unsubscribe(ch)
 
 	if !sess.IsAwaitingFirstReview() {
+		// A --range review whose head is HEAD (or a branch) shows the commit
+		// the agent is at now, not the one it was at when the daemon started.
+		if oldHead, newHead, err := sess.FollowRangeHead(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: range head not updated: %v\n", err)
+		} else if newHead != "" {
+			fmt.Fprintf(os.Stderr, "Range head moved: %.7s -> %.7s\n", oldHead, newHead)
+		}
 		// Agent finished changes — signal round-complete so browser refreshes
 		sess.SignalRoundComplete()
 	}

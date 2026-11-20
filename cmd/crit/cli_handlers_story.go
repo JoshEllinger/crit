@@ -18,6 +18,7 @@ import (
 	"github.com/JoshEllinger/crit/internal/clicmd"
 	"github.com/JoshEllinger/crit/internal/config"
 	"github.com/JoshEllinger/crit/internal/daemon"
+	"github.com/JoshEllinger/crit/internal/forge"
 	"github.com/JoshEllinger/crit/internal/github"
 	"github.com/JoshEllinger/crit/internal/prompt"
 	"github.com/JoshEllinger/crit/internal/review"
@@ -182,6 +183,10 @@ func runStoryE(args []string) error {
 		return nil
 	}
 
+	args, err := forge.ResolveBareChangeFlags(args)
+	if err != nil {
+		return err
+	}
 	f, err := parseStoryFlags(args)
 	if err != nil {
 		return err

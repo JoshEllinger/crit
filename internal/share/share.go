@@ -157,6 +157,12 @@ func shareFileEntries(files []ShareFile) []map[string]any {
 		if f.Encoding != "" {
 			entry["encoding"] = f.Encoding
 		}
+		if f.Lang != "" {
+			entry["lang"] = f.Lang
+		}
+		if f.FileType != "" {
+			entry["file_type"] = f.FileType
+		}
 		entries[i] = entry
 	}
 	return entries
@@ -369,6 +375,16 @@ func LoadCliArgsFromReviewFile(critPath string) []string {
 	if err := json.Unmarshal(data, &cj); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to load cli_args from review file: %v\n", err)
 		return nil
+	}
+	// A range/PR/MR review records its focus key ("range:<base>..<head>") so
+	// `crit --session` can restore it. That is not a runnable crit argument,
+	// and crit-web shows cli_args as a command to run, so it is not shared.
+	if len(cj.CliArgs) == 1 {
+		for _, prefix := range []string{"range:", "pr:", "mr:"} {
+			if strings.HasPrefix(cj.CliArgs[0], prefix) {
+				return nil
+			}
+		}
 	}
 	return cj.CliArgs
 }
@@ -706,6 +722,11 @@ func fetchWebCommentsFromTarget(shareURL, shareBaseURL string, localIDs map[stri
 
 // carriedPlacement reports a local comment whose shared copy has moved or
 // been marked drifted. The local id is the external_id the CLI sent.
+//
+// crit-web's carry-forward is still anchor-only, so a quoted comment the CLI
+// marked Drifted can come back undrifted. Keep the local quote-drift flag
+// until web gains the same check (OR in web Drifted; never clear local
+// Drifted for a comment that still has a Quote).
 func carriedPlacement(wc WebComment, locals map[string]session.Comment) (session.Comment, bool) {
 	if wc.ExternalID == "" || locals == nil {
 		return session.Comment{}, false
@@ -714,13 +735,17 @@ func carriedPlacement(wc WebComment, locals map[string]session.Comment) (session
 	if !ok {
 		return session.Comment{}, false
 	}
-	if local.StartLine == wc.StartLine && local.EndLine == wc.EndLine && local.Anchor == wc.Anchor && local.Drifted == wc.Drifted {
+	drifted := wc.Drifted
+	if local.Quote != "" {
+		drifted = local.Drifted || wc.Drifted
+	}
+	if local.StartLine == wc.StartLine && local.EndLine == wc.EndLine && local.Anchor == wc.Anchor && local.Drifted == drifted {
 		return session.Comment{}, false
 	}
 	local.StartLine = wc.StartLine
 	local.EndLine = wc.EndLine
 	local.Anchor = wc.Anchor
-	local.Drifted = wc.Drifted
+	local.Drifted = drifted
 	return local, true
 }
 
