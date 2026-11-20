@@ -19,6 +19,7 @@ Crit gives each type of output its own review UI. Point at the exact thing that'
 - `crit` finds your git changes and shows them as syntax-highlighted diffs.
 - `crit http://localhost:3000` proxies your running app and adds a review layer on top.
 - `crit landing.html` renders a static HTML file you can click and comment on.
+- `crit arch.excalidraw` opens an Excalidraw drawing on a canvas, with comments pinned to its shapes.
 
 Everything runs locally from a single binary.
 
@@ -92,6 +93,7 @@ crit plan.md                      # review a specific file
 crit plan.md api-spec.md          # review multiple files
 crit http://localhost:3000        # review a running dev server
 crit landing.html                 # review a static HTML file
+crit arch.excalidraw              # review an Excalidraw drawing
 ```
 
 In your agent chat, run `/crit` with any of the arguments above. Run it bare and the agent picks what to launch from the conversation.
@@ -142,6 +144,9 @@ crit live http://localhost:4000/dashboard --cdp-url http://127.0.0.1:9222
 ```
 
 Relative paths resolve from the repo root. Prefer a gitignored file under `.crit/` over committing `live_cookie` inline. Run `crit live --help` for all flags.
+Cookie forwarding is available only when Crit listens on loopback without
+`--public-url`; Crit refuses cookie options and their config keys when the live
+proxy may be exposed over the network.
 
 If Comment/Pin stays unavailable, or a framework needs local CSP / iframe
 tweaks, see the **[live mode guide](docs/live-mode.md)** (injection model,
@@ -247,7 +252,9 @@ Crit auto-detects GitHub or GitLab from the repository remote. Set `"forge": "gi
 #### Open a remote change for review
 
 ```bash
+crit pr                                     # PR for the current branch (like gh)
 crit pr 42                                  # GitHub pull request
+crit mr                                     # MR for the current branch
 crit mr 42                                  # GitLab MR in the current project
 crit mr https://gitlab.com/group/sub/project/-/merge_requests/42
 crit review --mr 42 --remote                # read MR files via GitLab instead of local git
@@ -271,6 +278,18 @@ crit push --message "Round 2"                  # add a review summary
 crit push --event approve 42                   # approve
 crit push --event request-changes --forge gitlab 42
 ```
+
+#### Sync viewed files with GitHub
+
+When you review with `crit --pr`, files you mark as viewed can be ticked in the PR's "Files changed" tab, and the other way round:
+
+```bash
+crit push --viewed             # tick your viewed files on the PR
+crit push --viewed --dry-run   # preview what would change
+crit pull --viewed             # bring in files ticked on GitHub
+```
+
+Push skips files that changed since you viewed them, files marked by `auto_viewed_patterns`, and marks made outside the PR's own diff. Unticking a file in Crit unticks it on GitHub. Your marks stay available after you finish a review, so you can push them afterwards. Pull adds GitHub's ticks but keeps any file you unticked in Crit; an open review page shows them after a reload. GitLab has no equivalent, so `--viewed` is an error there.
 
 GitLab inline comments are published as a single review using Draft Notes. `request-changes` requires GitLab support for the `reviewer_state=requested_changes` bulk-publish option; Crit reports an error instead of silently downgrading the outcome. Pulling again imports replies, edits, deletes, and discussion resolution without duplicating local comments.
 
@@ -337,7 +356,7 @@ After the first agent interaction, the comment becomes a **live thread**:
 - **Vim keybindings.** `j`/`k` to navigate, `c` to comment, `Shift+F` to finish. `?` for the full reference.
 - **Concurrent reviews.** Each instance runs on its own port - review multiple plans at once.
 - **Syntax highlighting.** Code blocks are highlighted and split per-line, so you can comment on individual lines inside a fence.
-- **Diagrams and custom renderers.** Mermaid fences render as diagrams, and `.mermaid` / `.mmd` files get a Diagram / Source toggle. In a Mermaid file, click a diagram node to comment on the line that defines it. See the **[renderers guide](docs/renderers.md)**.
+- **Diagrams and custom renderers.** Mermaid fences render as diagrams, and `.mermaid` / `.mmd` files get a Diagram / Source toggle. In a Mermaid file, click a diagram node to comment on the line that defines it. Excalidraw scenes (`.excalidraw` / `.excalidraw.json` files and `excalidraw` fences) are drawn as Excalidraw draws them; in a scene file, click a shape, arrow or label to comment on its JSON object. `crit arch.excalidraw` opens a single scene on a canvas you can pan and zoom, with comments pinned to its shapes. See the **[renderers guide](docs/renderers.md)**.
 - **Live file watching.** Each new round loads the latest files. If a file under review changes during a round (in files and plan mode), Crit offers to reload the files in place, keeping your place and any comment you're writing. Comments move to their new lines at the next round, so until then one below an added or removed line can sit slightly off, as after a browser refresh.
 - **Paired UI and code themes.** Choose light and dark Shiki-based palettes in Settings; code, rendered markdown and review UI share their colours. System/Light/Dark selects the active palette. Preferences persist in a cookie across ports.
 - **Configurable code font.** Code-review Settings → Display → Code font lists coding/monospace fonts detected by the local Crit daemon, plus Default, System monospace, and a custom `font-family` fallback. Applies to code and diffs, and persists across sessions.
@@ -379,6 +398,7 @@ All keys are optional — omit any you don't need.
 | `base_branch`          | string   | auto-detected              | Base branch to diff against (e.g. `"main"`, `"develop"`). Overrides auto-detection.                                                                                                     |
 | `ignore_patterns`      | string[] | `[".crit/"]` | File patterns to exclude from git-mode file lists. Global and project patterns are merged.                                                                                              |
 | `auto_viewed_patterns` | string[] | `[]`                       | File patterns auto-marked as viewed (collapsed) once when a review opens — e.g. `["*.lock", "generated/", "PLAN.md"]`. Manually un-marking a file keeps it open. Global and project patterns are merged. |
+| `languages`            | object   | `{}`                       | Review language per file pattern, for files Crit detects wrongly. A value is `"markdown"` (document view and document diff between rounds, e.g. `.qmd`, `.Rmd`), `"text"` (no highlighting), `"auto"` (Crit's own detection, to switch off a global rule in one project), or a grammar name (`"yaml"`, `"glimmer-ts"`) — e.g. `{"*.qmd": "markdown", "deploy/*.conf": "yaml"}`. Patterns use `ignore_patterns` syntax, relative to the repo root, case-insensitive. When several match a file, the most specific wins: an exact name or directory over a glob, then the longer pattern. Global and project maps are merged (project wins for the same pattern). An unknown language stops `crit` with an error listing close matches. |
 | `default_markdown_view` | string | `""` (diff in git mode) | Initial view for markdown files (Document/Diff toggle) in git mode: `"document"` opens them in document view, `"diff"` (or unset) keeps diff view. File mode is always document view. Project overrides global. |
 | `cleanup_on_approve`   | bool     | `true`                     | Automatically delete the review file when you approve with no unresolved comments. Set to `false` to preserve review history.                                                           |
 | `notify_on_round_ready`| bool     | `false`                    | Opt in to a desktop notification when a review round becomes ready for you (after the agent finishes addressing comments). On macOS, install [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) (`brew install terminal-notifier`) so clicking the notification opens the review URL — without it, clicking falls back to AppleScript's `display notification`, which macOS attributes to Script Editor and activates that instead of your browser. |
@@ -430,6 +450,21 @@ These keys can only be set in `~/.crit.config.json` (global). Project-level `.cr
 | `plan_approve_mode`    | string   | unset                      | Claude Code permission mode after Crit approves an `ExitPlanMode` hook: `default`, `manual`, `acceptEdits`, `plan`, `auto`, `dontAsk`, or `bypassPermissions`. The update uses `destination: "session"`, so it lasts only for the current Claude Code session. See [Claude Code plan approval mode](integrations/README.md#claude-code-plan-approval-mode). |
 | `close_on_approve_after_ms` | int | unset (disabled)          | Auto-close the review tab this many milliseconds after you Approve with no unresolved comments. Unset means no auto-close (current behavior); negative values are treated as unset. A Cancel button during the countdown skips the close for that approval. |
 | `stale_review_days`    | int      | `14`                       | Delete reviews untouched for this many days in the background sweep that runs when a review starts. Unset or non-positive values use the default. `crit cleanup --days N` is unaffected. |
+| `remote_images`        | string[] | `[]`                       | Hosts whose remote (http/https) images load without a click: `"img.shields.io"`, `"*.githubusercontent.com"` (subdomains only), or `"*"` for any host. See [Remote images](#remote-images). |
+
+### Remote images
+
+Reviewed files and comments can be written by an agent, so Crit does not load images from other hosts on its own: a remote image URL can carry data to whoever runs that host, even when the agent itself has no network access. Each remote image shows as a placeholder with the image's host; click it to load that image. The review page's Content-Security-Policy blocks remote images and media, so this holds for every way an image can get onto the page, including raw HTML and diagrams.
+
+To load images from hosts you trust without clicking, list them in `remote_images` in `~/.crit.config.json`:
+
+```json
+{ "remote_images": ["img.shields.io", "*.githubusercontent.com"] }
+```
+
+`remote_images` is global-only: a project's `.crit.config.json` cannot set it, because an agent can write that file. The same policy applies to `~/.crit/custom.css`: it can load fonts from Google Fonts and images from `remote_images` hosts, or use `data:` URLs.
+
+This covers the review page itself. The HTML file shown by `crit preview` and the pages of your dev server in live mode are not covered: they run with their own content and headers.
 
 ### CLI flags
 
@@ -566,3 +601,6 @@ Crit embeds the following open-source libraries:
 - [@pierre/diffs](https://github.com/pierrecomputer/pierre): Diff and code rendering
 - [Shiki](https://github.com/shikijs/shiki): Syntax highlighting and code themes
 - [Mermaid](https://github.com/mermaid-js/mermaid): Diagram rendering
+- [Rough.js](https://github.com/pshihn/rough): Hand-drawn shapes in Excalidraw scenes
+- [perfect-freehand](https://github.com/steveruizok/perfect-freehand) and [points-on-curve](https://github.com/pshihn/bezier-points): Freehand strokes in Excalidraw scenes
+- [Excalidraw](https://github.com/excalidraw/excalidraw): Fonts and laser-pointer stroke geometry for Excalidraw scenes
